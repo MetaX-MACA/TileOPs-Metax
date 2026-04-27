@@ -1,3 +1,5 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 # This test validates the compatibility of TileOps operators with torch.compile().
 # Check: https://docs.pytorch.org/tutorials/advanced/python_custom_ops.html
 

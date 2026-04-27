@@ -1,3 +1,5 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 """Tests for BatchNormFwdOp and BatchNormBwdOp.
 
 Correctness is validated against torch.nn.functional.batch_norm and the

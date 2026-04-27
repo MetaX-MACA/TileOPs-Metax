@@ -1,3 +1,5 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 import functools
 import itertools
 from typing import Optional, Tuple
