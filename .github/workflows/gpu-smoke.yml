@@ -7,10 +7,10 @@ permissions:
 
 on:
   push:
-    branches: [main]
+    branches: [dev]
     tags: ["v*"]
   pull_request:
-    branches: [main]
+    branches: [dev]
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
