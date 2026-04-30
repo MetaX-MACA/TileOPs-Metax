@@ -358,10 +358,12 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+      - name: Set up MACA environment
+        run: |
+          set -euo pipefail
+          # MACA environment is pre-configured in the runner container
+          # Image: maca-pytorch:3.5.3.6-torch2.8-py312-ubuntu24.04-amd64
+          echo "MACA environment ready (Python 3.12, PyTorch 2.8)"
 
       - name: Resolve runtime state
         env:
@@ -416,7 +418,7 @@ jobs:
             VENV_PREFIX="tileops_ci_venv"
             HASH_INPUT="$(
               {
-                echo "python=3.11"
+                echo "python=3.12"
                 echo "install=PIP_NO_BUILD_ISOLATION=1 pip install -e '.[dev]'"
                 sha256sum pyproject.toml
               } | sha256sum | cut -c1-16
@@ -441,20 +443,20 @@ jobs:
             echo "VENV_REUSED=${VENV_REUSED}"
           } >> "$GITHUB_ENV"
 
-      - name: Validate GPU frequency
+      - name: Validate MACA GPU frequency
         run: |
           set -euo pipefail
           TARGET_CLOCK_MHZ=1830
           RETRIES=5
           SLEEP_SECONDS=2
 
-          if ! command -v nvidia-smi >/dev/null 2>&1; then
-            echo "::error::nvidia-smi is not available on this runner."
+          if ! command -v mx-smi >/dev/null 2>&1; then
+            echo "::error::mx-smi is not available on this runner."
             exit 1
           fi
 
-          echo "Detected GPUs:"
-          nvidia-smi -L
+          echo "Detected MACA GPUs:"
+          mx-smi -L
 
           attempt=1
           while [ "$attempt" -le "$RETRIES" ]; do
@@ -468,7 +470,7 @@ jobs:
               if [[ "$gpu_clock" != "$TARGET_CLOCK_MHZ" ]]; then
                 mismatch=1
               fi
-            done < <(nvidia-smi --query-gpu=index,name,clocks.current.graphics --format=csv,noheader,nounits)
+            done < <(mx-smi --query-gpu=index,name,clocks.current.graphics --format=csv,noheader,nounits)
 
             if [[ "$mismatch" -eq 0 ]]; then
               echo "All GPUs locked at ${TARGET_CLOCK_MHZ} MHz."

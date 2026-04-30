@@ -1,5 +1,4 @@
-FROM sw-harbor-lt.mxcr.io/cimaster/maca-pytorch:20260227-616-torch2.6-py310-ubuntu24.04-amd64
-
+FROM https://developer.metax-tech.com/softnova/docker?package_name=maca-pytorch:3.5.3.6-torch2.8-py312-ubuntu24.04-amd64
 ENV DEBIAN_FRONTEND=noninteractive
 
 ENV USE_MACA=ON

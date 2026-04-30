@@ -1,5 +1,3 @@
 self-hosted-runner:
   labels:
-    - tile-ops
-    - venv
-    - tileops-metax-runner
+    - self-hosted
