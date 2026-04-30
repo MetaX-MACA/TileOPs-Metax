@@ -339,12 +339,11 @@ jobs:
     needs: [ci-prereq, security-policy]
     if: ${{ needs.ci-prereq.outputs.skip != 'true' && needs.security-policy.outputs.skip_gpu_smoke != 'true' }}
     runs-on: tileops-metax-runner
-    container:
-      image: maca-pytorch:3.5.3.6-torch2.8-py312-ubuntu24.04-amd64
-      options: --gpus all
-      env:
-        USE_MACA: "ON"
     steps:
+      - name: Print Python & Torch version
+        run: |
+          python -c "import sys; print('Python version:', sys.version)"
+          python -c "import torch; print('Torch version:', torch.__version__)"
       - name: Checkout code for fork PR
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
         uses: actions/checkout@v4
