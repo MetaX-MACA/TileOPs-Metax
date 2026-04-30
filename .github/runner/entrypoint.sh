@@ -31,4 +31,3 @@ trap cleanup EXIT INT TERM
 
 # ── Run one job, then exit ───────────────────────────────────────────────────
 ./run.sh
-
