@@ -25,7 +25,7 @@ jobs:
   cache-warmup:
     if: ${{ github.event_name == 'schedule' || github.ref == 'refs/heads/dev' }}
     timeout-minutes: 60
-    runs-on: [self-hosted, tile-ops, venv]
+    runs-on: [self-hosted, tileops-metax-runner]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -147,7 +147,7 @@ jobs:
     if: ${{ always() && (github.event_name == 'schedule' || github.ref == 'refs/heads/dev') }}
     needs: [cache-warmup]
     timeout-minutes: 120
-    runs-on: [self-hosted, tile-ops, venv]
+    runs-on: [self-hosted, tileops-metax-runner]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -384,7 +384,7 @@ jobs:
     if: ${{ always() && (github.event_name == 'schedule' || github.ref == 'refs/heads/dev') }}
     needs: [benchmark]
     timeout-minutes: 180
-    runs-on: [self-hosted, tile-ops, venv]
+    runs-on: [self-hosted, tileops-metax-runner]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -531,7 +531,7 @@ jobs:
     needs: [op_test]
     permissions:
       contents: write
-    runs-on: [self-hosted, tile-ops, venv]
+    runs-on: [self-hosted, tileops-metax-runner]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
