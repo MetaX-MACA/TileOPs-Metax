@@ -342,8 +342,8 @@ jobs:
     steps:
       - name: Print Python & Torch version
         run: |
-          python -c "import sys; print('Python version:', sys.version)"
-          python -c "import torch; print('Torch version:', torch.__version__)"
+          python3 -c "import sys; print('Python version:', sys.version)"
+          python3 -c "import torch; print('Torch version:', torch.__version__)"
       - name: Checkout code for fork PR
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
         uses: actions/checkout@v4
