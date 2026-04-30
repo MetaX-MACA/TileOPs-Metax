@@ -136,7 +136,7 @@ jobs:
 
   security-policy:
     needs: ci-prereq
-    if: ${{ github.repository == 'tile-ai/TileOPs' && needs.ci-prereq.outputs.skip != 'true' }}
+    if: ${{ needs.ci-prereq.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     outputs:
       is_fork: ${{ steps.policy.outputs.is_fork }}
@@ -337,7 +337,7 @@ jobs:
 
   gpu-smoke:
     needs: [ci-prereq, security-policy]
-    if: ${{ github.repository == 'tile-ai/TileOPs' && needs.ci-prereq.outputs.skip != 'true' && needs.security-policy.outputs.skip_gpu_smoke != 'true' }}
+    if: ${{ needs.ci-prereq.outputs.skip != 'true' && needs.security-policy.outputs.skip_gpu_smoke != 'true' }}
     runs-on: [self-hosted, tile-ops, venv]
     steps:
       - name: Checkout code for fork PR

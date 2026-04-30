@@ -146,7 +146,7 @@ jobs:
 
   pre-commit:
     needs: [validate-commits, validate-pr-title, ci-gate]
-    if: ${{ github.repository == 'tile-ai/TileOPs' && needs.ci-gate.outputs.skip != 'true' }}
+    if: ${{ needs.ci-gate.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -166,7 +166,7 @@ jobs:
 
   gitleaks:
     needs: [validate-commits, validate-pr-title, ci-gate]
-    if: ${{ github.repository == 'tile-ai/TileOPs' && needs.ci-gate.outputs.skip != 'true' }}
+    if: ${{ needs.ci-gate.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -194,7 +194,7 @@ jobs:
 
   actionlint:
     needs: [validate-commits, validate-pr-title, ci-gate]
-    if: ${{ github.repository == 'tile-ai/TileOPs' && needs.ci-gate.outputs.skip != 'true' }}
+    if: ${{ needs.ci-gate.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
