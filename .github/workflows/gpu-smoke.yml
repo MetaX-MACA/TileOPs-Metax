@@ -384,12 +384,24 @@ jobs:
           python -c "import sys; print('Python version:', sys.version)"
           python -c "import torch; print('Torch version:', torch.__version__)"
 
+          # Set up cache directories
+          RUNTIME_ROOT="${{ github.workspace }}/.cache"
+          TILELANG_CACHE_DIR="${RUNTIME_ROOT}/tilelang/cache"
+          TRITON_CACHE_DIR="${RUNTIME_ROOT}/triton/cache"
+          WHEEL_DIR="${RUNTIME_ROOT}/wheels"
+
+          mkdir -p "${TILELANG_CACHE_DIR}" "${TRITON_CACHE_DIR}" "${WHEEL_DIR}"
+
           # Save environment for subsequent steps
           {
             echo "PATH=${PATH}"
             echo "USE_MACA=ON"
             echo "UV_INDEX=http://mirrors.aliyun.com/pypi/simple"
             echo "VIRTUAL_ENV=${{ github.workspace }}/.venv"
+            echo "RUNTIME_ROOT=${RUNTIME_ROOT}"
+            echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR}"
+            echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR}"
+            echo "WHEEL_DIR=${WHEEL_DIR}"
           } >> "$GITHUB_ENV"
 
       - name: Install dependencies
@@ -487,12 +499,90 @@ jobs:
           echo "Resolved pytest targets: ${PYTEST_TARGETS}"
           read -r -a TARGETS <<< "${PYTEST_TARGETS}"
           echo "Running pytest -m \"${TEST_MARK_EXPR}\" on ${#TARGETS[@]} target(s)"
-          python -m pytest -q "${TARGETS[@]}" -m "${TEST_MARK_EXPR}" | tee gpu_smoke.log
+          python -m pytest -q "${TARGETS[@]}" -m "${TEST_MARK_EXPR}" \
+            --junit-xml=gpu_smoke_results.xml \
+            | tee gpu_smoke.log
+
+      - name: Generate gpu-smoke report
+        if: ${{ always() && hashFiles('gpu_smoke_results.xml') != '' }}
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+
+          REPORT_TARGET="smoke, full"
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            REPORT_TARGET="smoke"
+          fi
+
+          if [[ -f scripts/gpu_smoke_report.py ]]; then
+            python scripts/gpu_smoke_report.py \
+              --test-xml gpu_smoke_results.xml \
+              --target "${REPORT_TARGET}" \
+              --output gpu_smoke_report.md \
+              || echo "::warning::gpu_smoke_report.py failed"
+          else
+            echo "::warning::scripts/gpu_smoke_report.py not found, skipping report generation"
+          fi
+
+      - name: Post gpu-smoke report to step summary
+        if: ${{ always() && hashFiles('gpu_smoke_report.md') != '' }}
+        run: cat gpu_smoke_report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cache stats
+        if: ${{ always() }}
+        env:
+          IS_FORK: ${{ needs.security-policy.outputs.is_fork }}
+        run: |
+          set -u
+          echo "=== Cache stats (is_fork=${IS_FORK}) ==="
+          echo "VENV_REUSED=${VENV_REUSED:-unknown}"
+          echo "FORK_CAN_COPY_TRUSTED_VENV=${FORK_CAN_COPY_TRUSTED_VENV:-unknown}"
+          echo "TRUSTED_VENV_PATH=${TRUSTED_VENV_PATH:-unknown}"
+          for cache_dir in "${TILELANG_CACHE_DIR:-}" "${TRITON_CACHE_DIR:-}" "${WHEEL_DIR:-}"; do
+            if [[ -z "${cache_dir}" ]]; then
+              continue
+            fi
+            if [[ -d "${cache_dir}" ]]; then
+              file_count=$(set -o pipefail; find "${cache_dir}" -type f 2>/dev/null | wc -l 2>/dev/null) || file_count="unknown"
+              cache_size=$(set -o pipefail; du -sh "${cache_dir}" 2>/dev/null | cut -f1 2>/dev/null) || cache_size="unknown"
+              if [[ -z "${file_count}" ]]; then file_count="unknown"; fi
+              if [[ -z "${cache_size}" ]]; then cache_size="unknown"; fi
+              echo "${cache_dir}: ${file_count} files, ${cache_size}"
+            else
+              echo "${cache_dir}: does not exist"
+            fi
+          done
+
+          if [[ "${IS_FORK}" == "true" ]]; then
+            if [[ "${FORK_CAN_COPY_TRUSTED_VENV:-false}" == "true" ]]; then
+              echo "CACHE_SIGNAL: fork venv=hit"
+            else
+              echo "CACHE_SIGNAL: fork venv=miss (cold pip install path)"
+            fi
+          else
+            if [[ "${VENV_REUSED:-false}" == "true" ]]; then
+              echo "CACHE_SIGNAL: trusted venv=hit"
+            else
+              echo "CACHE_SIGNAL: trusted venv=miss (fresh venv created)"
+            fi
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: gpu_smoke.log
-          path: gpu_smoke.log
+          name: gpu_smoke_artifacts
+          path: |
+            gpu_smoke.log
+            gpu_smoke_results.xml
+            gpu_smoke_report.md
           retention-days: 7
+
+      - name: Cleanup isolated fork state
+        if: ${{ always() && needs.security-policy.outputs.is_fork == 'true' }}
+        run: |
+          if [[ -n "${RUNTIME_ROOT:-}" ]]; then
+            rm -rf "${RUNTIME_ROOT}"
+          fi
