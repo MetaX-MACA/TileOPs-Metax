@@ -340,6 +340,9 @@ jobs:
     if: ${{ needs.ci-prereq.outputs.skip != 'true' && needs.security-policy.outputs.skip_gpu_smoke != 'true' }}
     runs-on: tileops-metax-runner
     steps:
+      - name: Set up Docker
+        uses: docker/setup-docker-action@v4
+
       - name: Checkout code for fork PR
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
         uses: actions/checkout@v4
