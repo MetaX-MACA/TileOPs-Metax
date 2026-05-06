@@ -449,6 +449,12 @@ jobs:
             echo "::warning::mx-smi not available, skipping GPU frequency validation."
           fi
 
+      - name: Install TileOPs
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          pip install --no-build-isolation -e ".[dev]"
+
       - name: Install TileLang (MACA version)
         run: |
           set -euo pipefail
@@ -458,12 +464,6 @@ jobs:
           cd tilelang-metax
           git checkout dev
           pip install --no-cache-dir -e .
-
-      - name: Install TileOPs
-        run: |
-          set -euo pipefail
-          source .venv/bin/activate
-          pip install --no-build-isolation -e ".[dev]"
 
       - name: Run tests
         env:
