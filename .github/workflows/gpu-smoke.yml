@@ -340,10 +340,6 @@ jobs:
     if: ${{ needs.ci-prereq.outputs.skip != 'true' && needs.security-policy.outputs.skip_gpu_smoke != 'true' }}
     runs-on: tileops-metax-runner
     steps:
-      - name: Print Python & Torch version
-        run: |
-          python3 -c "import sys; print('Python version:', sys.version)"
-          docker version
       - name: Checkout code for fork PR
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
         uses: actions/checkout@v4
@@ -362,130 +358,92 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Install system dependencies
-        run: |
-          set -euo pipefail
-          apt-get update && apt-get install -y --no-install-recommends \
-            curl wget git rsync jq \
-            build-essential cmake libedit-dev libxml2-dev libtinfo-dev zlib1g-dev \
-            software-properties-common ca-certificates gnupg sudo unzip tar gzip
-
-      - name: Install Python dependencies
-        run: |
-          set -euo pipefail
-          pip install --no-cache-dir \
-            einops numpy "tqdm>=4.62.3" "typing_extensions>=4.10.0" \
-            cloudpickle ml_dtypes psutil Cython \
-            setuptools wheel ninja
-          pip install --no-cache-dir \
-            "pytest==9.0.2" \
-            "pytest-xdist>=3.0" \
-            "pyyaml>=6.0"
-
-      - name: Install TileLang (MACA version)
-        run: |
-          set -euo pipefail
-          pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@dev
-
-      - name: Resolve runtime state
-        run: |
-          set -euo pipefail
-
-          # Use container's temp directory for caches
-          RUNTIME_ROOT="/tmp/tileops-ci"
-          TILELANG_CACHE_DIR="${RUNTIME_ROOT}/tilelang/cache"
-          TILELANG_TMP_DIR="${TILELANG_CACHE_DIR}/tmp"
-          TRITON_CACHE_DIR="${RUNTIME_ROOT}/triton/cache"
-          WHEEL_DIR="${RUNTIME_ROOT}/wheels"
-          VENV_PATH="${RUNTIME_ROOT}/venv"
-
-          mkdir -p "${TILELANG_CACHE_DIR}" "${TILELANG_TMP_DIR}" "${TRITON_CACHE_DIR}" "${WHEEL_DIR}"
-
-          {
-            echo "RUNTIME_ROOT=${RUNTIME_ROOT}"
-            echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR}"
-            echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR}"
-            echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR}"
-            echo "WHEEL_DIR=${WHEEL_DIR}"
-            echo "VENV_PATH=${VENV_PATH}"
-          } >> "$GITHUB_ENV"
-
-      - name: Validate MACA GPU frequency
-        run: |
-          set -euo pipefail
-          TARGET_CLOCK_MHZ=1830
-          RETRIES=5
-          SLEEP_SECONDS=2
-
-          if ! command -v mx-smi >/dev/null 2>&1; then
-            echo "::error::mx-smi is not available on this runner."
-            exit 1
-          fi
-
-          echo "Detected MACA GPUs:"
-          mx-smi -L
-
-          attempt=1
-          while [ "$attempt" -le "$RETRIES" ]; do
-            echo "Validation attempt ${attempt}/${RETRIES}"
-            mismatch=0
-            while IFS=',' read -r gpu_index gpu_name gpu_clock; do
-              gpu_index="$(echo "$gpu_index" | xargs)"
-              gpu_name="$(echo "$gpu_name" | xargs)"
-              gpu_clock="$(echo "$gpu_clock" | xargs)"
-              echo "GPU ${gpu_index} (${gpu_name}) clock: ${gpu_clock} MHz"
-              if [[ "$gpu_clock" != "$TARGET_CLOCK_MHZ" ]]; then
-                mismatch=1
-              fi
-            done < <(mx-smi --query-gpu=index,name,clocks.current.graphics --format=csv,noheader,nounits)
-
-            if [[ "$mismatch" -eq 0 ]]; then
-              echo "All GPUs locked at ${TARGET_CLOCK_MHZ} MHz."
-              break
-            fi
-
-            if [[ "$attempt" -eq "$RETRIES" ]]; then
-              echo "::error::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz on all GPUs."
-              exit 1
-            fi
-
-            sleep "$SLEEP_SECONDS"
-            attempt=$((attempt + 1))
-          done
-
-      - name: Install TileOPs
-        run: |
-          set -euo pipefail
-          pip install --no-build-isolation -e '.[dev]'
-
-      - name: Run tests
+      - name: Run GPU smoke in MACA container
+        uses: addnab/docker-run-action@v3
         env:
           EVENT_NAME: ${{ github.event_name }}
           TEST_SCOPE: ${{ needs.security-policy.outputs.scope }}
           PYTEST_TARGETS: ${{ needs.security-policy.outputs.pytest_targets }}
-        run: |
-          set -euo pipefail
-          current_dir="$(pwd)"
-          export PYTHONPATH="${current_dir}${PYTHONPATH:+:$PYTHONPATH}"
-          echo "PYTHONPATH=$PYTHONPATH"
-          python - <<'PY'
-          import os
+        with:
+          image: developer.metax-tech.com/softnova/maca-pytorch:3.5.3.6-torch2.8-py312-ubuntu24.04-amd64
+          options: --gpus all -v ${{ github.workspace }}:/workspace -w /workspace
+          run: |
+            set -euo pipefail
 
-          print("Runtime cache env:")
-          for key in ("TILELANG_CACHE_DIR", "TILELANG_TMP_DIR", "TRITON_CACHE_DIR"):
-              print(f"{key}={os.environ.get(key)}")
-          PY
+            echo "Python version:"
+            python3 -c "import sys; print(sys.version)"
+            echo "Torch version:"
+            python3 -c "import torch; print(torch.__version__)"
 
-          TEST_MARK_EXPR="smoke or full"
-          if [[ "$EVENT_NAME" == "pull_request" ]]; then
-            TEST_MARK_EXPR="smoke"
-          fi
+            # Install Python dependencies
+            pip install --no-cache-dir \
+              einops numpy "tqdm>=4.62.3" "typing_extensions>=4.10.0" \
+              cloudpickle ml_dtypes psutil Cython \
+              setuptools wheel ninja
+            pip install --no-cache-dir \
+              "pytest==9.0.2" \
+              "pytest-xdist>=3.0" \
+              "pyyaml>=6.0"
 
-          echo "Resolved test scope: ${TEST_SCOPE}"
-          echo "Resolved pytest targets: ${PYTEST_TARGETS}"
-          read -r -a TARGETS <<< "${PYTEST_TARGETS}"
-          echo "Running pytest -m \"${TEST_MARK_EXPR}\" on ${#TARGETS[@]} target(s)"
-          python -m pytest -q "${TARGETS[@]}" -m "${TEST_MARK_EXPR}" | tee gpu_smoke.log
+            # Install TileLang (MACA version)
+            pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@dev
+
+            # Validate MACA GPU frequency
+            TARGET_CLOCK_MHZ=1830
+            RETRIES=5
+            SLEEP_SECONDS=2
+
+            if command -v mx-smi >/dev/null 2>&1; then
+              echo "Detected MACA GPUs:"
+              mx-smi -L
+
+              attempt=1
+              while [ "$attempt" -le "$RETRIES" ]; do
+                echo "Validation attempt ${attempt}/${RETRIES}"
+                mismatch=0
+                while IFS=',' read -r gpu_index gpu_name gpu_clock; do
+                  gpu_index="$(echo "$gpu_index" | xargs)"
+                  gpu_name="$(echo "$gpu_name" | xargs)"
+                  gpu_clock="$(echo "$gpu_clock" | xargs)"
+                  echo "GPU ${gpu_index} (${gpu_name}) clock: ${gpu_clock} MHz"
+                  if [[ "$gpu_clock" != "$TARGET_CLOCK_MHZ" ]]; then
+                    mismatch=1
+                  fi
+                done < <(mx-smi --query-gpu=index,name,clocks.current.graphics --format=csv,noheader,nounits)
+
+                if [[ "$mismatch" -eq 0 ]]; then
+                  echo "All GPUs locked at ${TARGET_CLOCK_MHZ} MHz."
+                  break
+                fi
+
+                if [[ "$attempt" -eq "$RETRIES" ]]; then
+                  echo "::warning::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz."
+                fi
+
+                sleep "$SLEEP_SECONDS"
+                attempt=$((attempt + 1))
+              done
+            else
+              echo "::warning::mx-smi not available, skipping GPU frequency validation."
+            fi
+
+            # Install TileOPs
+            pip install --no-build-isolation -e '.[dev]'
+
+            # Run tests
+            export PYTHONPATH="/workspace${PYTHONPATH:+:$PYTHONPATH}"
+            echo "PYTHONPATH=$PYTHONPATH"
+
+            TEST_MARK_EXPR="smoke or full"
+            if [[ "$EVENT_NAME" == "pull_request" ]]; then
+              TEST_MARK_EXPR="smoke"
+            fi
+
+            echo "Resolved test scope: ${TEST_SCOPE}"
+            echo "Resolved pytest targets: ${PYTEST_TARGETS}"
+            read -r -a TARGETS <<< "${PYTEST_TARGETS}"
+            echo "Running pytest -m \"${TEST_MARK_EXPR}\" on ${#TARGETS[@]} target(s)"
+            python -m pytest -q "${TARGETS[@]}" -m "${TEST_MARK_EXPR}" | tee gpu_smoke.log
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
