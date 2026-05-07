@@ -136,7 +136,7 @@ jobs:
 
   security-policy:
     needs: ci-prereq
-    if: ${{ needs.ci-prereq.outputs.skip != 'true' }}
+    if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && needs.ci-prereq.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     outputs:
       is_fork: ${{ steps.policy.outputs.is_fork }}
@@ -337,7 +337,7 @@ jobs:
 
   gpu-smoke:
     needs: [ci-prereq, security-policy]
-    if: ${{ needs.ci-prereq.outputs.skip != 'true' && needs.security-policy.outputs.skip_gpu_smoke != 'true' }}
+    if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && needs.ci-prereq.outputs.skip != 'true' && needs.security-policy.outputs.skip_gpu_smoke != 'true' }}
     runs-on: tileops-metax-runner
     steps:
       - name: Checkout code for fork PR
@@ -357,6 +357,10 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
           fetch-depth: 1
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y git
 
       - name: Resolve runtime state
         env:
