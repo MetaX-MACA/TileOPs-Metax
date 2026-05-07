@@ -358,11 +358,9 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update && sudo apt-get install -y git
-
-      - name: Set up MACA environment
+      - name: Resolve runtime state
+        env:
+          IS_FORK: ${{ needs.security-policy.outputs.is_fork }}
         run: |
           set -euo pipefail
 
@@ -371,44 +369,149 @@ jobs:
 
           # Set MACA environment variables
           export USE_MACA=ON
-          export UV_INDEX="http://mirrors.aliyun.com/pypi/simple"
 
-          # Create virtual environment
-          python -m venv .venv
-          source .venv/bin/activate
+          if [[ "$IS_FORK" == "true" ]]; then
+            RUNTIME_ROOT="${RUNNER_TEMP}/gpu-smoke-${{ github.run_id }}-${{ github.run_attempt }}"
+            # Per-run isolated cache: rsync from trusted cache into temp dir.
+            # Fork PRs never write to any persistent shared state.
+            TILELANG_CACHE_DIR="${RUNTIME_ROOT}/tilelang/cache"
+            TILELANG_TMP_DIR="${TILELANG_CACHE_DIR}/tmp"
+            TRITON_CACHE_DIR="${RUNTIME_ROOT}/triton/cache"
+            PIP_CACHE_DIR="${RUNTIME_ROOT}/pip/cache"
+            WHEEL_DIR="${RUNTIME_ROOT}/wheels"
+            VENV_PATH="${RUNTIME_ROOT}/venv"
+            VENV_REUSED="false"
+            mkdir -p "${TILELANG_CACHE_DIR}" "${TILELANG_TMP_DIR}" "${TRITON_CACHE_DIR}" "${PIP_CACHE_DIR}" "${WHEEL_DIR}"
 
-          # Copy pre-installed MACA torch packages from conda to venv
-          cp -rf /opt/conda/lib/python3.12/site-packages/* .venv/lib/python3.12/site-packages/
+            # Copy trusted compile caches into the isolated per-run dir.
+            TRUSTED_WHEEL_DIR="/home/ci-runner/.wheel-cache"
+            copy_start=$SECONDS
+            if command -v rsync >/dev/null 2>&1; then
+              rsync -a /home/ci-runner/.tilelang/cache/ "${TILELANG_CACHE_DIR}/" 2>/dev/null || true
+              rsync -a /home/ci-runner/.triton/cache/ "${TRITON_CACHE_DIR}/" 2>/dev/null || true
+              rsync -a /home/ci-runner/.cache/pip/ "${PIP_CACHE_DIR}/" 2>/dev/null || true
+              if [[ -d "${TRUSTED_WHEEL_DIR}" ]]; then
+                rsync -a "${TRUSTED_WHEEL_DIR}/" "${WHEEL_DIR}/" 2>/dev/null || true
+              fi
+            else
+              cp -a /home/ci-runner/.tilelang/cache/. "${TILELANG_CACHE_DIR}/" 2>/dev/null || true
+              cp -a /home/ci-runner/.triton/cache/. "${TRITON_CACHE_DIR}/" 2>/dev/null || true
+              cp -a /home/ci-runner/.cache/pip/. "${PIP_CACHE_DIR}/" 2>/dev/null || true
+              if [[ -d "${TRUSTED_WHEEL_DIR}" ]]; then
+                cp -a "${TRUSTED_WHEEL_DIR}/." "${WHEEL_DIR}/" 2>/dev/null || true
+              fi
+            fi
+            copy_elapsed=$(( SECONDS - copy_start ))
+            echo "Cache copy completed in ${copy_elapsed}s"
+          else
+            RUNTIME_ROOT="/home/ci-runner"
+            TILELANG_CACHE_DIR="/home/ci-runner/.tilelang/cache"
+            TILELANG_TMP_DIR="${TILELANG_CACHE_DIR}/tmp"
+            TRITON_CACHE_DIR="/home/ci-runner/.triton/cache"
+            PIP_CACHE_DIR=""
+            WHEEL_DIR="/home/ci-runner/.wheel-cache"
 
-          # Verify torch installation
-          python -c "import sys; print('Python version:', sys.version)"
-          python -c "import torch; print('Torch version:', torch.__version__)"
+            mkdir -p "${TILELANG_CACHE_DIR}" "${TILELANG_TMP_DIR}" "${TRITON_CACHE_DIR}" "${WHEEL_DIR}"
 
-          # Set up cache directories
-          RUNTIME_ROOT="${{ github.workspace }}/.cache"
-          TILELANG_CACHE_DIR="${RUNTIME_ROOT}/tilelang/cache"
-          TRITON_CACHE_DIR="${RUNTIME_ROOT}/triton/cache"
-          WHEEL_DIR="${RUNTIME_ROOT}/wheels"
+            VENV_PREFIX="tileops_ci_venv"
+            HASH_INPUT="$(
+              {
+                echo "python=3.12"
+                echo "install=PIP_NO_BUILD_ISOLATION=1 pip install -e '.[dev]'"
+                sha256sum pyproject.toml
+              } | sha256sum | cut -c1-16
+            )"
+            VENV_DIR="${VENV_PREFIX}_${HASH_INPUT}"
+            VENV_PATH="${{ runner.tool_cache }}/${VENV_DIR}"
+            if [[ -x "${VENV_PATH}/bin/python" ]]; then
+              VENV_REUSED="true"
+            else
+              VENV_REUSED="false"
+            fi
+          fi
 
-          mkdir -p "${TILELANG_CACHE_DIR}" "${TRITON_CACHE_DIR}" "${WHEEL_DIR}"
-
-          # Save environment for subsequent steps
           {
             echo "PATH=${PATH}"
             echo "USE_MACA=ON"
-            echo "UV_INDEX=http://mirrors.aliyun.com/pypi/simple"
-            echo "VIRTUAL_ENV=${{ github.workspace }}/.venv"
             echo "RUNTIME_ROOT=${RUNTIME_ROOT}"
             echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR}"
+            echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR}"
             echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR}"
+            echo "PIP_CACHE_DIR=${PIP_CACHE_DIR}"
             echo "WHEEL_DIR=${WHEEL_DIR}"
+            echo "VENV_PATH=${VENV_PATH}"
+            echo "VENV_REUSED=${VENV_REUSED}"
           } >> "$GITHUB_ENV"
 
-      - name: Install dependencies
+      - name: Validate MACA GPU frequency
         run: |
           set -euo pipefail
-          source .venv/bin/activate
+          TARGET_CLOCK_MHZ=1830
+          RETRIES=5
+          SLEEP_SECONDS=2
 
+          if ! command -v mx-smi >/dev/null 2>&1; then
+            echo "::error::mx-smi is not available on this runner."
+            exit 1
+          fi
+
+          echo "Detected MACA GPUs:"
+          mx-smi -L
+
+          attempt=1
+          while [ "$attempt" -le "$RETRIES" ]; do
+            echo "Validation attempt ${attempt}/${RETRIES}"
+            mismatch=0
+            while IFS=',' read -r gpu_index gpu_name gpu_clock; do
+              gpu_index="$(echo "$gpu_index" | xargs)"
+              gpu_name="$(echo "$gpu_name" | xargs)"
+              gpu_clock="$(echo "$gpu_clock" | xargs)"
+              echo "GPU ${gpu_index} (${gpu_name}) clock: ${gpu_clock} MHz"
+              if [[ "$gpu_clock" != "$TARGET_CLOCK_MHZ" ]]; then
+                mismatch=1
+              fi
+            done < <(mx-smi --query-gpu=index,name,clocks.current.graphics --format=csv,noheader,nounits)
+
+            if [[ "$mismatch" -eq 0 ]]; then
+              echo "All GPUs locked at ${TARGET_CLOCK_MHZ} MHz."
+              break
+            fi
+
+            if [[ "$attempt" -eq "$RETRIES" ]]; then
+              echo "::error::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz on all GPUs."
+              exit 1
+            fi
+
+            sleep "$SLEEP_SECONDS"
+            attempt=$((attempt + 1))
+          done
+
+      - name: Ensure venv and install dependencies
+        env:
+          IS_FORK: ${{ needs.security-policy.outputs.is_fork }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$VENV_REUSED" == "true" ]]; then
+            echo "Using cached venv at ${VENV_PATH}"
+            exit 0
+          fi
+
+          if [[ "$IS_FORK" == "true" ]]; then
+            rm -rf "${VENV_PATH}"
+          fi
+
+          echo "Creating fresh venv at ${VENV_PATH}"
+          python -m venv "${VENV_PATH}"
+          # shellcheck source=/dev/null
+          source "${VENV_PATH}/bin/activate"
+
+          # Copy pre-installed MACA torch packages from conda to venv
+          cp -rf /opt/conda/lib/python3.12/site-packages/* "${VENV_PATH}/lib/python3.12/site-packages/"
+
+          python -m pip install --upgrade pip setuptools wheel --no-user
+
+          # Install test dependencies
           pip install --no-cache-dir \
             einops numpy "tqdm>=4.62.3" "typing_extensions>=4.10.0" \
             cloudpickle ml_dtypes psutil Cython \
@@ -418,51 +521,40 @@ jobs:
             "pytest-xdist>=3.0" \
             "pyyaml>=6.0"
 
-      - name: Validate MACA GPU frequency
-        run: |
-          set -euo pipefail
-          source .venv/bin/activate
+          if [[ "$IS_FORK" == "true" ]]; then
+            FIND_LINKS_FLAG=""
+            if [[ -d "${WHEEL_DIR}" ]] && ls "${WHEEL_DIR}"/*.whl >/dev/null 2>&1; then
+              FIND_LINKS_FLAG="--find-links ${WHEEL_DIR}"
+            fi
+            # shellcheck disable=SC2086
+            PIP_NO_BUILD_ISOLATION=1 PIP_CACHE_DIR="${PIP_CACHE_DIR}" pip install -e '.[dev]' ${FIND_LINKS_FLAG}
 
-          TARGET_CLOCK_MHZ=1830
-          RETRIES=5
-          SLEEP_SECONDS=2
+            # Install TileLang (MACA version)
+            pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@dev
 
-          if command -v mx-smi >/dev/null 2>&1; then
-            echo "Detected MACA GPUs:"
-            mx-smi -L
-
-            attempt=1
-            while [ "$attempt" -le "$RETRIES" ]; do
-              echo "Validation attempt ${attempt}/${RETRIES}"
-              mismatch=0
-              while IFS=',' read -r gpu_index gpu_name gpu_clock; do
-                gpu_index="$(echo "$gpu_index" | xargs)"
-                gpu_name="$(echo "$gpu_name" | xargs)"
-                gpu_clock="$(echo "$gpu_clock" | xargs)"
-                echo "GPU ${gpu_index} (${gpu_name}) clock: ${gpu_clock} MHz"
-                if [[ "$gpu_clock" != "$TARGET_CLOCK_MHZ" ]]; then
-                  mismatch=1
-                fi
-              done < <(mx-smi --query-gpu=index,name,clocks.current.graphics --format=csv,noheader,nounits)
-
-              if [[ "$mismatch" -eq 0 ]]; then
-                echo "All GPUs locked at ${TARGET_CLOCK_MHZ} MHz."
-                break
+            # Sync libtilelang.so mtime with trusted venv so compile cache keys match.
+            TRUSTED_VENV=$(find "${{ runner.tool_cache }}" -maxdepth 1 -type d -name "tileops_ci_venv_*" -exec test -x '{}/bin/python' \; -print 2>/dev/null | sort -t_ -k5 -r | head -1 || true)
+            if [[ -n "$TRUSTED_VENV" ]]; then
+              TRUSTED_LIB=$(find "$TRUSTED_VENV" -name "libtilelang.so" -type f 2>/dev/null | head -1 || true)
+              FORK_LIB=$(find "${VENV_PATH}" -name "libtilelang.so" -type f 2>/dev/null | head -1 || true)
+              if [[ -n "$TRUSTED_LIB" && -n "$FORK_LIB" ]]; then
+                touch -r "$TRUSTED_LIB" "$FORK_LIB"
+                echo "Synced libtilelang.so mtime for cache key compatibility"
+              else
+                echo "Warning: could not locate libtilelang.so for mtime sync"
               fi
-
-              if [[ "$attempt" -eq "$RETRIES" ]]; then
-                echo "::warning::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz."
-              fi
-
-              sleep "$SLEEP_SECONDS"
-              attempt=$((attempt + 1))
-            done
+            else
+              echo "Warning: no trusted venv found for mtime sync"
+            fi
           else
-            echo "::warning::mx-smi not available, skipping GPU frequency validation."
-          fi
+            PIP_NO_BUILD_ISOLATION=1 PIP_NO_CACHE_DIR=1 pip install -e '.[dev]'
 
-      - name: Install TileOPs and TileLang
-        uses: ./.github/actions/install-tileops
+            # Install TileLang (MACA version)
+            pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@dev
+
+            # Export wheels (including dependencies) so fork PRs can reuse them
+            pip wheel -e '.[dev]' -w "${WHEEL_DIR}" 2>/dev/null || true
+          fi
 
       - name: Run tests
         env:
@@ -471,11 +563,18 @@ jobs:
           PYTEST_TARGETS: ${{ needs.security-policy.outputs.pytest_targets }}
         run: |
           set -euo pipefail
-          source .venv/bin/activate
-
+          # shellcheck source=/dev/null
+          source "${VENV_PATH}/bin/activate"
           current_dir="$(pwd)"
           export PYTHONPATH="${current_dir}${PYTHONPATH:+:$PYTHONPATH}"
           echo "PYTHONPATH=$PYTHONPATH"
+          python - <<'PY'
+          import os
+
+          print("Runtime cache env:")
+          for key in ("TILELANG_CACHE_DIR", "TILELANG_TMP_DIR", "TRITON_CACHE_DIR"):
+              print(f"{key}={os.environ.get(key)}")
+          PY
 
           TEST_MARK_EXPR="smoke or full"
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
@@ -486,90 +585,31 @@ jobs:
           echo "Resolved pytest targets: ${PYTEST_TARGETS}"
           read -r -a TARGETS <<< "${PYTEST_TARGETS}"
           echo "Running pytest -m \"${TEST_MARK_EXPR}\" on ${#TARGETS[@]} target(s)"
-          python -m pytest -q "${TARGETS[@]}" -m "${TEST_MARK_EXPR}" \
-            --junit-xml=gpu_smoke_results.xml \
-            | tee gpu_smoke.log
-
-      - name: Generate gpu-smoke report
-        if: ${{ always() && hashFiles('gpu_smoke_results.xml') != '' }}
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-        run: |
-          set -euo pipefail
-          source .venv/bin/activate
-
-          REPORT_TARGET="smoke, full"
-          if [[ "$EVENT_NAME" == "pull_request" ]]; then
-            REPORT_TARGET="smoke"
-          fi
-
-          if [[ -f scripts/gpu_smoke_report.py ]]; then
-            python scripts/gpu_smoke_report.py \
-              --test-xml gpu_smoke_results.xml \
-              --target "${REPORT_TARGET}" \
-              --output gpu_smoke_report.md \
-              || echo "::warning::gpu_smoke_report.py failed"
-          else
-            echo "::warning::scripts/gpu_smoke_report.py not found, skipping report generation"
-          fi
-
-      - name: Post gpu-smoke report to step summary
-        if: ${{ always() && hashFiles('gpu_smoke_report.md') != '' }}
-        run: cat gpu_smoke_report.md >> "$GITHUB_STEP_SUMMARY"
+          python -m pytest -q "${TARGETS[@]}" -m "${TEST_MARK_EXPR}" | tee gpu_smoke.log
 
       - name: Cache stats
-        if: ${{ always() }}
-        env:
-          IS_FORK: ${{ needs.security-policy.outputs.is_fork }}
+        if: ${{ always() && needs.security-policy.outputs.is_fork != 'true' }}
         run: |
-          set -u
-          echo "=== Cache stats (is_fork=${IS_FORK}) ==="
-          echo "VENV_REUSED=${VENV_REUSED:-unknown}"
-          echo "FORK_CAN_COPY_TRUSTED_VENV=${FORK_CAN_COPY_TRUSTED_VENV:-unknown}"
-          echo "TRUSTED_VENV_PATH=${TRUSTED_VENV_PATH:-unknown}"
-          for cache_dir in "${TILELANG_CACHE_DIR:-}" "${TRITON_CACHE_DIR:-}" "${WHEEL_DIR:-}"; do
-            if [[ -z "${cache_dir}" ]]; then
-              continue
-            fi
+          set -euo pipefail
+          echo "=== Trusted cache stats ==="
+          for cache_dir in "${TILELANG_CACHE_DIR}" "${TRITON_CACHE_DIR}" "${WHEEL_DIR}"; do
             if [[ -d "${cache_dir}" ]]; then
-              file_count=$(set -o pipefail; find "${cache_dir}" -type f 2>/dev/null | wc -l 2>/dev/null) || file_count="unknown"
-              cache_size=$(set -o pipefail; du -sh "${cache_dir}" 2>/dev/null | cut -f1 2>/dev/null) || cache_size="unknown"
-              if [[ -z "${file_count}" ]]; then file_count="unknown"; fi
-              if [[ -z "${cache_size}" ]]; then cache_size="unknown"; fi
+              file_count=$(find "${cache_dir}" -type f | wc -l)
+              cache_size=$(du -sh "${cache_dir}" 2>/dev/null | cut -f1)
               echo "${cache_dir}: ${file_count} files, ${cache_size}"
             else
               echo "${cache_dir}: does not exist"
             fi
           done
 
-          if [[ "${IS_FORK}" == "true" ]]; then
-            if [[ "${FORK_CAN_COPY_TRUSTED_VENV:-false}" == "true" ]]; then
-              echo "CACHE_SIGNAL: fork venv=hit"
-            else
-              echo "CACHE_SIGNAL: fork venv=miss (cold pip install path)"
-            fi
-          else
-            if [[ "${VENV_REUSED:-false}" == "true" ]]; then
-              echo "CACHE_SIGNAL: trusted venv=hit"
-            else
-              echo "CACHE_SIGNAL: trusted venv=miss (fresh venv created)"
-            fi
-          fi
-
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: gpu_smoke_artifacts
-          path: |
-            gpu_smoke.log
-            gpu_smoke_results.xml
-            gpu_smoke_report.md
+          name: gpu_smoke.log
+          path: gpu_smoke.log
           retention-days: 7
 
       - name: Cleanup isolated fork state
         if: ${{ always() && needs.security-policy.outputs.is_fork == 'true' }}
-        run: |
-          if [[ -n "${RUNTIME_ROOT:-}" ]]; then
-            rm -rf "${RUNTIME_ROOT}"
-          fi
+        run: rm -rf "${RUNTIME_ROOT}"
