@@ -388,6 +388,7 @@ jobs:
             mkdir -p "${TILELANG_CACHE_DIR}" "${TILELANG_TMP_DIR}" "${TRITON_CACHE_DIR}" "${PIP_CACHE_DIR}" "${WHEEL_DIR}"
 
             # Copy trusted compile caches into the isolated per-run dir.
+            # rsync is fast for warm caches (<5s); fork state is fully disposable.
             TRUSTED_WHEEL_DIR="/home/ci-runner/.wheel-cache"
             copy_start=$SECONDS
             if command -v rsync >/dev/null 2>&1; then
@@ -447,7 +448,7 @@ jobs:
             echo "VENV_REUSED=${VENV_REUSED}"
           } >> "$GITHUB_ENV"
 
-      - name: Validate MACA GPU frequency
+      - name: Validate GPU frequency
         run: |
           set -euo pipefail
           TARGET_CLOCK_MHZ=1830
@@ -459,7 +460,7 @@ jobs:
             exit 1
           fi
 
-          echo "Detected MACA GPUs:"
+          echo "Detected GPUs:"
           mx-smi -L
 
           attempt=1
@@ -537,6 +538,9 @@ jobs:
             pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@dev
 
             # Sync libtilelang.so mtime with trusted venv so compile cache keys match.
+            # TileLang cache keys include the library's mtime (kernel_cache.py); a fresh
+            # pip install produces a new mtime, causing all rsync'd cache entries to miss.
+            # See: https://github.com/tile-ai/TileOPs/issues/594
             TRUSTED_VENV=$(find "${{ runner.tool_cache }}" -maxdepth 1 -type d -name "tileops_ci_venv_*" -exec test -x '{}/bin/python' \; -print 2>/dev/null | sort -t_ -k5 -r | head -1 || true)
             if [[ -n "$TRUSTED_VENV" ]]; then
               TRUSTED_LIB=$(find "$TRUSTED_VENV" -name "libtilelang.so" -type f 2>/dev/null | head -1 || true)
