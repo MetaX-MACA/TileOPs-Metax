@@ -148,7 +148,7 @@ jobs:
           PIP_NO_BUILD_ISOLATION=1 PIP_CACHE_DIR="${PIP_CACHE_DIR}" pip install -e '.[dev]' ${FIND_LINKS_FLAG}
 
           # Install TileLang (MACA version)
-          pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@dev
+          pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@1efc3ba8a7c48bc97047e562223538d2dcb2222d
 
           pip wheel -e '.[dev]' -w "${WHEEL_DIR}" 2>/dev/null || true
         shell: bash
@@ -340,7 +340,7 @@ jobs:
           PIP_NO_BUILD_ISOLATION=1 PIP_CACHE_DIR="${PIP_CACHE_DIR}" pip install -e '.[dev]' ${FIND_LINKS_FLAG}
 
           # Install TileLang (MACA version)
-          pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@dev
+          pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@1efc3ba8a7c48bc97047e562223538d2dcb2222d
 
           pip wheel -e '.[dev]' -w "${WHEEL_DIR}" 2>/dev/null || true
         shell: bash
@@ -559,7 +559,7 @@ jobs:
           PIP_NO_BUILD_ISOLATION=1 PIP_CACHE_DIR="${PIP_CACHE_DIR}" pip install -e '.[dev]' ${FIND_LINKS_FLAG}
 
           # Install TileLang (MACA version)
-          pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@dev
+          pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@1efc3ba8a7c48bc97047e562223538d2dcb2222d
 
           pip wheel -e '.[dev]' -w "${WHEEL_DIR}" 2>/dev/null || true
         shell: bash
@@ -769,7 +769,7 @@ jobs:
           pip install build pytest --no-user
 
           # Install TileLang (MACA version)
-          pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@dev
+          pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@1efc3ba8a7c48bc97047e562223538d2dcb2222d
         shell: bash
 
       - name: Build wheel package

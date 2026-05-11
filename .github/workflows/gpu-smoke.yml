@@ -535,7 +535,7 @@ jobs:
             PIP_NO_BUILD_ISOLATION=1 PIP_CACHE_DIR="${PIP_CACHE_DIR}" pip install -e '.[dev]' ${FIND_LINKS_FLAG}
 
             # Install TileLang (MACA version)
-            pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@dev
+            pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@1efc3ba8a7c48bc97047e562223538d2dcb2222d
 
             # Sync libtilelang.so mtime with trusted venv so compile cache keys match.
             # TileLang cache keys include the library's mtime (kernel_cache.py); a fresh
@@ -558,7 +558,7 @@ jobs:
             PIP_NO_BUILD_ISOLATION=1 PIP_NO_CACHE_DIR=1 pip install -e '.[dev]'
 
             # Install TileLang (MACA version)
-            pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@dev
+            pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@1efc3ba8a7c48bc97047e562223538d2dcb2222d
 
             # Export wheels (including dependencies) so fork PRs can reuse them
             pip wheel -e '.[dev]' -w "${WHEEL_DIR}" 2>/dev/null || true
