@@ -6,7 +6,7 @@
 import pytest
 import torch
 
-from tests.ops.test_mha import MhaFwdTest
+from tests.ops.attention.test_mha import MhaFwdTest
 from tests.test_base import FixtureBase
 from tileops.ops import MultiHeadAttentionFwdOp
 
