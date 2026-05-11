@@ -1,8 +1,17 @@
-"""Benchmark for MoePermuteOp (cutlass path).
+"""Benchmark for MoePermutePaddedFwdOp.
 
 Baselines:
-  - vLLM moe_permute (optional): only runs when vllm is installed.
-  - PyTorch reference: pure Python counting sort + gather.
+  - PyTorch reference: vectorized counting sort + gather.
+  - vLLM moe_permute (optional): outputs tight layout [T*K, H] without padding,
+    semantically different from TileOPs' padded layout but included for
+    performance reference.
+
+Real model configurations:
+  Model              H     E    K
+  Kimi K2          7168  384   8
+  DeepSeek-V3      7168  256   8
+  Qwen3-235B-A22B  7168  128   8
+  Qwen3-30B-A3B    3072  128   8
 
 Usage:
     conda run -n tileops python -m pytest benchmarks/ops/bench_moe_permute.py -vvs
@@ -15,86 +24,59 @@ import pytest
 import torch
 
 try:
-    from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import (
-        moe_permute as _vllm_moe_permute,
-    )
+    from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import moe_permute
     _VLLM_AVAILABLE = True
 except ImportError:
     _VLLM_AVAILABLE = False
 
-from benchmarks.benchmark import BenchmarkBase, BenchmarkReport
-from tests.ops.test_moe_permute import MoePermuteTest, _ref_moe_permute
-from tests.test_base import FixtureBase
-from tileops.ops.moe import MoePermuteOp
+from benchmarks.benchmark_base import BenchmarkBase, BenchmarkReport
+from tileops.manifest import load_workloads
+from tileops.ops.moe import MoePermutePaddedFwdOp
+from workloads.moe import MoePermuteTest
 
-# ---------------------------------------------------------------------------
-# CUPTI warmup
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope="session", autouse=True)
-def warmup_cupti():
-    if not torch.cuda.is_available():
-        return
-    dummy = torch.empty(1, device="cuda")
-    schedule = torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1)
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CUDA],
-        schedule=schedule,
-    ) as prof:
-        for _ in range(2):
-            dummy.zero_()
-            prof.step()
-    torch.cuda.synchronize()
-
-
-# ---------------------------------------------------------------------------
-# Benchmark fixture (production-scale configs)
-# ---------------------------------------------------------------------------
-
-
-class MoePermuteBenchFixture(FixtureBase):
-    """Production-scale configs for throughput benchmarking.
-
-    Columns: total_tokens, top_k, num_experts, hidden_size
-    """
-    PARAMS = [
-        ("total_tokens, top_k, num_experts, hidden_size", [
-            # ── Mixtral-8x7B style: 8 experts, top_k=2 ──────────────────────
-            (512,  2,   8,  4096),
-            (2048, 2,   8,  4096),
-            (4096, 2,   8,  4096),
-            # ── DeepSeek-V3 style: 256 experts, top_k=8 ─────────────────────
-            (512,  8, 256,  7168),
-            (2048, 8, 256,  7168),
-            (4096, 8, 256,  7168),
-            # ── Qwen3 MoE: 128 experts, top_k=8 ─────────────────────────────
-            (512,  8, 128,  2048),
-            (2048, 8, 128,  2048),
-            (4096, 8, 128,  2048),
-        ]),
-    ]
-
+_OP_NAME = "MoePermutePaddedFwdOp"
 
 # ---------------------------------------------------------------------------
 # Benchmark class
 # ---------------------------------------------------------------------------
 
 
-class MoePermuteBenchmark(BenchmarkBase):
+class MoePermuteBenchmark(BenchmarkBase[MoePermuteTest]):
+
+    _roofline_cache: Optional[tuple[float, float]] = None
+
+    def __init__(self, test, op):
+        super().__init__(test)
+        self._op = op
+
+    def _get_roofline(self) -> tuple[float, float]:
+        if self._roofline_cache is None:
+            self._roofline_cache = self._op.eval_roofline()
+        return self._roofline_cache
 
     def calculate_flops(self) -> Optional[float]:
-        return None
+        return self._get_roofline()[0]
 
     def calculate_memory(self) -> Optional[float]:
-        t = self.test
-        numel = t.total_tokens * t.top_k
-        H = t.hidden_size
-        elem_bytes = 2  # bf16
-        # hidden_states read [T, H] + permuted_hidden write [T*K, H]
-        # + expert_first_token_offset write [E+1]*8 + inv_permuted_idx write [T*K]*4
-        return (t.total_tokens * H + numel * H) * elem_bytes + \
-               (t.num_experts + 1) * 8 + numel * 4
+        return self._get_roofline()[1]
+
+
+# ---------------------------------------------------------------------------
+# Manifest-driven parametrize
+# ---------------------------------------------------------------------------
+
+
+def _manifest_params():
+    """Convert manifest workloads to pytest params."""
+    params = []
+    for w in load_workloads(_OP_NAME):
+        label = w.get("label", "unlabeled")
+        for dtype_str in w["dtypes"]:
+            params.append(pytest.param(
+                w["total_tokens"], w["top_k"], w["num_experts"], w["hidden_size"],
+                id=f"{label}-{dtype_str}",
+            ))
+    return params
 
 
 # ---------------------------------------------------------------------------
@@ -102,45 +84,69 @@ class MoePermuteBenchmark(BenchmarkBase):
 # ---------------------------------------------------------------------------
 
 
-@MoePermuteBenchFixture
+@pytest.mark.parametrize(
+    "total_tokens, top_k, num_experts, hidden_size",
+    _manifest_params(),
+)
 def test_moe_permute_bench(
     total_tokens: int, top_k: int, num_experts: int, hidden_size: int
 ) -> None:
     dtype = torch.bfloat16
     test = MoePermuteTest(total_tokens, top_k, num_experts, hidden_size, dtype)
-    bm = MoePermuteBenchmark(test)
     hidden_states, topk_ids = test.gen_inputs()
 
     # TileOPs
-    op = MoePermuteOp(total_tokens, top_k, num_experts, hidden_size, dtype)
+    op = MoePermutePaddedFwdOp(total_tokens, top_k, num_experts, hidden_size, dtype)
+    bm = MoePermuteBenchmark(test, op)
     op(hidden_states, topk_ids)  # warmup / JIT compile
     torch.cuda.synchronize()
 
     result = bm.profile(op, hidden_states, topk_ids)
-    BenchmarkReport.record("moe_permute", locals(), result, tag="tileops")
+    BenchmarkReport.record(op, locals(), result, tag="tileops")
 
-    # PyTorch reference baseline
-    def _ref_fn(hidden_states, topk_ids):
-        return _ref_moe_permute(hidden_states, topk_ids, num_experts)
-
-    _ref_fn(hidden_states, topk_ids)  # warmup
-    torch.cuda.synchronize()
-
-    result_ref = bm.profile(_ref_fn, hidden_states, topk_ids)
-    BenchmarkReport.record("moe_permute", locals(), result_ref, tag="pytorch-ref")
-
-    # vLLM baseline (optional)
+    # vLLM baseline (optional) - outputs tight layout [T*K, H] without padding
     if _VLLM_AVAILABLE:
         def _vllm_fn(hidden_states, topk_ids):
-            return _vllm_moe_permute(
-                hidden_states, None, topk_ids, num_experts, top_k
-            )
+            return moe_permute(hidden_states, None, topk_ids, num_experts)
 
         _vllm_fn(hidden_states, topk_ids)  # warmup
         torch.cuda.synchronize()
 
         result_vllm = bm.profile(_vllm_fn, hidden_states, topk_ids)
-        BenchmarkReport.record("moe_permute", locals(), result_vllm, tag="vllm")
+        BenchmarkReport.record(op, locals(), result_vllm, tag="vllm")
+    else:
+        # Fallback: PyTorch optimized baseline (vectorized gather + scatter)
+        numel = total_tokens * top_k
+        padded_batch_sum_max = numel + num_experts * 64
+        perm_h_pad_buf = torch.zeros(padded_batch_sum_max, hidden_size,
+                                      dtype=dtype, device=hidden_states.device)
+        token_indices = torch.arange(total_tokens, device=hidden_states.device).unsqueeze(1).expand(-1, top_k).flatten()
+        scatter_indices = torch.empty(numel, dtype=torch.int64, device=hidden_states.device)
+
+        def _torch_fn(hidden_states, topk_ids):
+            gathered = hidden_states[token_indices]  # [T*K, H]
+            flat_ids = topk_ids.flatten().to(torch.int64)
+            counts = torch.bincount(flat_ids, minlength=num_experts)
+            padded_sizes = torch.where(counts > 0, ((counts + 63) // 64) * 64, torch.zeros_like(counts))
+            padded_offsets = torch.cat([torch.zeros(1, dtype=torch.int64, device=flat_ids.device),
+                                         padded_sizes.cumsum(0)[:-1]])
+            padded_batch_sum = padded_sizes.sum().item()
+            sorted_idx = torch.argsort(flat_ids, stable=True)
+            sorted_experts = flat_ids[sorted_idx]
+            expert_first = torch.cat([torch.zeros(1, dtype=torch.int64, device=flat_ids.device),
+                                       counts.cumsum(0)[:-1]])
+            within_rank = torch.arange(numel, device=flat_ids.device) - expert_first[sorted_experts]
+            scatter_for_sorted = padded_offsets[sorted_experts] + within_rank
+            scatter_indices[sorted_idx] = scatter_for_sorted
+            perm_h_pad_buf[:padded_batch_sum].zero_()
+            perm_h_pad_buf[scatter_indices] = gathered
+            return perm_h_pad_buf[:padded_batch_sum], padded_offsets.to(torch.int32), padded_sizes.to(torch.int32)
+
+        _torch_fn(hidden_states, topk_ids)  # warmup
+        torch.cuda.synchronize()
+
+        result_ref = bm.profile(_torch_fn, hidden_states, topk_ids)
+        BenchmarkReport.record(op, locals(), result_ref, tag="torch-ref")
 
 
 if __name__ == "__main__":
