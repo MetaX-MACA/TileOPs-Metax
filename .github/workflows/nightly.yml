@@ -172,7 +172,7 @@ jobs:
   benchmark:
     if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' && (github.event_name == 'schedule' || github.ref == 'refs/heads/dev') }}
     needs: [cache-warmup]
-    timeout-minutes: 120
+    timeout-minutes: 300
     runs-on: tileops-metax-runner
     steps:
       - name: Checkout code
@@ -785,7 +785,8 @@ jobs:
         run: |
           set -euo pipefail
           source "${VENV_PATH}/bin/activate"
-          pip install --force-reinstall dist/*.whl
+          # Use --no-deps to preserve MACA-specific torch/triton/tilelang versions
+          pip install --force-reinstall --no-deps dist/*.whl
 
           TMP_TEST_DIR="$(mktemp -d)"
           trap 'rm -rf "${TMP_TEST_DIR}"' EXIT
