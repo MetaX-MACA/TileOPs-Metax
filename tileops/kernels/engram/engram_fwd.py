@@ -19,7 +19,7 @@ Uses 2D fragments (1, d_padded) to leverage T.reduce_sum for safe reductions.
 """
 
 import functools
-from typing import Optional
+from typing import List, Optional
 
 import tilelang
 import tilelang.language as T
@@ -201,7 +201,7 @@ def _engram_gate_conv_fwd_wrapped(
     rms_w_h: torch.Tensor,
     rms_w_v: torch.Tensor,
     conv_w: torch.Tensor,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     results = _engram_gate_conv_fwd_kernel(M, seq_len, d, eps, dtype_str)(
         threads,
     )(H, k, v, rms_w_h, rms_w_v, conv_w)
@@ -273,7 +273,7 @@ class EngramGateConvFwdKernel(Kernel):
         rms_w_h: torch.Tensor,
         rms_w_v: torch.Tensor,
         conv_w: torch.Tensor,
-    ) -> list[torch.Tensor]:
+    ) -> List[torch.Tensor]:
         return _engram_gate_conv_fwd_wrapped(
             self.M, self.seq_len, self.d, self.eps,
             self.dtype_str, self.config["threads"],

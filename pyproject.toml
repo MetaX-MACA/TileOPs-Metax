@@ -62,7 +62,11 @@ where = ["."]
 exclude = ["tests", "tests.*", "benchmarks", "benchmarks.*"]
 
 [tool.setuptools.package-data]
-tileops = ["kernels/moe/_atomic_helper.h", "manifest/*.yaml"]
+tileops = [
+    "kernels/gemm/*.hpp",
+    "kernels/moe/_atomic_helper.h",
+    "manifest/*.yaml",
+]
 
 [tool.codespell]
 ignore-words-list = "nd, te, ist, LOD, offen, NotIn, HSA"

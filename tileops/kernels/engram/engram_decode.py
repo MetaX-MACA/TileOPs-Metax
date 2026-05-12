@@ -38,7 +38,7 @@ so the kernel is compiled once with max_conv_len.
 """
 
 import functools
-from typing import Optional
+from typing import List, Optional
 
 import tilelang
 import tilelang.language as T
@@ -254,7 +254,7 @@ def _engram_decode_wrapped(
     rms_w_h: torch.Tensor,
     rms_w_v: torch.Tensor,
     conv_w: torch.Tensor,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     results = _engram_decode_kernel(
         batch, d_mem, d, max_conv_len, conv_kernel_size, dilation, eps, dtype_str,
     )(threads)(e_t, h_t, conv_state, W_K, W_V, rms_w_h, rms_w_v, conv_w)
@@ -350,7 +350,7 @@ class EngramDecodeKernel(Kernel):
         rms_w_h: torch.Tensor,
         rms_w_v: torch.Tensor,
         conv_w: torch.Tensor,
-    ) -> list[torch.Tensor]:
+    ) -> List[torch.Tensor]:
         return _engram_decode_wrapped(
             self.batch, self.d_mem, self.d, self.max_conv_len,
             self.conv_kernel_size, self.dilation, self.eps,
