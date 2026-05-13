@@ -23,8 +23,8 @@ class ArgreduceBasicFixture(FixtureBase):
                 pytest.param(128, 512, torch.float32, marks=pytest.mark.smoke),
                 pytest.param(128, 512, torch.float16, marks=pytest.mark.full),
                 pytest.param(128, 512, torch.bfloat16, marks=pytest.mark.full),
-                # pytest.param(256, 4096, torch.float16, marks=pytest.mark.full),
-                # pytest.param(256, 4096, torch.bfloat16, marks=pytest.mark.full),
+                pytest.param(256, 4096, torch.float16, marks=[pytest.mark.full, pytest.mark.skip(reason="MACALaunch mcErrorMemoryValueTooLarge")]),
+                pytest.param(256, 4096, torch.bfloat16, marks=[pytest.mark.full, pytest.mark.skip(reason="MACALaunch mcErrorMemoryValueTooLarge")]),
                 # Non-aligned N (non-pow2 last dim)
                 pytest.param(128, 300, torch.float16, marks=pytest.mark.full),
                 pytest.param(128, 300, torch.bfloat16, marks=pytest.mark.full),
