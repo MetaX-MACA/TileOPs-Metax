@@ -632,22 +632,7 @@ jobs:
           python -m venv "${VENV_PATH}"
           # shellcheck source=/dev/null
           source "${VENV_PATH}/bin/activate"
-
-          # Copy pre-installed MACA torch packages from conda to venv
-          cp -rf /opt/conda/lib/python3.12/site-packages/* "${VENV_PATH}/lib/python3.12/site-packages/"
-
           python -m pip install --upgrade pip setuptools wheel --no-user
-
-          # Install test dependencies
-          pip install --no-cache-dir \
-            einops numpy "tqdm>=4.62.3" "typing_extensions>=4.10.0" \
-            cloudpickle ml_dtypes psutil Cython \
-            setuptools wheel ninja
-          pip install --no-cache-dir \
-            "pytest==9.0.2" \
-            "pytest-xdist>=3.0" \
-            "pyyaml>=6.0"
-
           if [[ "$IS_FORK" == "true" ]]; then
             FIND_LINKS_FLAG=""
             if [[ -d "${WHEEL_DIR}" ]] && ls "${WHEEL_DIR}"/*.whl >/dev/null 2>&1; then
@@ -655,9 +640,6 @@ jobs:
             fi
             # shellcheck disable=SC2086
             PIP_NO_BUILD_ISOLATION=1 PIP_CACHE_DIR="${PIP_CACHE_DIR}" pip install -e '.[dev]' ${FIND_LINKS_FLAG}
-
-            # Install TileLang (MACA version)
-            pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@1efc3ba8a7c48bc97047e562223538d2dcb2222d
 
             # Sync libtilelang.so mtime with trusted venv so compile cache keys match.
             # TileLang cache keys include the library's mtime (kernel_cache.py); a fresh
@@ -682,10 +664,6 @@ jobs:
             fi
           else
             PIP_NO_BUILD_ISOLATION=1 PIP_NO_CACHE_DIR=1 pip install -e '.[dev]'
-
-            # Install TileLang (MACA version)
-            pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@1efc3ba8a7c48bc97047e562223538d2dcb2222d
-
             # Export wheels (including dependencies) so fork PRs can reuse them
             pip wheel -e '.[dev]' -w "${WHEEL_DIR}" 2>/dev/null || true
           fi
