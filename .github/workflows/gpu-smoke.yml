@@ -404,13 +404,13 @@ jobs:
           reclaim-below-gib: "10"
           cache-trim-cooldown-minutes: "120"
           cache-dirs: |
-            /data7/shared/ci-cache/triton
-            /data7/shared/ci-cache/pip
-            /data7/shared/ci-cache/wheels
-            /data7/shared/ci-cache/tilelang/tmp
+            ${{ runner.temp }}/ci-cache/triton
+            ${{ runner.temp }}/ci-cache/pip
+            ${{ runner.temp }}/ci-cache/wheels
+            ${{ runner.temp }}/ci-cache/tilelang/tmp
           atomic-cache-dirs: |
-            /data7/shared/ci-cache/tilelang/autotuner
-          df-paths: "/data7 /data7/shared/ci-cache"
+            ${{ runner.temp }}/ci-cache/tilelang/autotuner
+          df-paths: "${{ runner.temp }} ${{ runner.temp }}/ci-cache"
           # Daily runner-maintenance.yml owns the destructive autotuner
           # age-trim; per-PR runs only need sentinel-repair (still
           # unconditional) so they don't evict tuning artefacts the next
@@ -458,7 +458,7 @@ jobs:
           VENV_PREFIX="tileops_ci_venv"
           VENV_DIR="${VENV_PREFIX}_${HASH_INPUT}"
           TRUSTED_VENV_PATH="${{ runner.tool_cache }}/${VENV_DIR}"
-          TRUSTED_CACHE_ROOT="/data7/shared/ci-cache"
+          TRUSTED_CACHE_ROOT="${RUNNER_TEMP}/ci-cache"
           FORK_CAN_COPY_TRUSTED_VENV="false"
 
           if [[ "$IS_FORK" == "true" ]]; then
