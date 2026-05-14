@@ -184,7 +184,7 @@ jobs:
           fi
 
   pre-commit:
-    needs: [validate-commits, validate-pr-title, ci-gate]
+    needs: [validate-pr-title, ci-gate]
     if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && needs.ci-gate.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     steps:
@@ -204,7 +204,7 @@ jobs:
           extra_args: --all-files --show-diff-on-failure
 
   gitleaks:
-    needs: [validate-commits, validate-pr-title, ci-gate]
+    needs: [validate-pr-title, ci-gate]
     if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && needs.ci-gate.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     steps:
@@ -253,7 +253,7 @@ jobs:
         run: python scripts/validate_manifest.py --levels schema,shape,dtype,bench
 
   actionlint:
-    needs: [validate-commits, validate-pr-title, ci-gate]
+    needs: [validate-pr-title, ci-gate]
     if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && needs.ci-gate.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     steps:
