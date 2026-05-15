@@ -669,7 +669,7 @@ jobs:
           else
             PIP_NO_BUILD_ISOLATION=1 PIP_NO_CACHE_DIR=1 pip install --no-deps -e '.[dev]'
             # Export wheels (including dependencies) so fork PRs can reuse them
-            pip wheel --no-deps -e '.' -w "${WHEEL_DIR}" 2>/dev/null || true
+            pip wheel --no-deps -e '.[dev]' -w "${WHEEL_DIR}" 2>/dev/null || true
           fi
 
       - name: Run tests
