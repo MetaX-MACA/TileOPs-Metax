@@ -18,6 +18,15 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Cache directories for nightly test jobs
+env:
+  TILELANG_CACHE_DIR: /home/runner/_temp/ci-cache/tilelang
+  TILELANG_TMP_DIR: /home/runner/_temp/ci-cache/tilelang/tmp
+  TRITON_CACHE_DIR: /home/runner/_temp/ci-cache/triton
+  PIP_CACHE_DIR: /home/runner/_temp/ci-cache/pip
+  WHEEL_DIR: /home/runner/_temp/ci-cache/wheels
+  MAX_JOBS: "64"
+
 jobs:
   ci-prereq:
     runs-on: ubuntu-latest
@@ -821,13 +830,6 @@ jobs:
     if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && needs.ci-prereq.outputs.skip != 'true' }}
     runs-on: tileops-metax-runner
     timeout-minutes: 60
-    env:
-      TILELANG_CACHE_DIR: ${{ runner.temp }}/ci-cache/tilelang
-      TILELANG_TMP_DIR: ${{ runner.temp }}/ci-cache/tilelang/tmp
-      TRITON_CACHE_DIR: ${{ runner.temp }}/ci-cache/triton
-      PIP_CACHE_DIR: ${{ runner.temp }}/ci-cache/pip
-      WHEEL_DIR: ${{ runner.temp }}/ci-cache/wheels
-      MAX_JOBS: "64"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -867,13 +869,6 @@ jobs:
     runs-on: tileops-metax-runner
     # timeout-minutes: 120
     timeout-minutes: 300
-    env:
-      TILELANG_CACHE_DIR: ${{ runner.temp }}/ci-cache/tilelang
-      TILELANG_TMP_DIR: ${{ runner.temp }}/ci-cache/tilelang/tmp
-      TRITON_CACHE_DIR: ${{ runner.temp }}/ci-cache/triton
-      PIP_CACHE_DIR: ${{ runner.temp }}/ci-cache/pip
-      WHEEL_DIR: ${{ runner.temp }}/ci-cache/wheels
-      MAX_JOBS: "64"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -910,10 +905,6 @@ jobs:
           PIP_NO_BUILD_ISOLATION=1 pip install --no-deps -e ".[dev]"
 
           export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
-          echo "Runtime cache env:"
-          echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-}"
-          echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR:-}"
-          echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
 
           set -o pipefail
           python -m pytest -q benchmarks/ops --junit-xml=bench_results.xml | tee tileops_benchmarks.log
