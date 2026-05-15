@@ -944,7 +944,7 @@ jobs:
         shell: bash
 
   nightly-packaging:
-    needs: [nightly-op-test]
+    # needs: [nightly-op-test]
     if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' }}
     runs-on: tileops-metax-runner
     timeout-minutes: 60
