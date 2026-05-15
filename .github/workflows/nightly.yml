@@ -3,13 +3,19 @@ name: Nightly
 permissions: read-all
 
 on:
+  push:
+    branches: [dev, main, testbed]
+    tags: ["v*"]
+  pull_request:
+    branches: [dev, main, testbed]
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
   schedule:
     - cron: "0 18 * * *"
 
 concurrency:
-  group: nightly-${{ github.ref }}
-  cancel-in-progress: false
+  group: nightly-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # ---------------------------------------------------------------------------
 # All nightly jobs run on a containerized self-hosted runner (label: nightly).
@@ -54,7 +60,7 @@ jobs:
           # shellcheck source=/dev/null
           source "${VENV_PATH}/bin/activate"
 
-          PIP_NO_BUILD_ISOLATION=1 pip install -e ".[dev]"
+          PIP_NO_BUILD_ISOLATION=1 pip install --no-deps -e ".[dev]"
 
           export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
           echo "Starting kernel cache warmup..."
@@ -114,7 +120,7 @@ jobs:
             sleep 2
           done
 
-          PIP_NO_BUILD_ISOLATION=1 pip install -e ".[dev]"
+          PIP_NO_BUILD_ISOLATION=1 pip install --no-deps -e ".[dev]"
 
           export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
           echo "Runtime cache env:"
@@ -187,7 +193,7 @@ jobs:
           # shellcheck source=/dev/null
           source "${VENV_PATH}/bin/activate"
 
-          PIP_NO_BUILD_ISOLATION=1 pip install -e ".[dev]"
+          PIP_NO_BUILD_ISOLATION=1 pip install --no-deps -e ".[dev]"
 
           export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
           echo "Runtime cache env:"
@@ -221,7 +227,7 @@ jobs:
                 owner,
                 repo,
                 workflow_id: workflowId,
-                branch: "main",
+                branch: "dev",
                 status: "completed",
                 per_page: 100,
               },
@@ -383,7 +389,7 @@ jobs:
           ls -lh dist/*.whl
 
           echo "=== Install built wheel ==="
-          pip install dist/*.whl
+          pip install --no-deps dist/*.whl
 
           TMP_TEST_DIR="$(mktemp -d "${RUNTIME_ROOT}/packaging-test.XXXXXX")"
           cp -r tests "${TMP_TEST_DIR}/tests"

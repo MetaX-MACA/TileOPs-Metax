@@ -22,7 +22,15 @@ python -m venv --system-site-packages "${VENV_PATH}"
 
 # shellcheck source=/dev/null
 source "${VENV_PATH}/bin/activate"
+
+# Copy pre-installed MACA torch packages from conda to venv
+mkdir -p "${VENV_PATH}/lib/python3.12/site-packages/"
+cp -rf /opt/conda/lib/python3.12/site-packages/* "${VENV_PATH}/lib/python3.12/site-packages/"
+
 python -m pip install --upgrade pip setuptools wheel --no-user
+
+# Install TileLang (MACA version)
+pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@1efc3ba8a7c48bc97047e562223538d2dcb2222d
 
 {
   echo "RUNTIME_ROOT=${RUNTIME_ROOT}"

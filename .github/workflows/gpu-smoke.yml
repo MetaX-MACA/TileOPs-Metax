@@ -224,19 +224,19 @@ jobs:
               if [[ "$path" == *.py ]]; then
                 has_python="true"
               fi
-              # if [[ "$is_fork" == "true" ]]; then
-              #   case "$path" in
-              #     .github/workflows/*|pyproject.toml|requirements*.txt|requirements*.in|setup.py|setup.cfg|Dockerfile*|scripts/bootstrap*|scripts/install*)
-              #       has_high_risk="true"
-              #       ;;
-              #   esac
-              # fi
+              if [[ "$is_fork" == "true" ]]; then
+                case "$path" in
+                  .github/workflows/*|pyproject.toml|requirements*.txt|requirements*.in|setup.py|setup.cfg|Dockerfile*|scripts/bootstrap*|scripts/install*)
+                    has_high_risk="true"
+                    ;;
+                esac
+              fi
               # TODO: Temporarily allow workflow changes to trigger GPU smoke for testing.
-              case "$path" in
-                .github/workflows/*|pyproject.toml|requirements*.txt|requirements*.in|setup.py|setup.cfg|Dockerfile*|scripts/bootstrap*|scripts/install*)
-                  has_high_risk="true"
-                  ;;
-              esac
+              # case "$path" in
+              #   .github/workflows/*|pyproject.toml|requirements*.txt|requirements*.in|setup.py|setup.cfg|Dockerfile*|scripts/bootstrap*|scripts/install*)
+              #     has_high_risk="true"
+              #     ;;
+              # esac
             done
             if [[ "$has_python" == "false" && "$has_high_risk" == "false" ]]; then
               skip_gpu_smoke="true"
