@@ -36,7 +36,7 @@ jobs:
   # Phase 1 — Warm the kernel compilation cache
   # =========================================================================
   cache-warmup:
-    if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && (github.event_name == 'schedule' || github.ref == 'refs/heads/dev') }}
+    if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' }}
     timeout-minutes: 60
     runs-on: [tileops-metax-runner, self-hosted, tile-ops, nightly]
     steps:
@@ -80,7 +80,7 @@ jobs:
   # Phase 2 — Benchmark (exclusive GPU access for accurate profiling)
   # =========================================================================
   benchmark:
-    if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' && (github.event_name == 'schedule' || github.ref == 'refs/heads/dev') }}
+    if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' }}
     needs: [cache-warmup]
     timeout-minutes: 120
     runs-on: [tileops-metax-runner, self-hosted, tile-ops, nightly]
@@ -167,7 +167,7 @@ jobs:
   # Phase 3 — Op correctness tests (serial after benchmark for GPU exclusivity)
   # =========================================================================
   op_test:
-    if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' && (github.event_name == 'schedule' || github.ref == 'refs/heads/dev') }}
+    if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' }}
     needs: [benchmark]
     timeout-minutes: 180
     runs-on: [tileops-metax-runner, self-hosted, tile-ops, nightly]
@@ -343,7 +343,7 @@ jobs:
   # Phase 4 — Packaging and smoke test
   # =========================================================================
   packaging:
-    if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' && (github.event_name == 'schedule' || github.ref == 'refs/heads/dev') }}
+    if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' }}
     needs: [op_test]
     permissions:
       contents: write
