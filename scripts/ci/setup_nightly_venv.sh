@@ -17,15 +17,18 @@ VENV_PATH="${RUNTIME_ROOT}/venv"
 rm -rf "${RUNTIME_ROOT}"
 mkdir -p "${RUNTIME_ROOT}"
 
+# Add conda to PATH for python access
+export PATH="/opt/conda/bin:${PATH}"
+
 echo "Creating run-local nightly venv at ${VENV_PATH}"
 python -m venv --system-site-packages "${VENV_PATH}"
 
 # shellcheck source=/dev/null
 source "${VENV_PATH}/bin/activate"
 
-# Copy pre-installed MACA torch packages from conda to venv
-mkdir -p "${VENV_PATH}/lib/python3.12/site-packages/"
-cp -rf /opt/conda/lib/python3.12/site-packages/* "${VENV_PATH}/lib/python3.12/site-packages/"
+# # Copy pre-installed MACA torch packages from conda to venv
+# mkdir -p "${VENV_PATH}/lib/python3.12/site-packages/"
+# cp -rf /opt/conda/lib/python3.12/site-packages/* "${VENV_PATH}/lib/python3.12/site-packages/"
 
 python -m pip install --upgrade pip setuptools wheel --no-user
 
@@ -42,3 +45,4 @@ echo "RUNTIME_ROOT=${RUNTIME_ROOT}"
 echo "VENV_PATH=${VENV_PATH}"
 python --version
 python -m pip --version
+python -c "import torch; print(f'torch={torch.__version__}')"
