@@ -11,6 +11,9 @@ if [[ -z "${GITHUB_RUN_ID:-}" || -z "${GITHUB_RUN_ATTEMPT:-}" || -z "${GITHUB_JO
   exit 1
 fi
 
+# Install system dependencies
+sudo apt-get update && sudo apt-get install -y git
+
 RUNTIME_ROOT="${RUNNER_TEMP}/nightly-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
 VENV_PATH="${RUNTIME_ROOT}/venv"
 
@@ -18,7 +21,7 @@ rm -rf "${RUNTIME_ROOT}"
 mkdir -p "${RUNTIME_ROOT}"
 
 # Add conda to PATH for python access
-export PATH="/opt/conda/bin:${PATH}"
+export PATH="/opt/conda/bin:/usr/bin:${PATH}"
 
 echo "Creating run-local nightly venv at ${VENV_PATH}"
 python -m venv --system-site-packages "${VENV_PATH}"
