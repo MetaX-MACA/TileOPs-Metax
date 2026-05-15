@@ -821,6 +821,13 @@ jobs:
     if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && needs.ci-prereq.outputs.skip != 'true' }}
     runs-on: tileops-metax-runner
     timeout-minutes: 60
+    env:
+      TILELANG_CACHE_DIR: ${{ runner.temp }}/ci-cache/tilelang
+      TILELANG_TMP_DIR: ${{ runner.temp }}/ci-cache/tilelang/tmp
+      TRITON_CACHE_DIR: ${{ runner.temp }}/ci-cache/triton
+      PIP_CACHE_DIR: ${{ runner.temp }}/ci-cache/pip
+      WHEEL_DIR: ${{ runner.temp }}/ci-cache/wheels
+      MAX_JOBS: "64"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -858,7 +865,15 @@ jobs:
     needs: [nightly-cache-warmup]
     if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' }}
     runs-on: tileops-metax-runner
-    timeout-minutes: 120
+    # timeout-minutes: 120
+    timeout-minutes: 300
+    env:
+      TILELANG_CACHE_DIR: ${{ runner.temp }}/ci-cache/tilelang
+      TILELANG_TMP_DIR: ${{ runner.temp }}/ci-cache/tilelang/tmp
+      TRITON_CACHE_DIR: ${{ runner.temp }}/ci-cache/triton
+      PIP_CACHE_DIR: ${{ runner.temp }}/ci-cache/pip
+      WHEEL_DIR: ${{ runner.temp }}/ci-cache/wheels
+      MAX_JOBS: "64"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
