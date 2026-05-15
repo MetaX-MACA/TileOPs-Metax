@@ -23,15 +23,14 @@ mkdir -p "${RUNTIME_ROOT}"
 # Add conda to PATH for python access
 export PATH="/opt/conda/bin:/usr/bin:${PATH}"
 
+# Set MACA environment variables
+export USE_MACA=ON
+
 echo "Creating run-local nightly venv at ${VENV_PATH}"
 python -m venv --system-site-packages "${VENV_PATH}"
 
 # shellcheck source=/dev/null
 source "${VENV_PATH}/bin/activate"
-
-# # Copy pre-installed MACA torch packages from conda to venv
-# mkdir -p "${VENV_PATH}/lib/python3.12/site-packages/"
-# cp -rf /opt/conda/lib/python3.12/site-packages/* "${VENV_PATH}/lib/python3.12/site-packages/"
 
 python -m pip install --upgrade pip setuptools wheel --no-user
 
