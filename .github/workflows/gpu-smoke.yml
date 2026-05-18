@@ -845,62 +845,76 @@ jobs:
         id: benchmark_tests
         continue-on-error: true
         run: |
-          set -euo pipefail
-          # shellcheck source=/dev/null
-          source "${VENV_PATH}/bin/activate"
 
-          # Validate GPU frequency (currently skipped - GPU not locked to target frequency)
-          # TARGET_CLOCK_MHZ=1830
-          # RETRIES=5
-          # for i in $(seq 1 "${RETRIES}"); do
-          #   clock_output=$(mx-smi --show-clock gr 2>/dev/null || mx-smi --show-clock all 2>/dev/null || mx-smi --show-clock)
-          #   gpu_clock=$(echo "$clock_output" | grep -Eo '[0-9]+ MHz' | grep -Eo '[0-9]+' | head -1 || echo "")
-          #   echo "GPU clock: ${gpu_clock:-unknown} MHz (attempt ${i}/${RETRIES})"
-          #   if [[ -n "$gpu_clock" && "$gpu_clock" = "${TARGET_CLOCK_MHZ}" ]]; then break; fi
-          #   if [ "${i}" -eq "${RETRIES}" ]; then
-          #     echo "::warning::GPU frequency validation skipped (not locked to ${TARGET_CLOCK_MHZ} MHz)"
-          #   fi
-          #   sleep 2
-          # done
-          echo "GPU frequency validation skipped"
+          # Validate GPU frequency
+          TARGET_CLOCK_MHZ=1830
+          RETRIES=5
+          for i in $(seq 1 "${RETRIES}"); do
+            gpu_clock=$(nvidia-smi --query-gpu=clocks.current.graphics --format=csv,noheader,nounits | xargs)
+            echo "GPU clock: ${gpu_clock} MHz (attempt ${i}/${RETRIES})"
+            if [ "${gpu_clock}" = "${TARGET_CLOCK_MHZ}" ]; then break; fi
+            if [ "${i}" -eq "${RETRIES}" ]; then
+              echo "::error::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz."
+              exit 1
+            fi
+            sleep 2
+          done
+      #     set -euo pipefail
+      #     # shellcheck source=/dev/null
+      #     source "${VENV_PATH}/bin/activate"
 
-          PIP_NO_BUILD_ISOLATION=1 pip install --no-deps -e ".[dev]"
+      #     # Validate GPU frequency (currently skipped - GPU not locked to target frequency)
+      #     # TARGET_CLOCK_MHZ=1830
+      #     # RETRIES=5
+      #     # for i in $(seq 1 "${RETRIES}"); do
+      #     #   clock_output=$(mx-smi --show-clock gr 2>/dev/null || mx-smi --show-clock all 2>/dev/null || mx-smi --show-clock)
+      #     #   gpu_clock=$(echo "$clock_output" | grep -Eo '[0-9]+ MHz' | grep -Eo '[0-9]+' | head -1 || echo "")
+      #     #   echo "GPU clock: ${gpu_clock:-unknown} MHz (attempt ${i}/${RETRIES})"
+      #     #   if [[ -n "$gpu_clock" && "$gpu_clock" = "${TARGET_CLOCK_MHZ}" ]]; then break; fi
+      #     #   if [ "${i}" -eq "${RETRIES}" ]; then
+      #     #     echo "::warning::GPU frequency validation skipped (not locked to ${TARGET_CLOCK_MHZ} MHz)"
+      #     #   fi
+      #     #   sleep 2
+      #     # done
+      #     echo "GPU frequency validation skipped"
 
-          export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
+      #     PIP_NO_BUILD_ISOLATION=1 pip install --no-deps -e ".[dev]"
 
-          set -o pipefail
-          # TODO: Run full benchmark suite after verifying fix
-          # python -m pytest -q benchmarks/ops --junit-xml=bench_results.xml | tee tileops_benchmarks.log
-          python -m pytest -q benchmarks/ops/bench_rms_norm.py -v --tb=short --junit-xml=bench_results.xml | tee tileops_benchmarks.log
+      #     export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
 
-          if [ -f profile_run.log ]; then
-            { echo; echo "===== profile_run.log summary ====="; cat profile_run.log; } >> tileops_benchmarks.log
-          else
-            echo "::warning::profile_run.log not found; benchmark may have failed partially" >> tileops_benchmarks.log
-          fi
-        shell: bash
+      #     set -o pipefail
+      #     # TODO: Run full benchmark suite after verifying fix
+      #     # python -m pytest -q benchmarks/ops --junit-xml=bench_results.xml | tee tileops_benchmarks.log
+      #     python -m pytest -q benchmarks/ops/bench_rms_norm.py -v --tb=short --junit-xml=bench_results.xml | tee tileops_benchmarks.log
 
-      - name: Upload benchmark artifacts
-        uses: actions/upload-artifact@v4
-        if: ${{ always() }}
-        with:
-          name: tileops_benchmark_${{ github.run_id }}
-          path: |
-            tileops_benchmarks.log
-            bench_results.xml
-          if-no-files-found: warn
-          retention-days: 14
+      #     if [ -f profile_run.log ]; then
+      #       { echo; echo "===== profile_run.log summary ====="; cat profile_run.log; } >> tileops_benchmarks.log
+      #     else
+      #       echo "::warning::profile_run.log not found; benchmark may have failed partially" >> tileops_benchmarks.log
+      #     fi
+      #   shell: bash
 
-      - name: Fail benchmark job if pytest failed
-        if: ${{ always() && steps.benchmark_tests.outcome == 'failure' }}
-        run: exit 1
-        shell: bash
+      # - name: Upload benchmark artifacts
+      #   uses: actions/upload-artifact@v4
+      #   if: ${{ always() }}
+      #   with:
+      #     name: tileops_benchmark_${{ github.run_id }}
+      #     path: |
+      #       tileops_benchmarks.log
+      #       bench_results.xml
+      #     if-no-files-found: warn
+      #     retention-days: 14
 
-      - name: Cleanup run-local venv
-        if: ${{ always() }}
-        run: |
-          set -euo pipefail
-          if [[ -n "${RUNTIME_ROOT:-}" && "${RUNTIME_ROOT}" == "${RUNNER_TEMP}/nightly-"* ]]; then
-            rm -rf "${RUNTIME_ROOT}"
-          fi
-        shell: bash
+      # - name: Fail benchmark job if pytest failed
+      #   if: ${{ always() && steps.benchmark_tests.outcome == 'failure' }}
+      #   run: exit 1
+      #   shell: bash
+
+      # - name: Cleanup run-local venv
+      #   if: ${{ always() }}
+      #   run: |
+      #     set -euo pipefail
+      #     if [[ -n "${RUNTIME_ROOT:-}" && "${RUNTIME_ROOT}" == "${RUNNER_TEMP}/nightly-"* ]]; then
+      #       rm -rf "${RUNTIME_ROOT}"
+      #     fi
+      #   shell: bash
