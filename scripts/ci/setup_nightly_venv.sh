@@ -44,6 +44,9 @@ source "${VENV_PATH}/bin/activate"
 
 python -m pip install --upgrade pip setuptools wheel --no-user
 
+# Install pytest-xdist for parallel test execution (required by warmup_kernel_cache.py)
+pip install --no-cache-dir pytest-xdist
+
 # Install TileLang (MACA version)
 pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@1efc3ba8a7c48bc97047e562223538d2dcb2222d
 
