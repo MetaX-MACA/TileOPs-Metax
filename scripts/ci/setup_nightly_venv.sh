@@ -26,6 +26,11 @@ export PATH="/opt/conda/bin:/usr/bin:${PATH}"
 # Set MACA environment variables
 export USE_MACA=ON
 
+# Clear CXX/CC to prevent cu-bridge compiler from interfering with TileLang
+# kernel compilation. Torch cpp extension may set these to cu-bridge paths,
+# which causes "__macro_mxcc.h not found" errors when TVM tries to link .so
+unset CXX CC
+
 # Set MACA SDK paths for compilation (fixes __macro_mxcc.h not found)
 if [[ -d "/opt/maca" ]]; then
   export MACA_PATH=/opt/maca
