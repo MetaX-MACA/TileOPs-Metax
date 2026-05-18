@@ -4,15 +4,14 @@ from typing import Optional
 
 import torch
 
-from tileops.kernels.gemm.gemm import GemmKernel
-from tileops.kernels.kernel import Kernel
-from tileops.utils import is_metax_c500
+from tileops.kernels.gemm import GemmKernel
+from tileops.kernels.kernel_base import Kernel
 
 
 class MacaAutoGemmKernel(Kernel):
-    """C500 GEMM dispatcher that selects the fastest validated safe backend."""
+    """Compatibility wrapper for the TileLang compiler GEMM backend."""
 
-    supported_archs: list[int] = [80]
+    supported_archs: list[int] = GemmKernel.supported_archs
 
     def __init__(
             self,
@@ -51,19 +50,6 @@ class MacaAutoGemmKernel(Kernel):
             trans_a: bool,
             trans_b: bool,
     ) -> Kernel:
-        if not is_metax_c500() or dtype is not torch.float16:
-            return GemmKernel(m, n, k, dtype, config=config, tune=tune, trans_a=trans_a,
-                              trans_b=trans_b)
-
-        if not trans_a:
-            try:
-                from tileops.kernels.gemm.maca_hgemm import MacaHGemmKernel
-
-                return MacaHGemmKernel(
-                    m, n, k, dtype, config=config, tune=tune, trans_a=trans_a, trans_b=trans_b)
-            except (ImportError, NotImplementedError):
-                pass
-
         return GemmKernel(m, n, k, dtype, config=config, tune=tune, trans_a=trans_a,
                           trans_b=trans_b)
 

@@ -10,7 +10,7 @@ from tileops.kernels.gemm import (
     GemvKernel,
 )
 from tileops.kernels.kernel_base import Kernel
-from tileops.utils import get_sm_version, is_metax_c500
+from tileops.utils import get_sm_version
 
 from .op_base import Op
 
@@ -19,18 +19,13 @@ __all__ = ["GemmFp8Op", "GemmOp"]
 
 def _select_gemm_kernel() -> type[Kernel]:
     backend = os.environ.get("TILEOPS_GEMM_BACKEND", "").strip().lower()
-    if backend in {"tilelang", "default"}:
+    if backend in {"maca_hgemm", "maca_auto"}:
+        raise RuntimeError(
+            "TILEOPS_GEMM_BACKEND no longer accepts direct HPP backends for GemmOp; "
+            "use the TileLang DSL/compiler path instead."
+        )
+    if backend in {"tilelang", "default", "", "auto"}:
         return GemmKernel
-
-    is_c500 = is_metax_c500()
-    if backend == "maca_hgemm" and is_c500:
-        from tileops.kernels.gemm.maca_hgemm import MacaHGemmKernel
-
-        return MacaHGemmKernel
-    if backend in {"", "auto", "maca_auto"} and is_c500:
-        from tileops.kernels.gemm.maca_auto import MacaAutoGemmKernel
-
-        return MacaAutoGemmKernel
     return GemmKernel
 
 

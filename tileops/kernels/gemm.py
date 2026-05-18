@@ -1,4 +1,9 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 import functools
+import itertools
+import os
+import weakref
 from typing import Callable, Optional
 
 import tilelang
@@ -7,7 +12,7 @@ import torch
 
 from tileops.kernels.kernel_base import Kernel
 from tileops.trace import trace
-from tileops.utils import get_sm_version, str2dtype
+from tileops.utils import get_sm_version, is_metax_c500, str2dtype
 
 __all__ = [
     'GemmFp8BlockScaledKernel',
@@ -298,6 +303,50 @@ def _gemm_fp8_kernel(
     return _gemm_fp8_func
 
 
+def _gemm_compile_flags(use_maca: Optional[bool] = None) -> list[str]:
+    if use_maca is None:
+        use_maca = is_metax_c500()
+    flags = ["-O3", "-DENABLE_BF16"]
+    if use_maca:
+        flags.extend([
+            "-mllvm -metaxgpu-direct-address=disshared",
+            "-mllvm -metaxgpu-force-global-saddr=1",
+            "-gcc-version 11",
+        ])
+    return flags
+
+
+def _make_maca_gemm_ab_layout(buf, kfactor: int):
+    layout_fn = getattr(tilelang.layout, "make_maca_gemm_ab_layout", None)
+    if layout_fn is None:
+        return tilelang.layout.make_swizzled_layout(buf)
+    return layout_fn(buf, kfactor)
+
+
+def _make_contiguous_output_layout(buf):
+    layout_fn = getattr(tilelang.layout, "make_linear_layout", None)
+    if layout_fn is None:
+        return tilelang.layout.make_swizzled_layout(buf)
+    return layout_fn(buf)
+
+
+def _get_maca_bsm_split_k() -> int:
+    value = os.environ.get("TILEOPS_GEMM_SPLIT_K", "1").strip()
+    if not value:
+        return 1
+    return max(1, int(value))
+
+
+def _get_maca_bsm_packed_b_tile() -> bool:
+    value = os.environ.get("TILEOPS_GEMM_PACKED_B_TILE", "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _get_maca_bsm_packed_b_async_pipeline() -> bool:
+    value = os.environ.get("TILEOPS_GEMM_PACKED_B_ASYNC_PIPELINE", "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 @functools.lru_cache(maxsize=32)
 def _gemm_kernel(m: int,
                  n: int,
@@ -493,6 +542,400 @@ def _gemm_kernel(m: int,
     return _gemm_func
 
 
+@functools.lru_cache(maxsize=32)
+def _gemm_kernel_bsm(m: int,
+                     n: int,
+                     k: int,
+                     dtype: str = 'float16') -> Callable:
+    accum_dtype = "float"
+
+    @tilelang.jit(out_idx=[-1], compile_flags=_gemm_compile_flags(use_maca=True))
+    def _gemm_func(block_m: int, block_n: int, block_k: int, threads: int, num_stages: int,
+                   enable_rasterization: bool) -> Callable:
+
+        a_shape = (m, k)
+        b_shape = (n, k)
+        a_shared_shape = (block_m, block_k)
+        b_shared_shape = (block_n, block_k)
+
+        @T.prim_func
+        def _gemm_main(
+                a: T.Tensor(a_shape, dtype),  # type: ignore
+                b: T.Tensor(b_shape, dtype),  # type: ignore
+                c: T.Tensor((m, n), dtype),  # type: ignore
+        ) -> None:
+            with T.Kernel(
+                    T.ceildiv(n, block_n), T.ceildiv(m, block_m), threads=threads) as (bx, by):
+                a_operand = T.alloc_shared(a_shared_shape, dtype)
+                b_shared = T.alloc_shared(b_shared_shape, dtype)
+                c_local = T.alloc_fragment((block_m, block_n), accum_dtype)
+                c_shared = T.alloc_shared((block_m, block_n), dtype)
+
+                T.annotate_layout({
+                    a_operand: _make_maca_gemm_ab_layout(a_operand, 2),
+                    c_shared: _make_contiguous_output_layout(c_shared),
+                })
+                T.use_swizzle(10, enable=enable_rasterization)
+
+                T.clear(c_local)
+                for _k in T.Pipelined(T.ceildiv(k, block_k), num_stages=num_stages):
+                    T.copy(a[by * block_m, _k * block_k], a_operand)
+                    T.copy(b[bx * block_n, _k * block_k], b_shared)
+                    T.gemm(a_operand, b_shared, c_local, False, True)
+
+                T.copy(c_local, c_shared)
+                T.copy(c_shared, c[by * block_m, bx * block_n])
+
+        return _gemm_main
+
+    return _gemm_func
+
+
+@functools.lru_cache(maxsize=32)
+def _gemm_kernel_bsm_packed_b_tile(m: int,
+                                   n: int,
+                                   k: int,
+                                   dtype: str = 'float16') -> Callable:
+    accum_dtype = "float"
+
+    @tilelang.jit(out_idx=[-1], compile_flags=_gemm_compile_flags(use_maca=True))
+    def _gemm_func(block_m: int, block_n: int, block_k: int, threads: int, num_stages: int,
+                   enable_rasterization: bool) -> Callable:
+
+        a_shape = (m, k)
+        b_shape = (n // block_n, k // block_k, block_n, block_k)
+        a_shared_shape = (block_m, block_k)
+        b_shared_shape = (block_n, block_k)
+
+        @T.prim_func
+        def _gemm_main(
+                a: T.Tensor(a_shape, dtype),  # type: ignore
+                b: T.Tensor(b_shape, dtype),  # type: ignore
+                c: T.Tensor((m, n), dtype),  # type: ignore
+        ) -> None:
+            with T.Kernel(
+                    T.ceildiv(n, block_n), T.ceildiv(m, block_m), threads=threads) as (bx, by):
+                a_operand = T.alloc_shared(a_shared_shape, dtype)
+                b_shared = T.alloc_shared(b_shared_shape, dtype)
+                c_local = T.alloc_fragment((block_m, block_n), accum_dtype)
+                c_shared = T.alloc_shared((block_m, block_n), dtype)
+
+                T.annotate_layout({
+                    a_operand: _make_maca_gemm_ab_layout(a_operand, 2),
+                    c_shared: _make_contiguous_output_layout(c_shared),
+                })
+                T.use_swizzle(10, enable=enable_rasterization)
+
+                T.clear(c_local)
+                for _k in T.Pipelined(T.ceildiv(k, block_k), num_stages=num_stages):
+                    T.copy(a[by * block_m, _k * block_k], a_operand)
+                    T.copy(b[bx, _k, 0, 0], b_shared)
+                    T.gemm(a_operand, b_shared, c_local, False, True)
+
+                T.copy(c_local, c_shared)
+                T.copy(c_shared, c[by * block_m, bx * block_n])
+
+        return _gemm_main
+
+    return _gemm_func
+
+
+@functools.lru_cache(maxsize=32)
+def _gemm_kernel_bsm_splitk(m: int,
+                            n: int,
+                            k: int,
+                            split_k: int,
+                            dtype: str = 'float16',
+                            partial_dtype: str = "float32") -> Callable:
+    accum_dtype = "float"
+    k_chunk = k // split_k
+
+    @tilelang.jit(out_idx=[2], compile_flags=_gemm_compile_flags(use_maca=True))
+    def _gemm_func(block_m: int, block_n: int, block_k: int, threads: int, num_stages: int,
+                   enable_rasterization: bool) -> Callable:
+
+        split_block_k = block_k // split_k
+        a_shape = (m, k)
+        b_shape = (n, k)
+        partial_c_shape = (split_k, m, n)
+        a_shared_shape = (block_m, split_block_k)
+        b_shared_shape = (block_n, split_block_k)
+
+        @T.prim_func
+        def _gemm_main(
+                a: T.Tensor(a_shape, dtype),  # type: ignore
+                b: T.Tensor(b_shape, dtype),  # type: ignore
+                partial_c: T.Tensor(partial_c_shape, partial_dtype),  # type: ignore
+        ) -> None:
+            with T.Kernel(
+                    T.ceildiv(n, block_n), T.ceildiv(m, block_m), split_k,
+                    threads=threads) as (bx, by, bz):
+                a_operand = T.alloc_shared(a_shared_shape, dtype)
+                b_shared = T.alloc_shared(b_shared_shape, dtype)
+                c_local = T.alloc_fragment((block_m, block_n), accum_dtype)
+
+                T.annotate_layout({
+                    a_operand: _make_maca_gemm_ab_layout(a_operand, 2),
+                })
+                T.use_swizzle(10, enable=enable_rasterization)
+
+                T.clear(c_local)
+                for _k in T.Pipelined(T.ceildiv(k_chunk, split_block_k), num_stages=num_stages):
+                    k_offset = bz * k_chunk + _k * split_block_k
+                    T.copy(a[by * block_m, k_offset], a_operand)
+                    T.copy(b[bx * block_n, k_offset], b_shared)
+                    T.gemm(a_operand, b_shared, c_local, False, True)
+
+                T.copy(c_local, partial_c[bz, by * block_m, bx * block_n])
+
+        return _gemm_main
+
+    return _gemm_func
+
+
+@functools.lru_cache(maxsize=32)
+def _gemm_kernel_bsm_splitk_packed_b_tile(m: int,
+                                          n: int,
+                                          k: int,
+                                          split_k: int,
+                                          dtype: str = 'float16',
+                                          partial_dtype: str = "float32") -> Callable:
+    accum_dtype = "float"
+    k_chunk = k // split_k
+
+    @tilelang.jit(out_idx=[2], compile_flags=_gemm_compile_flags(use_maca=True))
+    def _gemm_func(block_m: int, block_n: int, block_k: int, threads: int, num_stages: int,
+                   enable_rasterization: bool) -> Callable:
+
+        split_block_k = block_k // split_k
+        a_shape = (m, k)
+        b_shape = (n // block_n, k // split_block_k, block_n, split_block_k)
+        partial_c_shape = (split_k, m, n)
+        a_shared_shape = (block_m, split_block_k)
+        b_shared_shape = (block_n, split_block_k)
+
+        @T.prim_func
+        def _gemm_main(
+                a: T.Tensor(a_shape, dtype),  # type: ignore
+                b: T.Tensor(b_shape, dtype),  # type: ignore
+                partial_c: T.Tensor(partial_c_shape, partial_dtype),  # type: ignore
+        ) -> None:
+            with T.Kernel(
+                    T.ceildiv(n, block_n), T.ceildiv(m, block_m), split_k,
+                    threads=threads) as (bx, by, bz):
+                a_operand = T.alloc_shared(a_shared_shape, dtype)
+                b_shared = T.alloc_shared(b_shared_shape, dtype)
+                c_local = T.alloc_fragment((block_m, block_n), accum_dtype)
+
+                T.annotate_layout({
+                    a_operand: _make_maca_gemm_ab_layout(a_operand, 2),
+                })
+                T.use_swizzle(10, enable=enable_rasterization)
+
+                T.clear(c_local)
+                for _k in T.Pipelined(T.ceildiv(k_chunk, split_block_k), num_stages=num_stages):
+                    k_offset = bz * k_chunk + _k * split_block_k
+                    k_tile = k_offset // split_block_k
+                    T.copy(a[by * block_m, k_offset], a_operand)
+                    T.copy(b[bx, k_tile, 0, 0], b_shared)
+                    gemm_annotations = {
+                        "maca_wsm_a_source_ptr": T.address_of(
+                            a[by * block_m, k_offset]),
+                        "maca_wsm_b_source_ptr": T.address_of(b[bx, k_tile, 0, 0]),
+                        "maca_wsm_a_stride": k,
+                    }
+                    T.gemm(
+                        a_operand,
+                        b_shared,
+                        c_local,
+                        False,
+                        True,
+                        annotations=gemm_annotations,
+                    )
+
+                T.copy(c_local, partial_c[bz, by * block_m, bx * block_n])
+
+        return _gemm_main
+
+    return _gemm_func
+
+
+@functools.lru_cache(maxsize=32)
+def _gemm_kernel_bsm_splitk_packed_b_tile_async(m: int,
+                                                n: int,
+                                                k: int,
+                                                split_k: int,
+                                                dtype: str = 'float16',
+                                                partial_dtype: str = "float32") -> Callable:
+    accum_dtype = "float"
+    k_chunk = k // split_k
+    stage_count = 2
+
+    @tilelang.jit(out_idx=[2], compile_flags=_gemm_compile_flags(use_maca=True))
+    def _gemm_func(block_m: int, block_n: int, block_k: int, threads: int, num_stages: int,
+                   enable_rasterization: bool) -> Callable:
+
+        split_block_k = block_k // split_k
+        a_shape = (m, k)
+        b_shape = (n // block_n, k // split_block_k, block_n, split_block_k)
+        partial_c_shape = (split_k, m, n)
+        a_shared_shape = (stage_count, block_m, split_block_k)
+        b_shared_shape = (stage_count, block_n, split_block_k)
+        num_k_tiles = (k_chunk + split_block_k - 1) // split_block_k
+
+        @T.prim_func
+        def _gemm_main(
+                a: T.Tensor(a_shape, dtype),  # type: ignore
+                b: T.Tensor(b_shape, dtype),  # type: ignore
+                partial_c: T.Tensor(partial_c_shape, partial_dtype),  # type: ignore
+        ) -> None:
+            with T.Kernel(
+                    T.ceildiv(n, block_n), T.ceildiv(m, block_m), split_k,
+                    threads=threads) as (bx, by, bz):
+                a_operand = T.alloc_shared(a_shared_shape, dtype)
+                b_shared = T.alloc_shared(b_shared_shape, dtype)
+                c_local = T.alloc_fragment((block_m, block_n), accum_dtype)
+                bar = T.alloc_maca_barrier(stage_count)
+
+                T.annotate_layout({
+                    a_operand: _make_maca_gemm_ab_layout(a_operand, 2),
+                })
+                T.use_swizzle(10, enable=enable_rasterization)
+
+                first_k_offset = bz * k_chunk
+                first_k_tile = first_k_offset // split_block_k
+                T.maca_async_copy(
+                    a[by * block_m:(by + 1) * block_m,
+                      first_k_offset:first_k_offset + split_block_k],
+                    a_operand[0, :, :],
+                    barrier=bar[0],
+                )
+                T.maca_async_copy(
+                    b[bx, first_k_tile, :, :],
+                    b_shared[0, :, :],
+                    barrier=bar[0],
+                )
+                T.clear(c_local)
+
+                for _k in T.serial(num_k_tiles):
+                    stage = _k % stage_count
+                    next_k = _k + 1
+                    if next_k < num_k_tiles:
+                        next_stage = next_k % stage_count
+                        next_k_offset = bz * k_chunk + next_k * split_block_k
+                        next_k_tile = next_k_offset // split_block_k
+                        T.maca_async_copy(
+                            a[by * block_m:(by + 1) * block_m,
+                              next_k_offset:next_k_offset + split_block_k],
+                            a_operand[next_stage, :, :],
+                            barrier=bar[next_stage],
+                        )
+                        T.maca_async_copy(
+                            b[bx, next_k_tile, :, :],
+                            b_shared[next_stage, :, :],
+                            barrier=bar[next_stage],
+                        )
+                    T.gemm(
+                        a_operand[stage, :, :],
+                        b_shared[stage, :, :],
+                        c_local,
+                        False,
+                        True,
+                        mbar=bar[stage],
+                    )
+
+                T.copy(c_local, partial_c[bz, by * block_m, bx * block_n])
+
+        return _gemm_main
+
+    return _gemm_func
+
+
+@functools.lru_cache(maxsize=32)
+def _gemm_splitk_reduce_kernel(m: int,
+                               n: int,
+                               split_k: int,
+                               dtype: str = "float16",
+                               partial_dtype: str = "float32") -> Callable:
+    threads = 256
+    items_per_thread = 4
+    block_size = threads * items_per_thread
+    total = m * n
+
+    @tilelang.jit(out_idx=[1], compile_flags=_gemm_compile_flags(use_maca=True))
+    def _reduce_func() -> Callable:
+
+        @T.prim_func
+        def _reduce_main(
+                partial_c: T.Tensor((split_k, m, n), partial_dtype),  # type: ignore
+                c: T.Tensor((m, n), dtype),  # type: ignore
+        ) -> None:
+            with T.Kernel(T.ceildiv(total, block_size), threads=threads) as bx:
+                for tx, item in T.Parallel(threads, items_per_thread):
+                    flat_idx = (bx * threads + tx) * items_per_thread + item
+                    if flat_idx < total:
+                        row = flat_idx // n
+                        col = flat_idx - row * n
+                        acc = T.alloc_local((1,), "float32")
+                        acc[0] = 0.0
+                        for sk in T.serial(split_k):
+                            acc[0] += T.cast(partial_c[sk, row, col], "float32")
+                        c[row, col] = T.cast(acc[0], dtype)
+
+        return _reduce_main
+
+    return _reduce_func
+
+
+@functools.lru_cache(maxsize=32)
+def _gemm_kernel_col_major(m: int,
+                           n: int,
+                           k: int,
+                           dtype: str = 'float16') -> Callable:
+    accum_dtype = "float"
+
+    @tilelang.jit(out_idx=[-1], compile_flags=_gemm_compile_flags())
+    def _gemm_func(block_m: int, block_n: int, block_k: int, threads: int, num_stages: int,
+                   enable_rasterization: bool) -> Callable:
+
+        a_shape = (m, k)
+        b_shape = (n, k)
+        a_shared_shape = (block_m, block_k)
+        b_shared_shape = (block_n, block_k)
+
+        @T.prim_func
+        def _gemm_main(
+                a: T.Tensor(a_shape, dtype),  # type: ignore
+                b: T.Tensor(b_shape, dtype),  # type: ignore
+                c_col_major: T.Tensor((n, m), dtype),  # type: ignore
+        ) -> None:
+            with T.Kernel(
+                    T.ceildiv(m, block_m), T.ceildiv(n, block_n), threads=threads) as (bx, by):
+                a_shared = T.alloc_shared(a_shared_shape, dtype)
+                b_shared = T.alloc_shared(b_shared_shape, dtype)
+                c_local = T.alloc_fragment((block_n, block_m), accum_dtype)
+                c_shared = T.alloc_shared((block_n, block_m), dtype)
+
+                T.annotate_layout({
+                    c_shared: tilelang.layout.make_swizzled_layout(c_shared),
+                })
+                T.use_swizzle(10, enable=enable_rasterization)
+
+                T.clear(c_local)
+
+                for _k in T.Pipelined(T.ceildiv(k, block_k), num_stages=num_stages):
+                    T.copy(a[bx * block_m, _k * block_k], a_shared)
+                    T.copy(b[by * block_n, _k * block_k], b_shared)
+                    T.gemm(b_shared, a_shared, c_local, False, True)
+
+                T.copy(c_local, c_shared)
+                T.copy(c_shared, c_col_major[by * block_n, bx * block_m])
+
+        return _gemm_main
+
+    return _gemm_func
+
+
 @torch.library.custom_op("top::gemm_wrapped_kernel", mutates_args=())
 def _gemm_wrapped_kernel(
     m: int,
@@ -552,31 +995,168 @@ class GemmKernel(Kernel):
         self.dtype = dtype
         self.trans_a = trans_a
         self.trans_b = trans_b
+        self.split_k = _get_maca_bsm_split_k()
+        self._use_maca_bsm_path = (
+            is_metax_c500() and dtype == torch.float16 and not trans_a and m % 128 == 0
+            and n % 128 == 0 and k % 128 == 0 and not tune
+        )
+        if self.split_k > 1 and not self._use_maca_bsm_path:
+            raise RuntimeError(
+                "TILEOPS_GEMM_SPLIT_K currently only applies to the MetaX C500 BSM path"
+            )
+        if self.split_k > 1 and k % self.split_k != 0:
+            raise RuntimeError("TILEOPS_GEMM_SPLIT_K requires K to be divisible by split_k")
+        self._use_packed_b_tile_path = (
+            self._use_maca_bsm_path and not trans_b and _get_maca_bsm_packed_b_tile()
+        )
+        self._use_col_major_output = (not trans_a and dtype == torch.float16
+                                      and not self._use_maca_bsm_path)
+        self._use_split_k_path = self._use_maca_bsm_path and self.split_k > 1
+        self._use_packed_b_async_pipeline_path = (
+            self._use_split_k_path and self._use_packed_b_tile_path
+            and _get_maca_bsm_packed_b_async_pipeline()
+        )
 
-        self.kernel = _gemm_kernel(m, n, k, trans_a, trans_b, self.dtype_str)
-
+        if self._use_split_k_path:
+            if self._use_packed_b_async_pipeline_path:
+                self.kernel = _gemm_kernel_bsm_splitk_packed_b_tile_async(
+                    m,
+                    n,
+                    k,
+                    self.split_k,
+                    self.dtype_str,
+                )
+            elif self._use_packed_b_tile_path:
+                self.kernel = _gemm_kernel_bsm_splitk_packed_b_tile(
+                    m,
+                    n,
+                    k,
+                    self.split_k,
+                    self.dtype_str,
+                )
+            else:
+                self.kernel = _gemm_kernel_bsm_splitk(
+                    m, n, k, self.split_k, self.dtype_str)
+            self.reduce_kernel = _gemm_splitk_reduce_kernel(m, n, self.split_k, self.dtype_str)
+        elif self._use_maca_bsm_path:
+            if self._use_packed_b_tile_path:
+                self.kernel = _gemm_kernel_bsm_packed_b_tile(m, n, k, self.dtype_str)
+            else:
+                self.kernel = _gemm_kernel_bsm(m, n, k, self.dtype_str)
+        elif self._use_col_major_output:
+            self.kernel = _gemm_kernel_col_major(m, n, k, self.dtype_str)
+        else:
+            self.kernel = _gemm_kernel(m, n, k, trans_a, True, self.dtype_str)
         self.init_config(config, tune)
+        if self._use_split_k_path:
+            if self.config["block_k"] % self.split_k != 0:
+                raise RuntimeError("TILEOPS_GEMM_SPLIT_K requires block_k divisible by split_k")
+            if self.config["block_k"] < self.split_k:
+                raise RuntimeError("TILEOPS_GEMM_SPLIT_K requires block_k >= split_k")
+        if not self._use_split_k_path:
+            self.reduce_kernel = None
+        self._b_native_cache_source = None
+        self._b_native_cache_version = -1
+        self._b_native_cache_tensor: Optional[torch.Tensor] = None
 
     @property
     def default_config(self) -> dict:
+        # From tilelang/examples/gemm/example_gemm_autotune.py
+        if self._use_maca_bsm_path:
+            return {
+                "block_m": 128,
+                "block_n": 128,
+                "block_k": 128,
+                "num_stages": 0,
+                "threads": 256,
+                "enable_rasterization": True
+            }
+
+        sm_version = get_sm_version()
+
+        if sm_version in {80}:
+            return {
+                "block_m": 128,
+                "block_n": 128,
+                "block_k": 128,
+                "num_stages": 0,
+                "threads": 256,
+                "enable_rasterization": True
+            }
+        if sm_version in {90}:
+            return {
+                "block_m": 128,
+                "block_n": 256,
+                "block_k": 64,
+                "num_stages": 3,
+                "threads": 256,
+                "enable_rasterization": True
+            }
         return {
             "block_m": 128,
-            "block_n": 128,
-            "block_k": 64,
-            "num_stages": 3,
+            "block_n": 256,
+            "block_k": 32,
+            "num_stages": 0,
+            "threads": 128,
+            "enable_rasterization": True,
         }
 
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        # Call the compiled JIT directly (cf. GemvKernel); _gemm_wrapped_kernel is
-        # kept only for torch.compile compatibility. trace.run dumps the timeline
-        # when tracing is on and otherwise just returns C — so no branch here.
-        compiled = _gemm_kernel(
-            self.m, self.n, self.k, self.trans_a, self.trans_b, self.dtype_str,
-            traced=trace.enabled)(**self.config)
-        layout = f"{'T' if self.trans_a else 'N'}{'T' if self.trans_b else 'N'}"
-        return trace.run(
-            compiled, (a, b),
-            stem=f"gemm_{self.m}x{self.n}x{self.k}_{layout}_{self.dtype_str}")
+        return self.forward_with_prepared_b(a, self.prepare_b(b))
+
+    def prepare_a(self, a: torch.Tensor) -> torch.Tensor:
+        return a
+
+    def prepare_b(self, b: torch.Tensor) -> torch.Tensor:
+        if self.trans_b:
+            return b
+
+        version = int(getattr(b, "_version", 0))
+        if (self._b_native_cache_tensor is not None and self._b_native_cache_version == version
+                and self._b_native_cache_source is not None
+                and self._b_native_cache_source() is b):
+            return self._b_native_cache_tensor
+
+        native_b = b.transpose(0, 1).contiguous()
+        if self._use_packed_b_tile_path:
+            block_n = self.config["block_n"]
+            block_k = self.config["block_k"]
+            tile_k = block_k // self.split_k if self._use_split_k_path else block_k
+            if self.n % block_n != 0:
+                raise RuntimeError("TILEOPS_GEMM_PACKED_B_TILE requires N divisible by block_n")
+            if self.k % tile_k != 0:
+                raise RuntimeError("TILEOPS_GEMM_PACKED_B_TILE requires K divisible by tile_k")
+            native_b = native_b.view(
+                self.n // block_n,
+                block_n,
+                self.k // tile_k,
+                tile_k,
+            ).permute(0, 2, 1, 3).contiguous()
+        try:
+            self._b_native_cache_source = weakref.ref(b)
+            self._b_native_cache_version = version
+            self._b_native_cache_tensor = native_b
+        except TypeError:
+            self._b_native_cache_source = None
+            self._b_native_cache_version = -1
+            self._b_native_cache_tensor = None
+        return native_b
+
+    def forward_with_prepared_b(self, a: torch.Tensor, b_prepared: torch.Tensor) -> torch.Tensor:
+        kernel = self.kernel(self.config["block_m"], self.config["block_n"],
+                             self.config["block_k"], self.config["threads"],
+                             self.config["num_stages"], self.config["enable_rasterization"])
+        if self._use_split_k_path:
+            assert self.reduce_kernel is not None
+            partial_c = kernel(a, b_prepared)
+            return self.reduce_kernel()(partial_c)
+        if self._use_col_major_output:
+            return kernel(a, b_prepared).transpose(0, 1)
+        return kernel(a, b_prepared)
+
+    def forward_with_prepared_a_and_b(self, a_prepared: torch.Tensor,
+                                      b_prepared: torch.Tensor) -> torch.Tensor:
+        return self.forward_with_prepared_b(a_prepared, b_prepared)
 
 
 # TODO: add persistent, split-k, steam-k...

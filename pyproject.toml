@@ -63,7 +63,7 @@ exclude = ["tests", "tests.*", "benchmarks", "benchmarks.*"]
 
 [tool.setuptools.package-data]
 tileops = [
-    "kernels/gemm/*.hpp",
+    "kernels/gemm_maca/*.hpp",
     "kernels/moe/_atomic_helper.h",
     "manifest/*.yaml",
 ]

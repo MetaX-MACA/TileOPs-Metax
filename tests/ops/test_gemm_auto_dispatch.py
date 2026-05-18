@@ -5,9 +5,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tileops.kernels.gemm.maca_auto import MacaAutoGemmKernel
-from tileops.kernels.gemm import maca_hgemm as maca_hgemm_module
-from tileops.kernels.gemm.maca_hgemm import (
+from tileops.kernels.gemm import GemmKernel
+from tileops.kernels.gemm_maca import maca_hgemm as maca_hgemm_module
+from tileops.kernels.gemm_maca.maca_hgemm import (
     MacaHGemmKernel,
     _compile_flags,
     _reference_layout_repo,
@@ -130,11 +130,23 @@ def test_is_metax_c500(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.smoke
-def test_gemm_default_selector_uses_c500_auto_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_gemm_default_selector_uses_tilelang_compiler_backend_on_c500(
+        monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_metax_c500(monkeypatch)
     monkeypatch.delenv("TILEOPS_GEMM_BACKEND", raising=False)
 
-    assert _select_gemm_kernel().__name__ == "MacaAutoGemmKernel"
+    assert _select_gemm_kernel() is GemmKernel
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("backend", ["maca_hgemm", "maca_auto"])
+def test_gemm_selector_rejects_direct_hpp_backends(
+        monkeypatch: pytest.MonkeyPatch, backend: str) -> None:
+    _patch_metax_c500(monkeypatch)
+    monkeypatch.setenv("TILEOPS_GEMM_BACKEND", backend)
+
+    with pytest.raises(RuntimeError, match="TileLang DSL/compiler"):
+        _select_gemm_kernel()
 
 
 @pytest.mark.smoke
@@ -205,7 +217,7 @@ def test_maca_hgemm_example_async_a_staging_gate_is_disabled(
 def test_maca_hgemm_reference_repo_prefers_workspace_sibling(
         monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     repo_file = (
-        tmp_path / "TileOPs-Metax" / "tileops" / "kernels" / "gemm" / "maca_hgemm.py"
+        tmp_path / "TileOPs-Metax" / "tileops" / "kernels" / "gemm_maca" / "maca_hgemm.py"
     )
     repo_file.parent.mkdir(parents=True)
     repo_file.touch()
@@ -227,39 +239,157 @@ def test_maca_hgemm_experimental_rowa_layout_b_gate_is_disabled(
 
 
 @pytest.mark.smoke
-def test_gemm_op_auto_routes_to_maca_hgemm_on_c500_fp16(
+def test_gemm_op_auto_routes_to_tilelang_compiler_backend_on_c500_fp16(
         monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_metax_c500(monkeypatch)
     monkeypatch.delenv("TILEOPS_GEMM_BACKEND", raising=False)
-    _install_fake_backend_module(monkeypatch, "tileops.kernels.gemm.maca_hgemm",
-                                 "MacaHGemmKernel")
 
     op = GemmOp(128, 128, 128, dtype=torch.float16, tune=False)
 
-    assert isinstance(op.kernel, MacaAutoGemmKernel)
-    assert op.kernel.inner.__class__.__name__ == "MacaHGemmKernel"
-    assert op.kernel.config["selected_backend"] == "MacaHGemmKernel"
+    assert isinstance(op.kernel, GemmKernel)
 
 
 @pytest.mark.smoke
-def test_gemm_op_prepacked_b_path_is_exposed_through_auto_dispatch(
+def test_gemm_op_auto_dispatch_exposes_compiler_prepared_b_path(
         monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_metax_c500(monkeypatch)
     monkeypatch.delenv("TILEOPS_GEMM_BACKEND", raising=False)
-    _install_fake_backend_module_with_prepacked_api(monkeypatch, "tileops.kernels.gemm.maca_hgemm",
-                                                    "MacaHGemmKernel")
 
-    op = GemmOp(128, 128, 128, dtype=torch.float16, tune=False)
-    a = torch.ones((128, 128), dtype=torch.float16)
-    b = torch.ones((128, 128), dtype=torch.float16)
+    op = GemmOp(2, 3, 4, dtype=torch.float16, tune=False)
+    b = torch.arange(12, dtype=torch.float16).reshape(4, 3)
 
-    prepared = op.prepare_b(b)
-    out = op.forward_with_prepared_b(a, prepared)
+    prepared_b = op.prepare_b(b)
 
-    assert torch.equal(prepared, b + 1)
-    assert torch.equal(out, b)
-    assert op.kernel.inner.prepared_b is b
-    assert op.kernel.inner.forward_args == (a, prepared)
+    assert isinstance(op.kernel, GemmKernel)
+    assert prepared_b.shape == (3, 4)
+    assert torch.equal(prepared_b, b.transpose(0, 1).contiguous())
+
+
+@pytest.mark.smoke
+def test_gemm_kernel_prefers_maca_bsm_path_on_aligned_c500_fp16(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_metax_c500(monkeypatch)
+    kernel = GemmKernel(128, 128, 128, dtype=torch.float16, tune=False)
+
+    assert kernel._use_maca_bsm_path is True
+    assert kernel._use_col_major_output is False
+    assert kernel.config == {
+        "block_m": 128,
+        "block_n": 128,
+        "block_k": 128,
+        "num_stages": 0,
+        "threads": 256,
+        "enable_rasterization": True,
+    }
+
+
+@pytest.mark.smoke
+def test_gemm_kernel_prepare_b_reuses_native_cache(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_metax_c500(monkeypatch)
+    kernel = GemmKernel(2, 3, 4, dtype=torch.float16, tune=False)
+    b = torch.arange(12, dtype=torch.float16).reshape(4, 3)
+
+    prepared_first = kernel.prepare_b(b)
+    prepared_second = kernel.prepare_b(b)
+
+    assert prepared_first is prepared_second
+
+
+@pytest.mark.smoke
+def test_gemm_kernel_prepare_b_can_pack_bsm_tile_layout(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_metax_c500(monkeypatch)
+    monkeypatch.setenv("TILEOPS_GEMM_PACKED_B_TILE", "1")
+    monkeypatch.delenv("TILEOPS_GEMM_SPLIT_K", raising=False)
+    kernel = GemmKernel(128, 256, 128, dtype=torch.float16, tune=False)
+    b = torch.arange(128 * 256, dtype=torch.float16).reshape(128, 256)
+
+    prepared_b = kernel.prepare_b(b)
+    expected = b.transpose(0, 1).contiguous().view(
+        2,
+        128,
+        1,
+        128,
+    ).permute(0, 2, 1, 3).contiguous()
+
+    assert kernel._use_maca_bsm_path is True
+    assert kernel._use_packed_b_tile_path is True
+    assert prepared_b.shape == (2, 1, 128, 128)
+    assert torch.equal(prepared_b, expected)
+
+
+@pytest.mark.smoke
+def test_gemm_kernel_prepare_b_can_pack_splitk_bsm_tile_layout(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_metax_c500(monkeypatch)
+    monkeypatch.setenv("TILEOPS_GEMM_PACKED_B_TILE", "1")
+    monkeypatch.setenv("TILEOPS_GEMM_SPLIT_K", "2")
+    kernel = GemmKernel(128, 128, 256, dtype=torch.float16, tune=False)
+    b = torch.arange(256 * 128, dtype=torch.float16).reshape(256, 128)
+
+    prepared_b = kernel.prepare_b(b)
+    expected = b.transpose(0, 1).contiguous().view(
+        1,
+        128,
+        4,
+        64,
+    ).permute(0, 2, 1, 3).contiguous()
+
+    assert kernel._use_split_k_path is True
+    assert kernel._use_packed_b_tile_path is True
+    assert prepared_b.shape == (1, 4, 128, 64)
+    assert torch.equal(prepared_b, expected)
+
+
+@pytest.mark.smoke
+def test_gemm_kernel_can_select_packed_b_async_pipeline(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_metax_c500(monkeypatch)
+    monkeypatch.setenv("TILEOPS_GEMM_PACKED_B_TILE", "1")
+    monkeypatch.setenv("TILEOPS_GEMM_PACKED_B_ASYNC_PIPELINE", "1")
+    monkeypatch.setenv("TILEOPS_GEMM_SPLIT_K", "2")
+
+    kernel = GemmKernel(128, 128, 256, dtype=torch.float16, tune=False)
+
+    assert kernel._use_split_k_path is True
+    assert kernel._use_packed_b_tile_path is True
+    assert kernel._use_packed_b_async_pipeline_path is True
+
+
+@pytest.mark.smoke
+def test_gemm_kernel_rejects_incompatible_splitk_block_k_configuration(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_metax_c500(monkeypatch)
+    monkeypatch.setenv("TILEOPS_GEMM_SPLIT_K", "2")
+
+    with pytest.raises(RuntimeError, match="block_k divisible by split_k"):
+        GemmKernel(128, 128, 256, dtype=torch.float16, tune=False, config={"block_k": 33})
+
+
+@pytest.mark.smoke
+def test_gemm_kernel_packed_b_tile_leaves_transposed_b_layout_alone(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_metax_c500(monkeypatch)
+    monkeypatch.setenv("TILEOPS_GEMM_PACKED_B_TILE", "1")
+    kernel = GemmKernel(128, 128, 128, dtype=torch.float16, tune=False, trans_b=True)
+    b = torch.arange(128 * 128, dtype=torch.float16).reshape(128, 128)
+
+    prepared_b = kernel.prepare_b(b)
+
+    assert kernel._use_maca_bsm_path is True
+    assert kernel._use_packed_b_tile_path is False
+    assert prepared_b is b
+
+
+@pytest.mark.smoke
+def test_gemm_kernel_prepare_a_is_identity(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_metax_c500(monkeypatch)
+    kernel = GemmKernel(2, 3, 4, dtype=torch.float16, tune=False)
+    a = torch.arange(8, dtype=torch.float16).reshape(2, 4)
+
+    assert torch.equal(kernel.prepare_a(a), a)
 
 
 @pytest.mark.smoke
@@ -291,21 +421,20 @@ def test_maca_hgemm_explicit_launch_order_env_disables_auto_selection(
 
 
 @pytest.mark.smoke
-def test_gemm_op_reference_layout_ab_continuous_c_routes_through_external_entrypoint(
+def test_maca_hgemm_reference_layout_ab_continuous_c_routes_through_external_entrypoint(
         monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_metax_c500(monkeypatch)
     monkeypatch.setenv("TILEOPS_MACA_HGEMM_USE_REFERENCE_LAYOUT_AB_CONTINUOUS_C", "1")
-    monkeypatch.delenv("TILEOPS_GEMM_BACKEND", raising=False)
     fake_reference = _install_fake_reference_layout_ab_module(monkeypatch)
     _reference_muxi_layout_kernels.cache_clear()
 
-    op = GemmOp(128, 16, 5120, dtype=torch.float16, tune=False)
+    kernel = MacaHGemmKernel(128, 16, 5120, dtype=torch.float16, tune=False)
     a = torch.ones((128, 5120), dtype=torch.float16)
     b = torch.ones((5120, 16), dtype=torch.float16)
 
-    prepared_a = op.prepare_a(a)
-    prepared_b = op.prepare_b(b)
-    out = op.forward_with_prepared_a_and_b(prepared_a, prepared_b)
+    prepared_a = kernel.prepare_a(a)
+    prepared_b = kernel.prepare_b(b)
+    out = kernel.forward_with_prepared_a_and_b(prepared_a, prepared_b)
     expected_prepared_a = a.view(128 // 16, 16, 5120 // 8, 8).permute(0, 2, 1, 3).contiguous()
     expected_prepared_b = b.transpose(0, 1).contiguous().view(
         16 // 16,
@@ -315,8 +444,7 @@ def test_gemm_op_reference_layout_ab_continuous_c_routes_through_external_entryp
         8,
     ).permute(2, 0, 3, 1, 4).contiguous()
 
-    assert isinstance(op.kernel.inner, MacaHGemmKernel)
-    assert op.kernel.inner.use_reference_layout_ab_continuous_c is True
+    assert kernel.use_reference_layout_ab_continuous_c is True
     assert prepared_a.shape == (8, 640, 16, 8)
     assert prepared_b.shape == (160, 1, 4, 16, 8)
     assert torch.equal(prepared_a, expected_prepared_a)
@@ -326,27 +454,25 @@ def test_gemm_op_reference_layout_ab_continuous_c_routes_through_external_entryp
 
 
 @pytest.mark.smoke
-def test_gemm_op_reference_layout_a_routes_through_external_entrypoint(
+def test_maca_hgemm_reference_layout_a_routes_through_external_entrypoint(
         monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_metax_c500(monkeypatch)
     monkeypatch.setenv("TILEOPS_MACA_HGEMM_USE_REFERENCE_LAYOUT_A_BODY", "1")
-    monkeypatch.delenv("TILEOPS_GEMM_BACKEND", raising=False)
     fake_reference = _install_fake_reference_layout_a_module(monkeypatch)
     _reference_muxi_layout_kernels.cache_clear()
 
-    op = GemmOp(128, 64, 128, dtype=torch.float16, tune=False)
+    kernel = MacaHGemmKernel(128, 64, 128, dtype=torch.float16, tune=False)
     a = torch.arange(128 * 128, dtype=torch.float16).reshape(128, 128)
     b = torch.arange(128 * 64, dtype=torch.float16).reshape(128, 64)
 
-    prepared_a = op.prepare_a(a)
-    prepared_b = op.prepare_b(b)
-    out = op.forward_with_prepared_a_and_b(prepared_a, prepared_b)
+    prepared_a = kernel.prepare_a(a)
+    prepared_b = kernel.prepare_b(b)
+    out = kernel.forward_with_prepared_a_and_b(prepared_a, prepared_b)
     expected_prepared_a = a.view(128 // 16, 16, 128 // 8, 8).permute(0, 2, 1, 3).contiguous()
     expected_prepared_b = b.transpose(0, 1).contiguous()
 
-    assert isinstance(op.kernel.inner, MacaHGemmKernel)
-    assert op.kernel.inner.use_reference_layout_a is True
-    assert op.kernel.inner.config["backend"] == "maca_hgemm_reference_layout_a"
+    assert kernel.use_reference_layout_a is True
+    assert kernel.config["backend"] == "maca_hgemm_reference_layout_a"
     assert prepared_a.shape == (8, 16, 16, 8)
     assert prepared_b.shape == (64, 128)
     assert torch.equal(prepared_a, expected_prepared_a)
@@ -367,11 +493,12 @@ def test_maca_hgemm_rowa_layout_b_body_stays_disabled_after_failed_smoke(
 
 
 @pytest.mark.smoke
-def test_gemm_op_reference_layout_ab_continuous_c_rejects_unsupported_long_k_shape(
+def test_gemm_op_ignores_hpp_reference_layout_env_on_auto_dispatch(
         monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_metax_c500(monkeypatch)
     monkeypatch.setenv("TILEOPS_MACA_HGEMM_USE_REFERENCE_LAYOUT_AB_CONTINUOUS_C", "1")
     monkeypatch.delenv("TILEOPS_GEMM_BACKEND", raising=False)
 
-    with pytest.raises(RuntimeError, match="only supports shapes listed"):
-        GemmOp(1664, 1024, 16384, dtype=torch.float16, tune=False)
+    op = GemmOp(1664, 1024, 16384, dtype=torch.float16, tune=False)
+
+    assert isinstance(op.kernel, GemmKernel)

@@ -12,8 +12,8 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from tileops.kernels.gemm.gemm import GemmKernel
-from tileops.kernels.kernel import Kernel
+from tileops.kernels.gemm import GemmKernel
+from tileops.kernels.kernel_base import Kernel
 from tileops.utils import is_metax_c500
 
 __all__ = ["MacaHGemmKernel"]
