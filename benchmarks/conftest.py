@@ -82,11 +82,6 @@ def setup() -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(1235)
 
-    # Clear CXX env var to prevent torch cpp extension's cu-bridge compiler
-    # from interfering with TileLang kernel compilation (fixes __macro_mxcc.h not found)
-    import os
-    os.environ.pop("CXX", None)
-
 
 def pytest_sessionstart(session):
     BenchmarkReport.clear()

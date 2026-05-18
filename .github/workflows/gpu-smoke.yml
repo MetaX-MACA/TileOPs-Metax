@@ -825,46 +825,8 @@ jobs:
   # =========================================================================
   # Nightly test jobs (for PR testing only)
   # =========================================================================
-  nightly-cache-warmup:
-    needs: [ci-prereq, security-policy]
-    if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && needs.ci-prereq.outputs.skip != 'true' }}
-    runs-on: tileops-metax-runner
-    timeout-minutes: 60
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Set up nightly venv
-        run: scripts/ci/setup_nightly_venv.sh
-        shell: bash
-
-      - name: Warm kernel compilation cache
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-          # shellcheck source=/dev/null
-          source "${VENV_PATH}/bin/activate"
-
-          PIP_NO_BUILD_ISOLATION=1 pip install --no-deps -e ".[dev]"
-
-          export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
-          echo "Starting kernel cache warmup..."
-          python scripts/warmup_kernel_cache.py --max-workers 64 -n 16
-        shell: bash
-
-      - name: Cleanup run-local venv
-        if: ${{ always() }}
-        run: |
-          set -euo pipefail
-          if [[ -n "${RUNTIME_ROOT:-}" && "${RUNTIME_ROOT}" == "${RUNNER_TEMP}/nightly-"* ]]; then
-            rm -rf "${RUNTIME_ROOT}"
-          fi
-        shell: bash
 
   nightly-benchmark:
-    needs: [nightly-cache-warmup]
     if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' }}
     runs-on: tileops-metax-runner
     # timeout-minutes: 120
