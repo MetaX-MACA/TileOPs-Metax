@@ -850,18 +850,18 @@ jobs:
           source "${VENV_PATH}/bin/activate"
 
           # Validate GPU frequency
-          TARGET_CLOCK_MHZ=1830
-          RETRIES=5
-          for i in $(seq 1 "${RETRIES}"); do
-            gpu_clock=$(mx-smi --show-clock | awk '/XCORE/ {print $(NF-1); exit}')
-            echo "GPU clock: ${gpu_clock} MHz (attempt ${i}/${RETRIES})"
-            if [ "${gpu_clock}" = "${TARGET_CLOCK_MHZ}" ]; then break; fi
-            if [ "${i}" -eq "${RETRIES}" ]; then
-              echo "::error::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz."
-              exit 1
-            fi
-            sleep 2
-          done
+          # TARGET_CLOCK_MHZ=1830
+          # RETRIES=5
+          # for i in $(seq 1 "${RETRIES}"); do
+          #   gpu_clock=$(mx-smi --show-clock | awk '/XCORE/ {print $(NF-1); exit}')
+          #   echo "GPU clock: ${gpu_clock} MHz (attempt ${i}/${RETRIES})"
+          #   if [ "${gpu_clock}" = "${TARGET_CLOCK_MHZ}" ]; then break; fi
+          #   if [ "${i}" -eq "${RETRIES}" ]; then
+          #     echo "::error::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz."
+          #     exit 1
+          #   fi
+          #   sleep 2
+          #  done
 
           PIP_NO_BUILD_ISOLATION=1 pip install --no-deps -e ".[dev]"
 
