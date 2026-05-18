@@ -837,9 +837,9 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up nightly venv
-        run: scripts/ci/setup_nightly_venv.sh
-        shell: bash
+      # - name: Set up nightly venv
+      #   run: scripts/ci/setup_nightly_venv.sh
+      #   shell: bash
 
       - name: Run benchmark ops
         id: benchmark_tests
