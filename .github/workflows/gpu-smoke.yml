@@ -850,7 +850,7 @@ jobs:
           TARGET_CLOCK_MHZ=1830
           RETRIES=5
           for i in $(seq 1 "${RETRIES}"); do
-            gpu_clock=$(mx-smi --query-gpu=clocks.current.graphics | awk '/XCORE/ {print $(NF-1); exit}')
+            gpu_clock=$(mx-smi --show-clocks | awk '/XCORE/ {print $(NF-1); exit}')
             echo "GPU clock: ${gpu_clock} MHz (attempt ${i}/${RETRIES})"
             if [ "${gpu_clock}" = "${TARGET_CLOCK_MHZ}" ]; then break; fi
             if [ "${i}" -eq "${RETRIES}" ]; then
