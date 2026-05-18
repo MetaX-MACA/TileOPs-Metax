@@ -26,6 +26,16 @@ export PATH="/opt/conda/bin:/usr/bin:${PATH}"
 # Set MACA environment variables
 export USE_MACA=ON
 
+# Set MACA SDK paths for compilation (fixes __macro_mxcc.h not found)
+if [[ -d "/opt/maca" ]]; then
+  export MACA_PATH=/opt/maca
+  export C_INCLUDE_PATH="${MACA_PATH}/include${C_INCLUDE_PATH:+:${C_INCLUDE_PATH}}"
+  export CPLUS_INCLUDE_PATH="${MACA_PATH}/include${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}"
+  export LIBRARY_PATH="${MACA_PATH}/lib${LIBRARY_PATH:+:${LIBRARY_PATH}}"
+  export LD_LIBRARY_PATH="${MACA_PATH}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+  echo "MACA SDK paths configured: MACA_PATH=${MACA_PATH}"
+fi
+
 echo "Creating run-local nightly venv at ${VENV_PATH}"
 python -m venv --system-site-packages "${VENV_PATH}"
 
