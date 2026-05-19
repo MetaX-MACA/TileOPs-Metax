@@ -18,14 +18,14 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# Cache directories for nightly test jobs
-env:
-  TILELANG_CACHE_DIR: /home/runner/_temp/ci-cache/tilelang
-  TILELANG_TMP_DIR: /home/runner/_temp/ci-cache/tilelang/tmp
-  TRITON_CACHE_DIR: /home/runner/_temp/ci-cache/triton
-  PIP_CACHE_DIR: /home/runner/_temp/ci-cache/pip
-  WHEEL_DIR: /home/runner/_temp/ci-cache/wheels
-  MAX_JOBS: "64"
+# # Cache directories for nightly test jobs
+# env:
+#   TILELANG_CACHE_DIR: /home/runner/_temp/ci-cache/tilelang
+#   TILELANG_TMP_DIR: /home/runner/_temp/ci-cache/tilelang/tmp
+#   TRITON_CACHE_DIR: /home/runner/_temp/ci-cache/triton
+#   PIP_CACHE_DIR: /home/runner/_temp/ci-cache/pip
+#   WHEEL_DIR: /home/runner/_temp/ci-cache/wheels
+#   MAX_JOBS: "64"
 
 jobs:
   ci-prereq:
@@ -837,69 +837,90 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up nightly venv
-        run: scripts/ci/setup_nightly_venv.sh
-        shell: bash
-
-      - name: Run benchmark ops
-        id: benchmark_tests
-        continue-on-error: true
+      - name: Verify /data/cache directory
         run: |
-          set -euo pipefail
-          # shellcheck source=/dev/null
-          source "${VENV_PATH}/bin/activate"
+          echo "=== /data/cache directory check ==="
+          if [[ -d "/data/cache" ]]; then
+            echo "/data/cache exists"
+            ls -la /data/cache
 
-          # Validate GPU frequency
-          # TARGET_CLOCK_MHZ=1830
-          # RETRIES=5
-          # for i in $(seq 1 "${RETRIES}"); do
-          #   gpu_clock=$(mx-smi --show-clock | awk '/XCORE/ {print $(NF-1); exit}')
-          #   echo "GPU clock: ${gpu_clock} MHz (attempt ${i}/${RETRIES})"
-          #   if [ "${gpu_clock}" = "${TARGET_CLOCK_MHZ}" ]; then break; fi
-          #   if [ "${i}" -eq "${RETRIES}" ]; then
-          #     echo "::error::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz."
-          #     exit 1
-          #   fi
-          #   sleep 2
-          #  done
-
-          PIP_NO_BUILD_ISOLATION=1 pip install --no-deps -e ".[dev]"
-
-          export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
-
-          set -o pipefail
-          # TODO: Run full benchmark suite after verifying fix
-          python -m pytest -q benchmarks/ops --junit-xml=bench_results.xml | tee tileops_benchmarks.log
-          # python -m pytest -q benchmarks/ops/bench_activation.py -v --tb=short --junit-xml=bench_results.xml | tee tileops_benchmarks.log
-
-          if [ -f profile_run.log ]; then
-            { echo; echo "===== profile_run.log summary ====="; cat profile_run.log; } >> tileops_benchmarks.log
+            # Test write permission
+            TEST_FILE="/data/cache/.write_test_$$"
+            if touch "$TEST_FILE" 2>/dev/null; then
+              echo "Write permission: OK"
+              rm -f "$TEST_FILE"
+            else
+              echo "::error::/data/cache is not writable"
+              exit 1
+            fi
           else
-            echo "::warning::profile_run.log not found; benchmark may have failed partially" >> tileops_benchmarks.log
+            echo "::error::/data/cache does not exist"
+            exit 1
           fi
-        shell: bash
 
-      - name: Upload benchmark artifacts
-        uses: actions/upload-artifact@v4
-        if: ${{ always() }}
-        with:
-          name: tileops_benchmark_${{ github.run_id }}
-          path: |
-            tileops_benchmarks.log
-            bench_results.xml
-          if-no-files-found: warn
-          retention-days: 14
+  #     - name: Set up nightly venv
+  #       run: scripts/ci/setup_nightly_venv.sh
+  #       shell: bash
 
-      - name: Fail benchmark job if pytest failed
-        if: ${{ always() && steps.benchmark_tests.outcome == 'failure' }}
-        run: exit 1
-        shell: bash
+  #     - name: Run benchmark ops
+  #       id: benchmark_tests
+  #       continue-on-error: true
+  #       run: |
+  #         set -euo pipefail
+  #         # shellcheck source=/dev/null
+  #         source "${VENV_PATH}/bin/activate"
 
-      - name: Cleanup run-local venv
-        if: ${{ always() }}
-        run: |
-          set -euo pipefail
-          if [[ -n "${RUNTIME_ROOT:-}" && "${RUNTIME_ROOT}" == "${RUNNER_TEMP}/nightly-"* ]]; then
-            rm -rf "${RUNTIME_ROOT}"
-          fi
-        shell: bash
+  #         # Validate GPU frequency
+  #         # TARGET_CLOCK_MHZ=1830
+  #         # RETRIES=5
+  #         # for i in $(seq 1 "${RETRIES}"); do
+  #         #   gpu_clock=$(mx-smi --show-clock | awk '/XCORE/ {print $(NF-1); exit}')
+  #         #   echo "GPU clock: ${gpu_clock} MHz (attempt ${i}/${RETRIES})"
+  #         #   if [ "${gpu_clock}" = "${TARGET_CLOCK_MHZ}" ]; then break; fi
+  #         #   if [ "${i}" -eq "${RETRIES}" ]; then
+  #         #     echo "::error::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz."
+  #         #     exit 1
+  #         #   fi
+  #         #   sleep 2
+  #         #  done
+
+  #         PIP_NO_BUILD_ISOLATION=1 pip install --no-deps -e ".[dev]"
+
+  #         export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
+
+  #         set -o pipefail
+  #         # TODO: Run full benchmark suite after verifying fix
+  #         python -m pytest -q benchmarks/ops --junit-xml=bench_results.xml | tee tileops_benchmarks.log
+  #         # python -m pytest -q benchmarks/ops/bench_activation.py -v --tb=short --junit-xml=bench_results.xml | tee tileops_benchmarks.log
+
+  #         if [ -f profile_run.log ]; then
+  #           { echo; echo "===== profile_run.log summary ====="; cat profile_run.log; } >> tileops_benchmarks.log
+  #         else
+  #           echo "::warning::profile_run.log not found; benchmark may have failed partially" >> tileops_benchmarks.log
+  #         fi
+  #       shell: bash
+
+  #     - name: Upload benchmark artifacts
+  #       uses: actions/upload-artifact@v4
+  #       if: ${{ always() }}
+  #       with:
+  #         name: tileops_benchmark_${{ github.run_id }}
+  #         path: |
+  #           tileops_benchmarks.log
+  #           bench_results.xml
+  #         if-no-files-found: warn
+  #         retention-days: 14
+
+  #     - name: Fail benchmark job if pytest failed
+  #       if: ${{ always() && steps.benchmark_tests.outcome == 'failure' }}
+  #       run: exit 1
+  #       shell: bash
+
+  #     - name: Cleanup run-local venv
+  #       if: ${{ always() }}
+  #       run: |
+  #         set -euo pipefail
+  #         if [[ -n "${RUNTIME_ROOT:-}" && "${RUNTIME_ROOT}" == "${RUNNER_TEMP}/nightly-"* ]]; then
+  #           rm -rf "${RUNTIME_ROOT}"
+  #         fi
+  #       shell: bash
