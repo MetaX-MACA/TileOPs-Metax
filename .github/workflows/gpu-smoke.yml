@@ -869,8 +869,8 @@ jobs:
 
           set -o pipefail
           # TODO: Run full benchmark suite after verifying fix
-          # python -m pytest -q benchmarks/ops --junit-xml=bench_results.xml | tee tileops_benchmarks.log
-          python -m pytest -q benchmarks/ops/bench_activation.py -v --tb=short --junit-xml=bench_results.xml | tee tileops_benchmarks.log
+          python -m pytest -q benchmarks/ops --junit-xml=bench_results.xml | tee tileops_benchmarks.log
+          # python -m pytest -q benchmarks/ops/bench_activation.py -v --tb=short --junit-xml=bench_results.xml | tee tileops_benchmarks.log
 
           if [ -f profile_run.log ]; then
             { echo; echo "===== profile_run.log summary ====="; cat profile_run.log; } >> tileops_benchmarks.log
