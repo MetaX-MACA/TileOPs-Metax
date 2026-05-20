@@ -572,7 +572,7 @@ jobs:
             while IFS= read -r gpu_line; do
               gpu_index=$(echo "$gpu_line" | grep -Eo 'GPU#[0-9]+' | grep -Eo '[0-9]+' | head -1)
               gpu_name=$(echo "$gpu_line" | awk '{print $2}')
-              gpu_clock=$(mx-smi --show-clock all -i "$gpu_index" 2>/dev/null | awk '/XCORE/ {print $3}' || echo "")
+              gpu_clock=$(mx-smi --show-clock | awk '/XCORE/ {print $(NF-1); exit}')
               echo "GPU ${gpu_index} (${gpu_name}) XCORE clock: ${gpu_clock} MHz"
               if [[ "$gpu_clock" != "$TARGET_CLOCK_MHZ" ]]; then
                 mismatch=1
