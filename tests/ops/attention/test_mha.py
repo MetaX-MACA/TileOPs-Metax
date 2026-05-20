@@ -19,7 +19,7 @@ class MhaBwdTest(_MhaBwdTestWorkload, TestBase):
         q_bhsd = q.transpose(1, 2)  # [B, H, S, D]
         k_bhsd = k.transpose(1, 2)
         v_bhsd = v.transpose(1, 2)
-        with sdpa_kernel(backends=[SDPBackend.FLASH_ATTENTION]):
+        with sdpa_kernel(backends=[SDPBackend.MATH]):
             output_bhsd = F.scaled_dot_product_attention(
                 q_bhsd, k_bhsd, v_bhsd, is_causal=self.is_causal)
         output = output_bhsd.transpose(1, 2).contiguous()
@@ -34,7 +34,7 @@ class MhaFwdTest(_MhaFwdTestWorkload, TestBase):
         q_bhsd = q.transpose(1, 2)  # [B, H, S, D]
         k_bhsd = k.transpose(1, 2)
         v_bhsd = v.transpose(1, 2)
-        with sdpa_kernel(backends=[SDPBackend.FLASH_ATTENTION]):
+        with sdpa_kernel(backends=[SDPBackend.MATH]):
             output_bhsd = F.scaled_dot_product_attention(
                 q_bhsd, k_bhsd, v_bhsd, is_causal=self.is_causal)
         output = output_bhsd.transpose(1, 2).contiguous()

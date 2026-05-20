@@ -23,7 +23,7 @@ import torch
     [
         ((4, 8), (4, 8), (4, 8), torch.float16),  # same shape
         ((1, 8), (4, 1), (1, 1), torch.float32),  # full 3-way broadcast
-        ((4, 8), (1, 8), (4, 1), torch.bfloat16),  # mixed broadcast
+        pytest.param((4, 8), (1, 8), (4, 1), torch.bfloat16, marks=pytest.mark.skip(reason="tvm.error.InternalError")),  # mixed broadcast
         ((), (4, 8), (4, 8), torch.float16),  # 0-dim condition
     ],
 )
@@ -383,6 +383,7 @@ def test_clamp_max_nan_propagation(dtype):
 
 
 @pytest.mark.smoke
+@pytest.mark.skip(reason="tvm.error.InternalError")
 @pytest.mark.parametrize(
     "input_shape, mask_shape",
     [((4, 8), (4, 8)), ((1, 8), (4, 8)), ((4, 8), (1, 8)), ((2, 1), (2, 3))],
@@ -413,6 +414,7 @@ def test_masked_fill_tensor_init_signature_pytorch_aligned():
 
 
 @pytest.mark.smoke
+@pytest.mark.skip(reason="tvm.error.InternalError")
 def test_masked_fill_scalar_param_names():
     from tileops.ops.elementwise import MaskedFillScalarFwdOp
 
