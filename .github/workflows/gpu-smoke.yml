@@ -553,7 +553,7 @@ jobs:
       - name: Validate GPU frequency
         run: |
           set -euo pipefail
-          TARGET_CLOCK_MHZ=1830
+          TARGET_CLOCK_MHZ=428
           RETRIES=5
           SLEEP_SECONDS=2
 
@@ -569,15 +569,15 @@ jobs:
           while [ "$attempt" -le "$RETRIES" ]; do
             echo "Validation attempt ${attempt}/${RETRIES}"
             mismatch=0
-            while IFS=',' read -r gpu_index gpu_name gpu_clock; do
-              gpu_index="$(echo "$gpu_index" | xargs)"
-              gpu_name="$(echo "$gpu_name" | xargs)"
-              gpu_clock="$(echo "$gpu_clock" | xargs)"
-              echo "GPU ${gpu_index} (${gpu_name}) clock: ${gpu_clock} MHz"
+            while IFS= read -r gpu_line; do
+              gpu_index=$(echo "$gpu_line" | grep -Eo 'GPU#[0-9]+' | grep -Eo '[0-9]+' | head -1)
+              gpu_name=$(echo "$gpu_line" | awk '{print $2}')
+              gpu_clock=$(mx-smi --show-clock all -i "$gpu_index" 2>/dev/null | grep -E 'XCORE' | grep -Eo '[0-9]+' | head -1 || echo "")
+              echo "GPU ${gpu_index} (${gpu_name}) XCORE clock: ${gpu_clock} MHz"
               if [[ "$gpu_clock" != "$TARGET_CLOCK_MHZ" ]]; then
                 mismatch=1
               fi
-            done < <(mx-smi --show-clock)
+            done < <(mx-smi -L 2>/dev/null | grep -E 'GPU#[0-9]+')
 
             if [[ "$mismatch" -eq 0 ]]; then
               echo "All GPUs locked at ${TARGET_CLOCK_MHZ} MHz."
