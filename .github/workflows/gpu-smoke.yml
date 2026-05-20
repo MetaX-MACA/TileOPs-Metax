@@ -808,7 +808,7 @@ jobs:
   # Nightly test jobs (for PR testing only)
   # =========================================================================
   cache-warmup:
-    if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && (github.event_name == 'schedule' || github.ref == 'refs/heads/dev') }}
+    if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && (github.event_name == 'schedule' || github.ref == 'refs/heads/dev' || github.event_name == 'pull_request') }}
     timeout-minutes: 60
     runs-on: tileops-metax-runner
     steps:
@@ -930,7 +930,7 @@ jobs:
         shell: bash
 
   op_test:
-    if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax') }}
+    if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' }}
     needs: [benchmark]
     timeout-minutes: 180
     runs-on: tileops-metax-runner
@@ -1106,7 +1106,7 @@ jobs:
   # Phase 4 — Packaging and smoke test
   # =========================================================================
   packaging:
-    if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax') }}
+    if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' }}
     needs: [op_test]
     permissions:
       contents: write
