@@ -846,7 +846,7 @@ jobs:
   cache-warmup:
     if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && (github.event_name == 'schedule' || github.ref == 'refs/heads/dev' || github.event_name == 'pull_request') }}
     needs: [gpu-smoke]
-    timeout-minutes: 60
+    timeout-minutes: 300
     runs-on: tileops-metax-runner
     steps:
       - name: Checkout code
