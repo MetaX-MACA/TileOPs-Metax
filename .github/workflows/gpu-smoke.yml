@@ -479,7 +479,11 @@ jobs:
           echo "runner.tool_cache: ${{ runner.tool_cache }}"
           echo ""
           echo "Existing venv caches in runner.tool_cache:"
-          ls -la "${{ runner.tool_cache }}/" 2>/dev/null | grep -E "tileops_ci_venv_" || echo "  (no tileops_ci_venv_* found)"
+          for d in "${{ runner.tool_cache }}"/tileops_ci_venv_*; do
+            if [[ -d "$d" ]]; then
+              echo "  $(basename "$d")"
+            fi
+          done || echo "  (no tileops_ci_venv_* found)"
           echo ""
           echo "Checking if TRUSTED_VENV_PATH exists:"
           if [[ -d "${TRUSTED_VENV_PATH}" ]]; then
