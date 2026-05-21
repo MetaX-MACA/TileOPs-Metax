@@ -422,6 +422,7 @@ jobs:
             /data/cache/pip
             /data/cache/wheels
             /data/cache/tilelang/tmp
+            /data/cache/venv
           atomic-cache-dirs: |
             /data/cache/tilelang/autotuner
           df-paths: "/data /data/cache"
@@ -430,6 +431,9 @@ jobs:
           # unconditional) so they don't evict tuning artefacts the next
           # PR would otherwise reuse.
           skip-atomic-age-trim: "true"
+          # Disable tool_cache pruning since we use /data/cache/venv instead.
+          # The runner runs in Kubernetes pods where tool_cache is ephemeral.
+          prune-tool-cache: "false"
 
       - name: Resolve runtime state
         env:
@@ -466,7 +470,7 @@ jobs:
           )"
           VENV_PREFIX="tileops_ci_venv"
           VENV_DIR="${VENV_PREFIX}_${HASH_INPUT}"
-          TRUSTED_VENV_PATH="${{ runner.tool_cache }}/${VENV_DIR}"
+          TRUSTED_VENV_PATH="/data/cache/venv/${VENV_DIR}"
           TRUSTED_CACHE_ROOT="/data/cache"
           FORK_CAN_COPY_TRUSTED_VENV="false"
 
@@ -476,14 +480,17 @@ jobs:
           echo "Computed HASH_INPUT: ${HASH_INPUT}"
           echo "Expected VENV_DIR: ${VENV_DIR}"
           echo "TRUSTED_VENV_PATH: ${TRUSTED_VENV_PATH}"
-          echo "runner.tool_cache: ${{ runner.tool_cache }}"
           echo ""
-          echo "Existing venv caches in runner.tool_cache:"
-          for d in "${{ runner.tool_cache }}"/tileops_ci_venv_*; do
-            if [[ -d "$d" ]]; then
-              echo "  $(basename "$d")"
-            fi
-          done || echo "  (no tileops_ci_venv_* found)"
+          echo "Existing venv caches in /data/cache/venv:"
+          if [[ -d "/data/cache/venv" ]]; then
+            for d in /data/cache/venv/tileops_ci_venv_*; do
+              if [[ -d "$d" ]]; then
+                echo "  $(basename "$d")"
+              fi
+            done || echo "  (no tileops_ci_venv_* found)"
+          else
+            echo "  (directory /data/cache/venv does not exist)"
+          fi
           echo ""
           echo "Checking if TRUSTED_VENV_PATH exists:"
           if [[ -d "${TRUSTED_VENV_PATH}" ]]; then
@@ -813,31 +820,6 @@ jobs:
             else
               echo "CACHE_SIGNAL: trusted venv=miss (fresh venv created)"
             fi
-          fi
-
-      - name: Debug tool_cache persistence
-        if: ${{ always() }}
-        run: |
-          echo "=== Tool cache state at job end ==="
-          echo "runner.tool_cache: ${{ runner.tool_cache }}"
-          if [[ -d "${{ runner.tool_cache }}" ]]; then
-            echo "Directory exists. Contents:"
-            ls -la "${{ runner.tool_cache }}" || true
-            echo ""
-            echo "tileops_ci_venv_* directories:"
-            for d in "${{ runner.tool_cache }}"/tileops_ci_venv_*; do
-              if [[ -d "$d" ]]; then
-                echo "  $(basename "$d") - $(du -sh "$d" 2>/dev/null | cut -f1)"
-              fi
-            done || echo "  (none found)"
-          else
-            echo "Directory does NOT exist!"
-          fi
-          echo ""
-          echo "VENV_PATH: ${VENV_PATH:-not set}"
-          echo "TRUSTED_VENV_PATH: ${TRUSTED_VENV_PATH:-not set}"
-          if [[ -n "${VENV_PATH:-}" && -d "${VENV_PATH}" ]]; then
-            echo "VENV_PATH exists: $(du -sh "${VENV_PATH}" 2>/dev/null | cut -f1)"
           fi
 
       - name: Upload artifacts
