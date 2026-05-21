@@ -872,7 +872,9 @@ jobs:
 
           export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
           echo "Starting kernel cache warmup..."
-          python scripts/warmup_kernel_cache.py --max-workers 8 -n 16
+          # Reduce parallelism to avoid OOM on Kubernetes runners (exit code 137)
+          # Total parallelism = 4 × 4 = 16 compile threads
+          python scripts/warmup_kernel_cache.py --max-workers 4 -n 4
         shell: bash
 
       - name: Cleanup run-local venv
