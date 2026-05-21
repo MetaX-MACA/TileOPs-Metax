@@ -702,22 +702,6 @@ jobs:
             else
               echo "Warning: hash-matched trusted venv not found at ${TRUSTED_VENV_PATH}; skipping mtime sync"
             fi
-
-            # Persist the fork's freshly created venv to TRUSTED_VENV_PATH so
-            # subsequent fork PRs with the same hash can reuse it. This enables
-            # cache reuse across fork PR runs without requiring cleanup to be disabled.
-            # Security note: the venv was installed from the trusted pyproject.toml hash
-            # (WORKSPACE_PYPROJECT_HASH == PYPROJECT_HASH), so the package set matches
-            # the trusted baseline.
-            echo "Persisting fork venv to trusted cache: ${VENV_PATH} -> ${TRUSTED_VENV_PATH}"
-            rm -rf "${TRUSTED_VENV_PATH}"
-            if command -v rsync >/dev/null 2>&1; then
-              rsync -a "${VENV_PATH}/" "${TRUSTED_VENV_PATH}/"
-            else
-              mkdir -p "${TRUSTED_VENV_PATH}"
-              cp -a "${VENV_PATH}/." "${TRUSTED_VENV_PATH}/"
-            fi
-            echo "Fork venv persisted successfully"
           else
             PIP_NO_BUILD_ISOLATION=1 PIP_NO_CACHE_DIR=1 pip install --no-deps -e '.[dev]'
             # Export wheels (including dependencies) so fork PRs can reuse them
@@ -845,11 +829,7 @@ jobs:
       - name: Cleanup isolated fork state
         if: ${{ always() && needs.security-policy.outputs.is_fork == 'true' }}
         run: |
-          # Cleanup removes the per-run RUNTIME_ROOT directory, but the venv has
-          # already been persisted to TRUSTED_VENV_PATH (runner.tool_cache) above,
-          # so subsequent fork PRs with the same hash can reuse it.
           if [[ -n "${RUNTIME_ROOT:-}" ]]; then
-            echo "Cleaning up isolated fork state at ${RUNTIME_ROOT}"
             rm -rf "${RUNTIME_ROOT}"
           fi
 
