@@ -636,6 +636,17 @@ jobs:
         run: |
           set -euo pipefail
 
+          echo "=== Pre-install venv state ==="
+          echo "VENV_PATH: ${VENV_PATH}"
+          echo "TRUSTED_VENV_PATH: ${TRUSTED_VENV_PATH}"
+          if [[ -d "${VENV_PATH}" ]]; then
+            echo "VENV_PATH directory exists"
+            ls -la "${VENV_PATH}/" | head -5
+          else
+            echo "VENV_PATH directory does NOT exist"
+          fi
+          echo ""
+
           if [[ "$IS_FORK" == "true" && "$FORK_CAN_COPY_TRUSTED_VENV" == "true" ]]; then
             echo "Copying trusted venv from ${TRUSTED_VENV_PATH} to ${VENV_PATH}"
             rm -rf "${VENV_PATH}"
@@ -707,6 +718,28 @@ jobs:
             # Export wheels (including dependencies) so fork PRs can reuse them
             pip wheel --no-deps -e '.[dev]' -w "${WHEEL_DIR}" 2>/dev/null || true
           fi
+
+          echo ""
+          echo "=== Post-install venv state ==="
+          echo "VENV_PATH: ${VENV_PATH}"
+          if [[ -d "${VENV_PATH}" ]]; then
+            echo "VENV_PATH directory exists after install"
+            ls -la "${VENV_PATH}/" | head -5
+            if [[ -x "${VENV_PATH}/bin/python" ]]; then
+              echo "bin/python is executable: YES"
+              "${VENV_PATH}/bin/python" --version
+            fi
+          else
+            echo "VENV_PATH directory does NOT exist after install"
+          fi
+          echo ""
+          echo "Checking runner.tool_cache after install:"
+          for d in "${{ runner.tool_cache }}"/tileops_ci_venv_*; do
+            if [[ -d "$d" ]]; then
+              echo "  $(basename "$d")"
+            fi
+          done || echo "  (no tileops_ci_venv_* found)"
+          echo "=== End post-install state ==="
 
       - name: Run tests
         env:
@@ -826,12 +859,12 @@ jobs:
             gpu_smoke_report.md
           retention-days: 7
 
-      - name: Cleanup isolated fork state
-        if: ${{ always() && needs.security-policy.outputs.is_fork == 'true' }}
-        run: |
-          if [[ -n "${RUNTIME_ROOT:-}" ]]; then
-            rm -rf "${RUNTIME_ROOT}"
-          fi
+      # - name: Cleanup isolated fork state
+      #   if: ${{ always() && needs.security-policy.outputs.is_fork == 'true' }}
+      #   run: |
+      #     if [[ -n "${RUNTIME_ROOT:-}" ]]; then
+      #       rm -rf "${RUNTIME_ROOT}"
+      #     fi
 
   # =========================================================================
   # Nightly test jobs (for PR testing only)
