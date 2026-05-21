@@ -826,12 +826,12 @@ jobs:
             gpu_smoke_report.md
           retention-days: 7
 
-      # - name: Cleanup isolated fork state
-      #   if: ${{ always() && needs.security-policy.outputs.is_fork == 'true' }}
-      #   run: |
-      #     if [[ -n "${RUNTIME_ROOT:-}" ]]; then
-      #       rm -rf "${RUNTIME_ROOT}"
-      #     fi
+      - name: Cleanup isolated fork state
+        if: ${{ always() && needs.security-policy.outputs.is_fork == 'true' }}
+        run: |
+          if [[ -n "${RUNTIME_ROOT:-}" ]]; then
+            rm -rf "${RUNTIME_ROOT}"
+          fi
 
   # =========================================================================
   # Nightly test jobs (for PR testing only)
