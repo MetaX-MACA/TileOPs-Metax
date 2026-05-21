@@ -744,10 +744,7 @@ jobs:
           echo "Resolved pytest targets: ${PYTEST_TARGETS}"
           read -r -a TARGETS <<< "${PYTEST_TARGETS}"
           echo "Running pytest -m \"${TEST_MARK_EXPR}\" on ${#TARGETS[@]} target(s)"
-
-          # Run a subset of tests to verify cache hit quickly
-          # Full test suite takes too long if cache misses
-          python -m pytest -q tests/ops/test_rms_norm.py -m "${TEST_MARK_EXPR}" --junit-xml=gpu_smoke_results.xml | tee gpu_smoke.log
+          # python -m pytest -q "${TARGETS[@]}" -m "${TEST_MARK_EXPR}" --junit-xml=gpu_smoke_results.xml | tee gpu_smoke.log
 
       - name: Generate gpu-smoke report
         if: ${{ always() && hashFiles('gpu_smoke_results.xml') != '' }}
@@ -846,46 +843,46 @@ jobs:
   # =========================================================================
   # Nightly test jobs (for PR testing only)
   # =========================================================================
-  # cache-warmup:
-  #   if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && (github.event_name == 'schedule' || github.ref == 'refs/heads/dev' || github.event_name == 'pull_request') }}
-  #   timeout-minutes: 60
-  #   runs-on: tileops-metax-runner
-  #   steps:
-  #     - name: Checkout code
-  #       uses: actions/checkout@v4
-  #       with:
-  #         fetch-depth: 0
+  cache-warmup:
+    if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && (github.event_name == 'schedule' || github.ref == 'refs/heads/dev' || github.event_name == 'pull_request') }}
+    timeout-minutes: 60
+    runs-on: tileops-metax-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-  #     - name: Verify nightly runner environment
-  #       run: scripts/ci/verify_nightly_runner.sh
-  #       shell: bash
+      - name: Verify nightly runner environment
+        run: scripts/ci/verify_nightly_runner.sh
+        shell: bash
 
-  #     - name: Set up run-local venv
-  #       run: scripts/ci/setup_nightly_venv.sh
-  #       shell: bash
+      - name: Set up run-local venv
+        run: scripts/ci/setup_nightly_venv.sh
+        shell: bash
 
-  #     - name: Warm kernel compilation cache
-  #       continue-on-error: true
-  #       run: |
-  #         set -euo pipefail
-  #         # shellcheck source=/dev/null
-  #         source "${VENV_PATH}/bin/activate"
+      - name: Warm kernel compilation cache
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          source "${VENV_PATH}/bin/activate"
 
-  #         PIP_NO_BUILD_ISOLATION=1 pip install --no-deps -e ".[dev]"
+          PIP_NO_BUILD_ISOLATION=1 pip install --no-deps -e ".[dev]"
 
-  #         export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
-  #         echo "Starting kernel cache warmup..."
-  #         python scripts/warmup_kernel_cache.py --max-workers 8 -n 16
-  #       shell: bash
+          export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
+          echo "Starting kernel cache warmup..."
+          python scripts/warmup_kernel_cache.py --max-workers 8 -n 16
+        shell: bash
 
-  #     - name: Cleanup run-local venv
-  #       if: ${{ always() }}
-  #       run: |
-  #         set -euo pipefail
-  #         if [[ -n "${RUNTIME_ROOT:-}" && "${RUNTIME_ROOT}" == "${RUNNER_TEMP}/nightly-"* ]]; then
-  #           rm -rf "${RUNTIME_ROOT}"
-  #         fi
-  #       shell: bash
+      - name: Cleanup run-local venv
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${RUNTIME_ROOT:-}" && "${RUNTIME_ROOT}" == "${RUNNER_TEMP}/nightly-"* ]]; then
+            rm -rf "${RUNTIME_ROOT}"
+          fi
+        shell: bash
 
   # benchmark:
   #   if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' }}
