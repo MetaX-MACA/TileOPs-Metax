@@ -744,7 +744,7 @@ jobs:
           echo "Resolved pytest targets: ${PYTEST_TARGETS}"
           read -r -a TARGETS <<< "${PYTEST_TARGETS}"
           echo "Running pytest -m \"${TEST_MARK_EXPR}\" on ${#TARGETS[@]} target(s)"
-          # python -m pytest -q "${TARGETS[@]}" -m "${TEST_MARK_EXPR}" --junit-xml=gpu_smoke_results.xml | tee gpu_smoke.log
+          python -m pytest -q "${TARGETS[@]}" -m "${TEST_MARK_EXPR}" --junit-xml=gpu_smoke_results.xml | tee gpu_smoke.log
 
       - name: Generate gpu-smoke report
         if: ${{ always() && hashFiles('gpu_smoke_results.xml') != '' }}
@@ -845,6 +845,7 @@ jobs:
   # =========================================================================
   cache-warmup:
     if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && (github.event_name == 'schedule' || github.ref == 'refs/heads/dev' || github.event_name == 'pull_request') }}
+    needs: [gpu-smoke]
     timeout-minutes: 60
     runs-on: tileops-metax-runner
     steps:
@@ -886,359 +887,359 @@ jobs:
           fi
         shell: bash
 
-  # benchmark:
-  #   if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' }}
-  #   # needs: [cache-warmup]
-  #   # timeout-minutes: 120
-  #   timeout-minutes: 300
-  #   runs-on: tileops-metax-runner
-  #   steps:
-  #     - name: Checkout code
-  #       uses: actions/checkout@v4
-  #       with:
-  #         fetch-depth: 0
+  benchmark:
+    if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' }}
+    needs: [cache-warmup]
+    # timeout-minutes: 120
+    timeout-minutes: 300
+    runs-on: tileops-metax-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-  #     - name: Set up nightly venv
-  #       run: scripts/ci/setup_nightly_venv.sh
-  #       shell: bash
+      - name: Set up nightly venv
+        run: scripts/ci/setup_nightly_venv.sh
+        shell: bash
 
-  #     - name: Run benchmark ops
-  #       id: benchmark_tests
-  #       continue-on-error: true
-  #       run: |
-  #         set -euo pipefail
-  #         # shellcheck source=/dev/null
-  #         source "${VENV_PATH}/bin/activate"
+      - name: Run benchmark ops
+        id: benchmark_tests
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          source "${VENV_PATH}/bin/activate"
 
-  #         # Validate GPU frequency
-  #         TARGET_CLOCK_MHZ=428
-  #         RETRIES=5
-  #         for i in $(seq 1 "${RETRIES}"); do
-  #           gpu_clock=$(mx-smi --show-clock | awk '/XCORE/ {print $(NF-1); exit}')
-  #           echo "GPU clock: ${gpu_clock} MHz (attempt ${i}/${RETRIES})"
-  #           if [ "${gpu_clock}" = "${TARGET_CLOCK_MHZ}" ]; then break; fi
-  #           if [ "${i}" -eq "${RETRIES}" ]; then
-  #             echo "::error::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz."
-  #             exit 1
-  #           fi
-  #           sleep 2
-  #          done
+          # Validate GPU frequency
+          TARGET_CLOCK_MHZ=428
+          RETRIES=5
+          for i in $(seq 1 "${RETRIES}"); do
+            gpu_clock=$(mx-smi --show-clock | awk '/XCORE/ {print $(NF-1); exit}')
+            echo "GPU clock: ${gpu_clock} MHz (attempt ${i}/${RETRIES})"
+            if [ "${gpu_clock}" = "${TARGET_CLOCK_MHZ}" ]; then break; fi
+            if [ "${i}" -eq "${RETRIES}" ]; then
+              echo "::error::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz."
+              exit 1
+            fi
+            sleep 2
+           done
 
-  #         PIP_NO_BUILD_ISOLATION=1 pip install --no-deps -e ".[dev]"
+          PIP_NO_BUILD_ISOLATION=1 pip install --no-deps -e ".[dev]"
 
-  #         export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
-  #         echo "Runtime cache env:"
-  #         echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-}"
-  #         echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR:-}"
-  #         echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
+          export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
+          echo "Runtime cache env:"
+          echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-}"
+          echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR:-}"
+          echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
 
-  #         set -o pipefail
-  #         # python -m pytest -q benchmarks/ops --junit-xml=bench_results.xml | tee tileops_benchmarks.log
+          set -o pipefail
+          python -m pytest -q benchmarks/ops --junit-xml=bench_results.xml | tee tileops_benchmarks.log
 
-  #         if [ -f profile_run.log ]; then
-  #           { echo; echo "===== profile_run.log summary ====="; cat profile_run.log; } >> tileops_benchmarks.log
-  #         else
-  #           echo "::warning::profile_run.log not found; benchmark may have failed partially" >> tileops_benchmarks.log
-  #         fi
-  #       shell: bash
+          if [ -f profile_run.log ]; then
+            { echo; echo "===== profile_run.log summary ====="; cat profile_run.log; } >> tileops_benchmarks.log
+          else
+            echo "::warning::profile_run.log not found; benchmark may have failed partially" >> tileops_benchmarks.log
+          fi
+        shell: bash
 
-  #     - name: Upload benchmark artifacts
-  #       uses: actions/upload-artifact@v4
-  #       if: ${{ always() }}
-  #       with:
-  #         name: tileops_benchmark_${{ github.run_id }}
-  #         path: |
-  #           tileops_benchmarks.log
-  #           bench_results.xml
-  #         if-no-files-found: warn
-  #         retention-days: 14
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: tileops_benchmark_${{ github.run_id }}
+          path: |
+            tileops_benchmarks.log
+            bench_results.xml
+          if-no-files-found: warn
+          retention-days: 14
 
-  #     - name: Fail benchmark job if pytest failed
-  #       if: ${{ always() && steps.benchmark_tests.outcome == 'failure' }}
-  #       run: exit 1
-  #       shell: bash
+      - name: Fail benchmark job if pytest failed
+        if: ${{ always() && steps.benchmark_tests.outcome == 'failure' }}
+        run: exit 1
+        shell: bash
 
-  #     - name: Cleanup run-local venv
-  #       if: ${{ always() }}
-  #       run: |
-  #         set -euo pipefail
-  #         if [[ -n "${RUNTIME_ROOT:-}" && "${RUNTIME_ROOT}" == "${RUNNER_TEMP}/nightly-"* ]]; then
-  #           rm -rf "${RUNTIME_ROOT}"
-  #         fi
-  #       shell: bash
+      - name: Cleanup run-local venv
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${RUNTIME_ROOT:-}" && "${RUNTIME_ROOT}" == "${RUNNER_TEMP}/nightly-"* ]]; then
+            rm -rf "${RUNTIME_ROOT}"
+          fi
+        shell: bash
 
-  # op_test:
-  #   if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' }}
-  #   needs: [benchmark]
-  #   timeout-minutes: 180
-  #   runs-on: tileops-metax-runner
-  #   steps:
-  #     - name: Checkout code
-  #       uses: actions/checkout@v4
-  #       with:
-  #         fetch-depth: 0
+  op_test:
+    if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' }}
+    needs: [benchmark]
+    timeout-minutes: 180
+    runs-on: tileops-metax-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-  #     - name: Verify nightly runner environment
-  #       run: scripts/ci/verify_nightly_runner.sh
-  #       shell: bash
+      - name: Verify nightly runner environment
+        run: scripts/ci/verify_nightly_runner.sh
+        shell: bash
 
-  #     - name: Set up run-local venv
-  #       run: scripts/ci/setup_nightly_venv.sh
-  #       shell: bash
+      - name: Set up run-local venv
+        run: scripts/ci/setup_nightly_venv.sh
+        shell: bash
 
-  #     - name: Run full op tests
-  #       id: op_tests
-  #       continue-on-error: true
-  #       run: |
-  #         set -euo pipefail
-  #         # shellcheck source=/dev/null
-  #         source "${VENV_PATH}/bin/activate"
+      - name: Run full op tests
+        id: op_tests
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          source "${VENV_PATH}/bin/activate"
 
-  #         PIP_NO_BUILD_ISOLATION=1 pip install --no-deps -e ".[dev]"
+          PIP_NO_BUILD_ISOLATION=1 pip install --no-deps -e ".[dev]"
 
-  #         export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
-  #         echo "Runtime cache env:"
-  #         echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-}"
-  #         echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR:-}"
-  #         echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
+          export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
+          echo "Runtime cache env:"
+          echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-}"
+          echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR:-}"
+          echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
 
-  #         set -o pipefail
-  #         # python -m pytest tests/ -v --tb=short --junit-xml=test_results.xml | tee tileops_op_test.log
-  #       shell: bash
+          set -o pipefail
+          python -m pytest tests/ -v --tb=short --junit-xml=test_results.xml | tee tileops_op_test.log
+        shell: bash
 
-  #     - name: Download benchmark artifacts
-  #       uses: actions/download-artifact@v4
-  #       if: ${{ always() }}
-  #       with:
-  #         name: tileops_benchmark_${{ github.run_id }}
-  #       continue-on-error: true
+      - name: Download benchmark artifacts
+        uses: actions/download-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: tileops_benchmark_${{ github.run_id }}
+        continue-on-error: true
 
-  #     - name: Resolve previous perf history artifact
-  #       id: perf_history_source
-  #       if: ${{ always() }}
-  #       uses: actions/github-script@v7
-  #       with:
-  #         script: |
-  #           const { owner, repo } = context.repo;
-  #           const workflowId = "nightly.yml";
-  #           const currentRunId = context.runId;
-  #           const runs = await github.paginate(
-  #             github.rest.actions.listWorkflowRuns,
-  #             {
-  #               owner,
-  #               repo,
-  #               workflow_id: workflowId,
-  #               branch: "dev",
-  #               status: "completed",
-  #               per_page: 100,
-  #             },
-  #           );
+      - name: Resolve previous perf history artifact
+        id: perf_history_source
+        if: ${{ always() }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const workflowId = "nightly.yml";
+            const currentRunId = context.runId;
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRuns,
+              {
+                owner,
+                repo,
+                workflow_id: workflowId,
+                branch: "dev",
+                status: "completed",
+                per_page: 100,
+              },
+            );
 
-  #           for (const run of runs) {
-  #             if (run.id === currentRunId || run.conclusion !== "success") {
-  #               continue;
-  #             }
+            for (const run of runs) {
+              if (run.id === currentRunId || run.conclusion !== "success") {
+                continue;
+              }
 
-  #             const artifacts = await github.paginate(
-  #               github.rest.actions.listWorkflowRunArtifacts,
-  #               {
-  #                 owner,
-  #                 repo,
-  #                 run_id: run.id,
-  #                 per_page: 100,
-  #               },
-  #             );
+              const artifacts = await github.paginate(
+                github.rest.actions.listWorkflowRunArtifacts,
+                {
+                  owner,
+                  repo,
+                  run_id: run.id,
+                  per_page: 100,
+                },
+              );
 
-  #             const artifact = artifacts.find(
-  #               (candidate) =>
-  #                 !candidate.expired && candidate.name === "tileops_perf_history",
-  #             );
-  #             if (!artifact) {
-  #               continue;
-  #             }
+              const artifact = artifacts.find(
+                (candidate) =>
+                  !candidate.expired && candidate.name === "tileops_perf_history",
+              );
+              if (!artifact) {
+                continue;
+              }
 
-  #             core.info(
-  #               `Using perf history artifact from run ${run.id} (${run.html_url})`,
-  #             );
-  #             core.setOutput("run_id", String(run.id));
-  #             return;
-  #           }
+              core.info(
+                `Using perf history artifact from run ${run.id} (${run.html_url})`,
+              );
+              core.setOutput("run_id", String(run.id));
+              return;
+            }
 
-  #           core.info("No previous perf history artifact found; nightly report will start a new history baseline.");
+            core.info("No previous perf history artifact found; nightly report will start a new history baseline.");
 
-  #     - name: Download previous perf history
-  #       uses: actions/download-artifact@v4
-  #       if: ${{ always() && steps.perf_history_source.outputs.run_id != '' }}
-  #       with:
-  #         name: tileops_perf_history
-  #         path: .perf_history
-  #         github-token: ${{ github.token }}
-  #         repository: ${{ github.repository }}
-  #         run-id: ${{ steps.perf_history_source.outputs.run_id }}
+      - name: Download previous perf history
+        uses: actions/download-artifact@v4
+        if: ${{ always() && steps.perf_history_source.outputs.run_id != '' }}
+        with:
+          name: tileops_perf_history
+          path: .perf_history
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.perf_history_source.outputs.run_id }}
 
-  #     - name: Generate nightly report
-  #       if: ${{ always() }}
-  #       run: |
-  #         set -euo pipefail
-  #         # shellcheck source=/dev/null
-  #         source "${VENV_PATH}/bin/activate"
+      - name: Generate nightly report
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          source "${VENV_PATH}/bin/activate"
 
-  #         pip install --no-deps -e . 2>/dev/null
-  #         export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
+          pip install --no-deps -e . 2>/dev/null
+          export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
 
-  #         HISTORY_ARGS=()
-  #         if [ -f .perf_history/perf_history.json ]; then
-  #           HISTORY_ARGS=(--history .perf_history/perf_history.json)
-  #         fi
+          HISTORY_ARGS=()
+          if [ -f .perf_history/perf_history.json ]; then
+            HISTORY_ARGS=(--history .perf_history/perf_history.json)
+          fi
 
-  #         python scripts/nightly_report.py \
-  #           --test-xml test_results.xml \
-  #           --bench-xml bench_results.xml \
-  #           "${HISTORY_ARGS[@]}" \
-  #           --output nightly_report.md \
-  #           --history-out perf_history.json \
-  #           || echo "::warning::nightly_report.py failed"
-  #       shell: bash
+          python scripts/nightly_report.py \
+            --test-xml test_results.xml \
+            --bench-xml bench_results.xml \
+            "${HISTORY_ARGS[@]}" \
+            --output nightly_report.md \
+            --history-out perf_history.json \
+            || echo "::warning::nightly_report.py failed"
+        shell: bash
 
-  #     - name: Post nightly report to step summary
-  #       if: ${{ always() && hashFiles('nightly_report.md') != '' }}
-  #       run: cat nightly_report.md >> "$GITHUB_STEP_SUMMARY"
-  #       shell: bash
+      - name: Post nightly report to step summary
+        if: ${{ always() && hashFiles('nightly_report.md') != '' }}
+        run: cat nightly_report.md >> "$GITHUB_STEP_SUMMARY"
+        shell: bash
 
-  #     - name: Upload op test artifacts
-  #       uses: actions/upload-artifact@v4
-  #       if: ${{ always() }}
-  #       with:
-  #         name: tileops_op_test_${{ github.run_id }}
-  #         path: |
-  #           test_results.xml
-  #           tileops_op_test.log
-  #           nightly_report.md
-  #         if-no-files-found: warn
-  #         retention-days: 14
+      - name: Upload op test artifacts
+        uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: tileops_op_test_${{ github.run_id }}
+          path: |
+            test_results.xml
+            tileops_op_test.log
+            nightly_report.md
+          if-no-files-found: warn
+          retention-days: 14
 
-  #     - name: Upload perf history
-  #       uses: actions/upload-artifact@v4
-  #       if: ${{ always() && hashFiles('perf_history.json') != '' }}
-  #       with:
-  #         name: tileops_perf_history
-  #         path: perf_history.json
-  #         overwrite: true
-  #         retention-days: 14
+      - name: Upload perf history
+        uses: actions/upload-artifact@v4
+        if: ${{ always() && hashFiles('perf_history.json') != '' }}
+        with:
+          name: tileops_perf_history
+          path: perf_history.json
+          overwrite: true
+          retention-days: 14
 
-  #     - name: Fail op test job if pytest failed
-  #       if: ${{ always() && steps.op_tests.outcome == 'failure' }}
-  #       run: exit 1
-  #       shell: bash
+      - name: Fail op test job if pytest failed
+        if: ${{ always() && steps.op_tests.outcome == 'failure' }}
+        run: exit 1
+        shell: bash
 
-  #     - name: Cleanup run-local venv
-  #       if: ${{ always() }}
-  #       run: |
-  #         set -euo pipefail
-  #         if [[ -n "${RUNTIME_ROOT:-}" && "${RUNTIME_ROOT}" == "${RUNNER_TEMP}/nightly-"* ]]; then
-  #           rm -rf "${RUNTIME_ROOT}"
-  #         fi
-  #       shell: bash
+      - name: Cleanup run-local venv
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${RUNTIME_ROOT:-}" && "${RUNTIME_ROOT}" == "${RUNNER_TEMP}/nightly-"* ]]; then
+            rm -rf "${RUNTIME_ROOT}"
+          fi
+        shell: bash
 
-  # # =========================================================================
-  # # Phase 4 — Packaging and smoke test
-  # # =========================================================================
-  # packaging:
-  #   if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' }}
-  #   needs: [op_test]
-  #   permissions:
-  #     contents: write
-  #   runs-on: tileops-metax-runner
-  #   steps:
-  #     - name: Checkout code
-  #       uses: actions/checkout@v4
+  # =========================================================================
+  # Phase 4 — Packaging and smoke test
+  # =========================================================================
+  packaging:
+    if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' }}
+    needs: [op_test]
+    permissions:
+      contents: write
+    runs-on: tileops-metax-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-  #     - name: Verify nightly runner environment
-  #       run: scripts/ci/verify_nightly_runner.sh
-  #       shell: bash
+      - name: Verify nightly runner environment
+        run: scripts/ci/verify_nightly_runner.sh
+        shell: bash
 
-  #     - name: Set up run-local venv
-  #       run: scripts/ci/setup_nightly_venv.sh
-  #       shell: bash
+      - name: Set up run-local venv
+        run: scripts/ci/setup_nightly_venv.sh
+        shell: bash
 
-  #     - name: Build and test wheel package
-  #       run: |
-  #         set -euo pipefail
-  #         exec > >(tee packaging.log) 2>&1
-  #         # shellcheck source=/dev/null
-  #         source "${VENV_PATH}/bin/activate"
+      - name: Build and test wheel package
+        run: |
+          set -euo pipefail
+          exec > >(tee packaging.log) 2>&1
+          # shellcheck source=/dev/null
+          source "${VENV_PATH}/bin/activate"
 
-  #         # Validate GPU frequency
-  #         TARGET_CLOCK_MHZ=428
-  #         RETRIES=5
-  #         for i in $(seq 1 "${RETRIES}"); do
-  #           gpu_clock=$(mx-smi --show-clock | awk '/XCORE/ {print $(NF-1); exit}')
-  #           echo "GPU clock: ${gpu_clock} MHz (attempt ${i}/${RETRIES})"
-  #           if [ "${gpu_clock}" = "${TARGET_CLOCK_MHZ}" ]; then break; fi
-  #           if [ "${i}" -eq "${RETRIES}" ]; then
-  #             echo "::error::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz."
-  #             exit 1
-  #           fi
-  #           sleep 2
-  #         done
+          # Validate GPU frequency
+          TARGET_CLOCK_MHZ=428
+          RETRIES=5
+          for i in $(seq 1 "${RETRIES}"); do
+            gpu_clock=$(mx-smi --show-clock | awk '/XCORE/ {print $(NF-1); exit}')
+            echo "GPU clock: ${gpu_clock} MHz (attempt ${i}/${RETRIES})"
+            if [ "${gpu_clock}" = "${TARGET_CLOCK_MHZ}" ]; then break; fi
+            if [ "${i}" -eq "${RETRIES}" ]; then
+              echo "::error::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz."
+              exit 1
+            fi
+            sleep 2
+          done
 
-  #         pip install build pytest
+          pip install build pytest
 
-  #         echo "=== Build wheel package ==="
-  #         python -m build --wheel
-  #         echo "=== Build artifacts ==="
-  #         ls -lh dist/*.whl
+          echo "=== Build wheel package ==="
+          python -m build --wheel
+          echo "=== Build artifacts ==="
+          ls -lh dist/*.whl
 
-  #         echo "=== Install built wheel ==="
-  #         pip install --no-deps dist/*.whl
+          echo "=== Install built wheel ==="
+          pip install --no-deps dist/*.whl
 
-  #         TMP_TEST_DIR="$(mktemp -d "${RUNTIME_ROOT}/packaging-test.XXXXXX")"
-  #         cp -r tests "${TMP_TEST_DIR}/tests"
-  #         cp pyproject.toml "${TMP_TEST_DIR}/"
-  #         cd "${TMP_TEST_DIR}"
+          TMP_TEST_DIR="$(mktemp -d "${RUNTIME_ROOT}/packaging-test.XXXXXX")"
+          cp -r tests "${TMP_TEST_DIR}/tests"
+          cp pyproject.toml "${TMP_TEST_DIR}/"
+          cd "${TMP_TEST_DIR}"
 
-  #         echo "=== Runtime cache env ==="
-  #         echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-}"
-  #         echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR:-}"
-  #         echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
+          echo "=== Runtime cache env ==="
+          echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-}"
+          echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR:-}"
+          echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
 
-  #         echo "=== Run pytest packaging ==="
-  #         # python -m pytest -q tests/ops -m "packaging" \
-  #         #   --junit-xml="${GITHUB_WORKSPACE}/packaging_smoke.xml"
-  #       shell: bash
+          echo "=== Run pytest packaging ==="
+          python -m pytest -q tests/ops -m "packaging" \
+            --junit-xml="${GITHUB_WORKSPACE}/packaging_smoke.xml"
+        shell: bash
 
-  #     - name: Upload wheel artifact
-  #       if: ${{ success() }}
-  #       uses: actions/upload-artifact@v4
-  #       with:
-  #         name: tileops-wheel-${{ github.sha }}
-  #         path: dist/*.whl
-  #         if-no-files-found: error
-  #         retention-days: 14
+      - name: Upload wheel artifact
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tileops-wheel-${{ github.sha }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 14
 
-  #     - name: Upload packaging logs
-  #       if: ${{ always() }}
-  #       uses: actions/upload-artifact@v4
-  #       with:
-  #         name: packaging-logs-${{ github.sha }}
-  #         path: |
-  #           packaging.log
-  #           packaging_smoke.xml
-  #         if-no-files-found: warn
-  #         retention-days: 14
+      - name: Upload packaging logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: packaging-logs-${{ github.sha }}
+          path: |
+            packaging.log
+            packaging_smoke.xml
+          if-no-files-found: warn
+          retention-days: 14
 
-  #     - name: Publish wheel to GitHub Release (tag only)
-  #       if: ${{ startsWith(github.ref, 'refs/tags/v') }}
-  #       uses: softprops/action-gh-release@v2
-  #       with:
-  #         files: dist/*.whl
-  #         fail_on_unmatched_files: true
+      - name: Publish wheel to GitHub Release (tag only)
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.whl
+          fail_on_unmatched_files: true
 
-  #     - name: Cleanup run-local venv
-  #       if: ${{ always() }}
-  #       run: |
-  #         set -euo pipefail
-  #         if [[ -n "${RUNTIME_ROOT:-}" && "${RUNTIME_ROOT}" == "${RUNNER_TEMP}/nightly-"* ]]; then
-  #           rm -rf "${RUNTIME_ROOT}"
-  #         fi
-  #       shell: bash
+      - name: Cleanup run-local venv
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${RUNTIME_ROOT:-}" && "${RUNTIME_ROOT}" == "${RUNNER_TEMP}/nightly-"* ]]; then
+            rm -rf "${RUNTIME_ROOT}"
+          fi
+        shell: bash
