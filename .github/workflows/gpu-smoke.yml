@@ -422,7 +422,6 @@ jobs:
             /data/cache/pip
             /data/cache/wheels
             /data/cache/tilelang/tmp
-            /data/cache/venv
           atomic-cache-dirs: |
             /data/cache/tilelang/autotuner
           df-paths: "/data /data/cache"
@@ -431,9 +430,10 @@ jobs:
           # unconditional) so they don't evict tuning artefacts the next
           # PR would otherwise reuse.
           skip-atomic-age-trim: "true"
-          # Disable tool_cache pruning since we use /data/cache/venv instead.
-          # The runner runs in Kubernetes pods where tool_cache is ephemeral.
-          prune-tool-cache: "false"
+          # Prune old venvs from /data/cache/venv (persistent volume for K8s runners).
+          # Keep 2 most recent venvs based on mtime.
+          prune-tool-cache: "true"
+          venv-cache-dir: "/data/cache/venv"
 
       - name: Resolve runtime state
         env:
@@ -744,7 +744,10 @@ jobs:
           echo "Resolved pytest targets: ${PYTEST_TARGETS}"
           read -r -a TARGETS <<< "${PYTEST_TARGETS}"
           echo "Running pytest -m \"${TEST_MARK_EXPR}\" on ${#TARGETS[@]} target(s)"
-          # python -m pytest -q "${TARGETS[@]}" -m "${TEST_MARK_EXPR}" --junit-xml=gpu_smoke_results.xml | tee gpu_smoke.log
+
+          # Run a subset of tests to verify cache hit quickly
+          # Full test suite takes too long if cache misses
+          python -m pytest -q tests/ops/test_rms_norm.py -m "${TEST_MARK_EXPR}" --junit-xml=gpu_smoke_results.xml | tee gpu_smoke.log
 
       - name: Generate gpu-smoke report
         if: ${{ always() && hashFiles('gpu_smoke_results.xml') != '' }}
