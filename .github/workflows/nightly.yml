@@ -19,7 +19,7 @@ concurrency:
 
 env:
   TILELANG_CACHE_DIR: /data/cache/tilelang
-  TILELANG_TMP_DIR: /data/cache/ci-cache/tilelang/tmp
+  TILELANG_TMP_DIR: /data/cache/tilelang/tmp
   TRITON_CACHE_DIR: /data/cache/triton
   PIP_CACHE_DIR: /data/cache/pip
   WHEEL_DIR: /data/cache/wheels
