@@ -460,38 +460,6 @@ jobs:
           TRUSTED_CACHE_ROOT="/data/cache"
           FORK_CAN_COPY_TRUSTED_VENV="false"
 
-          # Debug: print computed hash and check existing caches
-          echo "=== VENV Cache Debug Info ==="
-          echo "Computed PYPROJECT_HASH: ${PYPROJECT_HASH}"
-          echo "Computed HASH_INPUT: ${HASH_INPUT}"
-          echo "Expected VENV_DIR: ${VENV_DIR}"
-          echo "TRUSTED_VENV_PATH: ${TRUSTED_VENV_PATH}"
-          echo ""
-          echo "Existing venv caches in /data/cache/venv:"
-          if [[ -d "/data/cache/venv" ]]; then
-            for d in /data/cache/venv/tileops_ci_venv_*; do
-              if [[ -d "$d" ]]; then
-                echo "  $(basename "$d")"
-              fi
-            done || echo "  (no tileops_ci_venv_* found)"
-          else
-            echo "  (directory /data/cache/venv does not exist)"
-          fi
-          echo ""
-          echo "Checking if TRUSTED_VENV_PATH exists:"
-          if [[ -d "${TRUSTED_VENV_PATH}" ]]; then
-            echo "  Directory exists: ${TRUSTED_VENV_PATH}"
-            if [[ -x "${TRUSTED_VENV_PATH}/bin/python" ]]; then
-              echo "  bin/python is executable: YES"
-            else
-              echo "  bin/python is executable: NO"
-            fi
-          else
-            echo "  Directory does NOT exist: ${TRUSTED_VENV_PATH}"
-          fi
-          echo "=== End Debug Info ==="
-          echo ""
-
           if [[ "$IS_FORK" == "true" ]]; then
             RUNTIME_ROOT="${RUNNER_TEMP}/gpu-smoke-${{ github.run_id }}-${{ github.run_attempt }}"
             # Per-run isolated cache: rsync from trusted cache into temp dir.

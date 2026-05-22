@@ -31,29 +31,18 @@ export USE_MACA=ON
 # which causes "__macro_mxcc.h not found" errors when TVM tries to link .so
 unset CXX CC
 
-# Set MACA SDK paths for compilation (fixes __macro_mxcc.h not found)
-if [[ -d "/opt/maca" ]]; then
-  export MACA_PATH=/opt/maca
-  export C_INCLUDE_PATH="${MACA_PATH}/include${C_INCLUDE_PATH:+:${C_INCLUDE_PATH}}"
-  export CPLUS_INCLUDE_PATH="${MACA_PATH}/include${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}"
-  export LIBRARY_PATH="${MACA_PATH}/lib${LIBRARY_PATH:+:${LIBRARY_PATH}}"
-  export LD_LIBRARY_PATH="${MACA_PATH}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-  echo "MACA SDK paths configured: MACA_PATH=${MACA_PATH}"
-fi
-
 echo "Creating run-local nightly venv at ${VENV_PATH}"
 python -m venv --system-site-packages "${VENV_PATH}"
 
 # shellcheck source=/dev/null
 source "${VENV_PATH}/bin/activate"
-
 python -m pip install --upgrade pip setuptools wheel --no-user
 
 # Install pytest-xdist for parallel test execution (required by warmup_kernel_cache.py)
 pip install --no-cache-dir pytest-xdist
 
 # Install TileLang (MACA version)
-pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@1efc3ba8a7c48bc97047e562223538d2dcb2222d
+pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@dev
 
 {
   echo "RUNTIME_ROOT=${RUNTIME_ROOT}"
@@ -65,4 +54,3 @@ echo "RUNTIME_ROOT=${RUNTIME_ROOT}"
 echo "VENV_PATH=${VENV_PATH}"
 python --version
 python -m pip --version
-python -c "import torch; print(f'torch={torch.__version__}')"
