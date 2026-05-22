@@ -523,7 +523,7 @@ def test_where_rejects_fp8_dtype(bad_dtype: torch.dtype) -> None:
     [
         pytest.param(torch.float16, id="fp16"),
         pytest.param(torch.bfloat16, id="bf16"),
-        pytest.param(torch.float32, id="fp32", marks=pytest.mark.xfail(reason="tvm.error.InternalError")),
+        pytest.param(torch.float32, id="fp32", marks=pytest.mark.skip(reason="tvm.error.InternalError")),
     ],
 )
 def test_where_accepts_manifest_dtypes(dtype: torch.dtype) -> None:

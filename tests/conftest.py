@@ -129,10 +129,9 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         ]
 
         # Smoke cases must never be xfail (checked before tune gate)
-        # Temporarily disabled to allow xfail on smoke cases for known issues
-        # for item in smoke_items:
-        #     if item.get_closest_marker("xfail") is not None:
-        #         tier_errors.append(f"{item.nodeid}: smoke cases must not be xfail")
+        for item in smoke_items:
+            if item.get_closest_marker("xfail") is not None:
+                tier_errors.append(f"{item.nodeid}: smoke cases must not be xfail")
 
         # For count and ordering checks, only consider non-xfail smoke cases
         valid_smoke_items = [

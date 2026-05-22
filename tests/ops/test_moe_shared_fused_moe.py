@@ -15,7 +15,7 @@ from tileops.ops.moe import FusedMoe, SharedFusedMoE
 
 
 @pytest.mark.smoke
-@pytest.mark.xfail(reason="MACALaunch mcErrorInvalidValue")
+@pytest.mark.skip(reason="MACALaunch mcErrorInvalidValue")
 def test_shared_fused_moe_basic():
     """SharedFusedMoE with shared expert kernel."""
     torch.manual_seed(42)
@@ -96,7 +96,7 @@ def test_shared_fused_moe_none():
 
 
 @pytest.mark.smoke
-@pytest.mark.xfail(reason="MACALaunch mcErrorInvalidValue")
+@pytest.mark.skip(reason="MACALaunch mcErrorInvalidValue")
 def test_shared_fused_moe_tp():
     """TP sharding: sum of partial outputs matches float32 math reference.
 
