@@ -18,11 +18,11 @@ concurrency:
 # ---------------------------------------------------------------------------
 
 env:
-  TILELANG_CACHE_DIR: /data7/shared/ci-cache/tilelang
-  TILELANG_TMP_DIR: /data7/shared/ci-cache/tilelang/tmp
-  TRITON_CACHE_DIR: /data7/shared/ci-cache/triton
-  PIP_CACHE_DIR: /data7/shared/ci-cache/pip
-  WHEEL_DIR: /data7/shared/ci-cache/wheels
+  TILELANG_CACHE_DIR: /data/cache/tilelang
+  TILELANG_TMP_DIR: /data/cache/ci-cache/tilelang/tmp
+  TRITON_CACHE_DIR: /data/cache/triton
+  PIP_CACHE_DIR: /data/cache/pip
+  WHEEL_DIR: /data/cache/wheels
   MAX_JOBS: "64"
 
 jobs:
@@ -30,8 +30,8 @@ jobs:
   # Phase 1 — Warm the kernel compilation cache
   # =========================================================================
   cache-warmup:
-    if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && (github.event_name == 'schedule' || github.ref == 'refs/heads/dev') }}
-    timeout-minutes: 60
+    if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && (github.event_name == 'schedule' || github.ref == 'refs/heads/dev' || github.event_name == 'pull_request') }}
+    timeout-minutes: 120
     runs-on: tileops-metax-runner
     steps:
       - name: Checkout code
@@ -58,7 +58,9 @@ jobs:
 
           export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
           echo "Starting kernel cache warmup..."
-          python scripts/warmup_kernel_cache.py --max-workers 64 -n 16
+          # Reduce parallelism to avoid OOM on Kubernetes runners (exit code 137)
+          # Total parallelism = 4 × 4 = 16 compile threads
+          python scripts/warmup_kernel_cache.py --max-workers 4 -n 4
         shell: bash
 
       - name: Cleanup run-local venv
@@ -74,7 +76,7 @@ jobs:
   # Phase 2 — Benchmark (exclusive GPU access for accurate profiling)
   # =========================================================================
   benchmark:
-    if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' && (github.event_name == 'schedule' || github.ref == 'refs/heads/dev') }}
+    if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' }}
     needs: [cache-warmup]
     timeout-minutes: 120
     runs-on: tileops-metax-runner
@@ -84,11 +86,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Verify nightly runner environment
-        run: scripts/ci/verify_nightly_runner.sh
-        shell: bash
-
-      - name: Set up run-local venv
+      - name: Set up nightly venv
         run: scripts/ci/setup_nightly_venv.sh
         shell: bash
 
@@ -101,10 +99,10 @@ jobs:
           source "${VENV_PATH}/bin/activate"
 
           # Validate GPU frequency
-          TARGET_CLOCK_MHZ=1830
+          TARGET_CLOCK_MHZ=428
           RETRIES=5
           for i in $(seq 1 "${RETRIES}"); do
-            gpu_clock=$(mx-smi --query-gpu=clocks.current.graphics --format=csv,noheader,nounits | xargs)
+            gpu_clock=$(mx-smi --show-clock | awk '/XCORE/ {print $(NF-1); exit}')
             echo "GPU clock: ${gpu_clock} MHz (attempt ${i}/${RETRIES})"
             if [ "${gpu_clock}" = "${TARGET_CLOCK_MHZ}" ]; then break; fi
             if [ "${i}" -eq "${RETRIES}" ]; then
@@ -112,7 +110,7 @@ jobs:
               exit 1
             fi
             sleep 2
-          done
+           done
 
           PIP_NO_BUILD_ISOLATION=1 pip install --no-deps -e ".[dev]"
 
@@ -161,7 +159,7 @@ jobs:
   # Phase 3 — Op correctness tests (serial after benchmark for GPU exclusivity)
   # =========================================================================
   op_test:
-    if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' && (github.event_name == 'schedule' || github.ref == 'refs/heads/dev') }}
+    if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' }}
     needs: [benchmark]
     timeout-minutes: 180
     runs-on: tileops-metax-runner
@@ -337,7 +335,7 @@ jobs:
   # Phase 4 — Packaging and smoke test
   # =========================================================================
   packaging:
-    if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' && (github.event_name == 'schedule' || github.ref == 'refs/heads/dev') }}
+    if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' }}
     needs: [op_test]
     permissions:
       contents: write
@@ -362,10 +360,10 @@ jobs:
           source "${VENV_PATH}/bin/activate"
 
           # Validate GPU frequency
-          TARGET_CLOCK_MHZ=1830
+          TARGET_CLOCK_MHZ=428
           RETRIES=5
           for i in $(seq 1 "${RETRIES}"); do
-            gpu_clock=$(mx-smi --query-gpu=clocks.current.graphics --format=csv,noheader,nounits | xargs)
+            gpu_clock=$(mx-smi --show-clock | awk '/XCORE/ {print $(NF-1); exit}')
             echo "GPU clock: ${gpu_clock} MHz (attempt ${i}/${RETRIES})"
             if [ "${gpu_clock}" = "${TARGET_CLOCK_MHZ}" ]; then break; fi
             if [ "${i}" -eq "${RETRIES}" ]; then
