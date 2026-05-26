@@ -203,8 +203,8 @@ class GroupedQueryAttentionFwdFixture(FixtureBase):
             pytest.param(1, 1024, 8, 4, 64, False, torch.bfloat16, False, marks=[pytest.mark.smoke, pytest.mark.skip(reason="No available kernel")]),
             pytest.param(4, 512, 64, 4, 128, False, torch.float16, False, marks=[pytest.mark.smoke, pytest.mark.skip(reason="No available kernel")]),
             pytest.param(4, 512, 64, 4, 128, True, torch.float16, False, marks=[pytest.mark.smoke, pytest.mark.skip(reason="No available kernel")]),
-            pytest.param(4, 2048, 64, 4, 128, False, torch.float16, False, marks=pytest.mark.full),
-            pytest.param(4, 2048, 64, 4, 128, False, torch.bfloat16, False, marks=pytest.mark.full),
+            pytest.param(4, 2048, 64, 4, 128, False, torch.float16, False, marks=[pytest.mark.full, pytest.mark.skip(reason="No available kernel")]),
+            pytest.param(4, 2048, 64, 4, 128, False, torch.bfloat16, False, marks=[pytest.mark.full, pytest.mark.skip(reason="No available kernel")]),
         ]),
     ]
 

@@ -35,6 +35,6 @@ jobs:
       # running. `@main` is trusted because this workflow only triggers on
       # schedule / workflow_dispatch; no fork-PR code path reaches it.
       - name: Reclaim runner disk
-        uses: MetaX-MACA/TileOPs-Metax/.github/actions/reclaim-runner-disk@main
+        uses: MetaX-MACA/TileOPs-Metax/.github/actions/reclaim-runner-disk@dev
         with:
           force-reclaim: "true"

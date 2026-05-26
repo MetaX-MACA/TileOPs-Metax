@@ -691,7 +691,8 @@ jobs:
 
           TEST_MARK_EXPR="smoke or full"
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
-            TEST_MARK_EXPR="smoke"
+            # TEST_MARK_EXPR="smoke"
+            TEST_MARK_EXPR="smoke or full"
           fi
 
           echo "Resolved test scope: ${TEST_SCOPE}"
