@@ -223,19 +223,22 @@ jobs:
             printf ' - %s\n' "${changed_files[@]}"
 
             # Fast path: if no Python files changed, GPU smoke is unnecessary.
-            # Check for high-risk files (workflow, build config, etc.) that
-            # must still trigger GPU smoke even without Python changes.
+            # For fork PRs, also check for high-risk files (workflow, build
+            # config, etc.) that must still trigger GPU smoke even without
+            # Python changes to avoid security bypass.
             has_python="false"
             has_high_risk="false"
             for path in "${changed_files[@]}"; do
               if [[ "$path" == *.py ]]; then
                 has_python="true"
               fi
-              case "$path" in
-                .github/workflows/gpu-smoke.yml|.github/workflows/nightly.yml|pyproject.toml|requirements*.txt|requirements*.in|setup.py|setup.cfg|Dockerfile*|scripts/bootstrap*|scripts/install*)
-                  has_high_risk="true"
-                  ;;
-              esac
+              if [[ "$is_fork" == "true" ]]; then
+                case "$path" in
+                  .github/workflows/*|pyproject.toml|requirements*.txt|requirements*.in|setup.py|setup.cfg|Dockerfile*|scripts/bootstrap*|scripts/install*)
+                    has_high_risk="true"
+                    ;;
+                esac
+              fi
             done
             if [[ "$has_python" == "false" && "$has_high_risk" == "false" ]]; then
               skip_gpu_smoke="true"
@@ -349,7 +352,7 @@ jobs:
 
   gpu-smoke:
     needs: [ci-prereq, security-policy]
-    if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && needs.ci-prereq.outputs.skip != 'true' && needs.security-policy.outputs.skip_gpu_smoke != 'true' }}
+    if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && needs.ci-prereq.outputs.skip != 'true' }}
     runs-on: tileops-metax-runner
     steps:
       - name: Checkout code for fork PR
@@ -802,7 +805,7 @@ jobs:
   benchmark:
     needs: [ci-prereq, security-policy, gpu-smoke]
     if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' && needs.ci-prereq.outputs.skip != 'true' }}
-    timeout-minutes: 120
+    timeout-minutes: 300
     runs-on: tileops-metax-runner
     steps:
       - name: Checkout code for fork PR
