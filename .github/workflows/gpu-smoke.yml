@@ -802,28 +802,17 @@ jobs:
             rm -rf "${RUNTIME_ROOT}"
           fi
 
-  benchmark:
+  nightly:
     needs: [ci-prereq, security-policy, gpu-smoke]
     if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' && needs.ci-prereq.outputs.skip != 'true' }}
-    timeout-minutes: 300
+    timeout-minutes: 480
     runs-on: tileops-metax-runner
+    permissions:
+      contents: write
     steps:
-      - name: Checkout code for fork PR
-        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+      - name: Checkout code
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.sha }}
-          persist-credentials: false
-          fetch-depth: 0
-
-      - name: Checkout code for trusted branch
-        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository }}
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
           fetch-depth: 0
 
       - name: Verify nightly runner environment
@@ -834,6 +823,31 @@ jobs:
         run: scripts/ci/setup_nightly_venv.sh
         shell: bash
 
+      # =========================================================================
+      # Phase 1 — Warm kernel compilation cache
+      # =========================================================================
+      - name: Warm kernel compilation cache
+        id: cache_warmup
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          source "${VENV_PATH}/bin/activate"
+
+          WARMUP_START=$(date +%s)
+          PIP_NO_BUILD_ISOLATION=1 pip install --no-deps -e ".[dev]"
+
+          export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
+          echo "Starting kernel cache warmup..."
+          python scripts/warmup_kernel_cache.py --max-workers 4 -n 4
+          WARMUP_END=$(date +%s)
+          WARMUP_SECONDS=$((WARMUP_END - WARMUP_START))
+          echo "===== WARMUP TIME: ${WARMUP_SECONDS}s ====="
+        shell: bash
+
+      # =========================================================================
+      # Phase 2 — Benchmark
+      # =========================================================================
       - name: Run benchmark ops
         id: benchmark_tests
         continue-on-error: true
@@ -856,16 +870,18 @@ jobs:
             sleep 2
           done
 
-          PIP_NO_BUILD_ISOLATION=1 pip install --no-deps -e ".[dev]"
-
           export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
           echo "Runtime cache env:"
           echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-}"
           echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR:-}"
           echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
 
+          BENCH_START=$(date +%s)
           set -o pipefail
           python -m pytest -q benchmarks/ops --junit-xml=bench_results.xml | tee tileops_benchmarks.log
+          BENCH_END=$(date +%s)
+          BENCH_SECONDS=$((BENCH_END - BENCH_START))
+          echo "===== BENCHMARK TIME: ${BENCH_SECONDS}s ====="
 
           if [ -f profile_run.log ]; then
             { echo; echo "===== profile_run.log summary ====="; cat profile_run.log; } >> tileops_benchmarks.log
@@ -885,8 +901,230 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Fail benchmark job if pytest failed
+      # =========================================================================
+      # Phase 3 — Op correctness tests
+      # =========================================================================
+      - name: Run full op tests
+        id: op_tests
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          source "${VENV_PATH}/bin/activate"
+
+          export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
+          echo "Runtime cache env:"
+          echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-}"
+          echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR:-}"
+          echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
+
+          TEST_START=$(date +%s)
+          set -o pipefail
+          python -m pytest tests/ -v --tb=short --junit-xml=test_results.xml | tee tileops_op_test.log
+          TEST_END=$(date +%s)
+          TEST_SECONDS=$((TEST_END - TEST_START))
+          echo "===== OP TEST TIME: ${TEST_SECONDS}s ====="
+        shell: bash
+
+      - name: Resolve previous perf history artifact
+        id: perf_history_source
+        if: ${{ always() }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const workflowId = "nightly.yml";
+            const currentRunId = context.runId;
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRuns,
+              {
+                owner,
+                repo,
+                workflow_id: workflowId,
+                branch: "dev",
+                status: "completed",
+                per_page: 100,
+              },
+            );
+
+            for (const run of runs) {
+              if (run.id === currentRunId || run.conclusion !== "success") {
+                continue;
+              }
+
+              const artifacts = await github.paginate(
+                github.rest.actions.listWorkflowRunArtifacts,
+                {
+                  owner,
+                  repo,
+                  run_id: run.id,
+                  per_page: 100,
+                },
+              );
+
+              const artifact = artifacts.find(
+                (candidate) =>
+                  !candidate.expired && candidate.name === "tileops_perf_history",
+              );
+              if (!artifact) {
+                continue;
+              }
+
+              core.info(
+                `Using perf history artifact from run ${run.id} (${run.html_url})`,
+              );
+              core.setOutput("run_id", String(run.id));
+              return;
+            }
+
+            core.info("No previous perf history artifact found; nightly report will start a new history baseline.");
+
+      - name: Download previous perf history
+        uses: actions/download-artifact@v4
+        if: ${{ always() && steps.perf_history_source.outputs.run_id != '' }}
+        with:
+          name: tileops_perf_history
+          path: .perf_history
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.perf_history_source.outputs.run_id }}
+
+      - name: Generate nightly report
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          source "${VENV_PATH}/bin/activate"
+
+          export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
+
+          HISTORY_ARGS=()
+          if [ -f .perf_history/perf_history.json ]; then
+            HISTORY_ARGS=(--history .perf_history/perf_history.json)
+          fi
+
+          python scripts/nightly_report.py \
+            --test-xml test_results.xml \
+            --bench-xml bench_results.xml \
+            "${HISTORY_ARGS[@]}" \
+            --output nightly_report.md \
+            --history-out perf_history.json \
+            || echo "::warning::nightly_report.py failed"
+        shell: bash
+
+      - name: Post nightly report to step summary
+        if: ${{ always() && hashFiles('nightly_report.md') != '' }}
+        run: cat nightly_report.md >> "$GITHUB_STEP_SUMMARY"
+        shell: bash
+
+      - name: Upload op test artifacts
+        uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: tileops_op_test_${{ github.run_id }}
+          path: |
+            test_results.xml
+            tileops_op_test.log
+            nightly_report.md
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload perf history
+        uses: actions/upload-artifact@v4
+        if: ${{ always() && hashFiles('perf_history.json') != '' }}
+        with:
+          name: tileops_perf_history
+          path: perf_history.json
+          overwrite: true
+          retention-days: 14
+
+      # =========================================================================
+      # Phase 4 — Packaging and smoke test
+      # =========================================================================
+      - name: Build and test wheel package
+        id: packaging
+        run: |
+          set -euo pipefail
+          exec > >(tee packaging.log) 2>&1
+          # shellcheck source=/dev/null
+          source "${VENV_PATH}/bin/activate"
+
+          # Validate GPU frequency
+          TARGET_CLOCK_MHZ=428
+          RETRIES=5
+          for i in $(seq 1 "${RETRIES}"); do
+            gpu_clock=$(mx-smi --show-clock | awk '/XCORE/ {print $(NF-1); exit}')
+            echo "GPU clock: ${gpu_clock} MHz (attempt ${i}/${RETRIES})"
+            if [ "${gpu_clock}" = "${TARGET_CLOCK_MHZ}" ]; then break; fi
+            if [ "${i}" -eq "${RETRIES}" ]; then
+              echo "::error::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz."
+              exit 1
+            fi
+            sleep 2
+          done
+
+          pip install build pytest
+
+          echo "=== Build wheel package ==="
+          python -m build --wheel
+          echo "=== Build artifacts ==="
+          ls -lh dist/*.whl
+
+          echo "=== Install built wheel ==="
+          pip install --no-deps dist/*.whl
+
+          TMP_TEST_DIR="$(mktemp -d "${RUNTIME_ROOT}/packaging-test.XXXXXX")"
+          cp -r tests "${TMP_TEST_DIR}/tests"
+          cp pyproject.toml "${TMP_TEST_DIR}/"
+          cd "${TMP_TEST_DIR}"
+
+          echo "=== Runtime cache env ==="
+          echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-}"
+          echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR:-}"
+          echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
+
+          echo "=== Run pytest packaging ==="
+          python -m pytest -q tests/ops -m "packaging" \
+            --junit-xml="${GITHUB_WORKSPACE}/packaging_smoke.xml"
+        shell: bash
+
+      - name: Upload wheel artifact
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tileops-wheel-${{ github.sha }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload packaging logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: packaging-logs-${{ github.sha }}
+          path: |
+            packaging.log
+            packaging_smoke.xml
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Publish wheel to GitHub Release (tag only)
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.whl
+          fail_on_unmatched_files: true
+
+      # =========================================================================
+      # Final — Fail job if any critical step failed
+      # =========================================================================
+      - name: Fail job if benchmark failed
         if: ${{ always() && steps.benchmark_tests.outcome == 'failure' }}
+        run: exit 1
+        shell: bash
+
+      - name: Fail job if op tests failed
+        if: ${{ always() && steps.op_tests.outcome == 'failure' }}
         run: exit 1
         shell: bash
 
