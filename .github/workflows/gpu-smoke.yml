@@ -802,13 +802,11 @@ jobs:
             rm -rf "${RUNTIME_ROOT}"
           fi
 
-  nightly:
-    needs: [ci-prereq, security-policy, gpu-smoke]
-    if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' && needs.ci-prereq.outputs.skip != 'true' }}
-    timeout-minutes: 480
+  cache-warmup:
+    needs: [gpu-smoke]
+    if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' }}
+    timeout-minutes: 120
     runs-on: tileops-metax-runner
-    permissions:
-      contents: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -819,35 +817,148 @@ jobs:
         run: scripts/ci/verify_nightly_runner.sh
         shell: bash
 
-      - name: Set up run-local venv
-        run: scripts/ci/setup_nightly_venv.sh
+      - name: Resolve venv cache path
+        id: venv_cache
+        run: |
+          set -euo pipefail
+
+          # Add conda to PATH
+          export PATH="/opt/conda/bin:${PATH}"
+
+          # Set MACA environment variables
+          export USE_MACA=ON
+
+          # Compute venv cache key from pyproject.toml
+          PYPROJECT_HASH=$(python scripts/ci_venv_hash.py pyproject.toml)
+          HASH_INPUT="$(
+            {
+              echo "python=3.12"
+              echo "install=PIP_NO_BUILD_ISOLATION=1 pip install -e '.[dev]'"
+              echo "pyproject=${PYPROJECT_HASH}"
+            } | sha256sum | cut -c1-16
+          )"
+          VENV_PREFIX="tileops_nightly_venv"
+          VENV_DIR="${VENV_PREFIX}_${HASH_INPUT}"
+          VENV_PATH="/data/cache/venv/${VENV_DIR}"
+
+          echo "VENV_PATH=${VENV_PATH}" >> "$GITHUB_ENV"
+          echo "VENV_REUSED=false" >> "$GITHUB_ENV"
+
+          if [[ -x "${VENV_PATH}/bin/python" ]]; then
+            echo "VENV_REUSED=true" >> "$GITHUB_ENV"
+            echo "Found cached venv at ${VENV_PATH}"
+          fi
         shell: bash
 
-      # =========================================================================
-      # Phase 1 — Warm kernel compilation cache
-      # =========================================================================
+      - name: Create or reuse venv
+        run: |
+          set -euo pipefail
+
+          # Add conda to PATH
+          export PATH="/opt/conda/bin:${PATH}"
+
+          if [[ "$VENV_REUSED" == "true" ]]; then
+            echo "Using cached venv at ${VENV_PATH}"
+            exit 0
+          fi
+
+          echo "Creating fresh venv at ${VENV_PATH}"
+          python -m venv --system-site-packages "${VENV_PATH}"
+          # shellcheck source=/dev/null
+          source "${VENV_PATH}/bin/activate"
+
+          # Copy pre-installed MACA torch packages from conda to venv
+          cp -rf /opt/conda/lib/python3.12/site-packages/* "${VENV_PATH}/lib/python3.12/site-packages/"
+
+          python -m pip install --upgrade pip setuptools wheel --no-user
+
+          # Install TileLang (MACA version)
+          pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@dev
+
+          # Install tileops with dev dependencies
+          PIP_NO_BUILD_ISOLATION=1 pip install --no-deps -e ".[dev]"
+
+          # Find the most recent cached venv to sync mtime with
+          TRUSTED_VENV_CANDIDATE=$(find /data/cache/venv -maxdepth 1 -name "tileops_*_venv_*" -type d 2>/dev/null | xargs ls -td 2>/dev/null | head -1 || true)
+          if [[ -n "${TRUSTED_VENV_CANDIDATE}" && -d "${TRUSTED_VENV_CANDIDATE}" ]]; then
+            TRUSTED_LIB=$(find "${TRUSTED_VENV_CANDIDATE}" -name "libtilelang.so" -type f 2>/dev/null | head -1 || true)
+            NEW_LIB=$(find "${VENV_PATH}" -name "libtilelang.so" -type f 2>/dev/null | head -1 || true)
+            if [[ -n "$TRUSTED_LIB" && -n "$NEW_LIB" ]]; then
+              touch -r "$TRUSTED_LIB" "$NEW_LIB"
+              echo "Synced libtilelang.so mtime with ${TRUSTED_VENV_CANDIDATE} for cache key compatibility"
+            fi
+          fi
+        shell: bash
+
       - name: Warm kernel compilation cache
-        id: cache_warmup
         continue-on-error: true
         run: |
           set -euo pipefail
           # shellcheck source=/dev/null
           source "${VENV_PATH}/bin/activate"
 
-          WARMUP_START=$(date +%s)
-          PIP_NO_BUILD_ISOLATION=1 pip install --no-deps -e ".[dev]"
-
           export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
           echo "Starting kernel cache warmup..."
           python scripts/warmup_kernel_cache.py --max-workers 4 -n 4
-          WARMUP_END=$(date +%s)
-          WARMUP_SECONDS=$((WARMUP_END - WARMUP_START))
-          echo "===== WARMUP TIME: ${WARMUP_SECONDS}s ====="
         shell: bash
 
-      # =========================================================================
-      # Phase 2 — Benchmark
-      # =========================================================================
+      - name: Print venv cache status
+        if: ${{ always() }}
+        run: |
+          echo "VENV_PATH=${VENV_PATH}"
+          echo "VENV_REUSED=${VENV_REUSED}"
+          if [[ "${VENV_REUSED}" == "true" ]]; then
+            echo "CACHE_SIGNAL: nightly venv=hit"
+          else
+            echo "CACHE_SIGNAL: nightly venv=miss (fresh venv created)"
+          fi
+        shell: bash
+
+  # =========================================================================
+  # Phase 2 — Benchmark (exclusive GPU access for accurate profiling)
+  # =========================================================================
+  benchmark:
+    if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' }}
+    needs: [cache-warmup]
+    timeout-minutes: 120
+    runs-on: tileops-metax-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify nightly runner environment
+        run: scripts/ci/verify_nightly_runner.sh
+        shell: bash
+
+      - name: Resolve venv cache path
+        id: venv_cache
+        run: |
+          set -euo pipefail
+
+          # Add conda to PATH
+          export PATH="/opt/conda/bin:${PATH}"
+
+          # Set MACA environment variables
+          export USE_MACA=ON
+
+          # Compute venv cache key from pyproject.toml
+          PYPROJECT_HASH=$(python scripts/ci_venv_hash.py pyproject.toml)
+          HASH_INPUT="$(
+            {
+              echo "python=3.12"
+              echo "install=PIP_NO_BUILD_ISOLATION=1 pip install -e '.[dev]'"
+              echo "pyproject=${PYPROJECT_HASH}"
+            } | sha256sum | cut -c1-16
+          )"
+          VENV_PREFIX="tileops_nightly_venv"
+          VENV_DIR="${VENV_PREFIX}_${HASH_INPUT}"
+          VENV_PATH="/data/cache/venv/${VENV_DIR}"
+
+          echo "VENV_PATH=${VENV_PATH}" >> "$GITHUB_ENV"
+        shell: bash
+
       - name: Run benchmark ops
         id: benchmark_tests
         continue-on-error: true
@@ -876,12 +987,8 @@ jobs:
           echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR:-}"
           echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
 
-          BENCH_START=$(date +%s)
           set -o pipefail
           python -m pytest -q benchmarks/ops --junit-xml=bench_results.xml | tee tileops_benchmarks.log
-          BENCH_END=$(date +%s)
-          BENCH_SECONDS=$((BENCH_END - BENCH_START))
-          echo "===== BENCHMARK TIME: ${BENCH_SECONDS}s ====="
 
           if [ -f profile_run.log ]; then
             { echo; echo "===== profile_run.log summary ====="; cat profile_run.log; } >> tileops_benchmarks.log
@@ -901,9 +1008,56 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      # =========================================================================
-      # Phase 3 — Op correctness tests
-      # =========================================================================
+      - name: Fail benchmark job if pytest failed
+        if: ${{ always() && steps.benchmark_tests.outcome == 'failure' }}
+        run: exit 1
+        shell: bash
+
+  # =========================================================================
+  # Phase 3 — Op correctness tests (serial after benchmark for GPU exclusivity)
+  # =========================================================================
+  op_test:
+    if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' }}
+    needs: [benchmark]
+    timeout-minutes: 180
+    runs-on: tileops-metax-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify nightly runner environment
+        run: scripts/ci/verify_nightly_runner.sh
+        shell: bash
+
+      - name: Resolve venv cache path
+        id: venv_cache
+        run: |
+          set -euo pipefail
+
+          # Add conda to PATH
+          export PATH="/opt/conda/bin:${PATH}"
+
+          # Set MACA environment variables
+          export USE_MACA=ON
+
+          # Compute venv cache key from pyproject.toml
+          PYPROJECT_HASH=$(python scripts/ci_venv_hash.py pyproject.toml)
+          HASH_INPUT="$(
+            {
+              echo "python=3.12"
+              echo "install=PIP_NO_BUILD_ISOLATION=1 pip install -e '.[dev]'"
+              echo "pyproject=${PYPROJECT_HASH}"
+            } | sha256sum | cut -c1-16
+          )"
+          VENV_PREFIX="tileops_nightly_venv"
+          VENV_DIR="${VENV_PREFIX}_${HASH_INPUT}"
+          VENV_PATH="/data/cache/venv/${VENV_DIR}"
+
+          echo "VENV_PATH=${VENV_PATH}" >> "$GITHUB_ENV"
+        shell: bash
+
       - name: Run full op tests
         id: op_tests
         continue-on-error: true
@@ -918,13 +1072,16 @@ jobs:
           echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR:-}"
           echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
 
-          TEST_START=$(date +%s)
           set -o pipefail
           python -m pytest tests/ -v --tb=short --junit-xml=test_results.xml | tee tileops_op_test.log
-          TEST_END=$(date +%s)
-          TEST_SECONDS=$((TEST_END - TEST_START))
-          echo "===== OP TEST TIME: ${TEST_SECONDS}s ====="
         shell: bash
+
+      - name: Download benchmark artifacts
+        uses: actions/download-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: tileops_benchmark_${{ github.run_id }}
+        continue-on-error: true
 
       - name: Resolve previous perf history artifact
         id: perf_history_source
@@ -996,6 +1153,7 @@ jobs:
           # shellcheck source=/dev/null
           source "${VENV_PATH}/bin/activate"
 
+          pip install --no-deps -e . 2>/dev/null
           export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
 
           HISTORY_ARGS=()
@@ -1038,11 +1196,56 @@ jobs:
           overwrite: true
           retention-days: 14
 
-      # =========================================================================
-      # Phase 4 — Packaging and smoke test
-      # =========================================================================
+      - name: Fail op test job if pytest failed
+        if: ${{ always() && steps.op_tests.outcome == 'failure' }}
+        run: exit 1
+        shell: bash
+
+  # =========================================================================
+  # Phase 4 — Packaging and smoke test
+  # =========================================================================
+  packaging:
+    if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' }}
+    needs: [op_test]
+    permissions:
+      contents: write
+    runs-on: tileops-metax-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify nightly runner environment
+        run: scripts/ci/verify_nightly_runner.sh
+        shell: bash
+
+      - name: Resolve venv cache path
+        id: venv_cache
+        run: |
+          set -euo pipefail
+
+          # Add conda to PATH
+          export PATH="/opt/conda/bin:${PATH}"
+
+          # Set MACA environment variables
+          export USE_MACA=ON
+
+          # Compute venv cache key from pyproject.toml
+          PYPROJECT_HASH=$(python scripts/ci_venv_hash.py pyproject.toml)
+          HASH_INPUT="$(
+            {
+              echo "python=3.12"
+              echo "install=PIP_NO_BUILD_ISOLATION=1 pip install -e '.[dev]'"
+              echo "pyproject=${PYPROJECT_HASH}"
+            } | sha256sum | cut -c1-16
+          )"
+          VENV_PREFIX="tileops_nightly_venv"
+          VENV_DIR="${VENV_PREFIX}_${HASH_INPUT}"
+          VENV_PATH="/data/cache/venv/${VENV_DIR}"
+
+          echo "VENV_PATH=${VENV_PATH}" >> "$GITHUB_ENV"
+        shell: bash
+
       - name: Build and test wheel package
-        id: packaging
         run: |
           set -euo pipefail
           exec > >(tee packaging.log) 2>&1
@@ -1073,7 +1276,7 @@ jobs:
           echo "=== Install built wheel ==="
           pip install --no-deps dist/*.whl
 
-          TMP_TEST_DIR="$(mktemp -d "${RUNTIME_ROOT}/packaging-test.XXXXXX")"
+          TMP_TEST_DIR="$(mktemp -d /tmp/packaging-test.XXXXXX)"
           cp -r tests "${TMP_TEST_DIR}/tests"
           cp pyproject.toml "${TMP_TEST_DIR}/"
           cd "${TMP_TEST_DIR}"
@@ -1114,25 +1317,3 @@ jobs:
         with:
           files: dist/*.whl
           fail_on_unmatched_files: true
-
-      # =========================================================================
-      # Final — Fail job if any critical step failed
-      # =========================================================================
-      - name: Fail job if benchmark failed
-        if: ${{ always() && steps.benchmark_tests.outcome == 'failure' }}
-        run: exit 1
-        shell: bash
-
-      - name: Fail job if op tests failed
-        if: ${{ always() && steps.op_tests.outcome == 'failure' }}
-        run: exit 1
-        shell: bash
-
-      - name: Cleanup run-local venv
-        if: ${{ always() }}
-        run: |
-          set -euo pipefail
-          if [[ -n "${RUNTIME_ROOT:-}" && "${RUNTIME_ROOT}" == "${RUNNER_TEMP}/nightly-"* ]]; then
-            rm -rf "${RUNTIME_ROOT}"
-          fi
-        shell: bash
