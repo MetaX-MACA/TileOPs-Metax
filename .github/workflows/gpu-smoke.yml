@@ -817,6 +817,11 @@ jobs:
         run: scripts/ci/verify_nightly_runner.sh
         shell: bash
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y git
+        shell: bash
+
       - name: Resolve runtime state
         run: |
           set -euo pipefail
@@ -934,6 +939,11 @@ jobs:
         run: scripts/ci/verify_nightly_runner.sh
         shell: bash
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y git
+        shell: bash
+
       - name: Resolve runtime state
         run: |
           set -euo pipefail
@@ -1030,6 +1040,11 @@ jobs:
 
       - name: Verify nightly runner environment
         run: scripts/ci/verify_nightly_runner.sh
+        shell: bash
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y git
         shell: bash
 
       - name: Resolve runtime state
@@ -1216,6 +1231,11 @@ jobs:
 
       - name: Verify nightly runner environment
         run: scripts/ci/verify_nightly_runner.sh
+        shell: bash
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y git
         shell: bash
 
       - name: Resolve runtime state
