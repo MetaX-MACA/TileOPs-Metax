@@ -906,7 +906,7 @@ jobs:
 
           export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
           echo "Starting kernel cache warmup..."
-          python scripts/warmup_kernel_cache.py --max-workers 4 -n 4
+          python scripts/warmup_kernel_cache.py --max-workers 4 --num-pytest-workers 4
         shell: bash
 
       - name: Print venv cache status
@@ -966,8 +966,57 @@ jobs:
           VENV_PREFIX="tileops_nightly_venv"
           VENV_DIR="${VENV_PREFIX}_${HASH_INPUT}"
           VENV_PATH="/data/cache/venv/${VENV_DIR}"
+          VENV_REUSED="false"
 
-          echo "VENV_PATH=${VENV_PATH}" >> "$GITHUB_ENV"
+          if [[ -x "${VENV_PATH}/bin/python" ]]; then
+            VENV_REUSED="true"
+            echo "Found cached venv at ${VENV_PATH}"
+          fi
+
+          {
+            echo "VENV_PATH=${VENV_PATH}"
+            echo "VENV_REUSED=${VENV_REUSED}"
+          } >> "$GITHUB_ENV"
+        shell: bash
+
+      - name: Ensure venv exists
+        run: |
+          set -euo pipefail
+
+          # Add conda to PATH
+          export PATH="/opt/conda/bin:${PATH}"
+
+          if [[ "$VENV_REUSED" == "true" ]]; then
+            echo "Using cached venv at ${VENV_PATH}"
+            exit 0
+          fi
+
+          echo "Creating fresh venv at ${VENV_PATH}"
+          python -m venv --system-site-packages "${VENV_PATH}"
+          # shellcheck source=/dev/null
+          source "${VENV_PATH}/bin/activate"
+
+          # Copy pre-installed MACA torch packages from conda to venv
+          cp -rf /opt/conda/lib/python3.12/site-packages/* "${VENV_PATH}/lib/python3.12/site-packages/"
+
+          python -m pip install --upgrade pip setuptools wheel --no-user
+
+          # Install TileLang (MACA version)
+          pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@dev
+
+          # Install tileops with dev dependencies
+          PIP_NO_BUILD_ISOLATION=1 pip install --no-deps -e ".[dev]"
+
+          # Find the most recent cached venv to sync mtime with
+          TRUSTED_VENV_CANDIDATE=$(find /data/cache/venv -maxdepth 1 -name "tileops_*_venv_*" -type d -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2- || true)
+          if [[ -n "${TRUSTED_VENV_CANDIDATE}" && -d "${TRUSTED_VENV_CANDIDATE}" ]]; then
+            TRUSTED_LIB=$(find "${TRUSTED_VENV_CANDIDATE}" -name "libtilelang.so" -type f 2>/dev/null | head -1 || true)
+            NEW_LIB=$(find "${VENV_PATH}" -name "libtilelang.so" -type f 2>/dev/null | head -1 || true)
+            if [[ -n "$TRUSTED_LIB" && -n "$NEW_LIB" ]]; then
+              touch -r "$TRUSTED_LIB" "$NEW_LIB"
+              echo "Synced libtilelang.so mtime with ${TRUSTED_VENV_CANDIDATE} for cache key compatibility"
+            fi
+          fi
         shell: bash
 
       - name: Run benchmark ops
@@ -1069,8 +1118,57 @@ jobs:
           VENV_PREFIX="tileops_nightly_venv"
           VENV_DIR="${VENV_PREFIX}_${HASH_INPUT}"
           VENV_PATH="/data/cache/venv/${VENV_DIR}"
+          VENV_REUSED="false"
 
-          echo "VENV_PATH=${VENV_PATH}" >> "$GITHUB_ENV"
+          if [[ -x "${VENV_PATH}/bin/python" ]]; then
+            VENV_REUSED="true"
+            echo "Found cached venv at ${VENV_PATH}"
+          fi
+
+          {
+            echo "VENV_PATH=${VENV_PATH}"
+            echo "VENV_REUSED=${VENV_REUSED}"
+          } >> "$GITHUB_ENV"
+        shell: bash
+
+      - name: Ensure venv exists
+        run: |
+          set -euo pipefail
+
+          # Add conda to PATH
+          export PATH="/opt/conda/bin:${PATH}"
+
+          if [[ "$VENV_REUSED" == "true" ]]; then
+            echo "Using cached venv at ${VENV_PATH}"
+            exit 0
+          fi
+
+          echo "Creating fresh venv at ${VENV_PATH}"
+          python -m venv --system-site-packages "${VENV_PATH}"
+          # shellcheck source=/dev/null
+          source "${VENV_PATH}/bin/activate"
+
+          # Copy pre-installed MACA torch packages from conda to venv
+          cp -rf /opt/conda/lib/python3.12/site-packages/* "${VENV_PATH}/lib/python3.12/site-packages/"
+
+          python -m pip install --upgrade pip setuptools wheel --no-user
+
+          # Install TileLang (MACA version)
+          pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@dev
+
+          # Install tileops with dev dependencies
+          PIP_NO_BUILD_ISOLATION=1 pip install --no-deps -e ".[dev]"
+
+          # Find the most recent cached venv to sync mtime with
+          TRUSTED_VENV_CANDIDATE=$(find /data/cache/venv -maxdepth 1 -name "tileops_*_venv_*" -type d -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2- || true)
+          if [[ -n "${TRUSTED_VENV_CANDIDATE}" && -d "${TRUSTED_VENV_CANDIDATE}" ]]; then
+            TRUSTED_LIB=$(find "${TRUSTED_VENV_CANDIDATE}" -name "libtilelang.so" -type f 2>/dev/null | head -1 || true)
+            NEW_LIB=$(find "${VENV_PATH}" -name "libtilelang.so" -type f 2>/dev/null | head -1 || true)
+            if [[ -n "$TRUSTED_LIB" && -n "$NEW_LIB" ]]; then
+              touch -r "$TRUSTED_LIB" "$NEW_LIB"
+              echo "Synced libtilelang.so mtime with ${TRUSTED_VENV_CANDIDATE} for cache key compatibility"
+            fi
+          fi
         shell: bash
 
       - name: Run full op tests
@@ -1260,8 +1358,57 @@ jobs:
           VENV_PREFIX="tileops_nightly_venv"
           VENV_DIR="${VENV_PREFIX}_${HASH_INPUT}"
           VENV_PATH="/data/cache/venv/${VENV_DIR}"
+          VENV_REUSED="false"
 
-          echo "VENV_PATH=${VENV_PATH}" >> "$GITHUB_ENV"
+          if [[ -x "${VENV_PATH}/bin/python" ]]; then
+            VENV_REUSED="true"
+            echo "Found cached venv at ${VENV_PATH}"
+          fi
+
+          {
+            echo "VENV_PATH=${VENV_PATH}"
+            echo "VENV_REUSED=${VENV_REUSED}"
+          } >> "$GITHUB_ENV"
+        shell: bash
+
+      - name: Ensure venv exists
+        run: |
+          set -euo pipefail
+
+          # Add conda to PATH
+          export PATH="/opt/conda/bin:${PATH}"
+
+          if [[ "$VENV_REUSED" == "true" ]]; then
+            echo "Using cached venv at ${VENV_PATH}"
+            exit 0
+          fi
+
+          echo "Creating fresh venv at ${VENV_PATH}"
+          python -m venv --system-site-packages "${VENV_PATH}"
+          # shellcheck source=/dev/null
+          source "${VENV_PATH}/bin/activate"
+
+          # Copy pre-installed MACA torch packages from conda to venv
+          cp -rf /opt/conda/lib/python3.12/site-packages/* "${VENV_PATH}/lib/python3.12/site-packages/"
+
+          python -m pip install --upgrade pip setuptools wheel --no-user
+
+          # Install TileLang (MACA version)
+          pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@dev
+
+          # Install tileops with dev dependencies
+          PIP_NO_BUILD_ISOLATION=1 pip install --no-deps -e ".[dev]"
+
+          # Find the most recent cached venv to sync mtime with
+          TRUSTED_VENV_CANDIDATE=$(find /data/cache/venv -maxdepth 1 -name "tileops_*_venv_*" -type d -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2- || true)
+          if [[ -n "${TRUSTED_VENV_CANDIDATE}" && -d "${TRUSTED_VENV_CANDIDATE}" ]]; then
+            TRUSTED_LIB=$(find "${TRUSTED_VENV_CANDIDATE}" -name "libtilelang.so" -type f 2>/dev/null | head -1 || true)
+            NEW_LIB=$(find "${VENV_PATH}" -name "libtilelang.so" -type f 2>/dev/null | head -1 || true)
+            if [[ -n "$TRUSTED_LIB" && -n "$NEW_LIB" ]]; then
+              touch -r "$TRUSTED_LIB" "$NEW_LIB"
+              echo "Synced libtilelang.so mtime with ${TRUSTED_VENV_CANDIDATE} for cache key compatibility"
+            fi
+          fi
         shell: bash
 
       - name: Build and test wheel package
