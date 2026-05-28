@@ -803,8 +803,8 @@ jobs:
           fi
 
   cache-warmup:
-    needs: [gpu-smoke]
     if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' }}
+    needs: [gpu-smoke]
     timeout-minutes: 120
     runs-on: tileops-metax-runner
     steps:
@@ -817,8 +817,7 @@ jobs:
         run: scripts/ci/verify_nightly_runner.sh
         shell: bash
 
-      - name: Resolve venv cache path
-        id: venv_cache
+      - name: Resolve runtime state
         run: |
           set -euo pipefail
 
@@ -840,14 +839,17 @@ jobs:
           VENV_PREFIX="tileops_nightly_venv"
           VENV_DIR="${VENV_PREFIX}_${HASH_INPUT}"
           VENV_PATH="/data/cache/venv/${VENV_DIR}"
-
-          echo "VENV_PATH=${VENV_PATH}" >> "$GITHUB_ENV"
-          echo "VENV_REUSED=false" >> "$GITHUB_ENV"
+          VENV_REUSED="false"
 
           if [[ -x "${VENV_PATH}/bin/python" ]]; then
-            echo "VENV_REUSED=true" >> "$GITHUB_ENV"
+            VENV_REUSED="true"
             echo "Found cached venv at ${VENV_PATH}"
           fi
+
+          {
+            echo "VENV_PATH=${VENV_PATH}"
+            echo "VENV_REUSED=${VENV_REUSED}"
+          } >> "$GITHUB_ENV"
         shell: bash
 
       - name: Create or reuse venv
@@ -879,7 +881,7 @@ jobs:
           PIP_NO_BUILD_ISOLATION=1 pip install --no-deps -e ".[dev]"
 
           # Find the most recent cached venv to sync mtime with
-          TRUSTED_VENV_CANDIDATE=$(find /data/cache/venv -maxdepth 1 -name "tileops_*_venv_*" -type d 2>/dev/null | xargs ls -td 2>/dev/null | head -1 || true)
+          TRUSTED_VENV_CANDIDATE=$(find /data/cache/venv -maxdepth 1 -name "tileops_*_venv_*" -type d -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2- || true)
           if [[ -n "${TRUSTED_VENV_CANDIDATE}" && -d "${TRUSTED_VENV_CANDIDATE}" ]]; then
             TRUSTED_LIB=$(find "${TRUSTED_VENV_CANDIDATE}" -name "libtilelang.so" -type f 2>/dev/null | head -1 || true)
             NEW_LIB=$(find "${VENV_PATH}" -name "libtilelang.so" -type f 2>/dev/null | head -1 || true)
@@ -932,8 +934,7 @@ jobs:
         run: scripts/ci/verify_nightly_runner.sh
         shell: bash
 
-      - name: Resolve venv cache path
-        id: venv_cache
+      - name: Resolve runtime state
         run: |
           set -euo pipefail
 
@@ -1031,8 +1032,7 @@ jobs:
         run: scripts/ci/verify_nightly_runner.sh
         shell: bash
 
-      - name: Resolve venv cache path
-        id: venv_cache
+      - name: Resolve runtime state
         run: |
           set -euo pipefail
 
@@ -1218,8 +1218,7 @@ jobs:
         run: scripts/ci/verify_nightly_runner.sh
         shell: bash
 
-      - name: Resolve venv cache path
-        id: venv_cache
+      - name: Resolve runtime state
         run: |
           set -euo pipefail
 
