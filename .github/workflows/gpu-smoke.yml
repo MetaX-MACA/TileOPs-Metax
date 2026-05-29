@@ -632,7 +632,7 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel --no-user
 
           # Install TileLang (MACA version)
-          pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@dev
+          pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@f7451dfce010234f540472d442b3f68d4f94232e
 
           if [[ "$IS_FORK" == "true" ]]; then
             FIND_LINKS_FLAG=""

@@ -42,7 +42,7 @@ python -m pip install --upgrade pip setuptools wheel --no-user
 pip install --no-cache-dir pytest-xdist
 
 # Install TileLang (MACA version)
-pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@dev
+pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@f7451dfce010234f540472d442b3f68d4f94232e
 
 {
   echo "RUNTIME_ROOT=${RUNTIME_ROOT}"
