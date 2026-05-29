@@ -430,6 +430,8 @@ jobs:
           venv-cache-dir: "/data/cache/venv"
 
       - name: Resolve runtime state
+        env:
+          IS_FORK: ${{ needs.security-policy.outputs.is_fork }}
         run: |
           set -euo pipefail
 
@@ -438,9 +440,22 @@ jobs:
 
           # Set MACA environment variables
           export USE_MACA=ON
+          # Narrow the venv cache key to sections that actually drive the
+          # installed package set. Hashing the whole pyproject.toml means a
+          # tweak to [tool.pytest] or [tool.ruff] invalidates every warm
+          # fork-PR venv, defeating #996's fast path for no packaging
+          # reason. See scripts/ci_venv_hash.py for the parsed sections and
+          # the full-file fallback contract.
+          #
+          # Trust note: always run the hash script from `.trusted/` (the
+          # sparse-checked-out base/head ref selected above). This prevents
+          # external fork PRs from executing attacker-controlled Python on
+          # the self-hosted runner before the IS_FORK runtime isolation
+          # branches. We also hash the `.trusted/` pyproject.toml so the
+          # computed key identifies the trusted venv that was actually
+          # installed from that same pyproject, not the fork's edits.
+          PYPROJECT_HASH=$(python .trusted/scripts/ci_venv_hash.py .trusted/pyproject.toml)
 
-          # Compute venv cache key from pyproject.toml
-          PYPROJECT_HASH=$(python scripts/ci_venv_hash.py pyproject.toml)
           HASH_INPUT="$(
             {
               echo "python=3.12"
@@ -626,7 +641,7 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel --no-user
 
           # Install TileLang (MACA version)
-          pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@dev
+          pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@f7451dfce010234f540472d442b3f68d4f94232e
 
           if [[ "$IS_FORK" == "true" ]]; then
             FIND_LINKS_FLAG=""
@@ -789,9 +804,9 @@ jobs:
           fi
 
   cache-warmup:
-    if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' }}
+    if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' }}
     needs: [gpu-smoke]
-    timeout-minutes: 120
+    timeout-minutes: 20
     runs-on: tileops-metax-runner
     steps:
       - name: Checkout code for fork PR
@@ -958,7 +973,7 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel --no-user
 
           # Install TileLang (MACA version)
-          pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@dev
+          pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@f7451dfce010234f540472d442b3f68d4f94232e
 
           PIP_NO_BUILD_ISOLATION=1 PIP_NO_CACHE_DIR=1 pip install --no-deps -e '.[dev]'
 
@@ -992,7 +1007,7 @@ jobs:
   benchmark:
     if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' }}
     needs: [cache-warmup]
-    timeout-minutes: 120
+    timeout-minutes: 20
     runs-on: tileops-metax-runner
     steps:
       - name: Checkout code for fork PR
@@ -1159,7 +1174,7 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel --no-user
 
           # Install TileLang (MACA version)
-          pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@dev
+          pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@f7451dfce010234f540472d442b3f68d4f94232e
 
           PIP_NO_BUILD_ISOLATION=1 PIP_NO_CACHE_DIR=1 pip install --no-deps -e '.[dev]'
 
@@ -1223,7 +1238,7 @@ jobs:
   op_test:
     if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' }}
     needs: [benchmark]
-    timeout-minutes: 180
+    timeout-minutes: 20
     runs-on: tileops-metax-runner
     steps:
       - name: Checkout code for fork PR
@@ -1390,7 +1405,7 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel --no-user
 
           # Install TileLang (MACA version)
-          pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@dev
+          pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@f7451dfce010234f540472d442b3f68d4f94232e
 
           PIP_NO_BUILD_ISOLATION=1 PIP_NO_CACHE_DIR=1 pip install --no-deps -e '.[dev]'
 
@@ -1712,7 +1727,7 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel --no-user
 
           # Install TileLang (MACA version)
-          pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@dev
+          pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@f7451dfce010234f540472d442b3f68d4f94232e
 
           PIP_NO_BUILD_ISOLATION=1 PIP_NO_CACHE_DIR=1 pip install --no-deps -e '.[dev]'
 
