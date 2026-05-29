@@ -803,10 +803,272 @@ jobs:
   #           rm -rf "${RUNTIME_ROOT}"
   #         fi
 
-  cache-warmup:
+  # cache-warmup:
+  #   if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' }}
+  #   needs: [ci-prereq, security-policy]
+  #   timeout-minutes: 60
+  #   runs-on: tileops-metax-runner
+  #   steps:
+  #     - name: Checkout code for fork PR
+  #       if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+  #       uses: actions/checkout@v4
+  #       with:
+  #         repository: ${{ github.event.pull_request.head.repo.full_name }}
+  #         ref: ${{ github.event.pull_request.head.sha }}
+  #         persist-credentials: false
+  #         fetch-depth: 1
+
+  #     - name: Checkout code for trusted branch
+  #       if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+  #       uses: actions/checkout@v4
+  #       with:
+  #         repository: ${{ github.repository }}
+  #         ref: ${{ github.event.pull_request.head.sha || github.sha }}
+  #         persist-credentials: false
+  #         fetch-depth: 1
+
+  #     - name: Install system dependencies
+  #       run: |
+  #         sudo apt-get update && sudo apt-get install -y git
+
+  #     - name: Checkout trusted actions (base repo)
+  #       uses: actions/checkout@v4
+  #       with:
+  #         repository: ${{ github.repository }}
+  #         ref: ${{ github.event.pull_request.head.sha || github.sha }}
+  #         path: .trusted
+  #         persist-credentials: false
+  #         fetch-depth: 1
+  #         sparse-checkout: |
+  #           .github/actions
+  #           scripts/ci_venv_hash.py
+  #           pyproject.toml
+
+  #     - name: Reclaim runner disk
+  #       uses: ./.trusted/.github/actions/reclaim-runner-disk
+  #       with:
+  #         reclaim-below-gib: "10"
+  #         cache-trim-cooldown-minutes: "120"
+  #         cache-dirs: |
+  #           /data/cache/triton
+  #           /data/cache/pip
+  #           /data/cache/wheels
+  #           /data/cache/tilelang/tmp
+  #         atomic-cache-dirs: |
+  #           /data/cache/tilelang/autotuner
+  #         df-paths: "/data /data/cache"
+  #         skip-atomic-age-trim: "true"
+  #         prune-tool-cache: "true"
+  #         venv-cache-dir: "/data/cache/venv"
+
+  #     - name: Resolve runtime state
+  #       run: |
+  #         set -euo pipefail
+
+  #         # Add conda to PATH
+  #         export PATH="/opt/conda/bin:${PATH}"
+
+  #         # Set MACA environment variables
+  #         export USE_MACA=ON
+
+  #         # Compute venv cache key from pyproject.toml
+  #         PYPROJECT_HASH=$(python scripts/ci_venv_hash.py pyproject.toml)
+  #         HASH_INPUT="$(
+  #           {
+  #             echo "python=3.12"
+  #             echo "tilelang=f7451dfce010234f540472d442b3f68d4f94232e"
+  #             echo "install=PIP_NO_BUILD_ISOLATION=1 pip install -e '.[dev]'"
+  #             echo "pyproject=${PYPROJECT_HASH}"
+  #           } | sha256sum | cut -c1-16
+  #         )"
+  #         VENV_PREFIX="tileops_ci_venv"
+  #         VENV_DIR="${VENV_PREFIX}_${HASH_INPUT}"
+  #         VENV_PATH="/data/cache/venv/${VENV_DIR}"
+  #         RUNTIME_ROOT="/home/ci-runner"
+  #         TILELANG_CACHE_DIR="/data/cache/tilelang"
+  #         TILELANG_TMP_DIR="${TILELANG_CACHE_DIR}/tmp"
+  #         TRITON_CACHE_DIR="/data/cache/triton"
+  #         PIP_CACHE_DIR="/data/cache/pip"
+  #         WHEEL_DIR="/data/cache/wheels"
+
+  #         mkdir -p "${TILELANG_CACHE_DIR}" "${TILELANG_TMP_DIR}" "${TRITON_CACHE_DIR}" "${PIP_CACHE_DIR}" "${WHEEL_DIR}"
+
+  #         VENV_REUSED="false"
+  #         if [[ -x "${VENV_PATH}/bin/python" ]]; then
+  #           VENV_REUSED="true"
+  #         fi
+
+  #         {
+  #           echo "PATH=${PATH}"
+  #           echo "USE_MACA=ON"
+  #           echo "RUNTIME_ROOT=${RUNTIME_ROOT}"
+  #           echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR}"
+  #           echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR}"
+  #           echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR}"
+  #           echo "PIP_CACHE_DIR=${PIP_CACHE_DIR}"
+  #           echo "WHEEL_DIR=${WHEEL_DIR}"
+  #           echo "VENV_PATH=${VENV_PATH}"
+  #           echo "VENV_REUSED=${VENV_REUSED}"
+  #         } >> "$GITHUB_ENV"
+
+  #     - name: Validate GPU frequency
+  #       run: |
+  #         set -euo pipefail
+  #         TARGET_CLOCK_MHZ=428
+  #         RETRIES=5
+  #         SLEEP_SECONDS=2
+
+  #         if ! command -v mx-smi >/dev/null 2>&1; then
+  #           echo "::error::mx-smi is not available on this runner."
+  #           exit 1
+  #         fi
+
+  #         echo "Detected GPUs:"
+  #         mx-smi -L
+
+  #         attempt=1
+  #         while [ "$attempt" -le "$RETRIES" ]; do
+  #           echo "Validation attempt ${attempt}/${RETRIES}"
+  #           mismatch=0
+  #           while IFS= read -r gpu_line; do
+  #             gpu_index=$(echo "$gpu_line" | grep -Eo 'GPU#[0-9]+' | grep -Eo '[0-9]+' | head -1)
+  #             gpu_name=$(echo "$gpu_line" | awk '{print $2}')
+  #             gpu_clock=$(mx-smi --show-clock | awk '/XCORE/ {print $(NF-1); exit}')
+  #             echo "GPU ${gpu_index} (${gpu_name}) XCORE clock: ${gpu_clock} MHz"
+  #             if [[ "$gpu_clock" != "$TARGET_CLOCK_MHZ" ]]; then
+  #               mismatch=1
+  #             fi
+  #           done < <(mx-smi -L 2>/dev/null | grep -E 'GPU#[0-9]+')
+
+  #           if [[ "$mismatch" -eq 0 ]]; then
+  #             echo "All GPUs locked at ${TARGET_CLOCK_MHZ} MHz."
+  #             break
+  #           fi
+
+  #           if [[ "$attempt" -eq "$RETRIES" ]]; then
+  #             echo "::error::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz on all GPUs."
+  #             exit 1
+  #           fi
+
+  #           sleep "$SLEEP_SECONDS"
+  #           attempt=$((attempt + 1))
+  #         done
+
+  #     - name: Ensure venv and install dependencies
+  #       run: |
+  #         set -euo pipefail
+
+  #         if [[ "$VENV_REUSED" == "true" ]]; then
+  #           echo "Using cached venv at ${VENV_PATH}"
+  #           exit 0
+  #         fi
+
+  #         echo "Creating fresh venv at ${VENV_PATH}"
+  #         python -m venv "${VENV_PATH}"
+  #         # shellcheck source=/dev/null
+  #         source "${VENV_PATH}/bin/activate"
+
+  #         # Copy pre-installed MACA torch packages from conda to venv
+  #         cp -rf /opt/conda/lib/python3.12/site-packages/* "${VENV_PATH}/lib/python3.12/site-packages/"
+
+  #         python -m pip install --upgrade pip setuptools wheel --no-user
+
+  #         # Install TileLang (MACA version)
+  #         pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@f7451dfce010234f540472d442b3f68d4f94232e
+
+  #         PIP_NO_BUILD_ISOLATION=1 PIP_NO_CACHE_DIR=1 pip install --no-deps -e '.[dev]'
+
+  #     - name: Debug cache namespace and structure
+  #       run: |
+  #         set -euo pipefail
+  #         source "${VENV_PATH}/bin/activate"
+
+  #         echo "=== TileLang version and cache info ==="
+  #         python -c "
+  #         import tilelang
+  #         from tilelang.cache.kernel_cache import KernelCache
+  #         from tilelang import env
+
+  #         print(f'tilelang.__version__: {tilelang.__version__}')
+  #         print(f'TILELANG_CACHE_DIR: {env.TILELANG_CACHE_DIR}')
+  #         print(f'cache namespace: {KernelCache._get_cache_namespace()}')
+  #         print(f'cache root: {KernelCache._get_cache_root()}')
+  #         print(f'')
+  #         print('=== Base key components ===')
+  #         base_key = KernelCache._get_base_key()
+  #         for k, v in base_key.items():
+  #             if k == 'tilelang_lib':
+  #                 print(f'{k}: {v[:50]}... (truncated)')
+  #             else:
+  #                 print(f'{k}: {v}')
+  #         "
+
+  #         echo ""
+  #         echo "=== Cache directory structure ==="
+  #         echo "--- TILELANG_CACHE_DIR contents ---"
+  #         ls -la "${TILELANG_CACHE_DIR}/" 2>/dev/null || echo "Directory not found or empty"
+
+  #         echo ""
+  #         echo "--- Namespace directories ---"
+  #         find "${TILELANG_CACHE_DIR}" -maxdepth 1 -type d 2>/dev/null || echo "No directories found"
+
+  #         echo ""
+  #         echo "--- Kernel cache per namespace ---"
+  #         for ns_dir in "${TILELANG_CACHE_DIR}"/*; do
+  #           if [[ -d "${ns_dir}" && "${ns_dir}" != "${TILELANG_CACHE_DIR}/tmp" ]]; then
+  #             ns_name=$(basename "${ns_dir}")
+  #             kernel_count=$(find "${ns_dir}" -name "kernel_lib.so" 2>/dev/null | wc -l)
+  #             autotune_count=$(find "${ns_dir}" -name "*.json" -path "*/autotuner/*" 2>/dev/null | wc -l)
+  #             ns_size=$(du -sh "${ns_dir}" 2>/dev/null | cut -f1)
+  #             echo "${ns_name}: ${kernel_count} kernels, ${autotune_count} autotune results, ${ns_size} size"
+  #           fi
+  #         done
+
+  #         echo ""
+  #         echo "--- Kernel cache size ---"
+  #         du -sh "${TILELANG_CACHE_DIR}" 2>/dev/null || echo "0"
+
+  #         echo ""
+  #         echo "--- Number of cached kernels (total) ---"
+  #         find "${TILELANG_CACHE_DIR}" -name "kernel_lib.so" 2>/dev/null | wc -l || echo "0"
+
+  #         echo ""
+  #         echo "--- Number of autotune results (total) ---"
+  #         find "${TILELANG_CACHE_DIR}" -name "*.json" -path "*/autotuner/*" 2>/dev/null | wc -l || echo "0"
+
+  #     - name: Warm kernel compilation cache
+  #       continue-on-error: true
+  #       run: |
+  #         set -euo pipefail
+  #         # shellcheck source=/dev/null
+  #         source "${VENV_PATH}/bin/activate"
+
+  #         pip install pytest-xdist
+
+  #         export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
+  #         echo "Starting kernel cache warmup..."
+  #         python scripts/warmup_kernel_cache.py --max-workers 4 -n 4
+  #       shell: bash
+
+  #     - name: Print venv cache status
+  #       if: ${{ always() }}
+  #       run: |
+  #         echo "VENV_PATH=${VENV_PATH}"
+  #         echo "VENV_REUSED=${VENV_REUSED}"
+  #         if [[ "${VENV_REUSED}" == "true" ]]; then
+  #           echo "CACHE_SIGNAL: nightly venv=hit"
+  #         else
+  #           echo "CACHE_SIGNAL: nightly venv=miss (fresh venv created)"
+  #         fi
+  #       shell: bash
+
+  # =========================================================================
+  # Phase 2 — Benchmark (exclusive GPU access for accurate profiling)
+  # =========================================================================
+  benchmark:
     if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' }}
     needs: [ci-prereq, security-policy]
-    timeout-minutes: 60
+    timeout-minutes: 20
     runs-on: tileops-metax-runner
     steps:
       - name: Checkout code for fork PR
@@ -978,320 +1240,59 @@ jobs:
 
           PIP_NO_BUILD_ISOLATION=1 PIP_NO_CACHE_DIR=1 pip install --no-deps -e '.[dev]'
 
-      - name: Debug cache namespace and structure
-        run: |
-          set -euo pipefail
-          source "${VENV_PATH}/bin/activate"
-
-          echo "=== TileLang version and cache info ==="
-          python -c "
-          import tilelang
-          from tilelang.cache.kernel_cache import KernelCache
-          from tilelang import env
-
-          print(f'tilelang.__version__: {tilelang.__version__}')
-          print(f'TILELANG_CACHE_DIR: {env.TILELANG_CACHE_DIR}')
-          print(f'cache namespace: {KernelCache._get_cache_namespace()}')
-          print(f'cache root: {KernelCache._get_cache_root()}')
-          print(f'')
-          print('=== Base key components ===')
-          base_key = KernelCache._get_base_key()
-          for k, v in base_key.items():
-              if k == 'tilelang_lib':
-                  print(f'{k}: {v[:50]}... (truncated)')
-              else:
-                  print(f'{k}: {v}')
-          "
-
-          echo ""
-          echo "=== Cache directory structure ==="
-          echo "--- TILELANG_CACHE_DIR contents ---"
-          ls -la "${TILELANG_CACHE_DIR}/" 2>/dev/null || echo "Directory not found or empty"
-
-          echo ""
-          echo "--- Namespace directories ---"
-          find "${TILELANG_CACHE_DIR}" -maxdepth 1 -type d 2>/dev/null || echo "No directories found"
-
-          echo ""
-          echo "--- Kernel cache per namespace ---"
-          for ns_dir in "${TILELANG_CACHE_DIR}"/*; do
-            if [[ -d "${ns_dir}" && "${ns_dir}" != "${TILELANG_CACHE_DIR}/tmp" ]]; then
-              ns_name=$(basename "${ns_dir}")
-              kernel_count=$(find "${ns_dir}" -name "kernel_lib.so" 2>/dev/null | wc -l)
-              autotune_count=$(find "${ns_dir}" -name "*.json" -path "*/autotuner/*" 2>/dev/null | wc -l)
-              ns_size=$(du -sh "${ns_dir}" 2>/dev/null | cut -f1)
-              echo "${ns_name}: ${kernel_count} kernels, ${autotune_count} autotune results, ${ns_size} size"
-            fi
-          done
-
-          echo ""
-          echo "--- Kernel cache size ---"
-          du -sh "${TILELANG_CACHE_DIR}" 2>/dev/null || echo "0"
-
-          echo ""
-          echo "--- Number of cached kernels (total) ---"
-          find "${TILELANG_CACHE_DIR}" -name "kernel_lib.so" 2>/dev/null | wc -l || echo "0"
-
-          echo ""
-          echo "--- Number of autotune results (total) ---"
-          find "${TILELANG_CACHE_DIR}" -name "*.json" -path "*/autotuner/*" 2>/dev/null | wc -l || echo "0"
-
-      - name: Warm kernel compilation cache
+      - name: Run benchmark ops
+        id: benchmark_tests
         continue-on-error: true
         run: |
           set -euo pipefail
           # shellcheck source=/dev/null
           source "${VENV_PATH}/bin/activate"
 
-          pip install pytest-xdist
+          # Validate GPU frequency
+          TARGET_CLOCK_MHZ=428
+          RETRIES=5
+          for i in $(seq 1 "${RETRIES}"); do
+            gpu_clock=$(mx-smi --show-clock | awk '/XCORE/ {print $(NF-1); exit}')
+            echo "GPU clock: ${gpu_clock} MHz (attempt ${i}/${RETRIES})"
+            if [ "${gpu_clock}" = "${TARGET_CLOCK_MHZ}" ]; then break; fi
+            if [ "${i}" -eq "${RETRIES}" ]; then
+              echo "::error::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz."
+              exit 1
+            fi
+            sleep 2
+          done
 
           export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
-          echo "Starting kernel cache warmup..."
-          python scripts/warmup_kernel_cache.py --max-workers 4 -n 4
-        shell: bash
+          echo "Runtime cache env:"
+          echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-}"
+          echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR:-}"
+          echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
 
-      - name: Print venv cache status
-        if: ${{ always() }}
-        run: |
-          echo "VENV_PATH=${VENV_PATH}"
-          echo "VENV_REUSED=${VENV_REUSED}"
-          if [[ "${VENV_REUSED}" == "true" ]]; then
-            echo "CACHE_SIGNAL: nightly venv=hit"
+          set -o pipefail
+          python -m pytest -q benchmarks/ops --junit-xml=bench_results.xml | tee tileops_benchmarks.log
+
+          if [ -f profile_run.log ]; then
+            { echo; echo "===== profile_run.log summary ====="; cat profile_run.log; } >> tileops_benchmarks.log
           else
-            echo "CACHE_SIGNAL: nightly venv=miss (fresh venv created)"
+            echo "::warning::profile_run.log not found; benchmark may have failed partially" >> tileops_benchmarks.log
           fi
         shell: bash
 
-  # # =========================================================================
-  # # Phase 2 — Benchmark (exclusive GPU access for accurate profiling)
-  # # =========================================================================
-  # benchmark:
-  #   if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' }}
-  #   needs: [cache-warmup]
-  #   timeout-minutes: 10
-  #   runs-on: tileops-metax-runner
-  #   steps:
-  #     - name: Checkout code for fork PR
-  #       if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
-  #       uses: actions/checkout@v4
-  #       with:
-  #         repository: ${{ github.event.pull_request.head.repo.full_name }}
-  #         ref: ${{ github.event.pull_request.head.sha }}
-  #         persist-credentials: false
-  #         fetch-depth: 1
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: tileops_benchmark_${{ github.run_id }}
+          path: |
+            tileops_benchmarks.log
+            bench_results.xml
+          if-no-files-found: warn
+          retention-days: 14
 
-  #     - name: Checkout code for trusted branch
-  #       if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-  #       uses: actions/checkout@v4
-  #       with:
-  #         repository: ${{ github.repository }}
-  #         ref: ${{ github.event.pull_request.head.sha || github.sha }}
-  #         persist-credentials: false
-  #         fetch-depth: 1
-
-  #     - name: Install system dependencies
-  #       run: |
-  #         sudo apt-get update && sudo apt-get install -y git
-
-  #     - name: Checkout trusted actions (base repo)
-  #       uses: actions/checkout@v4
-  #       with:
-  #         repository: ${{ github.repository }}
-  #         ref: ${{ github.event.pull_request.head.sha || github.sha }}
-  #         path: .trusted
-  #         persist-credentials: false
-  #         fetch-depth: 1
-  #         sparse-checkout: |
-  #           .github/actions
-  #           scripts/ci_venv_hash.py
-  #           pyproject.toml
-
-  #     - name: Reclaim runner disk
-  #       uses: ./.trusted/.github/actions/reclaim-runner-disk
-  #       with:
-  #         reclaim-below-gib: "10"
-  #         cache-trim-cooldown-minutes: "120"
-  #         cache-dirs: |
-  #           /data/cache/triton
-  #           /data/cache/pip
-  #           /data/cache/wheels
-  #           /data/cache/tilelang/tmp
-  #         atomic-cache-dirs: |
-  #           /data/cache/tilelang/autotuner
-  #         df-paths: "/data /data/cache"
-  #         skip-atomic-age-trim: "true"
-  #         prune-tool-cache: "true"
-  #         venv-cache-dir: "/data/cache/venv"
-
-  #     - name: Resolve runtime state
-  #       run: |
-  #         set -euo pipefail
-
-  #         # Add conda to PATH
-  #         export PATH="/opt/conda/bin:${PATH}"
-
-  #         # Set MACA environment variables
-  #         export USE_MACA=ON
-
-  #         # Compute venv cache key from pyproject.toml
-  #         PYPROJECT_HASH=$(python scripts/ci_venv_hash.py pyproject.toml)
-  #         HASH_INPUT="$(
-  #           {
-  #             echo "python=3.12"
-  #             echo "install=PIP_NO_BUILD_ISOLATION=1 pip install -e '.[dev]'"
-  #             echo "pyproject=${PYPROJECT_HASH}"
-  #           } | sha256sum | cut -c1-16
-  #         )"
-  #         VENV_PREFIX="tileops_ci_venv"
-  #         VENV_DIR="${VENV_PREFIX}_${HASH_INPUT}"
-  #         VENV_PATH="/data/cache/venv/${VENV_DIR}"
-  #         RUNTIME_ROOT="/home/ci-runner"
-  #         TILELANG_CACHE_DIR="/data/cache/tilelang"
-  #         TILELANG_TMP_DIR="${TILELANG_CACHE_DIR}/tmp"
-  #         TRITON_CACHE_DIR="/data/cache/triton"
-  #         PIP_CACHE_DIR="/data/cache/pip"
-  #         WHEEL_DIR="/data/cache/wheels"
-
-  #         mkdir -p "${TILELANG_CACHE_DIR}" "${TILELANG_TMP_DIR}" "${TRITON_CACHE_DIR}" "${PIP_CACHE_DIR}" "${WHEEL_DIR}"
-
-  #         VENV_REUSED="false"
-  #         if [[ -x "${VENV_PATH}/bin/python" ]]; then
-  #           VENV_REUSED="true"
-  #         fi
-
-  #         {
-  #           echo "PATH=${PATH}"
-  #           echo "USE_MACA=ON"
-  #           echo "RUNTIME_ROOT=${RUNTIME_ROOT}"
-  #           echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR}"
-  #           echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR}"
-  #           echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR}"
-  #           echo "PIP_CACHE_DIR=${PIP_CACHE_DIR}"
-  #           echo "WHEEL_DIR=${WHEEL_DIR}"
-  #           echo "VENV_PATH=${VENV_PATH}"
-  #           echo "VENV_REUSED=${VENV_REUSED}"
-  #         } >> "$GITHUB_ENV"
-
-  #     - name: Validate GPU frequency
-  #       run: |
-  #         set -euo pipefail
-  #         TARGET_CLOCK_MHZ=428
-  #         RETRIES=5
-  #         SLEEP_SECONDS=2
-
-  #         if ! command -v mx-smi >/dev/null 2>&1; then
-  #           echo "::error::mx-smi is not available on this runner."
-  #           exit 1
-  #         fi
-
-  #         echo "Detected GPUs:"
-  #         mx-smi -L
-
-  #         attempt=1
-  #         while [ "$attempt" -le "$RETRIES" ]; do
-  #           echo "Validation attempt ${attempt}/${RETRIES}"
-  #           mismatch=0
-  #           while IFS= read -r gpu_line; do
-  #             gpu_index=$(echo "$gpu_line" | grep -Eo 'GPU#[0-9]+' | grep -Eo '[0-9]+' | head -1)
-  #             gpu_name=$(echo "$gpu_line" | awk '{print $2}')
-  #             gpu_clock=$(mx-smi --show-clock | awk '/XCORE/ {print $(NF-1); exit}')
-  #             echo "GPU ${gpu_index} (${gpu_name}) XCORE clock: ${gpu_clock} MHz"
-  #             if [[ "$gpu_clock" != "$TARGET_CLOCK_MHZ" ]]; then
-  #               mismatch=1
-  #             fi
-  #           done < <(mx-smi -L 2>/dev/null | grep -E 'GPU#[0-9]+')
-
-  #           if [[ "$mismatch" -eq 0 ]]; then
-  #             echo "All GPUs locked at ${TARGET_CLOCK_MHZ} MHz."
-  #             break
-  #           fi
-
-  #           if [[ "$attempt" -eq "$RETRIES" ]]; then
-  #             echo "::error::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz on all GPUs."
-  #             exit 1
-  #           fi
-
-  #           sleep "$SLEEP_SECONDS"
-  #           attempt=$((attempt + 1))
-  #         done
-
-  #     - name: Ensure venv and install dependencies
-  #       run: |
-  #         set -euo pipefail
-
-  #         if [[ "$VENV_REUSED" == "true" ]]; then
-  #           echo "Using cached venv at ${VENV_PATH}"
-  #           exit 0
-  #         fi
-
-  #         echo "Creating fresh venv at ${VENV_PATH}"
-  #         python -m venv "${VENV_PATH}"
-  #         # shellcheck source=/dev/null
-  #         source "${VENV_PATH}/bin/activate"
-
-  #         # Copy pre-installed MACA torch packages from conda to venv
-  #         cp -rf /opt/conda/lib/python3.12/site-packages/* "${VENV_PATH}/lib/python3.12/site-packages/"
-
-  #         python -m pip install --upgrade pip setuptools wheel --no-user
-
-  #         # Install TileLang (MACA version)
-  #         pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@f7451dfce010234f540472d442b3f68d4f94232e
-
-  #         PIP_NO_BUILD_ISOLATION=1 PIP_NO_CACHE_DIR=1 pip install --no-deps -e '.[dev]'
-
-  #     - name: Run benchmark ops
-  #       id: benchmark_tests
-  #       continue-on-error: true
-  #       run: |
-  #         set -euo pipefail
-  #         # shellcheck source=/dev/null
-  #         source "${VENV_PATH}/bin/activate"
-
-  #         # Validate GPU frequency
-  #         TARGET_CLOCK_MHZ=428
-  #         RETRIES=5
-  #         for i in $(seq 1 "${RETRIES}"); do
-  #           gpu_clock=$(mx-smi --show-clock | awk '/XCORE/ {print $(NF-1); exit}')
-  #           echo "GPU clock: ${gpu_clock} MHz (attempt ${i}/${RETRIES})"
-  #           if [ "${gpu_clock}" = "${TARGET_CLOCK_MHZ}" ]; then break; fi
-  #           if [ "${i}" -eq "${RETRIES}" ]; then
-  #             echo "::error::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz."
-  #             exit 1
-  #           fi
-  #           sleep 2
-  #         done
-
-  #         export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
-  #         echo "Runtime cache env:"
-  #         echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-}"
-  #         echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR:-}"
-  #         echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
-
-  #         set -o pipefail
-  #         python -m pytest -q benchmarks/ops --junit-xml=bench_results.xml | tee tileops_benchmarks.log
-
-  #         if [ -f profile_run.log ]; then
-  #           { echo; echo "===== profile_run.log summary ====="; cat profile_run.log; } >> tileops_benchmarks.log
-  #         else
-  #           echo "::warning::profile_run.log not found; benchmark may have failed partially" >> tileops_benchmarks.log
-  #         fi
-  #       shell: bash
-
-  #     - name: Upload benchmark artifacts
-  #       uses: actions/upload-artifact@v4
-  #       if: ${{ always() }}
-  #       with:
-  #         name: tileops_benchmark_${{ github.run_id }}
-  #         path: |
-  #           tileops_benchmarks.log
-  #           bench_results.xml
-  #         if-no-files-found: warn
-  #         retention-days: 14
-
-  #     - name: Fail benchmark job if pytest failed
-  #       if: ${{ always() && steps.benchmark_tests.outcome == 'failure' }}
-  #       run: exit 1
-  #       shell: bash
+      - name: Fail benchmark job if pytest failed
+        if: ${{ always() && steps.benchmark_tests.outcome == 'failure' }}
+        run: exit 1
+        shell: bash
 
   # # =========================================================================
   # # Phase 3 — Op correctness tests (serial after benchmark for GPU exclusivity)
