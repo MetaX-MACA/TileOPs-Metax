@@ -1601,250 +1601,250 @@ jobs:
   # # Phase 4 — Packaging and smoke test
   # # =========================================================================
   # packaging:
-    if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' }}
-    needs: [op_test]
-    permissions:
-      contents: write
-    runs-on: tileops-metax-runner
-    steps:
-      - name: Checkout code for fork PR
-        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.sha }}
-          persist-credentials: false
-          fetch-depth: 1
+    # if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' }}
+    # needs: [op_test]
+    # permissions:
+    #   contents: write
+    # runs-on: tileops-metax-runner
+    # steps:
+    #   - name: Checkout code for fork PR
+    #     if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+    #     uses: actions/checkout@v4
+    #     with:
+    #       repository: ${{ github.event.pull_request.head.repo.full_name }}
+    #       ref: ${{ github.event.pull_request.head.sha }}
+    #       persist-credentials: false
+    #       fetch-depth: 1
 
-      - name: Checkout code for trusted branch
-        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository }}
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-          fetch-depth: 1
+    #   - name: Checkout code for trusted branch
+    #     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    #     uses: actions/checkout@v4
+    #     with:
+    #       repository: ${{ github.repository }}
+    #       ref: ${{ github.event.pull_request.head.sha || github.sha }}
+    #       persist-credentials: false
+    #       fetch-depth: 1
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update && sudo apt-get install -y git
+    #   - name: Install system dependencies
+    #     run: |
+    #       sudo apt-get update && sudo apt-get install -y git
 
-      - name: Checkout trusted actions (base repo)
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository }}
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          path: .trusted
-          persist-credentials: false
-          fetch-depth: 1
-          sparse-checkout: |
-            .github/actions
-            scripts/ci_venv_hash.py
-            pyproject.toml
+    #   - name: Checkout trusted actions (base repo)
+    #     uses: actions/checkout@v4
+    #     with:
+    #       repository: ${{ github.repository }}
+    #       ref: ${{ github.event.pull_request.head.sha || github.sha }}
+    #       path: .trusted
+    #       persist-credentials: false
+    #       fetch-depth: 1
+    #       sparse-checkout: |
+    #         .github/actions
+    #         scripts/ci_venv_hash.py
+    #         pyproject.toml
 
-      - name: Reclaim runner disk
-        uses: ./.trusted/.github/actions/reclaim-runner-disk
-        with:
-          reclaim-below-gib: "10"
-          cache-trim-cooldown-minutes: "120"
-          cache-dirs: |
-            /data/cache/triton
-            /data/cache/pip
-            /data/cache/wheels
-            /data/cache/tilelang/tmp
-          atomic-cache-dirs: |
-            /data/cache/tilelang/autotuner
-          df-paths: "/data /data/cache"
-          skip-atomic-age-trim: "true"
-          prune-tool-cache: "true"
-          venv-cache-dir: "/data/cache/venv"
+    #   - name: Reclaim runner disk
+    #     uses: ./.trusted/.github/actions/reclaim-runner-disk
+    #     with:
+    #       reclaim-below-gib: "10"
+    #       cache-trim-cooldown-minutes: "120"
+    #       cache-dirs: |
+    #         /data/cache/triton
+    #         /data/cache/pip
+    #         /data/cache/wheels
+    #         /data/cache/tilelang/tmp
+    #       atomic-cache-dirs: |
+    #         /data/cache/tilelang/autotuner
+    #       df-paths: "/data /data/cache"
+    #       skip-atomic-age-trim: "true"
+    #       prune-tool-cache: "true"
+    #       venv-cache-dir: "/data/cache/venv"
 
-      - name: Resolve runtime state
-        run: |
-          set -euo pipefail
+    #   - name: Resolve runtime state
+    #     run: |
+    #       set -euo pipefail
 
-          # Add conda to PATH
-          export PATH="/opt/conda/bin:${PATH}"
+    #       # Add conda to PATH
+    #       export PATH="/opt/conda/bin:${PATH}"
 
-          # Set MACA environment variables
-          export USE_MACA=ON
+    #       # Set MACA environment variables
+    #       export USE_MACA=ON
 
-          # Compute venv cache key from pyproject.toml
-          PYPROJECT_HASH=$(python scripts/ci_venv_hash.py pyproject.toml)
-          HASH_INPUT="$(
-            {
-              echo "python=3.12"
-              echo "install=PIP_NO_BUILD_ISOLATION=1 pip install -e '.[dev]'"
-              echo "pyproject=${PYPROJECT_HASH}"
-            } | sha256sum | cut -c1-16
-          )"
-          VENV_PREFIX="tileops_ci_venv"
-          VENV_DIR="${VENV_PREFIX}_${HASH_INPUT}"
-          VENV_PATH="/data/cache/venv/${VENV_DIR}"
-          RUNTIME_ROOT="/home/ci-runner"
-          TILELANG_CACHE_DIR="/data/cache/tilelang"
-          TILELANG_TMP_DIR="${TILELANG_CACHE_DIR}/tmp"
-          TRITON_CACHE_DIR="/data/cache/triton"
-          PIP_CACHE_DIR="/data/cache/pip"
-          WHEEL_DIR="/data/cache/wheels"
+    #       # Compute venv cache key from pyproject.toml
+    #       PYPROJECT_HASH=$(python scripts/ci_venv_hash.py pyproject.toml)
+    #       HASH_INPUT="$(
+    #         {
+    #           echo "python=3.12"
+    #           echo "install=PIP_NO_BUILD_ISOLATION=1 pip install -e '.[dev]'"
+    #           echo "pyproject=${PYPROJECT_HASH}"
+    #         } | sha256sum | cut -c1-16
+    #       )"
+    #       VENV_PREFIX="tileops_ci_venv"
+    #       VENV_DIR="${VENV_PREFIX}_${HASH_INPUT}"
+    #       VENV_PATH="/data/cache/venv/${VENV_DIR}"
+    #       RUNTIME_ROOT="/home/ci-runner"
+    #       TILELANG_CACHE_DIR="/data/cache/tilelang"
+    #       TILELANG_TMP_DIR="${TILELANG_CACHE_DIR}/tmp"
+    #       TRITON_CACHE_DIR="/data/cache/triton"
+    #       PIP_CACHE_DIR="/data/cache/pip"
+    #       WHEEL_DIR="/data/cache/wheels"
 
-          mkdir -p "${TILELANG_CACHE_DIR}" "${TILELANG_TMP_DIR}" "${TRITON_CACHE_DIR}" "${PIP_CACHE_DIR}" "${WHEEL_DIR}"
+    #       mkdir -p "${TILELANG_CACHE_DIR}" "${TILELANG_TMP_DIR}" "${TRITON_CACHE_DIR}" "${PIP_CACHE_DIR}" "${WHEEL_DIR}"
 
-          VENV_REUSED="false"
-          if [[ -x "${VENV_PATH}/bin/python" ]]; then
-            VENV_REUSED="true"
-          fi
+    #       VENV_REUSED="false"
+    #       if [[ -x "${VENV_PATH}/bin/python" ]]; then
+    #         VENV_REUSED="true"
+    #       fi
 
-          {
-            echo "PATH=${PATH}"
-            echo "USE_MACA=ON"
-            echo "RUNTIME_ROOT=${RUNTIME_ROOT}"
-            echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR}"
-            echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR}"
-            echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR}"
-            echo "PIP_CACHE_DIR=${PIP_CACHE_DIR}"
-            echo "WHEEL_DIR=${WHEEL_DIR}"
-            echo "VENV_PATH=${VENV_PATH}"
-            echo "VENV_REUSED=${VENV_REUSED}"
-          } >> "$GITHUB_ENV"
+    #       {
+    #         echo "PATH=${PATH}"
+    #         echo "USE_MACA=ON"
+    #         echo "RUNTIME_ROOT=${RUNTIME_ROOT}"
+    #         echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR}"
+    #         echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR}"
+    #         echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR}"
+    #         echo "PIP_CACHE_DIR=${PIP_CACHE_DIR}"
+    #         echo "WHEEL_DIR=${WHEEL_DIR}"
+    #         echo "VENV_PATH=${VENV_PATH}"
+    #         echo "VENV_REUSED=${VENV_REUSED}"
+    #       } >> "$GITHUB_ENV"
 
-      - name: Validate GPU frequency
-        run: |
-          set -euo pipefail
-          TARGET_CLOCK_MHZ=428
-          RETRIES=5
-          SLEEP_SECONDS=2
+    #   - name: Validate GPU frequency
+    #     run: |
+    #       set -euo pipefail
+    #       TARGET_CLOCK_MHZ=428
+    #       RETRIES=5
+    #       SLEEP_SECONDS=2
 
-          if ! command -v mx-smi >/dev/null 2>&1; then
-            echo "::error::mx-smi is not available on this runner."
-            exit 1
-          fi
+    #       if ! command -v mx-smi >/dev/null 2>&1; then
+    #         echo "::error::mx-smi is not available on this runner."
+    #         exit 1
+    #       fi
 
-          echo "Detected GPUs:"
-          mx-smi -L
+    #       echo "Detected GPUs:"
+    #       mx-smi -L
 
-          attempt=1
-          while [ "$attempt" -le "$RETRIES" ]; do
-            echo "Validation attempt ${attempt}/${RETRIES}"
-            mismatch=0
-            while IFS= read -r gpu_line; do
-              gpu_index=$(echo "$gpu_line" | grep -Eo 'GPU#[0-9]+' | grep -Eo '[0-9]+' | head -1)
-              gpu_name=$(echo "$gpu_line" | awk '{print $2}')
-              gpu_clock=$(mx-smi --show-clock | awk '/XCORE/ {print $(NF-1); exit}')
-              echo "GPU ${gpu_index} (${gpu_name}) XCORE clock: ${gpu_clock} MHz"
-              if [[ "$gpu_clock" != "$TARGET_CLOCK_MHZ" ]]; then
-                mismatch=1
-              fi
-            done < <(mx-smi -L 2>/dev/null | grep -E 'GPU#[0-9]+')
+    #       attempt=1
+    #       while [ "$attempt" -le "$RETRIES" ]; do
+    #         echo "Validation attempt ${attempt}/${RETRIES}"
+    #         mismatch=0
+    #         while IFS= read -r gpu_line; do
+    #           gpu_index=$(echo "$gpu_line" | grep -Eo 'GPU#[0-9]+' | grep -Eo '[0-9]+' | head -1)
+    #           gpu_name=$(echo "$gpu_line" | awk '{print $2}')
+    #           gpu_clock=$(mx-smi --show-clock | awk '/XCORE/ {print $(NF-1); exit}')
+    #           echo "GPU ${gpu_index} (${gpu_name}) XCORE clock: ${gpu_clock} MHz"
+    #           if [[ "$gpu_clock" != "$TARGET_CLOCK_MHZ" ]]; then
+    #             mismatch=1
+    #           fi
+    #         done < <(mx-smi -L 2>/dev/null | grep -E 'GPU#[0-9]+')
 
-            if [[ "$mismatch" -eq 0 ]]; then
-              echo "All GPUs locked at ${TARGET_CLOCK_MHZ} MHz."
-              break
-            fi
+    #         if [[ "$mismatch" -eq 0 ]]; then
+    #           echo "All GPUs locked at ${TARGET_CLOCK_MHZ} MHz."
+    #           break
+    #         fi
 
-            if [[ "$attempt" -eq "$RETRIES" ]]; then
-              echo "::error::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz on all GPUs."
-              exit 1
-            fi
+    #         if [[ "$attempt" -eq "$RETRIES" ]]; then
+    #           echo "::error::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz on all GPUs."
+    #           exit 1
+    #         fi
 
-            sleep "$SLEEP_SECONDS"
-            attempt=$((attempt + 1))
-          done
+    #         sleep "$SLEEP_SECONDS"
+    #         attempt=$((attempt + 1))
+    #       done
 
-      - name: Ensure venv and install dependencies
-        run: |
-          set -euo pipefail
+    #   - name: Ensure venv and install dependencies
+    #     run: |
+    #       set -euo pipefail
 
-          if [[ "$VENV_REUSED" == "true" ]]; then
-            echo "Using cached venv at ${VENV_PATH}"
-            exit 0
-          fi
+    #       if [[ "$VENV_REUSED" == "true" ]]; then
+    #         echo "Using cached venv at ${VENV_PATH}"
+    #         exit 0
+    #       fi
 
-          echo "Creating fresh venv at ${VENV_PATH}"
-          python -m venv "${VENV_PATH}"
-          # shellcheck source=/dev/null
-          source "${VENV_PATH}/bin/activate"
+    #       echo "Creating fresh venv at ${VENV_PATH}"
+    #       python -m venv "${VENV_PATH}"
+    #       # shellcheck source=/dev/null
+    #       source "${VENV_PATH}/bin/activate"
 
-          # Copy pre-installed MACA torch packages from conda to venv
-          cp -rf /opt/conda/lib/python3.12/site-packages/* "${VENV_PATH}/lib/python3.12/site-packages/"
+    #       # Copy pre-installed MACA torch packages from conda to venv
+    #       cp -rf /opt/conda/lib/python3.12/site-packages/* "${VENV_PATH}/lib/python3.12/site-packages/"
 
-          python -m pip install --upgrade pip setuptools wheel --no-user
+    #       python -m pip install --upgrade pip setuptools wheel --no-user
 
-          # Install TileLang (MACA version)
-          pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@f7451dfce010234f540472d442b3f68d4f94232e
+    #       # Install TileLang (MACA version)
+    #       pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@f7451dfce010234f540472d442b3f68d4f94232e
 
-          PIP_NO_BUILD_ISOLATION=1 PIP_NO_CACHE_DIR=1 pip install --no-deps -e '.[dev]'
+    #       PIP_NO_BUILD_ISOLATION=1 PIP_NO_CACHE_DIR=1 pip install --no-deps -e '.[dev]'
 
 
-      - name: Build and test wheel package
-        run: |
-          set -euo pipefail
-          exec > >(tee packaging.log) 2>&1
-          # shellcheck source=/dev/null
-          source "${VENV_PATH}/bin/activate"
+    #   - name: Build and test wheel package
+    #     run: |
+    #       set -euo pipefail
+    #       exec > >(tee packaging.log) 2>&1
+    #       # shellcheck source=/dev/null
+    #       source "${VENV_PATH}/bin/activate"
 
-          # Validate GPU frequency
-          TARGET_CLOCK_MHZ=428
-          RETRIES=5
-          for i in $(seq 1 "${RETRIES}"); do
-            gpu_clock=$(mx-smi --show-clock | awk '/XCORE/ {print $(NF-1); exit}')
-            echo "GPU clock: ${gpu_clock} MHz (attempt ${i}/${RETRIES})"
-            if [ "${gpu_clock}" = "${TARGET_CLOCK_MHZ}" ]; then break; fi
-            if [ "${i}" -eq "${RETRIES}" ]; then
-              echo "::error::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz."
-              exit 1
-            fi
-            sleep 2
-          done
+    #       # Validate GPU frequency
+    #       TARGET_CLOCK_MHZ=428
+    #       RETRIES=5
+    #       for i in $(seq 1 "${RETRIES}"); do
+    #         gpu_clock=$(mx-smi --show-clock | awk '/XCORE/ {print $(NF-1); exit}')
+    #         echo "GPU clock: ${gpu_clock} MHz (attempt ${i}/${RETRIES})"
+    #         if [ "${gpu_clock}" = "${TARGET_CLOCK_MHZ}" ]; then break; fi
+    #         if [ "${i}" -eq "${RETRIES}" ]; then
+    #           echo "::error::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz."
+    #           exit 1
+    #         fi
+    #         sleep 2
+    #       done
 
-          pip install build pytest
+    #       pip install build pytest
 
-          echo "=== Build wheel package ==="
-          python -m build --wheel
-          echo "=== Build artifacts ==="
-          ls -lh dist/*.whl
+    #       echo "=== Build wheel package ==="
+    #       python -m build --wheel
+    #       echo "=== Build artifacts ==="
+    #       ls -lh dist/*.whl
 
-          echo "=== Install built wheel ==="
-          pip install --no-deps dist/*.whl
+    #       echo "=== Install built wheel ==="
+    #       pip install --no-deps dist/*.whl
 
-          TMP_TEST_DIR="$(mktemp -d /tmp/packaging-test.XXXXXX)"
-          cp -r tests "${TMP_TEST_DIR}/tests"
-          cp pyproject.toml "${TMP_TEST_DIR}/"
-          cd "${TMP_TEST_DIR}"
+    #       TMP_TEST_DIR="$(mktemp -d /tmp/packaging-test.XXXXXX)"
+    #       cp -r tests "${TMP_TEST_DIR}/tests"
+    #       cp pyproject.toml "${TMP_TEST_DIR}/"
+    #       cd "${TMP_TEST_DIR}"
 
-          echo "=== Runtime cache env ==="
-          echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-}"
-          echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR:-}"
-          echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
+    #       echo "=== Runtime cache env ==="
+    #       echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-}"
+    #       echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR:-}"
+    #       echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
 
-          echo "=== Run pytest packaging ==="
-          python -m pytest -q tests/ops -m "packaging" \
-            --junit-xml="${GITHUB_WORKSPACE}/packaging_smoke.xml"
-        shell: bash
+    #       echo "=== Run pytest packaging ==="
+    #       python -m pytest -q tests/ops -m "packaging" \
+    #         --junit-xml="${GITHUB_WORKSPACE}/packaging_smoke.xml"
+    #     shell: bash
 
-      - name: Upload wheel artifact
-        if: ${{ success() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: tileops-wheel-${{ github.sha }}
-          path: dist/*.whl
-          if-no-files-found: error
-          retention-days: 14
+    #   - name: Upload wheel artifact
+    #     if: ${{ success() }}
+    #     uses: actions/upload-artifact@v4
+    #     with:
+    #       name: tileops-wheel-${{ github.sha }}
+    #       path: dist/*.whl
+    #       if-no-files-found: error
+    #       retention-days: 14
 
-      - name: Upload packaging logs
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: packaging-logs-${{ github.sha }}
-          path: |
-            packaging.log
-            packaging_smoke.xml
-          if-no-files-found: warn
-          retention-days: 14
+    #   - name: Upload packaging logs
+    #     if: ${{ always() }}
+    #     uses: actions/upload-artifact@v4
+    #     with:
+    #       name: packaging-logs-${{ github.sha }}
+    #       path: |
+    #         packaging.log
+    #         packaging_smoke.xml
+    #       if-no-files-found: warn
+    #       retention-days: 14
 
-      - name: Publish wheel to GitHub Release (tag only)
-        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*.whl
-          fail_on_unmatched_files: true
+    #   - name: Publish wheel to GitHub Release (tag only)
+    #     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    #     uses: softprops/action-gh-release@v2
+    #     with:
+    #       files: dist/*.whl
+    #       fail_on_unmatched_files: true
