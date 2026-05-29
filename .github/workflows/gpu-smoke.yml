@@ -806,7 +806,7 @@ jobs:
   cache-warmup:
     if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' }}
     needs: [gpu-smoke]
-    timeout-minutes: 20
+    timeout-minutes: 300
     runs-on: tileops-metax-runner
     steps:
       - name: Checkout code for fork PR
@@ -1047,7 +1047,7 @@ jobs:
 
           export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
           echo "Starting kernel cache warmup..."
-          # python scripts/warmup_kernel_cache.py --max-workers 4 -n 4
+          python scripts/warmup_kernel_cache.py --max-workers 4 -n 4
         shell: bash
 
       - name: Print venv cache status
