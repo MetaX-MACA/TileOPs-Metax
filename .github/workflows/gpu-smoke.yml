@@ -876,6 +876,7 @@ jobs:
           HASH_INPUT="$(
             {
               echo "python=3.12"
+              echo "tilelang=f7451dfce010234f540472d442b3f68d4f94232e"
               echo "install=PIP_NO_BUILD_ISOLATION=1 pip install -e '.[dev]'"
               echo "pyproject=${PYPROJECT_HASH}"
             } | sha256sum | cut -c1-16
@@ -1012,12 +1013,28 @@ jobs:
           find "${TILELANG_CACHE_DIR}" -maxdepth 1 -type d 2>/dev/null || echo "No directories found"
 
           echo ""
+          echo "--- Kernel cache per namespace ---"
+          for ns_dir in "${TILELANG_CACHE_DIR}"/*; do
+            if [[ -d "${ns_dir}" && "${ns_dir}" != "${TILELANG_CACHE_DIR}/tmp" ]]; then
+              ns_name=$(basename "${ns_dir}")
+              kernel_count=$(find "${ns_dir}" -name "kernel_lib.so" 2>/dev/null | wc -l)
+              autotune_count=$(find "${ns_dir}" -name "*.json" -path "*/autotuner/*" 2>/dev/null | wc -l)
+              ns_size=$(du -sh "${ns_dir}" 2>/dev/null | cut -f1)
+              echo "${ns_name}: ${kernel_count} kernels, ${autotune_count} autotune results, ${ns_size} size"
+            fi
+          done
+
+          echo ""
           echo "--- Kernel cache size ---"
           du -sh "${TILELANG_CACHE_DIR}" 2>/dev/null || echo "0"
 
           echo ""
-          echo "--- Number of cached kernels ---"
+          echo "--- Number of cached kernels (total) ---"
           find "${TILELANG_CACHE_DIR}" -name "kernel_lib.so" 2>/dev/null | wc -l || echo "0"
+
+          echo ""
+          echo "--- Number of autotune results (total) ---"
+          find "${TILELANG_CACHE_DIR}" -name "*.json" -path "*/autotuner/*" 2>/dev/null | wc -l || echo "0"
 
       - name: Warm kernel compilation cache
         continue-on-error: true
@@ -1030,7 +1047,7 @@ jobs:
 
           export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
           echo "Starting kernel cache warmup..."
-          python scripts/warmup_kernel_cache.py --max-workers 4 -n 4
+          # python scripts/warmup_kernel_cache.py --max-workers 4 -n 4
         shell: bash
 
       - name: Print venv cache status
