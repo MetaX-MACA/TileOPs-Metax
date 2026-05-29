@@ -60,8 +60,9 @@ def main():
           f"x {args.max_workers} compile threads each")
 
     # Collect benchmark files and shard.
+    # Use recursive glob to include subdirectories like attention/
     bench_dir = os.path.join(os.path.dirname(__file__), "..", "benchmarks", "ops")
-    all_files = sorted(glob.glob(os.path.join(bench_dir, "bench_*.py")))
+    all_files = sorted(glob.glob(os.path.join(bench_dir, "**", "bench_*.py"), recursive=True))
     shard_files = all_files[args.shard::args.total_shards]
 
     if not shard_files:
