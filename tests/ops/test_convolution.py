@@ -49,7 +49,7 @@ class Conv1dFixture(FixtureBase):
             ),
             pytest.param(
                 2, 128, 4096, 256, 3, 2, 1, 1, torch.bfloat16, False,
-                marks=[pytest.mark.full, pytest.mark.skip(reason="Tensor-likes are not close")],
+                marks=pytest.mark.full,
                 id="full-sequence-downsample-k3-s2-bf16",
             ),
             pytest.param(
@@ -101,15 +101,15 @@ class Conv1dTest(TestBase):
         bias: Optional[torch.Tensor],
     ) -> torch.Tensor:
         out = F.conv1d(
-            x.permute(0, 2, 1).contiguous(),
-            weight,
-            bias=bias,
+            x.permute(0, 2, 1).float(),
+            weight.float(),
+            bias=bias.float() if bias is not None else None,
             stride=self.stride,
             padding=self.padding,
             dilation=self.dilation,
             groups=1,
         )
-        return out.permute(0, 2, 1).contiguous()
+        return out.permute(0, 2, 1).to(dtype=x.dtype).contiguous()
 
 
 @Conv1dFixture
@@ -261,7 +261,7 @@ class Conv2dFixture(FixtureBase):
             ),
             pytest.param(
                 1, 128, 56, 56, 256, (3, 3), (2, 2), (1, 1), torch.float16, False,
-                marks=[pytest.mark.full, pytest.mark.skip(reason="Tensor-likes are not close")],
+                marks=pytest.mark.full,
                 id="full-stage-transition-3x3-s2-fp16",
             ),
             pytest.param(
@@ -338,15 +338,15 @@ class Conv2dTest(TestBase):
         bias: Optional[torch.Tensor],
     ) -> torch.Tensor:
         out = F.conv2d(
-            x.permute(0, 3, 1, 2).contiguous(),
-            weight,
-            bias=bias,
+            x.permute(0, 3, 1, 2).float(),
+            weight.float(),
+            bias=bias.float() if bias is not None else None,
             stride=self.stride,
             padding=self.padding,
             dilation=1,
             groups=1,
         )
-        return out.permute(0, 2, 3, 1).contiguous()
+        return out.permute(0, 2, 3, 1).to(dtype=x.dtype).contiguous()
 
 
 @Conv2dFixture
@@ -465,12 +465,12 @@ class Conv3dFixture(FixtureBase):
         ("n, c_in, d_in, h_in, w_in, c_out, kernel_size, stride, padding, dtype, tune", [
             pytest.param(
                 1, 16, 8, 32, 32, 32, (3, 3, 3), (1, 1, 1), (1, 1, 1), torch.float16, False,
-                marks=[pytest.mark.smoke, pytest.mark.skip(reason="Tensor-likes are not close")],
+                marks=pytest.mark.smoke,
                 id="smoke-3d-unet-k3-s1-fp16",
             ),
             pytest.param(
                 1, 16, 8, 32, 32, 32, (3, 3, 3), (1, 1, 1), (1, 1, 1), torch.bfloat16, False,
-                marks=[pytest.mark.smoke, pytest.mark.skip(reason="Tensor-likes are not close")],
+                marks=pytest.mark.smoke,
                 id="smoke-3d-unet-k3-s1-bf16",
             ),
             pytest.param(
@@ -480,7 +480,7 @@ class Conv3dFixture(FixtureBase):
             ),
             pytest.param(
                 1, 64, 8, 56, 56, 128, (3, 3, 3), (2, 2, 2), (1, 1, 1), torch.float16, False,
-                marks=[pytest.mark.full, pytest.mark.skip(reason="Tensor-likes are not close")],
+                marks=pytest.mark.full,
                 id="full-video-stage-downsample-k3-s2-fp16",
             ),
             pytest.param(
@@ -537,15 +537,15 @@ class Conv3dTest(TestBase):
         bias: Optional[torch.Tensor],
     ) -> torch.Tensor:
         out = F.conv3d(
-            x.permute(0, 4, 1, 2, 3).contiguous(),
-            weight,
-            bias=bias,
+            x.permute(0, 4, 1, 2, 3).contiguous().float(),
+            weight.float(),
+            bias=bias.float() if bias is not None else None,
             stride=self.stride,
             padding=self.padding,
             dilation=1,
             groups=1,
         )
-        return out.permute(0, 2, 3, 4, 1).contiguous()
+        return out.permute(0, 2, 3, 4, 1).to(dtype=x.dtype).contiguous()
 
 
 @Conv3dFixture
@@ -582,7 +582,6 @@ def test_conv3d(
 
 
 @pytest.mark.smoke
-@pytest.mark.skip(reason="Tensor-likes are not close")
 def test_conv3d_accepts_zero_bias() -> None:
     op = Conv3dOp(
         n=1,
@@ -601,13 +600,13 @@ def test_conv3d_accepts_zero_bias() -> None:
     bias = torch.zeros(16, device="cuda", dtype=torch.float16).contiguous()
     out = op(x, weight, bias)
     ref = F.conv3d(
-        x.permute(0, 4, 1, 2, 3).contiguous(),
-        weight,
-        bias=bias,
+        x.permute(0, 4, 1, 2, 3).contiguous().float(),
+        weight.float(),
+        bias=bias.float(),
         stride=2,
         padding=1,
     )
-    ref = ref.permute(0, 2, 3, 4, 1).contiguous()
+    ref = ref.permute(0, 2, 3, 4, 1).to(dtype=x.dtype).contiguous()
     torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
 
 

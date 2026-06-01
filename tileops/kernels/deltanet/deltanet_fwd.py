@@ -284,9 +284,9 @@ class DeltaNetFwdKernel(Kernel):
     def default_config(self) -> dict:
         h_block_v = 32 if self.chunk_size >= 64 else 0
         return {
-            "fused_num_stages": 2,
+            "fused_num_stages": 0,
             "fused_threads": 256,
-            "h_num_stages": 2,
+            "h_num_stages": 0,
             "h_threads": 256,
             "h_block_v": h_block_v,
             "o_threads": 256,

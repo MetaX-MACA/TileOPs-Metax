@@ -141,7 +141,7 @@ def test_grouped_gemm_block_m(label, true_batch_sizes, N, K):
             transpose_a=False,
             transpose_b=True,
             config={"block_m": bm, "block_n": 256, "block_k": 64,
-                    "num_stages": 2, "threads": 128},
+                    "num_stages": 1, "threads": 128},
         )
 
         # Warmup / JIT compile
