@@ -46,8 +46,16 @@ if [[ ! -f "$PYPROJECT_PATH" ]]; then
   exit 1
 fi
 
+# ci_venv_hash.py is in scripts/ directory (not scripts/ci/)
+CI_VENV_HASH_SCRIPT="${PROJECT_ROOT}/scripts/ci_venv_hash.py"
+
+if [[ ! -f "$CI_VENV_HASH_SCRIPT" ]]; then
+  echo "::error::ci_venv_hash.py not found at ${CI_VENV_HASH_SCRIPT}"
+  exit 1
+fi
+
 # Compute hash using ci_venv_hash.py (same as gpu-smoke.yml benchmark job)
-PYPROJECT_HASH=$(python "${SCRIPT_DIR}/ci_venv_hash.py" "$PYPROJECT_PATH")
+PYPROJECT_HASH=$(python "${CI_VENV_HASH_SCRIPT}" "$PYPROJECT_PATH")
 
 HASH_INPUT="$(
   {
