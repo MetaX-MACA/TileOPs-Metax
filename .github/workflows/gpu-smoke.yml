@@ -805,7 +805,7 @@ jobs:
 
   cache-warmup:
     if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' }}
-    needs: [cache-cleanup]
+    needs: [gpu-smoke]
     timeout-minutes: 300
     runs-on: tileops-metax-runner
     steps:
