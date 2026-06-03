@@ -166,6 +166,56 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y git
 
+      - name: Resolve runtime state
+        run: |
+          set -euo pipefail
+
+          # Add conda to PATH
+          export PATH="/opt/conda/bin:${PATH}"
+
+          # Set MACA environment variables
+          export USE_MACA=ON
+
+          # Compute venv cache key from pyproject.toml
+          PYPROJECT_HASH=$(python scripts/ci_venv_hash.py pyproject.toml)
+          HASH_INPUT="$(
+            {
+              echo "python=3.12"
+              echo "tilelang=f7451dfce010234f540472d442b3f68d4f94232e"
+              echo "install=PIP_NO_BUILD_ISOLATION=1 pip install -e '.[dev]'"
+              echo "pyproject=${PYPROJECT_HASH}"
+            } | sha256sum | cut -c1-16
+          )"
+          VENV_PREFIX="tileops_ci_venv"
+          VENV_DIR="${VENV_PREFIX}_${HASH_INPUT}"
+          VENV_PATH="/data/cache/venv/${VENV_DIR}"
+          RUNTIME_ROOT="/home/ci-runner"
+          TILELANG_CACHE_DIR="/data/cache/tilelang"
+          TILELANG_TMP_DIR="${TILELANG_CACHE_DIR}/tmp"
+          TRITON_CACHE_DIR="/data/cache/triton"
+          PIP_CACHE_DIR="/data/cache/pip"
+          WHEEL_DIR="/data/cache/wheels"
+
+          mkdir -p "${TILELANG_CACHE_DIR}" "${TILELANG_TMP_DIR}" "${TRITON_CACHE_DIR}" "${PIP_CACHE_DIR}" "${WHEEL_DIR}"
+
+          VENV_REUSED="false"
+          if [[ -x "${VENV_PATH}/bin/python" ]]; then
+            VENV_REUSED="true"
+          fi
+
+          {
+            echo "PATH=${PATH}"
+            echo "USE_MACA=ON"
+            echo "RUNTIME_ROOT=${RUNTIME_ROOT}"
+            echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR}"
+            echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR}"
+            echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR}"
+            echo "PIP_CACHE_DIR=${PIP_CACHE_DIR}"
+            echo "WHEEL_DIR=${WHEEL_DIR}"
+            echo "VENV_PATH=${VENV_PATH}"
+            echo "VENV_REUSED=${VENV_REUSED}"
+          } >> "$GITHUB_ENV"
+
       - name: Ensure venv and install dependencies
         run: |
           set -euo pipefail
