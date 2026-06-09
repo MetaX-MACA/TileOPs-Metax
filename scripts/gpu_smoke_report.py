@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import platform
 import subprocess
+import sys
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from pathlib import Path
@@ -62,6 +64,24 @@ def _get_git_commit() -> str:
     if result.returncode != 0:
         return "unknown"
     return result.stdout.strip() or "unknown"
+
+
+def _get_runtime_env() -> dict[str, str]:
+    env = {
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+    }
+    try:
+        import torch
+
+        env["torch"] = torch.__version__
+        env["cuda_available"] = str(torch.cuda.is_available())
+        env["cuda_device_count"] = str(torch.cuda.device_count())
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            env["cuda_device"] = torch.cuda.get_device_name(torch.cuda.current_device())
+    except Exception as exc:
+        env["torch"] = f"unavailable: {exc}"
+    return env
 
 
 def parse_test_xml(path: str) -> list[dict[str, str]]:
@@ -127,7 +147,14 @@ def generate_report(results: list[dict[str, str]], target: str) -> str:
         f"| **Gpu-smoke Failures** | {len(failed_cases)} |",
         f"| **Failures ops** | {failures_ops_str} |",
         "",
+        "## Environment",
+        "",
+        "| Key | Value |",
+        "|:----|:------|",
     ]
+    for key, value in _get_runtime_env().items():
+        lines.append(f"| `{key}` | `{_escape_markdown_cell(value)}` |")
+    lines.append("")
 
     if failed_cases:
         lines.extend(
