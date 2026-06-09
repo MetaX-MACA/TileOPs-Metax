@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
@@ -95,24 +96,23 @@ def parse_test_xml(path: str) -> list[dict[str, str]]:
 
 
 def generate_report(results: list[dict[str, str]], target: str) -> str:
-    total_cases = len(results)
+    summary = summarize_results(results, target)
     failed_cases = [result for result in results if result["outcome"] == "failed"]
-    passed_count = sum(1 for result in results if result["outcome"] == "passed")
-    skipped_count = sum(1 for result in results if result["outcome"] == "skipped")
-    failed_ops = list(
-        OrderedDict.fromkeys(result["op"] for result in failed_cases if result["op"])
-    )
 
-    correctness = f"{_PASS} Pass" if not failed_cases else f"{_FAIL} {len(failed_cases)} failed"
-    failures_ops_str = (
-        ", ".join(_escape_markdown_cell(op) for op in failed_ops) if failed_ops else "-"
+    correctness = (
+        f"{_PASS} Pass" if summary["failed_count"] == 0 else f"{_FAIL} {summary['failed_count']} failed"
     )
-    health = _PASS if not failed_cases else _FAIL
+    failures_ops_str = (
+        ", ".join(_escape_markdown_cell(op) for op in summary["failed_ops"])
+        if summary["failed_ops"]
+        else "-"
+    )
+    health = _PASS if summary["failed_count"] == 0 else _FAIL
 
     lines = [
         f"# {health} TileOPs GPU Smoke Report",
         "",
-        f"> `{_get_git_commit()}`",
+        f"> `{summary['git_commit']}`",
         "",
         "## Summary",
         "",
@@ -121,10 +121,10 @@ def generate_report(results: list[dict[str, str]], target: str) -> str:
         f"| **Correctness** | {correctness} |",
         f"| **gpu-smoke target** | `{target}` |",
         (
-            f"| **Gpu-smoke ops number** | {total_cases} "
-            f"({passed_count} passed, {skipped_count} skipped) |"
+            f"| **Gpu-smoke ops number** | {summary['total_cases']} "
+            f"({summary['passed_count']} passed, {summary['skipped_count']} skipped) |"
         ),
-        f"| **Gpu-smoke Failures** | {len(failed_cases)} |",
+        f"| **Gpu-smoke Failures** | {summary['failed_count']} |",
         f"| **Failures ops** | {failures_ops_str} |",
         "",
     ]
@@ -149,19 +149,49 @@ def generate_report(results: list[dict[str, str]], target: str) -> str:
     return "\n".join(lines)
 
 
+def summarize_results(results: list[dict[str, str]], target: str) -> dict[str, object]:
+    total_cases = len(results)
+    failed_cases = [result for result in results if result["outcome"] == "failed"]
+    passed_count = sum(1 for result in results if result["outcome"] == "passed")
+    skipped_count = sum(1 for result in results if result["outcome"] == "skipped")
+    failed_ops = list(
+        OrderedDict.fromkeys(result["op"] for result in failed_cases if result["op"])
+    )
+
+    return {
+        "target": target,
+        "git_commit": _get_git_commit(),
+        "total_cases": total_cases,
+        "passed_count": passed_count,
+        "skipped_count": skipped_count,
+        "failed_count": len(failed_cases),
+        "failed_ops": failed_ops,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate TileOPs GPU smoke report")
     parser.add_argument("--test-xml", required=True, help="Path to pytest JUnit XML")
     parser.add_argument("--target", required=True, help="Displayed gpu-smoke target label")
     parser.add_argument("--output", required=True, help="Output markdown report path")
+    parser.add_argument("--json-output", help="Optional JSON summary output path")
     args = parser.parse_args()
 
     results = parse_test_xml(args.test_xml)
     report = generate_report(results, args.target)
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(report)
+    output_path.write_text(report, encoding="utf-8")
     print(f"Report written to {args.output}")
+
+    if args.json_output:
+        json_path = Path(args.json_output)
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(
+            json.dumps(summarize_results(results, args.target), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        print(f"JSON summary written to {args.json_output}")
 
 
 if __name__ == "__main__":
