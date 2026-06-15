@@ -73,7 +73,7 @@ jobs:
 
           export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
           echo "Starting kernel cache warmup..."
-          python scripts/warmup_kernel_cache.py --max-workers 64 -n 16
+          python scripts/warmup_kernel_cache.py --max-workers 64 -n 8
         shell: bash
 
       - name: Cleanup run-local venv
