@@ -25,6 +25,7 @@ env:
   WHEEL_DIR: /data/cache/wheels
   MAX_JOBS: "64"
   USE_MACA: ON
+  CCACHE_DIR: /data/cache/ccache
 
 jobs:
   # =========================================================================
@@ -39,6 +40,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y git ccache
+          export PATH="/opt/conda/bin${PATH:+:$PATH}"
+          echo "PATH=${PATH}" | tee -a "${GITHUB_ENV}"
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -61,7 +64,9 @@ jobs:
           # shellcheck source=/dev/null
           source "${VENV_PATH}/bin/activate"
 
+          ccache -sv
           pip install -v 3rdparty/tilelang-metax
+          ccache -sv
           pip install -v 3rdparty/tilelang-metax/3rdparty/tvm/3rdparty/tvm-ffi
 
           PIP_NO_BUILD_ISOLATION=1 pip install -e ".[dev]"
