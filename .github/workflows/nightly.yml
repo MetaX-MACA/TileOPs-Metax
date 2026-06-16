@@ -74,7 +74,7 @@ jobs:
 
           export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
           echo "Starting kernel cache warmup..."
-          python scripts/warmup_kernel_cache.py --max-workers 64 -n 8
+          python scripts/warmup_kernel_cache.py --max-workers 64 -n 4
         shell: bash
 
       - name: Cleanup run-local venv
@@ -139,7 +139,11 @@ jobs:
           echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
 
           set -o pipefail
-          python -m pytest -q benchmarks/ops --junit-xml=bench_results.xml | tee tileops_benchmarks.log
+          python -m pytest \
+            benchmarks/ops/bench_activation.py \
+            benchmarks/ops/bench_ada_layer_norm.py \
+            --durations=0 --durations-min=1 \
+            --junit-xml=bench_results.xml | tee tileops_benchmarks.log
 
           if [ -f profile_run.log ]; then
             { echo; echo "===== profile_run.log summary ====="; cat profile_run.log; } >> tileops_benchmarks.log
@@ -177,7 +181,7 @@ jobs:
   # Phase 3 — Op correctness tests (serial after benchmark for GPU exclusivity)
   # =========================================================================
   op_test:
-    if: ${{ false && always() && github.repository == 'MetaX-MACA/TileOPs-Metax' && (github.event_name == 'schedule' || github.ref == 'refs/heads/dev') }}
+    if: ${{ always() && github.repository == 'MetaX-MACA/TileOPs-Metax' && (github.event_name == 'schedule' || github.ref == 'refs/heads/nightly') }}
     needs: [benchmark]
     timeout-minutes: 180
     runs-on: tileops-metax-runner
@@ -186,11 +190,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y git ccache
+          export PATH="/opt/conda/bin${PATH:+:$PATH}"
+          echo "PATH=${PATH}" | tee -a "${GITHUB_ENV}"
 
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          submodules: recursive
 
       - name: Verify nightly runner environment
         run: scripts/ci/verify_nightly_runner.sh
@@ -208,6 +215,12 @@ jobs:
           # shellcheck source=/dev/null
           source "${VENV_PATH}/bin/activate"
 
+          ccache -sv
+          pip install -v 3rdparty/tilelang-metax
+          ccache -sv
+          pip install -v 3rdparty/tilelang-metax/3rdparty/tvm/3rdparty/tvm-ffi
+          pip install --target=${VENV_PATH}/lib/python3.12/site-packages --python-version 3.10.0 --no-deps flash-linear-attention==0.4.0 -i https://repos.metax-tech.com/r/maca-pypi/simple --trusted-host repos.metax-tech.com
+
           PIP_NO_BUILD_ISOLATION=1 pip install -e ".[dev]"
 
           export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
@@ -217,7 +230,11 @@ jobs:
           echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
 
           set -o pipefail
-          python -m pytest tests/ -v --tb=short --junit-xml=test_results.xml | tee tileops_op_test.log
+          python -m pytest \
+          tests/ops/test_activation.py \
+          tests/ops/test_ada_layer_norm.py \
+          --durations=0 --durations-min=1 \
+          -v --tb=short --junit-xml=test_results.xml | tee tileops_op_test.log
         shell: bash
 
       - name: Download benchmark artifacts
@@ -358,11 +375,11 @@ jobs:
   # Phase 4 — Packaging and smoke test
   # =========================================================================
   packaging:
-    if: ${{ false && always() && github.repository == 'MetaX-MACA/TileOPs-Metax' && (github.event_name == 'schedule' || github.ref == 'refs/heads/dev') }}
+    if: ${{ always() && github.repository == 'tile-ai/TileOPs' && (github.event_name == 'schedule' || github.ref == 'refs/heads/main') }}
     needs: [op_test]
     permissions:
       contents: write
-    runs-on: tileops-metax-runner
+    runs-on: [self-hosted, tile-ops, nightly]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -381,6 +398,20 @@ jobs:
           exec > >(tee packaging.log) 2>&1
           # shellcheck source=/dev/null
           source "${VENV_PATH}/bin/activate"
+
+          # Validate GPU frequency
+          TARGET_CLOCK_MHZ=1830
+          RETRIES=5
+          for i in $(seq 1 "${RETRIES}"); do
+            gpu_clock=$(nvidia-smi --query-gpu=clocks.current.graphics --format=csv,noheader,nounits | xargs)
+            echo "GPU clock: ${gpu_clock} MHz (attempt ${i}/${RETRIES})"
+            if [ "${gpu_clock}" = "${TARGET_CLOCK_MHZ}" ]; then break; fi
+            if [ "${i}" -eq "${RETRIES}" ]; then
+              echo "::error::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz."
+              exit 1
+            fi
+            sleep 2
+          done
 
           pip install build pytest
 
