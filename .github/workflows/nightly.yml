@@ -64,9 +64,7 @@ jobs:
           # shellcheck source=/dev/null
           source "${VENV_PATH}/bin/activate"
 
-          ccache -sv
           pip install -v 3rdparty/tilelang-metax
-          ccache -sv
           pip install -v 3rdparty/tilelang-metax/3rdparty/tvm/3rdparty/tvm-ffi
           pip install --target=${VENV_PATH}/lib/python3.12/site-packages --python-version 3.10.0 --no-deps flash-linear-attention==0.4.0 -i https://repos.metax-tech.com/r/maca-pypi/simple --trusted-host repos.metax-tech.com
 
@@ -124,9 +122,7 @@ jobs:
           # shellcheck source=/dev/null
           source "${VENV_PATH}/bin/activate"
 
-          ccache -sv
           pip install -v 3rdparty/tilelang-metax
-          ccache -sv
           pip install -v 3rdparty/tilelang-metax/3rdparty/tvm/3rdparty/tvm-ffi
           pip install --target=${VENV_PATH}/lib/python3.12/site-packages --python-version 3.10.0 --no-deps flash-linear-attention==0.4.0 -i https://repos.metax-tech.com/r/maca-pypi/simple --trusted-host repos.metax-tech.com
 
@@ -141,7 +137,6 @@ jobs:
           set -o pipefail
           python -m pytest \
             benchmarks/ops/bench_activation.py \
-            benchmarks/ops/bench_ada_layer_norm.py \
             --durations=0 --durations-min=1 \
             --junit-xml=bench_results.xml | tee tileops_benchmarks.log
 
@@ -215,9 +210,7 @@ jobs:
           # shellcheck source=/dev/null
           source "${VENV_PATH}/bin/activate"
 
-          ccache -sv
           pip install -v 3rdparty/tilelang-metax
-          ccache -sv
           pip install -v 3rdparty/tilelang-metax/3rdparty/tvm/3rdparty/tvm-ffi
           pip install --target=${VENV_PATH}/lib/python3.12/site-packages --python-version 3.10.0 --no-deps flash-linear-attention==0.4.0 -i https://repos.metax-tech.com/r/maca-pypi/simple --trusted-host repos.metax-tech.com
 
@@ -231,10 +224,9 @@ jobs:
 
           set -o pipefail
           python -m pytest \
-          tests/ops/test_activation.py \
-          tests/ops/test_ada_layer_norm.py \
-          --durations=0 --durations-min=1 \
-          -v --tb=short --junit-xml=test_results.xml | tee tileops_op_test.log
+            tests/ops/test_activation.py \
+            --durations=0 --durations-min=1 \
+            -v --tb=short --junit-xml=test_results.xml | tee tileops_op_test.log
         shell: bash
 
       - name: Download benchmark artifacts

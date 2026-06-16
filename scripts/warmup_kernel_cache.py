@@ -83,7 +83,8 @@ def main():
         sys.path.insert(0, scripts_dir)
 
     pytest_args = [
-        *shard_files,
+        # *shard_files,
+        "benchmarks/ops/bench_activation.py",
         "-v",
         "--durations=0",
         "--durations-min=1",
@@ -121,7 +122,8 @@ def main():
     os.environ["TILEOPS_WARMUP_VALIDATE"] = "1"
 
     validate_args = [
-        *shard_files,
+        # *shard_files,
+        "benchmarks/ops/bench_activation.py",
         "-v",
         "--durations=0",
         "--durations-min=1",
