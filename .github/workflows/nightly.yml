@@ -130,6 +130,10 @@ jobs:
           set -o pipefail
           python -m pytest \
             benchmarks/ops/bench_activation.py \
+            benchmarks/ops/bench_batch_norm.py \
+            benchmarks/ops/bench_binary_arith.py \
+            benchmarks/ops/bench_binary_elementwise.py \
+            benchmarks/ops/bench_binary_strategy.py \
             --durations=0 --durations-min=1 \
             --junit-xml=bench_results.xml | tee tileops_benchmarks.log
 
@@ -214,6 +218,9 @@ jobs:
           set -o pipefail
           python -m pytest \
             tests/ops/test_activation.py \
+            tests/ops/test_batch_norm.py \
+            tests/ops/test_binary_arith.py \
+            tests/ops/test_bitwise.py \
             --durations=0 --durations-min=1 \
             -v --tb=short --junit-xml=test_results.xml | tee tileops_op_test.log
         shell: bash
