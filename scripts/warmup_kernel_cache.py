@@ -85,6 +85,8 @@ def main():
     pytest_args = [
         *shard_files,
         "-v",
+        "--durations=0",
+        "--durations-min=1",
         "--tb=line",
         "-p", "no:cacheprovider",
         "-p", "conftest_warmup",
@@ -121,6 +123,8 @@ def main():
     validate_args = [
         *shard_files,
         "-v",
+        "--durations=0",
+        "--durations-min=1",
         "--tb=line",
         "-p", "no:cacheprovider",
         "-p", "conftest_warmup",
