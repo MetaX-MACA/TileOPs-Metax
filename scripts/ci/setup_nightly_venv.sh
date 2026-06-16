@@ -25,7 +25,8 @@ source "${VENV_PATH}/bin/activate"
 python -m pip install --upgrade pip setuptools wheel --no-user
 
 # Install tilelang-metax and tvm-ffi
-python -m pip install build
+pip install -r 3rdparty/tilelang-metax/requirements.txt
+pip install build
 python -m build -w 3rdparty/tilelang-metax
 pip install --target=/data/cache/site-packages --no-deps 3rdparty/tilelang-metax/dist/tilelang-0.1.9+maca.gitf7451dfc-cp38-abi3-linux_x86_64.whl
 python -m build -w 3rdparty/tilelang-metax/3rdparty/tvm/3rdparty/tvm-ffi
