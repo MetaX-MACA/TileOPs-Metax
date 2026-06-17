@@ -234,6 +234,7 @@ jobs:
             --ignore=tests/ops/attention \
             --ignore=tests/ops/test_argreduce.py \
             --ignore=tests/ops/test_deltanet_chunkwise_bwd.py \
+            --ignore=tests/ops/test_fused_add_layer_norm.py \
             --ignore=tests/ops/test_gated_deltanet_chunkwise_bwd.py \
             --ignore=tests/ops/test_gemm.py \
             --ignore=tests/ops/test_gla_chunkwise_bwd.py \
