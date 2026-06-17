@@ -63,27 +63,6 @@ def main():
     bench_dir = os.path.join(os.path.dirname(__file__), "..", "benchmarks", "ops")
     all_files = sorted(glob.glob(os.path.join(bench_dir, "bench_*.py")))
     shard_files = all_files[args.shard::args.total_shards]
-    ignore_files = [
-        "--ignore=benchmarks/ops/attention",
-        "--ignore=benchmarks/ops/bench_ada_layer_norm.py",
-        "--ignore=benchmarks/ops/bench_argreduce.py",
-        "--ignore=benchmarks/ops/bench_gemm.py",
-        "--ignore=benchmarks/ops/bench_group_norm.py",
-        "--ignore=benchmarks/ops/bench_independent_elementwise.py",
-        "--ignore=benchmarks/ops/bench_mamba.py",
-        "--ignore=benchmarks/ops/bench_mhc_post.py",
-        "--ignore=benchmarks/ops/bench_mhc_pre.py",
-        "--ignore=benchmarks/ops/bench_moe_experts_nopad.py",
-        "--ignore=benchmarks/ops/bench_moe_fused_moe.py",
-        "--ignore=benchmarks/ops/bench_moe_fused_topk.py",
-        "--ignore=benchmarks/ops/bench_moe_kernel_breakdown.py",
-        "--ignore=benchmarks/ops/bench_moe_permute_align.py",
-        "--ignore=benchmarks/ops/bench_moe_permute_nopad.py",
-        "--ignore=benchmarks/ops/bench_moe_permute.py",
-        "--ignore=benchmarks/ops/bench_moe_shared_fused_moe.py",
-        "--ignore=benchmarks/ops/bench_moe_unpermute.py",
-        "--ignore=benchmarks/ops/bench_reduce_multidim.py",
-    ]
 
     if not shard_files:
         print(f"Shard {args.shard}/{args.total_shards}: no files to process")
@@ -103,9 +82,46 @@ def main():
     if scripts_dir not in sys.path:
         sys.path.insert(0, scripts_dir)
 
+    shard_files = [
+        "benchmarks/ops/bench_activation.py",
+        "benchmarks/ops/bench_batch_norm.py",
+        "benchmarks/ops/bench_binary_arith.py",
+        "benchmarks/ops/bench_binary_elementwise.py",
+        "benchmarks/ops/bench_binary_strategy.py",
+        "benchmarks/ops/bench_convolution.py",
+        "benchmarks/ops/bench_cumulative.py",
+        "benchmarks/ops/bench_deltanet.py",
+        "benchmarks/ops/bench_deltanet_recurrence.py",
+        "benchmarks/ops/bench_dropout.py",
+        "benchmarks/ops/bench_elementwise_fp8.py",
+        "benchmarks/ops/bench_engram.py",
+        "benchmarks/ops/bench_fft.py",
+        "benchmarks/ops/bench_fp8_lighting_indexer.py",
+        "benchmarks/ops/bench_fp8_quant.py",
+        "benchmarks/ops/bench_fused_add_layer_norm.py",
+        "benchmarks/ops/bench_fused_add_rms_norm.py",
+        "benchmarks/ops/bench_gated_deltanet.py",
+        "benchmarks/ops/bench_gated_deltanet_recurrence.py",
+        "benchmarks/ops/bench_gla_chunkwise.py",
+        "benchmarks/ops/bench_gla_recurrence.py",
+        "benchmarks/ops/bench_grouped_gemm_block_m.py",
+        "benchmarks/ops/bench_grouped_gemm.py",
+        "benchmarks/ops/bench_instance_norm.py",
+        "benchmarks/ops/bench_layer_norm.py",
+        "benchmarks/ops/bench_logical_reduce.py",
+        "benchmarks/ops/bench_pool.py",
+        "benchmarks/ops/bench_reduce.py",
+        "benchmarks/ops/bench_rms_norm.py",
+        "benchmarks/ops/bench_rope.py",
+        "benchmarks/ops/bench_softmax.py",
+        "benchmarks/ops/bench_topk_selector.py",
+        "benchmarks/ops/bench_unary_elementwise.py",
+        "benchmarks/ops/bench_unary_strategy.py",
+        "benchmarks/ops/bench_vector_norm.py",
+    ]
+
     pytest_args = [
         *shard_files,
-        *ignore_files,
         "-v",
         "--durations=0",
         "--durations-min=1",
@@ -144,7 +160,6 @@ def main():
 
     validate_args = [
         *shard_files,
-        *ignore_files,
         "-v",
         "--durations=0",
         "--durations-min=1",
