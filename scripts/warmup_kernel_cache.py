@@ -63,6 +63,27 @@ def main():
     bench_dir = os.path.join(os.path.dirname(__file__), "..", "benchmarks", "ops")
     all_files = sorted(glob.glob(os.path.join(bench_dir, "bench_*.py")))
     shard_files = all_files[args.shard::args.total_shards]
+    ignore_files = [
+        "--ignore=benchmarks/ops/attention",
+        "--ignore=benchmarks/ops/bench_ada_layer_norm.py",
+        "--ignore=benchmarks/ops/bench_argreduce.py",
+        "--ignore=benchmarks/ops/bench_gemm.py",
+        "--ignore=benchmarks/ops/bench_group_norm.py",
+        "--ignore=benchmarks/ops/bench_independent_elementwise.py",
+        "--ignore=benchmarks/ops/bench_mamba.py",
+        "--ignore=benchmarks/ops/bench_mhc_post.py",
+        "--ignore=benchmarks/ops/bench_mhc_pre.py",
+        "--ignore=benchmarks/ops/bench_moe_experts_nopad.py",
+        "--ignore=benchmarks/ops/bench_moe_fused_moe.py",
+        "--ignore=benchmarks/ops/bench_moe_fused_topk.py",
+        "--ignore=benchmarks/ops/bench_moe_kernel_breakdown.py",
+        "--ignore=benchmarks/ops/bench_moe_permute_align.py",
+        "--ignore=benchmarks/ops/bench_moe_permute_nopad.py",
+        "--ignore=benchmarks/ops/bench_moe_permute.py",
+        "--ignore=benchmarks/ops/bench_moe_shared_fused_moe.py",
+        "--ignore=benchmarks/ops/bench_moe_unpermute.py",
+        "--ignore=benchmarks/ops/bench_reduce_multidim.py",
+    ]
 
     if not shard_files:
         print(f"Shard {args.shard}/{args.total_shards}: no files to process")
@@ -82,17 +103,9 @@ def main():
     if scripts_dir not in sys.path:
         sys.path.insert(0, scripts_dir)
 
-    shard_files = [
-        "benchmarks/ops/bench_activation.py",
-        "benchmarks/ops/bench_batch_norm.py",
-        "benchmarks/ops/bench_binary_arith.py",
-        "benchmarks/ops/bench_binary_elementwise.py",
-        "benchmarks/ops/bench_binary_strategy.py",
-        "benchmarks/ops/bench_convolution.py",
-    ]
-
     pytest_args = [
         *shard_files,
+        *ignore_files,
         "-v",
         "--durations=0",
         "--durations-min=1",
@@ -131,6 +144,7 @@ def main():
 
     validate_args = [
         *shard_files,
+        *ignore_files,
         "-v",
         "--durations=0",
         "--durations-min=1",

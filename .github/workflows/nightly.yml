@@ -34,7 +34,7 @@ jobs:
   # =========================================================================
   cache-warmup:
     if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && (github.event_name == 'schedule' || github.ref == 'refs/heads/nightly') }}
-    timeout-minutes: 120
+    timeout-minutes: 60
     runs-on: tileops-metax-runner
     steps:
       - name: Install dependencies for runner (MetaX)
@@ -128,12 +128,26 @@ jobs:
           echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
 
           set -o pipefail
-          python -m pytest \
-            benchmarks/ops/bench_activation.py \
-            benchmarks/ops/bench_batch_norm.py \
-            benchmarks/ops/bench_binary_arith.py \
-            benchmarks/ops/bench_binary_elementwise.py \
-            benchmarks/ops/bench_binary_strategy.py \
+          python -m pytest benchmarks/ops \
+            --ignore=benchmarks/ops/attention \
+            --ignore=benchmarks/ops/bench_ada_layer_norm.py \
+            --ignore=benchmarks/ops/bench_argreduce.py \
+            --ignore=benchmarks/ops/bench_gemm.py \
+            --ignore=benchmarks/ops/bench_group_norm.py \
+            --ignore=benchmarks/ops/bench_independent_elementwise.py \
+            --ignore=benchmarks/ops/bench_mamba.py \
+            --ignore=benchmarks/ops/bench_mhc_post.py \
+            --ignore=benchmarks/ops/bench_mhc_pre.py \
+            --ignore=benchmarks/ops/bench_moe_experts_nopad.py \
+            --ignore=benchmarks/ops/bench_moe_fused_moe.py \
+            --ignore=benchmarks/ops/bench_moe_fused_topk.py \
+            --ignore=benchmarks/ops/bench_moe_kernel_breakdown.py \
+            --ignore=benchmarks/ops/bench_moe_permute_align.py \
+            --ignore=benchmarks/ops/bench_moe_permute_nopad.py \
+            --ignore=benchmarks/ops/bench_moe_permute.py \
+            --ignore=benchmarks/ops/bench_moe_shared_fused_moe.py \
+            --ignore=benchmarks/ops/bench_moe_unpermute.py \
+            --ignore=benchmarks/ops/bench_reduce_multidim.py \
             --durations=0 --durations-min=1 \
             --junit-xml=bench_results.xml | tee tileops_benchmarks.log
 
@@ -216,11 +230,16 @@ jobs:
           echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
 
           set -o pipefail
-          python -m pytest \
-            tests/ops/test_activation.py \
-            tests/ops/test_batch_norm.py \
-            tests/ops/test_binary_arith.py \
-            tests/ops/test_bitwise.py \
+          python -m pytest tests/ \
+            --ignore=tests/ops/attention \
+            --ignore=tests/ops/test_argreduce.py \
+            --ignore=tests/ops/test_deltanet_chunkwise_bwd.py \
+            --ignore=tests/ops/test_gated_deltanet_chunkwise_bwd.py \
+            --ignore=tests/ops/test_gemm.py \
+            --ignore=tests/ops/test_gla_chunkwise_bwd.py \
+            --ignore=tests/ops/test_moe_fused_moe.py \
+            --ignore=tests/ops/test_topk_selector.py \
+            --ignore=tests/test_validate_manifest.py \
             --durations=0 --durations-min=1 \
             -v --tb=short --junit-xml=test_results.xml | tee tileops_op_test.log
         shell: bash
