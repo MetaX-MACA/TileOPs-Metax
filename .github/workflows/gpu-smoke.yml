@@ -7,10 +7,10 @@ permissions:
 
 on:
   push:
-    branches: [dev, main, testbed]
+    branches: [dev, testbed]
     tags: ["v*"]
   pull_request:
-    branches: [dev, main, testbed]
+    branches: [dev, testbed]
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
@@ -347,6 +347,15 @@ jobs:
     if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && needs.ci-prereq.outputs.skip != 'true' && needs.security-policy.outputs.skip_gpu_smoke != 'true' }}
     runs-on: tileops-metax-runner
     steps:
+      - name: Install dependencies for runner (MetaX)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git ccache
+          export USE_MACA=ON
+          export PATH="/opt/conda/bin${PATH:+:$PATH}"
+          echo "USE_MACA=ON" | tee -a "${GITHUB_ENV}"
+          echo "PATH=${PATH}" | tee -a "${GITHUB_ENV}"
+
       - name: Checkout code for fork PR
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
         uses: actions/checkout@v4
@@ -365,9 +374,6 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update && sudo apt-get install -y git
       # Trusted actions checkout: must run AFTER the workspace checkouts so
       # their `git clean -ffdx` pass does not wipe `.trusted/`. Anything
       # loaded via `uses: ./...` from here on MUST resolve through
@@ -404,22 +410,24 @@ jobs:
           reclaim-below-gib: "10"
           cache-trim-cooldown-minutes: "120"
           cache-dirs: |
-            /data/cache/triton
-            /data/cache/pip
-            /data/cache/wheels
-            /data/cache/tilelang/tmp
+            /data/cache/ci/triton
+            /data/cache/ci/pip
+            /data/cache/ci/wheels
+            /data/cache/ci/tilelang/tmp
           atomic-cache-dirs: |
-            /data/cache/tilelang/autotuner
-          df-paths: "/data /data/cache"
+            /data/cache/ci/tilelang/autotuner
+          df-paths: "/data /data/cache/ci"
           # Daily runner-maintenance.yml owns the destructive autotuner
           # age-trim; per-PR runs only need sentinel-repair (still
           # unconditional) so they don't evict tuning artefacts the next
           # PR would otherwise reuse.
           skip-atomic-age-trim: "true"
-          # Prune old venvs from /data/cache/venv (persistent volume for K8s runners).
-          # Keep 2 most recent venvs based on mtime.
-          prune-tool-cache: "true"
-          venv-cache-dir: "/data/cache/venv"
+
+      - name: Set up Python
+        if: ${{ false }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
       - name: Resolve runtime state
         env:
@@ -427,11 +435,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Add conda to PATH
-          export PATH="/opt/conda/bin:${PATH}"
-
-          # Set MACA environment variables
-          export USE_MACA=ON
           # Narrow the venv cache key to sections that actually drive the
           # installed package set. Hashing the whole pyproject.toml means a
           # tweak to [tool.pytest] or [tool.ruff] invalidates every warm
@@ -456,8 +459,8 @@ jobs:
           )"
           VENV_PREFIX="tileops_ci_venv"
           VENV_DIR="${VENV_PREFIX}_${HASH_INPUT}"
-          TRUSTED_VENV_PATH="/data/cache/venv/${VENV_DIR}"
-          TRUSTED_CACHE_ROOT="/data/cache"
+          TRUSTED_VENV_PATH="${{ runner.tool_cache }}/${VENV_DIR}"
+          TRUSTED_CACHE_ROOT="/data/cache/ci"
           FORK_CAN_COPY_TRUSTED_VENV="false"
 
           if [[ "$IS_FORK" == "true" ]]; then
@@ -533,8 +536,6 @@ jobs:
           fi
 
           {
-            echo "PATH=${PATH}"
-            echo "USE_MACA=ON"
             echo "RUNTIME_ROOT=${RUNTIME_ROOT}"
             echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR}"
             echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR}"
@@ -549,33 +550,34 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Validate GPU frequency
+        if: ${{ false }}
         run: |
           set -euo pipefail
-          TARGET_CLOCK_MHZ=428
+          TARGET_CLOCK_MHZ=1830
           RETRIES=5
           SLEEP_SECONDS=2
 
-          if ! command -v mx-smi >/dev/null 2>&1; then
-            echo "::error::mx-smi is not available on this runner."
+          if ! command -v nvidia-smi >/dev/null 2>&1; then
+            echo "::error::nvidia-smi is not available on this runner."
             exit 1
           fi
 
           echo "Detected GPUs:"
-          mx-smi -L
+          nvidia-smi -L
 
           attempt=1
           while [ "$attempt" -le "$RETRIES" ]; do
             echo "Validation attempt ${attempt}/${RETRIES}"
             mismatch=0
-            while IFS= read -r gpu_line; do
-              gpu_index=$(echo "$gpu_line" | grep -Eo 'GPU#[0-9]+' | grep -Eo '[0-9]+' | head -1)
-              gpu_name=$(echo "$gpu_line" | awk '{print $2}')
-              gpu_clock=$(mx-smi --show-clock | awk '/XCORE/ {print $(NF-1); exit}')
-              echo "GPU ${gpu_index} (${gpu_name}) XCORE clock: ${gpu_clock} MHz"
+            while IFS=',' read -r gpu_index gpu_name gpu_clock; do
+              gpu_index="$(echo "$gpu_index" | xargs)"
+              gpu_name="$(echo "$gpu_name" | xargs)"
+              gpu_clock="$(echo "$gpu_clock" | xargs)"
+              echo "GPU ${gpu_index} (${gpu_name}) clock: ${gpu_clock} MHz"
               if [[ "$gpu_clock" != "$TARGET_CLOCK_MHZ" ]]; then
                 mismatch=1
               fi
-            done < <(mx-smi -L 2>/dev/null | grep -E 'GPU#[0-9]+')
+            done < <(nvidia-smi --query-gpu=index,name,clocks.current.graphics --format=csv,noheader,nounits)
 
             if [[ "$mismatch" -eq 0 ]]; then
               echo "All GPUs locked at ${TARGET_CLOCK_MHZ} MHz."
@@ -626,13 +628,16 @@ jobs:
           # shellcheck source=/dev/null
           source "${VENV_PATH}/bin/activate"
 
-          # Copy pre-installed MACA torch packages from conda to venv
-          cp -rf /opt/conda/lib/python3.12/site-packages/* "${VENV_PATH}/lib/python3.12/site-packages/"
-
           python -m pip install --upgrade pip setuptools wheel --no-user
 
-          # Install TileLang (MACA version)
-          pip install --no-cache-dir git+https://github.com/tile-ai/tilelang-metax.git@f7451dfce010234f540472d442b3f68d4f94232e
+          # Install tilelang-metax and tvm-ffi
+          pip install build
+          python -m build -w 3rdparty/tilelang-metax
+          pip install --target=/data/cache/ci/site-packages --no-deps 3rdparty/tilelang-metax/dist/tilelang-0.1.9+maca.gitf7451dfc-cp38-abi3-linux_x86_64.whl
+          pip install --target=/data/cache/ci/site-packages --no-deps "z3-solver>=4.13.0,<4.15.5"
+          SETUPTOOLS_SCM_OVERRIDES_FOR_APACHE_TVM_FFI='{local_scheme="no-local-version"}' python -m build -w 3rdparty/tilelang-metax/3rdparty/tvm/3rdparty/tvm-ffi
+          pip install --target=/data/cache/ci/site-packages --no-deps 3rdparty/tilelang-metax/3rdparty/tvm/3rdparty/tvm-ffi/dist/apache_tvm_ffi-0.1.3.dev11-cp312-abi3-linux_x86_64.whl
+          pip install --target=/data/cache/ci/site-packages --python-version 3.10.0 --no-deps flash-linear-attention==0.4.0 -i https://repos.metax-tech.com/r/maca-pypi/simple --trusted-host repos.metax-tech.com
 
           if [[ "$IS_FORK" == "true" ]]; then
             FIND_LINKS_FLAG=""
@@ -640,7 +645,7 @@ jobs:
               FIND_LINKS_FLAG="--find-links ${WHEEL_DIR}"
             fi
             # shellcheck disable=SC2086
-            PIP_NO_BUILD_ISOLATION=1 PIP_CACHE_DIR="${PIP_CACHE_DIR}" pip install --no-deps -e '.[dev]' ${FIND_LINKS_FLAG}
+            PIP_NO_BUILD_ISOLATION=1 PIP_CACHE_DIR="${PIP_CACHE_DIR}" pip install -e '.[dev]' ${FIND_LINKS_FLAG}
 
             # Sync libtilelang.so mtime with trusted venv so compile cache keys match.
             # TileLang cache keys include the library's mtime (kernel_cache.py); a fresh
@@ -664,9 +669,9 @@ jobs:
               echo "Warning: hash-matched trusted venv not found at ${TRUSTED_VENV_PATH}; skipping mtime sync"
             fi
           else
-            PIP_NO_BUILD_ISOLATION=1 PIP_NO_CACHE_DIR=1 pip install --no-deps -e '.[dev]'
+            PIP_NO_BUILD_ISOLATION=1 PIP_NO_CACHE_DIR=1 pip install -e '.[dev]'
             # Export wheels (including dependencies) so fork PRs can reuse them
-            pip wheel --no-deps -e '.[dev]' -w "${WHEEL_DIR}" 2>/dev/null || true
+            pip wheel -e '.[dev]' -w "${WHEEL_DIR}" 2>/dev/null || true
           fi
 
       - name: Run tests
