@@ -49,16 +49,16 @@ inputs:
     description: >
       Newline-separated list of cache directory roots whose files older than
       cache-age-days should be trimmed at file granularity. Defaults target
-      the shared /data runner cache layout.
+      the shared /data7-backed runner cache layout.
       Do NOT include atomic cache roots here (see atomic-cache-dirs); file-
       level trim on an atomic root can produce a half-dead "directory exists
       but sentinel missing" state that crashes downstream consumers.
     required: false
     default: |
-      /data/cache/triton
-      /data/cache/pip
-      /data/cache/wheels
-      /data/cache/tilelang/tmp
+      /data/cache/ci/triton
+      /data/cache/ci/pip
+      /data/cache/ci/wheels
+      /data/cache/ci/tilelang/tmp
   atomic-cache-dirs:
     description: >
       Newline-separated list of cache directory roots whose first-level
@@ -75,7 +75,7 @@ inputs:
       tuning artefacts alongside a best_config.json sentinel.
     required: false
     default: |
-      /data/cache/tilelang/autotuner
+      /data/cache/ci/tilelang/autotuner
   prune-tool-cache:
     description: >
       Whether to prune old tileops_ci_venv_* directories under runner.tool_cache.
@@ -83,13 +83,6 @@ inputs:
       (e.g. nightly's docker-based jobs).
     required: false
     default: "true"
-  venv-cache-dir:
-    description: >
-      Directory containing tileops_ci_venv_* venv caches. Defaults to runner.tool_cache
-      for bare-metal/VM runners. For Kubernetes runners (ARC), use a persistent
-      volume path like /data/cache/venv.
-    required: false
-    default: ""
   df-paths:
     description: Space-separated paths to pass to `df -h` for before/after logging.
     required: false
@@ -127,7 +120,6 @@ runs:
         CACHE_DIRS: ${{ inputs.cache-dirs }}
         ATOMIC_CACHE_DIRS: ${{ inputs.atomic-cache-dirs }}
         PRUNE_TOOL_CACHE: ${{ inputs.prune-tool-cache }}
-        VENV_CACHE_DIR: ${{ inputs.venv-cache-dir }}
         DF_PATHS: ${{ inputs.df-paths }}
         FORCE_RECLAIM: ${{ inputs.force-reclaim }}
         SKIP_ATOMIC_AGE_TRIM: ${{ inputs.skip-atomic-age-trim }}
@@ -232,12 +224,9 @@ runs:
         fi
 
         # 1) Prune old trusted venvs: keep N most recent by mtime.
-        # Support both runner.tool_cache (bare-metal runners) and custom venv-cache-dir
-        # (Kubernetes runners with persistent volume).
-        VENV_PRUNE_DIR="${VENV_CACHE_DIR:-${TOOL_CACHE}}"
-        if [[ "${SHOULD_RECLAIM}" == "true" && "${PRUNE_TOOL_CACHE}" == "true" && -d "${VENV_PRUNE_DIR}" ]]; then
+        if [[ "${SHOULD_RECLAIM}" == "true" && "${PRUNE_TOOL_CACHE}" == "true" && -d "${TOOL_CACHE}" ]]; then
           DID_RECLAIM="true"
-          mapfile -t venvs < <(find "${VENV_PRUNE_DIR}" -maxdepth 1 -type d -name "tileops_ci_venv_*" -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
+          mapfile -t venvs < <(find "${TOOL_CACHE}" -maxdepth 1 -type d -name "tileops_ci_venv_*" -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
           if [[ ${#venvs[@]} -gt ${VENV_KEEP} ]]; then
             for stale in "${venvs[@]:${VENV_KEEP}}"; do
               echo "Removing stale venv: ${stale}"

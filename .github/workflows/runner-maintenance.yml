@@ -8,7 +8,7 @@ name: Runner Maintenance
 # little PR traffic.
 #
 # GPU smoke and nightly share the persistent cache tree under
-# `/data/cache/*`.
+# `/data7/shared/ci-cache/*`.
 
 on:
   schedule:
