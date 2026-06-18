@@ -378,6 +378,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
           fetch-depth: 1
+          submodules: recursive
 
       # Trusted actions checkout: must run AFTER the workspace checkouts so
       # their `git clean -ffdx` pass does not wipe `.trusted/`. Anything
@@ -408,6 +409,7 @@ jobs:
             .github/actions
             scripts/ci_venv_hash.py
             pyproject.toml
+          submodules: recursive
 
       - name: Reclaim runner disk
         uses: ./.trusted/.github/actions/reclaim-runner-disk
