@@ -1,5 +1,3 @@
-# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
-
 """Tests for BatchNormFwdOp and BatchNormBwdOp.
 
 Correctness is validated against torch.nn.functional.batch_norm and the
@@ -127,7 +125,7 @@ def test_batch_norm_fwd(N, C, spatial, dtype, training):
     # float16 accumulates more error; use loose tolerances.
     atol, rtol = (1e-2, 1e-2) if dtype == torch.float16 else (2e-2, 2e-2)
     max_err = (y.float() - ref_y.float()).abs().max()
-    assert torch.allclose(y, ref_y, atol=atol, rtol=rtol), \
+    assert torch.allclose(y.float(), ref_y.float(), atol=atol, rtol=rtol), \
         f"fwd mismatch (training={training}): max_err={max_err:.4e}"
 
     if training:

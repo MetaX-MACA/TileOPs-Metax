@@ -34,7 +34,7 @@ class FusedAddLayerNormFixture(FixtureBase):
             # Standard aligned shapes -- fp32
             pytest.param(1024, 4096, torch.float32, False, marks=pytest.mark.smoke),
             pytest.param(1024, 4096, torch.float16, False, marks=pytest.mark.smoke),
-            pytest.param(1024, 4096, torch.bfloat16, False, marks=[pytest.mark.smoke, pytest.mark.skip(reason="MACALaunch mcErrorMemoryValueTooLarge")]),
+            pytest.param(1024, 4096, torch.bfloat16, False, marks=pytest.mark.smoke),
             pytest.param(4096, 4096, torch.float32, False, marks=pytest.mark.full),
             # Standard aligned shapes -- fp16
             pytest.param(4096, 4096, torch.float16, False, marks=pytest.mark.full),
@@ -73,7 +73,7 @@ class FusedAddLayerNormNonContigFixture(FixtureBase):
         ("m, n, dtype", [
             pytest.param(1024, 4096, torch.float32, marks=pytest.mark.smoke),
             pytest.param(1024, 4096, torch.float16, marks=pytest.mark.smoke),
-            pytest.param(1024, 4096, torch.bfloat16, marks=[pytest.mark.smoke, pytest.mark.skip(reason="MACALaunch mcErrorMemoryValueTooLarge")]),
+            pytest.param(1024, 4096, torch.bfloat16, marks=pytest.mark.smoke),
         ]),
     ]
 
@@ -107,7 +107,7 @@ class FusedAddLayerNorm3DFixture(FixtureBase):
         ("batch, seq, hidden, dtype", [
             pytest.param(2, 512, 4096, torch.float32, marks=pytest.mark.smoke),
             pytest.param(2, 512, 4096, torch.float16, marks=pytest.mark.smoke),
-            pytest.param(2, 512, 4096, torch.bfloat16, marks=[pytest.mark.smoke, pytest.mark.skip(reason="MACALaunch mcErrorMemoryValueTooLarge")]),
+            pytest.param(2, 512, 4096, torch.bfloat16, marks=pytest.mark.smoke),
         ]),
     ]
 

@@ -520,11 +520,7 @@ def test_where_rejects_fp8_dtype(bad_dtype: torch.dtype) -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     "dtype",
-    [
-        pytest.param(torch.float16, id="fp16"),
-        pytest.param(torch.bfloat16, id="bf16"),
-        pytest.param(torch.float32, id="fp32", marks=pytest.mark.skip(reason="tvm.error.InternalError")),
-    ],
+    [torch.float16, torch.bfloat16, torch.float32],
 )
 def test_where_accepts_manifest_dtypes(dtype: torch.dtype) -> None:
     """WhereFwdOp constructs and runs for every manifest-declared dtype."""

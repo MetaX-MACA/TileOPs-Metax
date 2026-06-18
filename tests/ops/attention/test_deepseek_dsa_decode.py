@@ -1,4 +1,3 @@
-# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 
 import pytest
 import torch
@@ -66,7 +65,7 @@ class DsaDecodeFixture(FixtureBase):
          ]),
     ]
 
-@pytest.mark.skip(reason="MACA ERROR")
+
 @DsaDecodeFixture
 def test_sparse_mla_decode(batch: int, heads: int, seq_len_q: int, seq_len_kv: int, dim: int,
                            dim_tail: int, topk: int, stride_kv: int, heads_kv: int,
