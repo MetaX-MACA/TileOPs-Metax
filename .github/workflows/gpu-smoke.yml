@@ -424,7 +424,7 @@ jobs:
           skip-atomic-age-trim: "true"
 
       - name: Set up Python
-        if: ${{ false }}
+        if: ${{ github.repository == 'tile-ai/TileOPs' }}
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -550,7 +550,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Validate GPU frequency
-        if: ${{ false }}
+        if: ${{ github.repository == 'tile-ai/TileOPs' }}
         run: |
           set -euo pipefail
           TARGET_CLOCK_MHZ=1830
