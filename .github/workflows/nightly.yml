@@ -63,7 +63,8 @@ jobs:
           set -euo pipefail
           export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
           echo "Starting kernel cache warmup..."
-          python scripts/warmup_kernel_cache.py --max-workers 64 -n 4
+          python3 -m pip install "pytest-xdist>=3.0"
+          python3 scripts/warmup_kernel_cache.py --max-workers 64 -n 4
         shell: bash
 
   # =========================================================================
