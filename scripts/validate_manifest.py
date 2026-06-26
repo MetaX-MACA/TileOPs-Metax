@@ -25,6 +25,7 @@ import contextlib
 import importlib
 import inspect
 import itertools
+import json
 import re
 import sys
 import textwrap
@@ -3788,12 +3789,30 @@ def _parse_check_op(argv: list[str]) -> str | None:
     return None
 
 
+def _parse_json_output(argv: list[str]) -> str | None:
+    """Parse ``--json-output <path>`` from argv."""
+    for i, arg in enumerate(argv):
+        if arg == "--json-output":
+            if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
+                print("ERROR: --json-output requires a path argument")
+                sys.exit(2)
+            return argv[i + 1]
+        if arg.startswith("--json-output="):
+            value = arg.split("=", 1)[1]
+            if not value or value.startswith("-"):
+                print("ERROR: --json-output requires a path argument")
+                sys.exit(2)
+            return value
+    return None
+
+
 def main() -> int:
     import os
 
     verbose = "--verbose" in sys.argv or "-v" in sys.argv
     levels = _parse_levels(sys.argv)
     check_op = _parse_check_op(sys.argv)
+    json_output = _parse_json_output(sys.argv)
     strict_parity = (
         "--strict" in sys.argv
         or os.environ.get("MANIFEST_STRICT_BLOCKING", "") == "1"
@@ -3817,6 +3836,20 @@ def main() -> int:
         verbose=verbose, levels=levels, check_op=check_op,
         strict_parity=strict_parity,
     )
+
+    if json_output:
+        payload = {
+            "ok": not errors,
+            "error_count": len(errors),
+            "warning_count": len(warnings),
+            "errors": errors,
+            "warnings": warnings,
+            "levels": sorted(levels) if levels else "all",
+            "check_op": check_op,
+            "strict_parity": strict_parity,
+        }
+        Path(json_output).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print(f"Wrote JSON manifest report to {json_output}")
 
     if warnings:
         print(f"\n{len(warnings)} warning(s):")
