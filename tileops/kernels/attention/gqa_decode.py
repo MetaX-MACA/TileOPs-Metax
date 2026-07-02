@@ -452,6 +452,25 @@ class GQADecodeKernel(Kernel):
             # K/V and exceeds that budget.
             block_N = 64
             num_stages = 0
+            kv_group_num = self.heads // self.groups
+            elem_bytes = 2 if self.dtype_str in ("float16", "bfloat16") else 4
+            smem_limit = _shared_memory_limit_bytes()
+
+            def _estimate_smem(bh: int, bn: int) -> int:
+                return _gqa_decode_shared_memory_bytes(
+                    bh,
+                    bn,
+                    self.dim,
+                    num_stages,
+                    valid_block_H=min(bh, kv_group_num),
+                    num_split=num_split,
+                    elem_bytes=elem_bytes,
+                )
+
+            if _estimate_smem(block_H, block_N) > smem_limit:
+                block_H = 32
+            if _estimate_smem(block_H, block_N) > smem_limit:
+                block_N = 32
         else:
             block_N = 128
             num_stages = 2
