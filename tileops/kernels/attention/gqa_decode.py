@@ -16,6 +16,46 @@ from tileops.kernels.online_softmax import (
 
 __all__ = ["GQADecodeKernel"]
 
+
+def _is_metax() -> bool:
+    version = getattr(torch, "version", None)
+    if version is None:
+        return False
+    ver = getattr(version, "__version__", "") or ""
+    return "metax" in ver or hasattr(version, "maca")
+
+
+def _shared_memory_limit_bytes() -> int:
+    if _is_metax():
+        return 65536
+    try:
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_properties(
+                torch.cuda.current_device()).shared_memory_per_block_optin
+    except Exception:
+        pass
+    return 48 * 1024
+
+
+def _gqa_decode_shared_memory_bytes(
+    block_H: int,
+    block_N: int,
+    dim: int,
+    num_stages: int,
+    valid_block_H: int | None = None,
+    num_split: int = 0,
+    elem_bytes: int = 2,
+) -> int:
+    """Estimate dynamic shared memory for GQA decode main kernels."""
+    o_rows = block_H if valid_block_H is None else valid_block_H
+    kv_buffers = max(num_stages, 1)
+    q_bytes = block_H * dim * elem_bytes
+    kv_bytes = block_N * dim * elem_bytes * kv_buffers
+    o_bytes = o_rows * dim * elem_bytes
+    split_bytes = num_split * 4 if num_split > 0 else 0
+    return q_bytes + 2 * kv_bytes + o_bytes + split_bytes
+
+
 # ---------------------------------------------------------------------------
 # JIT kernel: no-split variant
 # ---------------------------------------------------------------------------
@@ -404,11 +444,22 @@ class GQADecodeKernel(Kernel):
 
     @property
     def default_config(self) -> dict:
+        block_H = 64
+        num_split = self._default_num_split()
+        if _is_metax():
+            # Metax MACA devices expose 64 KiB shared memory per block.  The
+            # CUDA-oriented default (block_N=128, num_stages=2) double-buffers
+            # K/V and exceeds that budget.
+            block_N = 64
+            num_stages = 0
+        else:
+            block_N = 128
+            num_stages = 2
         return {
-            "block_H": 64,
-            "block_N": 128,
-            "num_split": self._default_num_split(),
-            "num_stages": 2,
+            "block_H": block_H,
+            "block_N": block_N,
+            "num_split": num_split,
+            "num_stages": num_stages,
             "threads": 128,
         }
 
@@ -431,18 +482,36 @@ class GQADecodeKernel(Kernel):
         block_N = [64, 128]
         block_H = [64]
         num_split = [ns for ns in [2, 4, 8, 16, 32] if ns <= self.seqlen_kv] or [1]
-        num_stages = [1, 2, 3]
+        num_stages = [0, 1, 2, 3] if _is_metax() else [1, 2, 3]
         threads = [128]
         _configs = list(itertools.product(block_N, block_H, num_split, num_stages, threads))
 
-        configs = [{
-            'block_N': c[0],
-            'block_H': c[1],
-            'num_split': c[2],
-            'num_stages': c[3],
-            'threads': c[4]
-        } for c in _configs]
-        return configs
+        kv_group_num = self.heads // self.groups
+        valid_block_H = min(64, kv_group_num)
+        elem_bytes = 2 if self.dtype_str in ("float16", "bfloat16") else 4
+        smem_limit = _shared_memory_limit_bytes()
+
+        configs = []
+        for c in _configs:
+            cfg = {
+                'block_N': c[0],
+                'block_H': c[1],
+                'num_split': c[2],
+                'num_stages': c[3],
+                'threads': c[4],
+            }
+            smem = _gqa_decode_shared_memory_bytes(
+                cfg["block_H"],
+                cfg["block_N"],
+                self.dim,
+                cfg["num_stages"],
+                valid_block_H=valid_block_H,
+                num_split=cfg["num_split"],
+                elem_bytes=elem_bytes,
+            )
+            if smem <= smem_limit:
+                configs.append(cfg)
+        return configs or [self.default_config]
 
     def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, real_seqlen_kv: int):
         block_H = self.config["block_H"]
