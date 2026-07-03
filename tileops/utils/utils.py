@@ -2,8 +2,6 @@ import functools
 
 import torch
 
-from .platform import is_maca
-
 str2dtype = {
     'float16': torch.float16,
     'bfloat16': torch.bfloat16,
