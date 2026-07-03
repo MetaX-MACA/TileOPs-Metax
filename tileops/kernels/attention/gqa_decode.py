@@ -13,7 +13,8 @@ from tileops.kernels.online_softmax import (
     make_online_softmax,
     make_rescale,
 )
-from tileops.utils.platform import is_maca, shared_memory_budget_bytes
+from tileops.utils import is_maca
+from tileops.utils.utils import shared_memory_budget_bytes
 
 __all__ = ["GQADecodeKernel"]
 
