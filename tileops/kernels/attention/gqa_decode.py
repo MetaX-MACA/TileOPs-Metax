@@ -1,6 +1,6 @@
 import functools
 import itertools
-from typing import Any, Optional
+from typing import Optional
 
 import tilelang
 import tilelang.language as T
@@ -14,29 +14,8 @@ from tileops.kernels.online_softmax import (
     make_rescale,
 )
 from tileops.utils import is_maca
-from tileops.utils.utils import shared_memory_budget_bytes
 
 __all__ = ["GQADecodeKernel"]
-
-
-def _gqa_decode_shared_memory_bytes(
-    block_H: int,
-    block_N: int,
-    dim: int,
-    num_stages: int,
-    valid_block_H: int | None = None,
-    num_split: int = 0,
-    elem_bytes: int = 2,
-) -> int:
-    """Estimate dynamic shared memory for GQA decode main kernels."""
-    o_rows = block_H if valid_block_H is None else valid_block_H
-    kv_buffers = max(num_stages, 1)
-    q_bytes = block_H * dim * elem_bytes
-    kv_bytes = block_N * dim * elem_bytes * kv_buffers
-    o_bytes = o_rows * dim * elem_bytes
-    split_bytes = num_split * 4 if num_split > 0 else 0
-    return q_bytes + 2 * kv_bytes + o_bytes + split_bytes
-
 
 # ---------------------------------------------------------------------------
 # JIT kernel: no-split variant
@@ -437,76 +416,6 @@ class GQADecodeKernel(Kernel):
             config.update(block_N=64, num_stages=0)
         return config
 
-    def _elem_bytes(self) -> int:
-        return 2 if self.dtype_str in ("float16", "bfloat16") else 4
-
-    def _fit_config_to_smem_budget(self, cfg: dict) -> dict:
-        """Shrink tile sizes on MACA when the config exceeds shared memory."""
-        if not is_maca():
-            return cfg
-
-        block_H = cfg["block_H"]
-        block_N = cfg["block_N"]
-        num_stages = cfg["num_stages"]
-        num_split = cfg["num_split"]
-        kv_group_num = self.heads // self.groups
-        elem_bytes = self._elem_bytes()
-        smem_limit = shared_memory_budget_bytes()
-
-        def _estimate_smem(bh: int, bn: int) -> int:
-            return _gqa_decode_shared_memory_bytes(
-                bh,
-                bn,
-                self.dim,
-                num_stages,
-                valid_block_H=min(bh, kv_group_num),
-                num_split=num_split,
-                elem_bytes=elem_bytes,
-            )
-
-        if _estimate_smem(block_H, block_N) > smem_limit:
-            block_H = 32
-        if _estimate_smem(block_H, block_N) > smem_limit:
-            block_N = 32
-        return {**cfg, "block_H": block_H, "block_N": block_N}
-
-    def _merge_user_config(self, config: Optional[dict]) -> dict:
-        merged = dict(self.default_config)
-        if config is not None:
-            for key in merged:
-                if config.get(key) is not None:
-                    merged[key] = config[key]
-        return merged
-
-    def init_config(self, config: Optional[dict] = None, tune: bool = False) -> None:
-        if tune:
-            super().init_config(config, tune=True)
-            return
-        super().init_config(self._fit_config_to_smem_budget(self._merge_user_config(config)), tune=False)
-
-    def autotune(self, warmup: int = 25, rep: int = 50) -> None:
-        configs = self.autotune_configs_maca if is_maca() else self.autotune_configs
-        if configs is None:
-            return
-        if not hasattr(self, "kernel") or self.kernel is None:
-            raise AttributeError(
-                f"Cannot autotune {self.__class__.__name__}: 'self.kernel' is not set. "
-                "Set 'self.kernel' in __init__ before calling init_config with tune=True.")
-        print(f"Start autotuning {self.__class__.__name__}...")
-
-        from tilelang.autotuner import autotune
-
-        tunable_params = list(self._autotune_initial_kwargs(self.kernel).keys())
-        autotune_kwargs: dict[str, Any] = dict(configs=configs, warmup=warmup, rep=rep)
-        if tunable_params:
-            autotune_kwargs["do_not_specialize"] = tunable_params
-        if self.autotune_supply_prog is not None:
-            autotune_kwargs["supply_prog"] = self.autotune_supply_prog
-        autotuned_kernel_fn = autotune(**autotune_kwargs)(self.kernel)
-        tuned_kernel = self._call_autotuned_kernel(autotuned_kernel_fn, self.kernel)
-        self.config = tuned_kernel.config
-        print(f"Best config: {self.config}")
-
     def _default_num_split(self) -> int:
         """Choose a conservative default split policy for GQA decode.
 
@@ -538,41 +447,6 @@ class GQADecodeKernel(Kernel):
             'threads': c[4]
         } for c in _configs]
         return configs
-
-    @property
-    def autotune_configs_maca(self) -> list[dict]:
-        block_N = [32, 64, 128]
-        block_H = [32, 64]
-        num_split = [ns for ns in [2, 4, 8, 16, 32] if ns <= self.seqlen_kv] or [1]
-        num_stages = [0, 1, 2, 3]
-        threads = [128]
-        _configs = list(itertools.product(block_N, block_H, num_split, num_stages, threads))
-
-        kv_group_num = self.heads // self.groups
-        elem_bytes = self._elem_bytes()
-        smem_limit = shared_memory_budget_bytes()
-
-        configs = []
-        for c in _configs:
-            cfg = {
-                'block_N': c[0],
-                'block_H': c[1],
-                'num_split': c[2],
-                'num_stages': c[3],
-                'threads': c[4],
-            }
-            smem = _gqa_decode_shared_memory_bytes(
-                cfg["block_H"],
-                cfg["block_N"],
-                self.dim,
-                cfg["num_stages"],
-                valid_block_H=min(cfg["block_H"], kv_group_num),
-                num_split=cfg["num_split"],
-                elem_bytes=elem_bytes,
-            )
-            if smem <= smem_limit:
-                configs.append(cfg)
-        return configs or [self._fit_config_to_smem_budget(dict(self.default_config))]
 
     def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, real_seqlen_kv: int):
         block_H = self.config["block_H"]
