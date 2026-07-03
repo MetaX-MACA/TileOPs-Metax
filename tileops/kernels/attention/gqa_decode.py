@@ -425,22 +425,16 @@ class GQADecodeKernel(Kernel):
 
     @property
     def default_config(self) -> dict:
-        num_split = self._default_num_split()
-        if is_maca():
-            return {
-                "block_H": 64,
-                "block_N": 64,
-                "num_split": num_split,
-                "num_stages": 0,
-                "threads": 128,
-            }
-        return {
+        config = {
             "block_H": 64,
             "block_N": 128,
-            "num_split": num_split,
+            "num_split": self._default_num_split(),
             "num_stages": 2,
             "threads": 128,
         }
+        if is_maca():
+            config.update(block_N=64, num_stages=0)
+        return config
 
     def _elem_bytes(self) -> int:
         return 2 if self.dtype_str in ("float16", "bfloat16") else 4
