@@ -498,15 +498,14 @@ class GQADecodeKernel(Kernel):
 
     @property
     def autotune_configs(self) -> list[dict]:
-        block_N = [64, 128]
-        block_H = [64]
+        block_N = [32, 64, 128] if _is_metax() else [64, 128]
+        block_H = [32, 64] if _is_metax() else [64]
         num_split = [ns for ns in [2, 4, 8, 16, 32] if ns <= self.seqlen_kv] or [1]
         num_stages = [0, 1, 2, 3] if _is_metax() else [1, 2, 3]
         threads = [128]
         _configs = list(itertools.product(block_N, block_H, num_split, num_stages, threads))
 
         kv_group_num = self.heads // self.groups
-        valid_block_H = min(64, kv_group_num)
         elem_bytes = 2 if self.dtype_str in ("float16", "bfloat16") else 4
         smem_limit = _shared_memory_limit_bytes()
 
@@ -524,7 +523,7 @@ class GQADecodeKernel(Kernel):
                 cfg["block_N"],
                 self.dim,
                 cfg["num_stages"],
-                valid_block_H=valid_block_H,
+                valid_block_H=min(cfg["block_H"], kv_group_num),
                 num_split=cfg["num_split"],
                 elem_bytes=elem_bytes,
             )
