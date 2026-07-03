@@ -472,7 +472,7 @@ class GQADecodeKernel(Kernel):
     def _merge_user_config(self, config: Optional[dict]) -> dict:
         merged = dict(self.default_config)
         if config is not None:
-            for key, value in merged.items():
+            for key in merged:
                 if config.get(key) is not None:
                     merged[key] = config[key]
         return merged
