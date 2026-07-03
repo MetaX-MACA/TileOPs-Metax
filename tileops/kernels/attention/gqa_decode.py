@@ -13,28 +13,9 @@ from tileops.kernels.online_softmax import (
     make_online_softmax,
     make_rescale,
 )
+from tileops.utils.platform import is_maca, shared_memory_budget_bytes
 
 __all__ = ["GQADecodeKernel"]
-
-
-def _is_metax() -> bool:
-    version = getattr(torch, "version", None)
-    if version is None:
-        return False
-    ver = getattr(version, "__version__", "") or ""
-    return "metax" in ver or hasattr(version, "maca")
-
-
-def _shared_memory_limit_bytes() -> int:
-    if _is_metax():
-        return 65536
-    try:
-        if torch.cuda.is_available():
-            return torch.cuda.get_device_properties(
-                torch.cuda.current_device()).shared_memory_per_block_optin
-    except Exception:
-        pass
-    return 48 * 1024
 
 
 def _gqa_decode_shared_memory_bytes(
@@ -444,43 +425,72 @@ class GQADecodeKernel(Kernel):
 
     @property
     def default_config(self) -> dict:
-        block_H = 64
         num_split = self._default_num_split()
-        if _is_metax():
-            # Metax MACA devices expose 64 KiB shared memory per block.  The
-            # CUDA-oriented default (block_N=128, num_stages=2) double-buffers
-            # K/V and exceeds that budget.
-            block_N = 64
-            num_stages = 0
-            kv_group_num = self.heads // self.groups
-            elem_bytes = 2 if self.dtype_str in ("float16", "bfloat16") else 4
-            smem_limit = _shared_memory_limit_bytes()
-
-            def _estimate_smem(bh: int, bn: int) -> int:
-                return _gqa_decode_shared_memory_bytes(
-                    bh,
-                    bn,
-                    self.dim,
-                    num_stages,
-                    valid_block_H=min(bh, kv_group_num),
-                    num_split=num_split,
-                    elem_bytes=elem_bytes,
-                )
-
-            if _estimate_smem(block_H, block_N) > smem_limit:
-                block_H = 32
-            if _estimate_smem(block_H, block_N) > smem_limit:
-                block_N = 32
-        else:
-            block_N = 128
-            num_stages = 2
+        if is_maca():
+            return {
+                "block_H": 64,
+                "block_N": 64,
+                "num_split": num_split,
+                "num_stages": 0,
+                "threads": 128,
+            }
         return {
-            "block_H": block_H,
-            "block_N": block_N,
+            "block_H": 64,
+            "block_N": 128,
             "num_split": num_split,
-            "num_stages": num_stages,
+            "num_stages": 2,
             "threads": 128,
         }
+
+    def _elem_bytes(self) -> int:
+        return 2 if self.dtype_str in ("float16", "bfloat16") else 4
+
+    def _fit_config_to_smem_budget(self, cfg: dict) -> dict:
+        """Shrink tile sizes on MACA when the config exceeds shared memory."""
+        if not is_maca():
+            return cfg
+
+        block_H = cfg["block_H"]
+        block_N = cfg["block_N"]
+        num_stages = cfg["num_stages"]
+        num_split = cfg["num_split"]
+        kv_group_num = self.heads // self.groups
+        elem_bytes = self._elem_bytes()
+        smem_limit = shared_memory_budget_bytes()
+
+        def _estimate_smem(bh: int, bn: int) -> int:
+            return _gqa_decode_shared_memory_bytes(
+                bh,
+                bn,
+                self.dim,
+                num_stages,
+                valid_block_H=min(bh, kv_group_num),
+                num_split=num_split,
+                elem_bytes=elem_bytes,
+            )
+
+        if _estimate_smem(block_H, block_N) > smem_limit:
+            block_H = 32
+        if _estimate_smem(block_H, block_N) > smem_limit:
+            block_N = 32
+        return {**cfg, "block_H": block_H, "block_N": block_N}
+
+    def _merge_user_config(self, config: Optional[dict]) -> dict:
+        merged = dict(self.default_config)
+        if config is not None:
+            for key, value in merged.items():
+                if config.get(key) is not None:
+                    merged[key] = config[key]
+        return merged
+
+    def init_config(self, config: Optional[dict] = None, tune: bool = False) -> None:
+        self._resolved_autotune_configs = (
+            self.autotune_configs_maca if is_maca() else self._cuda_autotune_configs()
+        )
+        if tune:
+            super().init_config(config, tune=True)
+            return
+        super().init_config(self._fit_config_to_smem_budget(self._merge_user_config(config)), tune=False)
 
     def _default_num_split(self) -> int:
         """Choose a conservative default split policy for GQA decode.
@@ -496,18 +506,41 @@ class GQADecodeKernel(Kernel):
             candidate = 16
         return min(candidate, self.seqlen_kv)
 
+    def _cuda_autotune_configs(self) -> list[dict]:
+        block_N = [64, 128]
+        block_H = [64]
+        num_split = [ns for ns in [2, 4, 8, 16, 32] if ns <= self.seqlen_kv] or [1]
+        num_stages = [1, 2, 3]
+        threads = [128]
+        _configs = list(itertools.product(block_N, block_H, num_split, num_stages, threads))
+
+        return [{
+            'block_N': c[0],
+            'block_H': c[1],
+            'num_split': c[2],
+            'num_stages': c[3],
+            'threads': c[4],
+        } for c in _configs]
+
     @property
     def autotune_configs(self) -> list[dict]:
-        block_N = [32, 64, 128] if _is_metax() else [64, 128]
-        block_H = [32, 64] if _is_metax() else [64]
+        resolved = getattr(self, "_resolved_autotune_configs", None)
+        if resolved is not None:
+            return resolved
+        return self._cuda_autotune_configs()
+
+    @property
+    def autotune_configs_maca(self) -> list[dict]:
+        block_N = [32, 64, 128]
+        block_H = [32, 64]
         num_split = [ns for ns in [2, 4, 8, 16, 32] if ns <= self.seqlen_kv] or [1]
-        num_stages = [0, 1, 2, 3] if _is_metax() else [1, 2, 3]
+        num_stages = [0, 1, 2, 3]
         threads = [128]
         _configs = list(itertools.product(block_N, block_H, num_split, num_stages, threads))
 
         kv_group_num = self.heads // self.groups
-        elem_bytes = 2 if self.dtype_str in ("float16", "bfloat16") else 4
-        smem_limit = _shared_memory_limit_bytes()
+        elem_bytes = self._elem_bytes()
+        smem_limit = shared_memory_budget_bytes()
 
         configs = []
         for c in _configs:
@@ -529,7 +562,7 @@ class GQADecodeKernel(Kernel):
             )
             if smem <= smem_limit:
                 configs.append(cfg)
-        return configs or [self.default_config]
+        return configs or [self._fit_config_to_smem_budget(dict(self.default_config))]
 
     def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, real_seqlen_kv: int):
         block_H = self.config["block_H"]
