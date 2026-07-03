@@ -1,6 +1,6 @@
 import functools
 import itertools
-from typing import Optional
+from typing import Any, Optional
 
 import tilelang
 import tilelang.language as T
@@ -484,13 +484,33 @@ class GQADecodeKernel(Kernel):
         return merged
 
     def init_config(self, config: Optional[dict] = None, tune: bool = False) -> None:
-        self._resolved_autotune_configs = (
-            self.autotune_configs_maca if is_maca() else self._cuda_autotune_configs()
-        )
         if tune:
             super().init_config(config, tune=True)
             return
         super().init_config(self._fit_config_to_smem_budget(self._merge_user_config(config)), tune=False)
+
+    def autotune(self, warmup: int = 25, rep: int = 50) -> None:
+        configs = self.autotune_configs_maca if is_maca() else self.autotune_configs
+        if configs is None:
+            return
+        if not hasattr(self, "kernel") or self.kernel is None:
+            raise AttributeError(
+                f"Cannot autotune {self.__class__.__name__}: 'self.kernel' is not set. "
+                "Set 'self.kernel' in __init__ before calling init_config with tune=True.")
+        print(f"Start autotuning {self.__class__.__name__}...")
+
+        from tilelang.autotuner import autotune
+
+        tunable_params = list(self._autotune_initial_kwargs(self.kernel).keys())
+        autotune_kwargs: dict[str, Any] = dict(configs=configs, warmup=warmup, rep=rep)
+        if tunable_params:
+            autotune_kwargs["do_not_specialize"] = tunable_params
+        if self.autotune_supply_prog is not None:
+            autotune_kwargs["supply_prog"] = self.autotune_supply_prog
+        autotuned_kernel_fn = autotune(**autotune_kwargs)(self.kernel)
+        tuned_kernel = self._call_autotuned_kernel(autotuned_kernel_fn, self.kernel)
+        self.config = tuned_kernel.config
+        print(f"Best config: {self.config}")
 
     def _default_num_split(self) -> int:
         """Choose a conservative default split policy for GQA decode.
@@ -506,7 +526,8 @@ class GQADecodeKernel(Kernel):
             candidate = 16
         return min(candidate, self.seqlen_kv)
 
-    def _cuda_autotune_configs(self) -> list[dict]:
+    @property
+    def autotune_configs(self) -> list[dict]:
         block_N = [64, 128]
         block_H = [64]
         num_split = [ns for ns in [2, 4, 8, 16, 32] if ns <= self.seqlen_kv] or [1]
@@ -514,20 +535,14 @@ class GQADecodeKernel(Kernel):
         threads = [128]
         _configs = list(itertools.product(block_N, block_H, num_split, num_stages, threads))
 
-        return [{
+        configs = [{
             'block_N': c[0],
             'block_H': c[1],
             'num_split': c[2],
             'num_stages': c[3],
-            'threads': c[4],
+            'threads': c[4]
         } for c in _configs]
-
-    @property
-    def autotune_configs(self) -> list[dict]:
-        resolved = getattr(self, "_resolved_autotune_configs", None)
-        if resolved is not None:
-            return resolved
-        return self._cuda_autotune_configs()
+        return configs
 
     @property
     def autotune_configs_maca(self) -> list[dict]:
