@@ -584,6 +584,9 @@ class GroupedQueryAttentionPrefillFwdOp(Op):
 
     def _get_fp8_kernel(self) -> Kernel:
         if self._fp8_kernel is None:
+            kernel_cls = self.kernel_map["gqa_prefill_fp8_tensor_core_fwd_kernel"]
+            if kernel_cls is None:
+                raise NotImplementedError("FP8 prefill is only supported on Hopper (sm90) GPUs.")
             self._fp8_kernel = self.kernel_map["gqa_prefill_fp8_tensor_core_fwd_kernel"](
                 self.batch,
                 self.heads,
