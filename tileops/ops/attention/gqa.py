@@ -422,7 +422,7 @@ class GroupedQueryAttentionPrefillFwdOp(Op):
             "gqa_prefill_varlen_fwd_kernel": _select_gqa_prefill_varlen_fwd_kernel_cls(),
             "gqa_sliding_window_varlen_fwd": sliding_kernel_cls,
             "gqa_prefill_fp8_tensor_core_fwd_kernel":
-                GQAFwdFP8Fa3ContractPtxAccBN224WsTmaVKernel,
+                GQAFwdFP8Fa3ContractPtxAccBN224WsTmaVKernel if is_hopper() else None,
         }
 
     def _infer_output_shapes(
