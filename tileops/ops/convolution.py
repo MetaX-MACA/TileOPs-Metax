@@ -13,6 +13,7 @@ from tileops.kernels.convolution import (
     GroupConv3dKernel,
 )
 from tileops.kernels.kernel_base import Kernel
+from tileops.utils import is_maca
 
 from .op_base import Op
 
@@ -417,7 +418,9 @@ class Conv1dBiasFwdOp(Conv1dFwdOp):
             dtype=dtype,
             kernel_map=kernel_map,
             tune=tune,
-            _has_bias=True,
+            # MACA codegen mishandles in-kernel bias for some conv1d shapes;
+            # bias is fused in forward() on that backend instead.
+            _has_bias=not is_maca(),
         )
 
     def forward(
@@ -435,7 +438,10 @@ class Conv1dBiasFwdOp(Conv1dFwdOp):
             (self.c_out, self.c_in // self.groups, self.kernel_size),
         )
         _validate_tensor_shape("Conv1d", "bias", bias, (self.c_out,))
-        return self.kernel(input, weight, bias)
+        out = self.kernel(input, weight, None if is_maca() else bias)
+        if is_maca():
+            out = out + bias.view(1, self.c_out, 1)
+        return out
 
     def _infer_output_shapes(
         self,

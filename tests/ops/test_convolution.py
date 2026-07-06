@@ -23,6 +23,7 @@ from tileops.ops import (
     Conv3dBiasFwdOp,
     Conv3dFwdOp,
 )
+from tileops.utils import is_maca
 
 
 class Conv1dFixture(FixtureBase):
@@ -698,6 +699,17 @@ class Conv3dTest(TestBase):
         weight: torch.Tensor,
         bias: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        if is_maca():
+            out = F.conv3d(
+                x.float(),
+                weight.float(),
+                bias=bias.float() if bias is not None else None,
+                stride=self.stride,
+                padding=self.padding,
+                dilation=self.dilation,
+                groups=self.groups,
+            )
+            return out.to(dtype=x.dtype).contiguous()
         out = F.conv3d(
             x,
             weight,
@@ -765,15 +777,21 @@ def test_conv3d_no_bias_matches_torch() -> None:
     x = torch.randn(1, 8, 8, 16, 16, device="cuda", dtype=torch.float16).contiguous()
     weight = torch.randn(16, 8, 3, 3, 3, device="cuda", dtype=torch.float16).contiguous()
     out = op(x, weight)
-    ref = F.conv3d(
-        x,
-        weight,
-        bias=None,
-        stride=2,
-        padding=2,
-        dilation=2,
-    )
-    ref = ref.contiguous()
+    if is_maca():
+        ref = F.conv3d(
+            x.float(), weight.float(), bias=None, stride=2, padding=2, dilation=2,
+        )
+        ref = ref.to(dtype=x.dtype).contiguous()
+    else:
+        ref = F.conv3d(
+            x,
+            weight,
+            bias=None,
+            stride=2,
+            padding=2,
+            dilation=2,
+        )
+        ref = ref.contiguous()
     torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
 
 
@@ -815,14 +833,20 @@ def test_conv3d_accepts_zero_bias() -> None:
     weight = torch.randn(16, 8, 3, 3, 3, device="cuda", dtype=torch.float16).contiguous()
     bias = torch.zeros(16, device="cuda", dtype=torch.float16).contiguous()
     out = op(x, weight, bias)
-    ref = F.conv3d(
-        x,
-        weight,
-        bias=bias,
-        stride=2,
-        padding=1,
-    )
-    ref = ref.contiguous()
+    if is_maca():
+        ref = F.conv3d(
+            x.float(), weight.float(), bias=bias.float(), stride=2, padding=1,
+        )
+        ref = ref.to(dtype=x.dtype).contiguous()
+    else:
+        ref = F.conv3d(
+            x,
+            weight,
+            bias=bias,
+            stride=2,
+            padding=1,
+        )
+        ref = ref.contiguous()
     torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
 
 

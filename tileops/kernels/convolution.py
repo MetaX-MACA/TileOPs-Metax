@@ -7,7 +7,7 @@ import tilelang.language as T
 import torch
 
 from tileops.kernels.kernel_base import Kernel
-from tileops.utils import get_sm_version
+from tileops.utils import get_sm_version, is_maca
 
 __all__ = [
     "Conv1dKernel",
@@ -263,7 +263,15 @@ def _conv1d_group_kernel(
     c_out_g = c_out_g if c_out_g > 0 else c_out // groups
     k_total = c_in_g * kernel_l
 
-    @tilelang.jit(out_idx=[2], compile_flags=["-O3", "-DENABLE_BF16"])
+    @tilelang.jit(
+        out_idx=[2],
+        compile_flags=["-O3", "-DENABLE_BF16"],
+        **(
+            {"pass_configs": {"tl.enable_async_copy": False, "tir.disable_vectorize": True}}
+            if is_maca()
+            else {}
+        ),
+    )
     def _conv1d_group_func(
         block_m: int,
         block_n: int,
@@ -1351,7 +1359,10 @@ def _conv2d_group_kernel(
     @tilelang.jit(
         out_idx=[2],
         compile_flags=["-O3", "-DENABLE_BF16"],
-        pass_configs={"tl.enable_async_copy": False},
+        pass_configs={
+            "tl.enable_async_copy": False,
+            **({"tir.disable_vectorize": True} if is_maca() else {}),
+        },
     )
     def _conv2d_group_func(
         block_m: int,
@@ -1368,6 +1379,8 @@ def _conv2d_group_kernel(
             out: T.Tensor((n, c_out, out_h, out_w), dtype),  # type: ignore
             bias: T.Tensor((c_out,), dtype),  # type: ignore
         ):
+            if is_maca():
+                out_flat = T.Tensor((n, c_out, out_hw), dtype, out.data)
             with T.Kernel(
                 T.ceildiv(out_hw, block_n),
                 T.ceildiv(c_out_g, block_m),
@@ -1446,10 +1459,14 @@ def _conv2d_group_kernel(
                     oc_g = by * block_m + i
                     oc = group_id * c_out_g + oc_g
                     spatial_idx = bx * block_n + j
-                    oh = spatial_idx // out_w
-                    ow = spatial_idx % out_w
-                    if oc_g < c_out_g and spatial_idx < out_hw:
-                        out[batch_id, oc, oh, ow] = out_shared[i, j]
+                    if is_maca():
+                        if oc_g < c_out_g and spatial_idx < out_hw:
+                            out_flat[batch_id, oc, spatial_idx] = out_shared[i, j]
+                    else:
+                        oh = spatial_idx // out_w
+                        ow = spatial_idx % out_w
+                        if oc_g < c_out_g and spatial_idx < out_hw:
+                            out[batch_id, oc, oh, ow] = out_shared[i, j]
 
         return _conv2d_group_main
 
@@ -2275,7 +2292,10 @@ def _conv3d_group_kernel(
     @tilelang.jit(
         out_idx=[2],
         compile_flags=["-O3", "-DENABLE_BF16"],
-        pass_configs={"tl.enable_async_copy": False},
+        pass_configs={
+            "tl.enable_async_copy": False,
+            **({"tir.disable_vectorize": True} if is_maca() else {}),
+        },
     )
     def _conv3d_group_func(
         block_m: int,
@@ -2292,6 +2312,8 @@ def _conv3d_group_kernel(
             out: T.Tensor((n, c_out, out_d, out_h, out_w), dtype),  # type: ignore
             bias: T.Tensor((c_out,), dtype),  # type: ignore
         ):
+            if is_maca():
+                out_flat = T.Tensor((n, c_out, out_dhw), dtype, out.data)
             with T.Kernel(
                 T.ceildiv(out_dhw, block_n),
                 T.ceildiv(c_out_g, block_m),
@@ -2376,11 +2398,15 @@ def _conv3d_group_kernel(
                     oc_g = by * block_m + i
                     oc = group_id * c_out_g + oc_g
                     spatial_idx = bx * block_n + j
-                    od = spatial_idx // (out_h * out_w)
-                    oh = (spatial_idx // out_w) % out_h
-                    ow = spatial_idx % out_w
-                    if oc_g < c_out_g and spatial_idx < out_dhw:
-                        out[batch_id, oc, od, oh, ow] = out_shared[i, j]
+                    if is_maca():
+                        if oc_g < c_out_g and spatial_idx < out_dhw:
+                            out_flat[batch_id, oc, spatial_idx] = out_shared[i, j]
+                    else:
+                        od = spatial_idx // (out_h * out_w)
+                        oh = (spatial_idx // out_w) % out_h
+                        ow = spatial_idx % out_w
+                        if oc_g < c_out_g and spatial_idx < out_dhw:
+                            out[batch_id, oc, od, oh, ow] = out_shared[i, j]
 
         return _conv3d_group_main
 
