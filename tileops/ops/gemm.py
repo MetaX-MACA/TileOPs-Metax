@@ -35,14 +35,17 @@ class GemmOp(Op):
     The logical dims ``m, n, k`` and dtype are normally derived from the
     ``forward`` inputs and kernels are built lazily. Passing ``m, n, k`` as the
     first three positional arguments is also supported for prepared-weight
-    paths that must build a kernel before the first ``forward`` call.
+    paths that must build a kernel before the first ``forward`` call. The
+    input-inferred form keeps the upstream NT default, while the shaped
+    compatibility form keeps the legacy NN default used by prepared-B HGEMM
+    benchmarks.
     """
 
     def __init__(
         self,
         *shape_args: int,
         trans_a: bool = False,
-        trans_b: bool = True,
+        trans_b: Optional[bool] = None,
         dtype: Optional[torch.dtype] = None,
         kernel_map: Optional[Dict[str, Kernel]] = None,
         tune: bool = False,
@@ -64,7 +67,7 @@ class GemmOp(Op):
         self.N = self.n
         self.K = self.k
         self.trans_a = trans_a
-        self.trans_b = trans_b
+        self.trans_b = (False if shape_args else True) if trans_b is None else trans_b
         self.dtype = dtype
         self._tune = tune
         self.dispatch_kernel(kernel_map)

@@ -4,6 +4,7 @@ import functools
 import itertools
 import os
 import weakref
+from contextlib import contextmanager
 from typing import Callable, Optional
 
 import tilelang
@@ -337,14 +338,65 @@ def _get_maca_bsm_split_k() -> int:
     return max(1, int(value))
 
 
-def _get_maca_bsm_packed_b_tile() -> bool:
-    value = os.environ.get("TILEOPS_GEMM_PACKED_B_TILE", "").strip().lower()
+def _get_maca_bsm_split_k_override() -> Optional[int]:
+    value = os.environ.get("TILEOPS_GEMM_SPLIT_K")
+    if value is None or not value.strip():
+        return None
+    return max(1, int(value))
+
+
+def _get_bool_env_override(name: str) -> Optional[bool]:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    value = value.strip().lower()
     return value in {"1", "true", "yes", "on"}
+
+
+def _get_maca_bsm_packed_b_tile() -> bool:
+    value = _get_bool_env_override("TILEOPS_GEMM_PACKED_B_TILE")
+    return bool(value)
 
 
 def _get_maca_bsm_packed_b_async_pipeline() -> bool:
-    value = os.environ.get("TILEOPS_GEMM_PACKED_B_ASYNC_PIPELINE", "").strip().lower()
-    return value in {"1", "true", "yes", "on"}
+    value = _get_bool_env_override("TILEOPS_GEMM_PACKED_B_ASYNC_PIPELINE")
+    return bool(value)
+
+
+def _should_auto_use_maca_compiler_splitk_packed(
+        m: int,
+        n: int,
+        k: int,
+        dtype: torch.dtype,
+        trans_a: bool,
+        trans_b: bool,
+        tune: bool,
+) -> bool:
+    return (
+        is_metax_c500()
+        and dtype == torch.float16
+        and not trans_a
+        and not trans_b
+        and not tune
+        and m % 128 == 0
+        and n % 128 == 0
+        and k % 128 == 0
+        and k >= 131072
+    )
+
+
+@contextmanager
+def _temporary_env(updates: dict[str, str]):
+    old_values = {key: os.environ.get(key) for key in updates}
+    os.environ.update(updates)
+    try:
+        yield
+    finally:
+        for key, old_value in old_values.items():
+            if old_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old_value
 
 
 @functools.lru_cache(maxsize=32)
@@ -708,6 +760,7 @@ def _gemm_kernel_bsm_splitk_packed_b_tile(m: int,
                    enable_rasterization: bool) -> Callable:
 
         split_block_k = block_k // split_k
+        k_tiles_per_split = k_chunk // split_block_k
         a_shape = (m, k)
         b_shape = (n // block_n, k // split_block_k, block_n, split_block_k)
         partial_c_shape = (split_k, m, n)
@@ -735,7 +788,7 @@ def _gemm_kernel_bsm_splitk_packed_b_tile(m: int,
                 T.clear(c_local)
                 for _k in T.Pipelined(T.ceildiv(k_chunk, split_block_k), num_stages=num_stages):
                     k_offset = bz * k_chunk + _k * split_block_k
-                    k_tile = k_offset // split_block_k
+                    k_tile = bz * k_tiles_per_split + _k
                     T.copy(a[by * block_m, k_offset], a_operand)
                     T.copy(b[bx, k_tile, 0, 0], b_shared)
                     gemm_annotations = {
@@ -858,12 +911,33 @@ def _gemm_splitk_reduce_kernel(m: int,
                                dtype: str = "float16",
                                partial_dtype: str = "float32") -> Callable:
     threads = 256
-    items_per_thread = 4
+    items_per_thread = 16
     block_size = threads * items_per_thread
     total = m * n
 
     @tilelang.jit(out_idx=[1], compile_flags=_gemm_compile_flags(use_maca=True))
     def _reduce_func() -> Callable:
+
+        if split_k == 2:
+
+            @T.prim_func
+            def _reduce_main(
+                    partial_c: T.Tensor((split_k, m, n), partial_dtype),  # type: ignore
+                    c: T.Tensor((m, n), dtype),  # type: ignore
+            ) -> None:
+                with T.Kernel(T.ceildiv(total, block_size), threads=threads) as bx:
+                    for tx, item in T.Parallel(threads, items_per_thread):
+                        flat_idx = (bx * threads + tx) * items_per_thread + item
+                        if flat_idx < total:
+                            row = flat_idx // n
+                            col = flat_idx - row * n
+                            c[row, col] = T.cast(
+                                T.cast(partial_c[0, row, col], "float32")
+                                + T.cast(partial_c[1, row, col], "float32"),
+                                dtype,
+                            )
+
+            return _reduce_main
 
         @T.prim_func
         def _reduce_main(
@@ -995,7 +1069,17 @@ class GemmKernel(Kernel):
         self.dtype = dtype
         self.trans_a = trans_a
         self.trans_b = trans_b
-        self.split_k = _get_maca_bsm_split_k()
+        split_k_override = _get_maca_bsm_split_k_override()
+        packed_b_override = _get_bool_env_override("TILEOPS_GEMM_PACKED_B_TILE")
+        # Keep the long-K C500 compiler split-K packed-B path selected by default.
+        auto_splitk_packed = (
+            split_k_override is None
+            and packed_b_override is None
+            and _should_auto_use_maca_compiler_splitk_packed(
+                m, n, k, dtype, trans_a, trans_b, tune)
+        )
+        self.split_k = split_k_override if split_k_override is not None else (
+            2 if auto_splitk_packed else 1)
         self._use_maca_bsm_path = (
             is_metax_c500() and dtype == torch.float16 and not trans_a and m % 128 == 0
             and n % 128 == 0 and k % 128 == 0 and not tune
@@ -1007,7 +1091,9 @@ class GemmKernel(Kernel):
         if self.split_k > 1 and k % self.split_k != 0:
             raise RuntimeError("TILEOPS_GEMM_SPLIT_K requires K to be divisible by split_k")
         self._use_packed_b_tile_path = (
-            self._use_maca_bsm_path and not trans_b and _get_maca_bsm_packed_b_tile()
+            self._use_maca_bsm_path
+            and not trans_b
+            and (packed_b_override if packed_b_override is not None else auto_splitk_packed)
         )
         self._use_col_major_output = (not trans_a and dtype == torch.float16
                                       and not self._use_maca_bsm_path)
@@ -1015,6 +1101,16 @@ class GemmKernel(Kernel):
         self._use_packed_b_async_pipeline_path = (
             self._use_split_k_path and self._use_packed_b_tile_path
             and _get_maca_bsm_packed_b_async_pipeline()
+        )
+        self._compiler_env = (
+            {
+                "TILELANG_MACA_GEMM_USE_TEMPLATE": "1",
+                "TILELANG_MACA_GEMM_K_PACK": "1",
+            }
+            if self._use_split_k_path
+            and self._use_packed_b_tile_path
+            and not self._use_packed_b_async_pipeline_path
+            else {}
         )
 
         if self._use_split_k_path:
@@ -1058,11 +1154,24 @@ class GemmKernel(Kernel):
         self._b_native_cache_source = None
         self._b_native_cache_version = -1
         self._b_native_cache_tensor: Optional[torch.Tensor] = None
+        self._compiled_kernel_config: Optional[tuple] = None
+        self._compiled_kernel = None
+        self._compiled_reduce_kernel = None
 
     @property
     def default_config(self) -> dict:
         # From tilelang/examples/gemm/example_gemm_autotune.py
         if self._use_maca_bsm_path:
+            if (self._use_split_k_path and self._use_packed_b_tile_path
+                    and self.k >= 131072):
+                return {
+                    "block_m": 128,
+                    "block_n": 128,
+                    "block_k": 128,
+                    "num_stages": 0,
+                    "threads": 256,
+                    "enable_rasterization": True
+                }
             return {
                 "block_m": 128,
                 "block_n": 128,
@@ -1142,14 +1251,35 @@ class GemmKernel(Kernel):
             self._b_native_cache_tensor = None
         return native_b
 
-    def forward_with_prepared_b(self, a: torch.Tensor, b_prepared: torch.Tensor) -> torch.Tensor:
-        kernel = self.kernel(self.config["block_m"], self.config["block_n"],
-                             self.config["block_k"], self.config["threads"],
-                             self.config["num_stages"], self.config["enable_rasterization"])
-        if self._use_split_k_path:
+    def _compiled_kernel_config_key(self) -> tuple:
+        return (
+            self.config["block_m"],
+            self.config["block_n"],
+            self.config["block_k"],
+            self.config["threads"],
+            self.config["num_stages"],
+            self.config["enable_rasterization"],
+        )
+
+    def _get_compiled_kernel(self):
+        config_key = self._compiled_kernel_config_key()
+        if self._compiled_kernel is None or self._compiled_kernel_config != config_key:
+            with _temporary_env(self._compiler_env):
+                self._compiled_kernel = self.kernel(*config_key)
+            self._compiled_kernel_config = config_key
+        return self._compiled_kernel
+
+    def _get_compiled_reduce_kernel(self):
+        if self._compiled_reduce_kernel is None:
             assert self.reduce_kernel is not None
+            self._compiled_reduce_kernel = self.reduce_kernel()
+        return self._compiled_reduce_kernel
+
+    def forward_with_prepared_b(self, a: torch.Tensor, b_prepared: torch.Tensor) -> torch.Tensor:
+        kernel = self._get_compiled_kernel()
+        if self._use_split_k_path:
             partial_c = kernel(a, b_prepared)
-            return self.reduce_kernel()(partial_c)
+            return self._get_compiled_reduce_kernel()(partial_c)
         if self._use_col_major_output:
             return kernel(a, b_prepared).transpose(0, 1)
         return kernel(a, b_prepared)

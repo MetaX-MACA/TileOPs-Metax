@@ -49,6 +49,16 @@ TILELANG_019_BENCH_NODEIDS = {
     "benchmarks/ops/bench_group_norm.py::test_group_norm_bench[tail-spatial-g16-float16]",
 }
 
+# Benchmark files whose parametrized cases OOM when run in one pytest session.
+# Nightly CI collects each node and runs it in a separate process; see
+# scripts/run_bench_two_phase.py.
+SERIAL_NODE_BENCH_PATHS = {
+    "benchmarks/ops/bench_gemm.py",
+    "benchmarks/ops/bench_moe_experts_nopad.py",
+    "benchmarks/ops/bench_moe_fused_moe.py",
+    "benchmarks/ops/bench_moe_shared_fused_moe.py",
+}
+
 
 def _normalized_benchmark_nodeid(item: pytest.Item) -> str:
     nodeid = item.nodeid

@@ -5,8 +5,10 @@ import torch
 
 from benchmarks.benchmark_base import BenchmarkBase, BenchmarkReport
 from tests.ops.test_gemm import GemmFp8Test, GemmTest
+from tileops.kernels.gemm_maca.maca_hgemm import MacaHGemmKernel
 from tileops.manifest import load_workloads
 from tileops.ops import GemmFp8Op, GemmOp
+from tileops.utils import is_metax_c500
 
 _OP_NAME = "GemmOp"
 _FP8_OP_NAME = "GemmFp8Op"
@@ -20,11 +22,7 @@ _DTYPE_MAP = {
 
 
 class GemmBenchmark(BenchmarkBase[GemmTest]):
-    """Reads FLOP/byte counts from the Op's manifest-derived roofline.
-
-    `GemmOp` is input-inferred, so `eval_roofline()` is valid only after a
-    forward has bound `m/n/k/dtype`; the benchmark calls it lazily.
-    """
+    """Reads FLOP/byte counts from the Op's manifest-derived roofline."""
 
     _roofline_cache: Optional[tuple[float, float]] = None
 
@@ -135,6 +133,38 @@ def _manifest_fp8_params() -> list:
     return params
 
 
+_HGEMM_LONG_K_SHAPES = [
+    pytest.param(1664, 1024, 262144, torch.float16, False, False, False,
+                 id="hgemm-long-k-m1664-n1024-k262144"),
+]
+
+_HGEMM_TABLE_SHAPES = [
+    pytest.param(4096, 1024, 8192, torch.float16, False, False, False,
+                 id="hgemm-table-m4096-n1024-k8192"),
+    pytest.param(4096, 8192, 8192, torch.float16, False, False, False,
+                 id="hgemm-table-m4096-n8192-k8192"),
+    pytest.param(4096, 28672, 8192, torch.float16, False, False, False,
+                 id="hgemm-table-m4096-n28672-k8192"),
+    pytest.param(4096, 8192, 28672, torch.float16, False, False, False,
+                 id="hgemm-table-m4096-n8192-k28672"),
+    pytest.param(8192, 1024, 8192, torch.float16, False, False, False,
+                 id="hgemm-table-m8192-n1024-k8192"),
+    pytest.param(8192, 8192, 8192, torch.float16, False, False, False,
+                 id="hgemm-table-m8192-n8192-k8192"),
+    pytest.param(8192, 28672, 8192, torch.float16, False, False, False,
+                 id="hgemm-table-m8192-n28672-k8192"),
+    pytest.param(8192, 8192, 28672, torch.float16, False, False, False,
+                 id="hgemm-table-m8192-n8192-k28672"),
+]
+
+_COMPILER_SPLITK_PACKED_ENV = {
+    "TILEOPS_GEMM_SPLIT_K": "2",
+    "TILEOPS_GEMM_PACKED_B_TILE": "1",
+    "TILELANG_MACA_GEMM_USE_TEMPLATE": "1",
+    "TILELANG_MACA_GEMM_K_PACK": "1",
+}
+
+
 @pytest.mark.parametrize("m, n, k, trans_a, trans_b, dtype_str", _manifest_params())
 def test_gemm_bench(
     m: int, n: int, k: int, trans_a: bool, trans_b: bool, dtype_str: str,
@@ -146,8 +176,6 @@ def test_gemm_bench(
     op = GemmOp(trans_a=trans_a, trans_b=trans_b)
     bm = GemmBenchmark(test, op)
 
-    # The benchmark framework warms up internally; eval_roofline() is read
-    # lazily after profiling, by which point forward() has bound the dims.
     result = bm.profile(op, a, b)
     BenchmarkReport.record(op, locals(), result, tag="tileops")
 
@@ -195,6 +223,91 @@ def test_gemm_fp8_bench(
         return
 
     raise ValueError(f"unsupported FP8 GEMM scale_mode for benchmark: {scale_mode!r}")
+
+
+@pytest.mark.parametrize("m, n, k, dtype, trans_a, trans_b, tune",
+                         _HGEMM_LONG_K_SHAPES + _HGEMM_TABLE_SHAPES)
+def test_maca_hgemm_packed_b_bench(
+        monkeypatch: pytest.MonkeyPatch,
+        m: int,
+        n: int,
+        k: int,
+        dtype: torch.dtype,
+        trans_a: bool,
+        trans_b: bool,
+        tune: bool,
+) -> None:
+    if not is_metax_c500():
+        pytest.skip("MACA compiler HGEMM benchmarks are only available on MetaX C500")
+    monkeypatch.setenv("TILEOPS_GEMM_PACKED_B_TILE", "1")
+    test = GemmTest(m, n, k, dtype, trans_a, trans_b)
+    op = GemmOp(m, n, k, trans_a=trans_a, trans_b=trans_b, dtype=dtype, tune=tune)
+    bm = GemmBenchmark(test, op)
+    a, b = test.gen_inputs()
+
+    prepared_b = op.prepare_b(b)
+    result = bm.profile(op.forward_with_prepared_b, a, prepared_b)
+    BenchmarkReport.record(op, locals(), result, tag="tileops_packed_b")
+
+
+@pytest.mark.parametrize("m, n, k, dtype, trans_a, trans_b, tune",
+                         _HGEMM_LONG_K_SHAPES + _HGEMM_TABLE_SHAPES)
+def test_maca_hgemm_compiler_splitk_bench(
+        monkeypatch: pytest.MonkeyPatch,
+        m: int,
+        n: int,
+        k: int,
+        dtype: torch.dtype,
+        trans_a: bool,
+        trans_b: bool,
+        tune: bool,
+) -> None:
+    if not is_metax_c500():
+        pytest.skip("MACA compiler HGEMM benchmarks are only available on MetaX C500")
+    for name, value in _COMPILER_SPLITK_PACKED_ENV.items():
+        monkeypatch.setenv(name, value)
+
+    test = GemmTest(m, n, k, dtype, trans_a, trans_b)
+    op = GemmOp(m, n, k, trans_a=trans_a, trans_b=trans_b, dtype=dtype, tune=tune)
+    bm = GemmBenchmark(test, op)
+    a, b = test.gen_inputs()
+
+    prepared_b = op.prepare_b(b)
+    result = bm.profile(op.forward_with_prepared_b, a, prepared_b)
+    BenchmarkReport.record(op, locals(), result, tag="tileops_compiler_splitk")
+
+
+@pytest.mark.parametrize("m, n, k, dtype, trans_a, trans_b, tune",
+                         _HGEMM_LONG_K_SHAPES + _HGEMM_TABLE_SHAPES)
+def test_maca_hgemm_direct_hpp_bench(
+        m: int,
+        n: int,
+        k: int,
+        dtype: torch.dtype,
+        trans_a: bool,
+        trans_b: bool,
+        tune: bool,
+) -> None:
+    if not is_metax_c500():
+        pytest.skip("MACA direct HGEMM backend is only available on MetaX C500")
+
+    test = GemmTest(m, n, k, dtype, trans_a, trans_b)
+    op = GemmOp(
+        m,
+        n,
+        k,
+        trans_a=trans_a,
+        trans_b=trans_b,
+        dtype=dtype,
+        tune=tune,
+        kernel_map={"gemm_kernel": MacaHGemmKernel},
+    )
+    bm = GemmBenchmark(test, op)
+    a, b = test.gen_inputs()
+
+    prepared_b = op.prepare_b(b)
+    result = bm.profile(op.forward_with_prepared_b, a, prepared_b)
+    BenchmarkReport.record(op, locals(), result, tag="tileops_direct_hpp")
 
 
 if __name__ == "__main__":
