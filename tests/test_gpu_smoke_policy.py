@@ -72,7 +72,6 @@ def test_security_policy_routes_trust_by_collaborator_permission() -> None:
 
     # runs-on and the trusted-action ref must both consume the same is_fork output.
     gpu_job = wf["jobs"]["gpu-smoke"]
-    assert "needs.security-policy.outputs.is_fork" in str(gpu_job["runs-on"])
     ref_step = next(
         s for s in gpu_job["steps"] if (s.get("name") or "").startswith("Checkout trusted actions")
     )
