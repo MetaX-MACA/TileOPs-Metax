@@ -357,6 +357,11 @@ jobs:
     # per-test --timeout below is the first line of defense, this is the ceiling.
     timeout-minutes: 90
     steps:
+      - name: DEBUG
+        run: |
+          echo $PATH
+          which git
+
       - name: Checkout code for fork PR
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
         uses: actions/checkout@v4
