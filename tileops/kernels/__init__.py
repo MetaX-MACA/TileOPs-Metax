@@ -52,7 +52,11 @@ from .engram import EngramDecodeKernel, EngramGateConvBwdKernel, EngramGateConvF
 from .fft import FFTC2CKernel
 from .fp8_lighting_indexer import FP8LightingIndexerKernel
 from .fp8_quant import FP8QuantKernel
-from .gated_deltanet import GatedDeltaNetBwdKernel, GatedDeltaNetFwdKernel
+from .gated_deltanet import (
+    GatedDeltaNetBwdKernel,
+    GatedDeltaNetBwdMACAKernel,
+    GatedDeltaNetFwdKernel,
+)
 from .gated_deltanet_recurrence import (
     GatedDeltaNetDecodeFP32Kernel,
     GatedDeltaNetDecodeKernel,
@@ -135,6 +139,7 @@ __all__ = [
     "GQASlidingWindowVarlenFwdKernel",
     "GQASlidingWindowVarlenFwdWgmmaPipelinedKernel",
     "GatedDeltaNetBwdKernel",
+    "GatedDeltaNetBwdMACAKernel",
     "GatedDeltaNetDecodeFP32Kernel",
     "GatedDeltaNetDecodeKernel",
     "GatedDeltaNetDecodeRawCudaFlaStyleKernel",

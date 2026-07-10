@@ -4,6 +4,7 @@ import torch
 
 from tileops.kernels.gated_deltanet import (
     GatedDeltaNetBwdKernel,
+    GatedDeltaNetBwdMACAKernel,
     GatedDeltaNetFwdKernel,
 )
 from tileops.kernels.gated_deltanet_recurrence import (
@@ -12,7 +13,7 @@ from tileops.kernels.gated_deltanet_recurrence import (
     GatedDeltaNetDecodeRawCudaFlaStyleKernel,
 )
 from tileops.kernels.kernel_base import Kernel
-from tileops.utils import get_sm_version
+from tileops.utils import get_sm_version, is_maca
 
 from .op_base import Op
 
@@ -174,8 +175,9 @@ class GatedDeltaNetBwdOp(Op):
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
+        bwd_cls = GatedDeltaNetBwdMACAKernel if is_maca() else GatedDeltaNetBwdKernel
         return {
-            "GatedDeltaNetBwdKernel": GatedDeltaNetBwdKernel,
+            "GatedDeltaNetBwdKernel": bwd_cls,
         }
 
     def forward(
@@ -290,9 +292,10 @@ class GatedDeltaNetOp(Op):
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
+        bwd_cls = GatedDeltaNetBwdMACAKernel if is_maca() else GatedDeltaNetBwdKernel
         return {
             "GatedDeltaNetFwdKernel": GatedDeltaNetFwdKernel,
-            "GatedDeltaNetBwdKernel": GatedDeltaNetBwdKernel,
+            "GatedDeltaNetBwdKernel": bwd_cls,
         }
 
     def forward(
