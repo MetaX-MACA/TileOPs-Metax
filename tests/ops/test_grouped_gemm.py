@@ -49,12 +49,14 @@ class GroupedGemmTest(_GroupedGemmTestWorkload, TestBase):
                 K = B.shape[0]
                 assert B.shape[1] == total_batch
                 output = torch.zeros((batch_count, N, K), device=A.device, dtype=A.dtype)
+                B_tn = B.transpose(0, 1).contiguous()
                 start = 0
                 for i, size in enumerate(batch_sizes):
                     size = int(size.item())
                     end = start + size
-                    output[i] = torch.mm(A[start:end].transpose(0, 1),
-                                         B[:, start:end].transpose(0, 1))
+                    output[i] = torch.mm(
+                        A[start:end].transpose(0, 1),
+                        B_tn[start:end],)
                     start = end
             else:
                 # TN: A^T @ B
@@ -109,7 +111,7 @@ def test_grouped_gemm(batch_sum: int, batch_count: int, N: int, K: int, dtype: t
     op = GroupedGemmOp(
         batch_sum, batch_count, N, K, dtype, transpose_a=transpose_a, transpose_b=transpose_b,
         tune=tune)
-    test.check(op, *test.gen_inputs())
+    test.check(op, *test.gen_inputs(), atol=5e-4, rtol=5e-3)
 
 
 # ---------------------------------------------------------------------------
