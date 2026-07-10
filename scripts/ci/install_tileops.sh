@@ -7,10 +7,6 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONSTRAINTS="${REPO_ROOT}/constraints.txt"
 
 # Install tilelang-metax and tvm-ffi
-if [ -d /data/cache/ci/site-packages/apache_tvm_ffi-0.1.dev1.dist-info ]; then
-  rm -rf /data/cache/ci/site-packages/tvm_ffi
-  rm -rf /data/cache/ci/site-packages/apache_tvm_ffi-0.1.dev1.dist-info
-fi
 pip install -r 3rdparty/tilelang-metax/requirements.txt
 pip install -r 3rdparty/tilelang-metax/requirements-dev.txt
 python -m build -w 3rdparty/tilelang-metax
