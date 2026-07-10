@@ -400,7 +400,6 @@ jobs:
           fetch-depth: 1
           sparse-checkout: |
             .github/actions
-          submodules: recursive
 
       - name: Reclaim runner disk
         uses: ./.trusted/.github/actions/reclaim-runner-disk
@@ -465,6 +464,10 @@ jobs:
             sleep "$SLEEP_SECONDS"
             attempt=$((attempt + 1))
           done
+
+      - name: Install tilelang-metax
+        if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' }}
+        run: bash scripts/ci/install_tilelang.sh
 
       - name: Install TileOPs (image-baked stack, --no-deps)
         # tilelang + the full runtime/dev stack are baked into the runner image; this installs
