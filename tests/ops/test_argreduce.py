@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from tests.test_base import FixtureBase, TestBase
+from tileops.utils import is_maca
 from workloads.reduction import ArgmaxTest as _ArgmaxWorkload
 
 
@@ -530,6 +531,44 @@ def test_argmin_dim_none(shape: tuple, dtype: torch.dtype) -> None:
     assert torch.equal(y_keep.reshape(()), ref_flat), (
         f"dim=None keepdim argmin value mismatch on shape={shape} dtype={dtype}"
     )
+
+
+@pytest.mark.skipif(not is_maca(), reason="the tiled argreduce kernel is MACA-only")
+@pytest.mark.parametrize(
+    "op_kind, dtype",
+    [
+        pytest.param("argmax", torch.float16, marks=pytest.mark.smoke),
+        pytest.param("argmax", torch.bfloat16, marks=pytest.mark.smoke),
+        pytest.param("argmin", torch.float16, marks=pytest.mark.full),
+        pytest.param("argmin", torch.bfloat16, marks=pytest.mark.full),
+    ],
+)
+def test_argreduce_tiled_path(op_kind: str, dtype: torch.dtype) -> None:
+    # MACA gives a block 64 KiB of shared memory, so a row past ~11k fp16 columns no
+    # longer fits in one tile and the kernel folds it tile by tile. Every other case in
+    # this file stays under that cap, so the merge step is otherwise never executed.
+    m, n = 4, 16384
+
+    x = torch.randn(m, n, dtype=dtype, device="cuda")
+    tail = 12000  # in the last tile, so a merge that never writes out_idx is visible
+    for i in range(m):
+        x[i, tail + i] = 100.0 if op_kind == "argmax" else -100.0
+
+    if op_kind == "argmax":
+        from tileops.ops.reduction.argmax import ArgmaxFwdOp as Op
+
+        ref = x.argmax(dim=-1)
+    else:
+        from tileops.ops.reduction.argmin import ArgminFwdOp as Op
+
+        ref = x.argmin(dim=-1)
+
+    op = Op(dtype=dtype, dim=-1)
+    y = _call(op, x)
+
+    kernel = next(iter(op._kernel_cache.values()))
+    assert kernel.config["tile_n"] > 0, "expected the tiled path"
+    assert torch.equal(y, ref)
 
 
 if __name__ == "__main__":
