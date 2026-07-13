@@ -425,7 +425,7 @@ def _dh_recurrence_bwd_tl(
     return _func
 
 
-@torch.library.custom_op("tileops::gated_deltanet_bwd_kernel", mutates_args=())
+@torch.library.custom_op("tileops::gated_deltanet_bwd_maca_kernel", mutates_args=())
 def _gated_deltanet_bwd_wrapped_kernel(
     batch: int, head: int, seq_len: int, chunk_size: int, dim_k: int, dim_v: int,
     dtype: str,
