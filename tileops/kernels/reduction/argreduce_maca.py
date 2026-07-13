@@ -121,15 +121,17 @@ def _argreduce_kernel_tiled(M: int, N: int, op_kind: str, dtype: str, tile_n: in
                                     T.loop_break()
 
                         for i in T.Parallel(block_m):
-                            row_extreme[i] = T.if_then_else(
-                                tile_extreme[i] > row_extreme[i],
-                                tile_extreme[i],
-                                row_extreme[i],
-                            )
+                            # out_idx has to be decided against the previous row extreme,
+                            # so it must be written before row_extreme is overwritten.
                             out_idx[i] = T.if_then_else(
                                 tile_extreme[i] > row_extreme[i],
                                 tile_idx[i],
                                 out_idx[i],
+                            )
+                            row_extreme[i] = T.if_then_else(
+                                tile_extreme[i] > row_extreme[i],
+                                tile_extreme[i],
+                                row_extreme[i],
                             )
 
                     T.copy(out_idx, out[pid_m * block_m])
@@ -173,15 +175,17 @@ def _argreduce_kernel_tiled(M: int, N: int, op_kind: str, dtype: str, tile_n: in
                                     T.loop_break()
 
                         for i in T.Parallel(block_m):
-                            row_extreme[i] = T.if_then_else(
-                                tile_extreme[i] < row_extreme[i],
-                                tile_extreme[i],
-                                row_extreme[i],
-                            )
+                            # out_idx has to be decided against the previous row extreme,
+                            # so it must be written before row_extreme is overwritten.
                             out_idx[i] = T.if_then_else(
                                 tile_extreme[i] < row_extreme[i],
                                 tile_idx[i],
                                 out_idx[i],
+                            )
+                            row_extreme[i] = T.if_then_else(
+                                tile_extreme[i] < row_extreme[i],
+                                tile_extreme[i],
+                                row_extreme[i],
                             )
 
                     T.copy(out_idx, out[pid_m * block_m])
