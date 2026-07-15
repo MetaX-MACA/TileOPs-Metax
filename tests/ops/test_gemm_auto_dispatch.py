@@ -35,7 +35,7 @@ def _install_fake_backend_module(
 ) -> type:
     module = types.ModuleType(module_name)
 
-    def __init__(self, *args: object, **kwargs: object) -> None:
+    def initializer(self, *args: object, **kwargs: object) -> None:
         self.args = args
         self.kwargs = kwargs
         self.config = {"backend": class_name}
@@ -45,7 +45,7 @@ def _install_fake_backend_module(
         (),
         {
             "supported_archs": [80],
-            "__init__": __init__,
+            "__init__": initializer,
         },
     )
     setattr(module, class_name, fake_backend)
@@ -60,7 +60,7 @@ def _install_fake_backend_module_with_prepacked_api(
 ) -> type:
     module = types.ModuleType(module_name)
 
-    def __init__(self, *args: object, **kwargs: object) -> None:
+    def initializer(self, *args: object, **kwargs: object) -> None:
         self.args = args
         self.kwargs = kwargs
         self.config = {"backend": class_name}
@@ -79,7 +79,7 @@ def _install_fake_backend_module_with_prepacked_api(
         (),
         {
             "supported_archs": [80],
-            "__init__": __init__,
+            "__init__": initializer,
             "prepare_b": prepare_b,
             "forward_with_prepared_b": forward_with_prepared_b,
         },
@@ -280,6 +280,39 @@ def test_gemm_kernel_prefers_maca_bsm_path_on_aligned_c500_fp16(
         "num_stages": 0,
         "threads": 256,
         "enable_rasterization": True,
+    }
+
+
+@pytest.mark.smoke
+def test_gemm_kernel_reports_automatic_long_k_compiler_splitk_route(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_metax_c500(monkeypatch)
+    monkeypatch.delenv("TILEOPS_GEMM_SPLIT_K", raising=False)
+    monkeypatch.delenv("TILEOPS_GEMM_PACKED_B_TILE", raising=False)
+    kernel = GemmKernel(1664, 1024, 262144, dtype=torch.float16, tune=False)
+
+    assert kernel.execution_info == {
+        "backend": "compiler-splitk-packed",
+        "split_k": 2,
+        "packed_b_tile": True,
+        "template": True,
+        "specialized_reduce": True,
+    }
+
+
+@pytest.mark.smoke
+def test_gemm_kernel_preserves_wgmma_dispatch_outside_c500(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("tileops.kernels.gemm.is_metax_c500", lambda: False)
+    monkeypatch.setattr("tileops.kernels.gemm.get_sm_version", lambda: 90)
+    kernel = GemmKernel(128, 128, 128, dtype=torch.float16, tune=False)
+
+    assert kernel.execution_info["backend"] == "wgmma"
+    assert kernel.config == {
+        "block_m": 128,
+        "block_n": 128,
+        "block_k": 64,
+        "num_stages": 3,
     }
 
 

@@ -1069,6 +1069,8 @@ class GemmKernel(Kernel):
         self.dtype = dtype
         self.trans_a = trans_a
         self.trans_b = trans_b
+        self._is_maca_c500 = is_metax_c500()
+        self._use_wgmma_path = not self._is_maca_c500 and get_sm_version() == 90
         split_k_override = _get_maca_bsm_split_k_override()
         packed_b_override = _get_bool_env_override("TILEOPS_GEMM_PACKED_B_TILE")
         # Keep the long-K C500 compiler split-K packed-B path selected by default.
@@ -1081,7 +1083,7 @@ class GemmKernel(Kernel):
         self.split_k = split_k_override if split_k_override is not None else (
             2 if auto_splitk_packed else 1)
         self._use_maca_bsm_path = (
-            is_metax_c500() and dtype == torch.float16 and not trans_a and m % 128 == 0
+            self._is_maca_c500 and dtype == torch.float16 and not trans_a and m % 128 == 0
             and n % 128 == 0 and k % 128 == 0 and not tune
         )
         if self.split_k > 1 and not self._use_maca_bsm_path:
@@ -1113,7 +1115,9 @@ class GemmKernel(Kernel):
             else {}
         )
 
-        if self._use_split_k_path:
+        if self._use_wgmma_path:
+            self.kernel = _gemm_kernel(m, n, k, trans_a, trans_b, self.dtype_str)
+        elif self._use_split_k_path:
             if self._use_packed_b_async_pipeline_path:
                 self.kernel = _gemm_kernel_bsm_splitk_packed_b_tile_async(
                     m,
@@ -1161,6 +1165,13 @@ class GemmKernel(Kernel):
     @property
     def default_config(self) -> dict:
         # From tilelang/examples/gemm/example_gemm_autotune.py
+        if self._use_wgmma_path:
+            return {
+                "block_m": 128,
+                "block_n": 128,
+                "block_k": 64,
+                "num_stages": 3,
+            }
         if self._use_maca_bsm_path:
             if (self._use_split_k_path and self._use_packed_b_tile_path
                     and self.k >= 131072):
@@ -1210,6 +1221,52 @@ class GemmKernel(Kernel):
             "enable_rasterization": True,
         }
 
+    @property
+    def autotune_configs(self) -> list[dict]:
+        block_ms = [64, 128, 256]
+        block_ns = [64, 128, 256]
+        block_ks = [32, 64]
+        num_stages = [0, 1, 2, 3]
+        threads = [128, 256]
+        enable_rasterization = [True, False]
+        configs = itertools.product(
+            block_ms, block_ns, block_ks, num_stages, threads, enable_rasterization)
+        return [
+            {
+                "block_m": block_m,
+                "block_n": block_n,
+                "block_k": block_k,
+                "num_stages": stages,
+                "threads": num_threads,
+                "enable_rasterization": rasterization,
+            }
+            for block_m, block_n, block_k, stages, num_threads, rasterization in configs
+        ]
+
+    @property
+    def execution_info(self) -> dict[str, object]:
+        if self._use_wgmma_path:
+            backend = "wgmma"
+        elif self._use_split_k_path and self._use_packed_b_tile_path:
+            backend = "compiler-splitk-packed"
+        elif self._use_split_k_path:
+            backend = "compiler-splitk"
+        elif self._use_maca_bsm_path and self._use_packed_b_tile_path:
+            backend = "compiler-packed-b"
+        elif self._use_maca_bsm_path:
+            backend = "compiler-bsm"
+        elif self._use_col_major_output:
+            backend = "compiler-col-major"
+        else:
+            backend = "compiler-generic"
+        return {
+            "backend": backend,
+            "split_k": self.split_k,
+            "packed_b_tile": self._use_packed_b_tile_path,
+            "template": bool(self._compiler_env),
+            "specialized_reduce": self._use_split_k_path,
+        }
+
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return self.forward_with_prepared_b(a, self.prepare_b(b))
 
@@ -1217,7 +1274,7 @@ class GemmKernel(Kernel):
         return a
 
     def prepare_b(self, b: torch.Tensor) -> torch.Tensor:
-        if self.trans_b:
+        if self._use_wgmma_path or self.trans_b:
             return b
 
         version = int(getattr(b, "_version", 0))
@@ -1252,6 +1309,13 @@ class GemmKernel(Kernel):
         return native_b
 
     def _compiled_kernel_config_key(self) -> tuple:
+        if self._use_wgmma_path:
+            return (
+                self.config["block_m"],
+                self.config["block_n"],
+                self.config["block_k"],
+                self.config["num_stages"],
+            )
         return (
             self.config["block_m"],
             self.config["block_n"],
@@ -1277,6 +1341,13 @@ class GemmKernel(Kernel):
 
     def forward_with_prepared_b(self, a: torch.Tensor, b_prepared: torch.Tensor) -> torch.Tensor:
         kernel = self._get_compiled_kernel()
+        if self._use_wgmma_path:
+            layout = f"{'T' if self.trans_a else 'N'}{'T' if self.trans_b else 'N'}"
+            return trace.run(
+                kernel,
+                (a, b_prepared),
+                stem=f"gemm_{self.m}x{self.n}x{self.k}_{layout}_{self.dtype_str}",
+            )
         if self._use_split_k_path:
             partial_c = kernel(a, b_prepared)
             return self._get_compiled_reduce_kernel()(partial_c)

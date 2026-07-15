@@ -59,8 +59,22 @@ def _splitk_packed_kernel_body(source: str) -> str:
     return match.group(0)
 
 
+def _compiler_splitk_benchmark_body(source: str) -> str:
+    match = re.search(
+        r"def test_maca_hgemm_compiler_splitk_bench\(.*?"
+        r"(?=\n\n@pytest\.mark\.parametrize\(\"m, n, k, dtype, trans_a, trans_b, tune\",\n"
+        r"                         _HGEMM_LONG_K_SHAPES \+ _HGEMM_TABLE_SHAPES\)\n"
+        r"def test_maca_hgemm_direct_hpp_bench\()",
+        source,
+        re.DOTALL,
+    )
+    assert match is not None
+    return match.group(0)
+
+
 def test_bench_gemm_includes_production_hgemm_shapes_and_prepacked_case() -> None:
     source = BENCH_GEMM.read_text()
+    compiler_splitk_body = _compiler_splitk_benchmark_body(source)
 
     assert "_HGEMM_TABLE_SHAPES" in source
     assert "_HGEMM_LONG_K_SHAPES" in source
@@ -76,6 +90,8 @@ def test_bench_gemm_includes_production_hgemm_shapes_and_prepacked_case() -> Non
     assert "TILELANG_MACA_GEMM_USE_TEMPLATE" in source
     assert "TILELANG_MACA_GEMM_K_PACK" in source
     assert "tileops_compiler_splitk" in source
+    assert '"backend": "compiler-splitk-packed"' in compiler_splitk_body
+    assert "compiler split-K benchmark selected" in compiler_splitk_body
     assert "test_maca_hgemm_direct_hpp_bench" in source
     assert "MacaHGemmKernel" in source
     assert 'kernel_map={"gemm_kernel": MacaHGemmKernel}' in source
@@ -123,6 +139,9 @@ def test_hgemm_driver_supports_direct_and_compiler_packed_backends() -> None:
     assert "CUPTI_BENCH_TRIALS = 7" in source
     assert "latency_ms = min(latency for latency in latencies if latency > 0)" in source
     assert "sys.path.insert" not in source
+    assert "_validate_compiler_execution" in source
+    assert "execution: dict | None" in source
+    assert '"compiler-splitk-packed"' in source
 
 
 def test_gemm_kernel_has_first_class_long_k_compiler_fast_path() -> None:
@@ -142,6 +161,8 @@ def test_gemm_kernel_has_first_class_long_k_compiler_fast_path() -> None:
     assert '"num_stages": 0' in long_k_config
     assert '"threads": 256' in long_k_config
     assert '"enable_rasterization": True' in long_k_config
+    assert "def execution_info" in source
+    assert '"specialized_reduce": self._use_split_k_path' in source
 
 
 def test_gemm_kernel_caches_compiled_hot_path_wrappers() -> None:

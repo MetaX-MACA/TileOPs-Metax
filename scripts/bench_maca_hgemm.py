@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import statistics
@@ -36,6 +37,7 @@ class HgemmResult:
     max_abs_diff: float | None
     mean_abs_diff: float | None
     config: dict | None
+    execution: dict | None
 
 
 def resolve_shapes(shape_set: str) -> tuple[tuple[int, int, int], ...]:
@@ -107,6 +109,40 @@ def _make_op(backend: str, m: int, n: int, k: int, torch_module):
     if backend in {"compiler-packed-b", "compiler-splitk-packed"}:
         return GemmOp(m, n, k, dtype=torch_module.float16, tune=False)
     raise ValueError(f"unknown backend: {backend}")
+
+
+def _validate_compiler_execution(backend: str, op) -> dict | None:
+    if backend == "direct-hpp":
+        return None
+
+    execution = getattr(op.kernel, "execution_info", None)
+    if not isinstance(execution, dict):
+        raise RuntimeError(f"{backend} did not expose compiler execution provenance")
+
+    expected = {
+        "compiler-packed-b": {
+            "backend": "compiler-packed-b",
+            "split_k": 1,
+            "packed_b_tile": True,
+            "template": False,
+            "specialized_reduce": False,
+        },
+        "compiler-splitk-packed": {
+            "backend": "compiler-splitk-packed",
+            "split_k": 2,
+            "packed_b_tile": True,
+            "template": True,
+            "specialized_reduce": True,
+        },
+    }[backend]
+    mismatches = {
+        key: (execution.get(key), value)
+        for key, value in expected.items()
+        if execution.get(key) != value
+    }
+    if mismatches:
+        raise RuntimeError(f"{backend} selected an unexpected execution route: {mismatches}")
+    return dict(execution)
 
 
 def _time_hot_path(torch_module, fn, warmup: int, repeat: int) -> tuple[float, object]:
@@ -216,12 +252,14 @@ def run_one(
         a = torch.randn((m, k), device="cuda", dtype=torch.float16)
         b = torch.randn((k, n), device="cuda", dtype=torch.float16)
         op = _make_op(backend, m, n, k, torch)
+        execution = _validate_compiler_execution(backend, op)
         b_prepared = op.prepare_b(b)
         torch.cuda.synchronize()
+        run_hot_path = functools.partial(op.forward_with_prepared_b, a, b_prepared)
 
         latency_ms, out = _time_hot_path(
             torch,
-            lambda: op.forward_with_prepared_b(a, b_prepared),
+            run_hot_path,
             warmup,
             repeat,
         )
@@ -244,6 +282,7 @@ def run_one(
             max_abs_diff=max_abs_diff,
             mean_abs_diff=mean_abs_diff,
             config=config,
+            execution=execution,
         )
 
         del a, b, b_prepared, out
@@ -253,6 +292,7 @@ def run_one(
 
 def metadata() -> dict[str, object]:
     import torch
+
     import tileops
     from tileops.kernels.gemm_maca import maca_hgemm
 

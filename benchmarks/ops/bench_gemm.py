@@ -272,6 +272,18 @@ def test_maca_hgemm_compiler_splitk_bench(
     bm = GemmBenchmark(test, op)
     a, b = test.gen_inputs()
 
+    expected_execution = {
+        "backend": "compiler-splitk-packed",
+        "split_k": 2,
+        "packed_b_tile": True,
+        "template": True,
+        "specialized_reduce": True,
+    }
+    execution = getattr(op.kernel, "execution_info", None)
+    if not isinstance(execution, dict) or any(
+            execution.get(name) != value for name, value in expected_execution.items()):
+        raise AssertionError(f"compiler split-K benchmark selected {execution!r}")
+
     prepared_b = op.prepare_b(b)
     result = bm.profile(op.forward_with_prepared_b, a, prepared_b)
     BenchmarkReport.record(op, locals(), result, tag="tileops_compiler_splitk")
