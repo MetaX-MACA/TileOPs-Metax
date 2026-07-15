@@ -245,6 +245,7 @@ def test_gemm_op_auto_routes_to_tilelang_compiler_backend_on_c500_fp16(
     monkeypatch.delenv("TILEOPS_GEMM_BACKEND", raising=False)
 
     op = GemmOp(128, 128, 128, dtype=torch.float16, tune=False)
+    op.prepare_b(torch.empty((128, 128), dtype=torch.float16))
 
     assert isinstance(op.kernel, GemmKernel)
 

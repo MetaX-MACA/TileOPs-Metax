@@ -58,10 +58,12 @@ def resolve_backends(backend: str) -> tuple[str, ...]:
     raise ValueError(f"unknown backend: {backend}")
 
 
-def compiler_packed_b_env() -> dict[str, str]:
+def compiler_packed_b_env() -> dict[str, str | None]:
     return {
         "TILEOPS_GEMM_SPLIT_K": "1",
         "TILEOPS_GEMM_PACKED_B_TILE": "1",
+        "TILELANG_MACA_GEMM_USE_TEMPLATE": None,
+        "TILELANG_MACA_GEMM_K_PACK": None,
     }
 
 
@@ -75,9 +77,13 @@ def compiler_splitk_packed_env() -> dict[str, str]:
 
 
 @contextmanager
-def _temporary_env(updates: dict[str, str]) -> Iterator[None]:
+def _temporary_env(updates: dict[str, str | None]) -> Iterator[None]:
     old_values = {key: os.environ.get(key) for key in updates}
-    os.environ.update(updates)
+    for key, value in updates.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
     try:
         yield
     finally:
@@ -252,8 +258,8 @@ def run_one(
         a = torch.randn((m, k), device="cuda", dtype=torch.float16)
         b = torch.randn((k, n), device="cuda", dtype=torch.float16)
         op = _make_op(backend, m, n, k, torch)
-        execution = _validate_compiler_execution(backend, op)
         b_prepared = op.prepare_b(b)
+        execution = _validate_compiler_execution(backend, op)
         torch.cuda.synchronize()
         run_hot_path = functools.partial(op.forward_with_prepared_b, a, b_prepared)
 

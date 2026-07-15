@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
 import sys
 from pathlib import Path
@@ -74,6 +75,7 @@ def _compiler_splitk_benchmark_body(source: str) -> str:
 
 def test_bench_gemm_includes_production_hgemm_shapes_and_prepacked_case() -> None:
     source = BENCH_GEMM.read_text()
+    gemm_kernel = GEMM_KERNEL.read_text()
     compiler_splitk_body = _compiler_splitk_benchmark_body(source)
 
     assert "_HGEMM_TABLE_SHAPES" in source
@@ -92,11 +94,15 @@ def test_bench_gemm_includes_production_hgemm_shapes_and_prepacked_case() -> Non
     assert "tileops_compiler_splitk" in source
     assert '"backend": "compiler-splitk-packed"' in compiler_splitk_body
     assert "compiler split-K benchmark selected" in compiler_splitk_body
+    assert compiler_splitk_body.index("prepared_b = op.prepare_b(b)") < compiler_splitk_body.index(
+        "execution = getattr(op.kernel, \"execution_info\", None)"
+    )
     assert "test_maca_hgemm_direct_hpp_bench" in source
     assert "MacaHGemmKernel" in source
     assert 'kernel_map={"gemm_kernel": MacaHGemmKernel}' in source
     assert "is_metax_c500()" in source
     assert "tileops_direct_hpp" in source
+    assert "supported_archs: list[int] = [80, 90]" in gemm_kernel
 
 
 def test_bench_gemm_runs_serial_nodes_for_large_hgemm_shapes() -> None:
@@ -115,15 +121,19 @@ def test_hgemm_driver_declares_exact_table_and_long_k_shape_sets() -> None:
     assert driver.resolve_shapes("all") == (LONG_K_SHAPE,) + TABLE_SHAPES
 
 
-def test_hgemm_driver_supports_direct_and_compiler_packed_backends() -> None:
+def test_hgemm_driver_supports_direct_and_compiler_packed_backends(
+        monkeypatch) -> None:
     driver = _load_driver_module()
     source = HGEMM_DRIVER.read_text()
+    run_one_body = source[source.index("def run_one("):source.index("\ndef metadata(")]
 
     assert driver.BACKENDS == ("direct-hpp", "compiler-packed-b", "compiler-splitk-packed")
     assert driver.resolve_backends("both") == driver.BACKENDS
     assert driver.compiler_packed_b_env() == {
         "TILEOPS_GEMM_SPLIT_K": "1",
         "TILEOPS_GEMM_PACKED_B_TILE": "1",
+        "TILELANG_MACA_GEMM_USE_TEMPLATE": None,
+        "TILELANG_MACA_GEMM_K_PACK": None,
     }
     assert driver.compiler_splitk_packed_env() == {
         "TILEOPS_GEMM_SPLIT_K": "2",
@@ -142,6 +152,14 @@ def test_hgemm_driver_supports_direct_and_compiler_packed_backends() -> None:
     assert "_validate_compiler_execution" in source
     assert "execution: dict | None" in source
     assert '"compiler-splitk-packed"' in source
+    assert run_one_body.index("b_prepared = op.prepare_b(b)") < run_one_body.index(
+        "execution = _validate_compiler_execution(backend, op)"
+    )
+    monkeypatch.setenv("TILELANG_MACA_GEMM_USE_TEMPLATE", "1")
+    monkeypatch.setenv("TILELANG_MACA_GEMM_K_PACK", "1")
+    with driver._temporary_env(driver.compiler_packed_b_env()):
+        assert os.environ.get("TILELANG_MACA_GEMM_USE_TEMPLATE") is None
+        assert os.environ.get("TILELANG_MACA_GEMM_K_PACK") is None
 
 
 def test_gemm_kernel_has_first_class_long_k_compiler_fast_path() -> None:

@@ -1043,15 +1043,14 @@ def _(m: int, n: int, k: int, trans_a: bool, trans_b: bool, dtype: str,
 
 
 class GemmKernel(Kernel):
-    """Dense GEMM kernel: a hand-written warp-specialized implementation (SM90).
+    """Dense GEMM kernel with C500 compiler and SM90 WGMMA implementations.
 
-    Computes ``C = op(A) @ op(B)`` for any ``(trans_a, trans_b)`` layout. One
-    producer warpgroup issues TMA loads into a double-buffered SMEM ring; one
-    consumer warpgroup runs the WGMMA over K. fp16 / bf16 inputs, fp32
-    accumulation. Hopper-only — TMA + WGMMA require SM90.
+    Computes ``C = op(A) @ op(B)`` for any ``(trans_a, trans_b)`` layout. C500
+    reports capability 8.0 through PyTorch and selects the MACA compiler path;
+    other supported hardware uses the SM90 WGMMA path.
     """
 
-    supported_archs: list[int] = [90]
+    supported_archs: list[int] = [80, 90]
 
     def __init__(self,
                  m: int,
