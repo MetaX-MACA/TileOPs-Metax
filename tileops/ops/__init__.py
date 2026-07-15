@@ -19,6 +19,7 @@ from .attention import (
     NSAFwdVarlenOp,
     NSATopkVarlenOp,
 )
+from .bmm import BmmFwdOp
 from .convolution import (
     Conv1dBiasFwdOp,
     Conv1dFwdOp,
@@ -40,9 +41,10 @@ from .gated_deltanet import (
     GatedDeltaNetDecodeOp,
     GatedDeltaNetFwdOp,
     GatedDeltaNetOp,
+    GatedDeltaNetPrefillFwdOp,
 )
 from .gated_linear_attn import GLADecodeOp
-from .gemm import GemmOp
+from .gemm import GemmFp8Op, GemmOp
 from .gla import GLABwdOp, GLAFwdOp
 from .grouped_gemm import GroupedGemmOp
 from .mamba2_fwd import Mamba2FwdOp
@@ -112,6 +114,7 @@ __all__ = [
     "AdaLayerNormZeroFwdOp",
     "BatchNormBwdOp",
     "BatchNormFwdOp",
+    "BmmFwdOp",
     "Conv1dBiasFwdOp",
     "Conv1dFwdOp",
     "Conv2dBiasFwdOp",
@@ -135,9 +138,11 @@ __all__ = [
     "GatedDeltaNetDecodeOp",
     "GatedDeltaNetFwdOp",
     "GatedDeltaNetOp",
+    "GatedDeltaNetPrefillFwdOp",
     "GLABwdOp",
     "GLADecodeOp",
     "GLAFwdOp",
+    "GemmFp8Op",
     "GemmOp",
     "GroupedQueryAttentionSlidingWindowFwdOp",
     "GroupedQueryAttentionSlidingWindowVarlenFwdOp",

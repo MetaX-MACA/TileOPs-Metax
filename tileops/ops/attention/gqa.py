@@ -9,6 +9,7 @@ from tileops.kernels.attention import (
     FlashAttnBwdPreprocessKernel,
     GQABwdKernel,
     GQABwdWgmmaPipelinedKernel,
+    GQADecodeBs1Kernel,
     GQADecodeKernel,
     GQADecodePagedKernel,
     GQAFwdFP8Fa3ContractPtxAccBN224WsTmaVKernel,
@@ -29,7 +30,7 @@ from tileops.kernels.attention import (
     GQASlidingWindowVarlenFwdWgmmaPipelinedKernel,
 )
 from tileops.kernels.kernel_base import Kernel
-from tileops.utils import is_hopper
+from tileops.utils import is_h200, is_hopper
 
 from ..op_base import Op
 from ..rope import _base_freqs
@@ -244,7 +245,9 @@ def _rope_rotary_dim(dim: int, rotary_dim: Optional[int]) -> int:
     return rotary_dim
 
 
-def _attention_output(result: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+def _attention_output(result: torch.Tensor | tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    if isinstance(result, torch.Tensor):
+        return result
     output, _ = result
     return output
 
@@ -289,8 +292,6 @@ class GroupedQueryAttentionFwdOp(Op):
             kernel_map=self.kernel_map,
             tune=tune,
         )
-        self._cu_seqlens_cache: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
-        self._scale_cache: dict[torch.device, torch.Tensor] = {}
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
@@ -309,27 +310,26 @@ class GroupedQueryAttentionFwdOp(Op):
         return self._prefill_op._get_dense_kernel()
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        cu_cache_key = (q.device, torch.int32)
-        cu_seqlens = self._cu_seqlens_cache.get(cu_cache_key)
-        if cu_seqlens is None:
-            cu_seqlens = torch.arange(
-                self.batch + 1, device=q.device, dtype=torch.int32) * self.seq_len
-            self._cu_seqlens_cache[cu_cache_key] = cu_seqlens
-        scale = self._scale_cache.get(q.device)
-        if scale is None:
-            scale = torch.ones((self.batch, self.heads_kv), device=q.device, dtype=torch.float32)
-            self._scale_cache[q.device] = scale
-        output = self._prefill_op(
-            q.reshape(self.batch * self.seq_len, self.heads, self.dim).contiguous(),
-            k.reshape(self.batch * self.seq_len, self.heads_kv, self.dim).contiguous(),
-            v.reshape(self.batch * self.seq_len, self.heads_kv, self.dim).contiguous(),
-            cu_seqlens,
-            cu_seqlens,
-            scale,
-            scale,
-            scale,
+        expected_q = (self.batch, self.seq_len, self.heads, self.dim)
+        expected_kv = (self.batch, self.seq_len, self.heads_kv, self.dim)
+        if tuple(q.shape) != expected_q:
+            raise ValueError(f"q must have shape {expected_q}, got {tuple(q.shape)}")
+        if tuple(k.shape) != expected_kv:
+            raise ValueError(f"k must have shape {expected_kv}, got {tuple(k.shape)}")
+        if tuple(v.shape) != expected_kv:
+            raise ValueError(f"v must have shape {expected_kv}, got {tuple(v.shape)}")
+        if q.dtype != self.dtype or k.dtype != self.dtype or v.dtype != self.dtype:
+            raise ValueError(f"q/k/v dtype must match op dtype {self.dtype}.")
+
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+        kernel = (
+            self._prefill_op._get_square_dense_kernel()
+            if self._prefill_op._uses_square_dense_fast_path()
+            else self._prefill_op._get_dense_kernel()
         )
-        return output.reshape(self.batch, self.seq_len, self.heads, self.dim)
+        return _attention_output(kernel(q, k, v))
 
 
 class GroupedQueryAttentionPrefillFwdOp(Op):
@@ -355,6 +355,7 @@ class GroupedQueryAttentionPrefillFwdOp(Op):
         window_size_left: int = -1,
         window_size_right: int = -1,
         backend: str = "auto",
+        validate_uniform_cu_seqlens: bool = True,
         kernel_map: Optional[Dict[str, Kernel]] = None,
         tune: bool = False,
     ) -> None:
@@ -377,6 +378,8 @@ class GroupedQueryAttentionPrefillFwdOp(Op):
             raise ValueError(
                 "backend must be one of 'auto', 'dense', 'varlen', 'fp8', or 'sliding_window'"
             )
+        if backend == "auto" and not validate_uniform_cu_seqlens:
+            raise ValueError("backend='auto' requires validate_uniform_cu_seqlens=True.")
         _validate_attention_dtype(dtype)
 
         self.batch = batch
@@ -392,8 +395,10 @@ class GroupedQueryAttentionPrefillFwdOp(Op):
         self.window_size_left = window_size_left
         self.window_size_right = window_size_right
         self.backend = backend
+        self.validate_uniform_cu_seqlens = validate_uniform_cu_seqlens
         self.tune = tune
         self._dense_kernel = None
+        self._square_dense_kernel = None
         self._varlen_kernel = None
         self._sliding_window_varlen_kernel = None
         self._fp8_kernel = None
@@ -419,6 +424,7 @@ class GroupedQueryAttentionPrefillFwdOp(Op):
         )
         return {
             "gqa_prefill_fwd_kernel": dense_kernel_cls,
+            "gqa_prefill_square_fwd_kernel": GQAFwdWsPersistentCausalKernel,
             "gqa_prefill_varlen_fwd_kernel": _select_gqa_prefill_varlen_fwd_kernel_cls(),
             "gqa_sliding_window_varlen_fwd": sliding_kernel_cls,
             "gqa_prefill_fp8_tensor_core_fwd_kernel":
@@ -550,6 +556,40 @@ class GroupedQueryAttentionPrefillFwdOp(Op):
             )
         return self._dense_kernel
 
+    def _uses_square_dense_fast_path(self) -> bool:
+        if self.dtype not in (torch.float16, torch.bfloat16):
+            return False
+        if not is_h200() or self.dim != 128:
+            return False
+        if self.heads % self.heads_kv != 0 or self.max_seqlen_q % _WS_BLOCK_M != 0:
+            return False
+        m_blocks = math.ceil(self.max_seqlen_q / _WS_BLOCK_M)
+        if m_blocks % 2 != 0:
+            return False
+        return (
+            self.is_causal
+            and self.max_seqlen_q == self.max_seqlen_kv
+            and _gqa_ws_causal_total_work_items(
+                self.batch, self.heads, self.heads_kv, self.max_seqlen_q
+            ) >= _H200_SMS
+        )
+
+    def _get_square_dense_kernel(self) -> Kernel:
+        if self._square_dense_kernel is None:
+            self._square_dense_kernel = self.kernel_map["gqa_prefill_square_fwd_kernel"](
+                self.batch,
+                self.heads,
+                self.heads_kv,
+                self.max_seqlen_q,
+                self.dim,
+                self.is_causal,
+                self.dtype,
+                sm_scale=self.sm_scale,
+                softcap=self.softcap,
+                tune=self.tune,
+            )
+        return self._square_dense_kernel
+
     def _get_varlen_kernel(self) -> Kernel:
         if self._varlen_kernel is None:
             self._varlen_kernel = self.kernel_map["gqa_prefill_varlen_fwd_kernel"](
@@ -631,9 +671,14 @@ class GroupedQueryAttentionPrefillFwdOp(Op):
         self._validate_dtypes(q, k, v, cu_seqlens_q, cu_seqlens_kv, q_scale, k_scale, v_scale)
         self._validate_common_shapes(q, k, v, cu_seqlens_q, cu_seqlens_kv, q_scale, k_scale,
                                      v_scale)
-        q_uniform = self._uniform_cu_seqlens(cu_seqlens_q, self.max_seqlen_q)
-        kv_uniform = self._uniform_cu_seqlens(cu_seqlens_kv, self.max_seqlen_kv)
-        is_uniform = q_uniform and kv_uniform
+        if self.backend == "auto" or (
+            self.backend in ("dense", "fp8") and self.validate_uniform_cu_seqlens
+        ):
+            q_uniform = self._uniform_cu_seqlens(cu_seqlens_q, self.max_seqlen_q)
+            kv_uniform = self._uniform_cu_seqlens(cu_seqlens_kv, self.max_seqlen_kv)
+            is_uniform = q_uniform and kv_uniform
+        else:
+            is_uniform = True
 
         kernel_key = _select_gqa_prefill_kernel_key(
             backend=self.backend,
@@ -669,7 +714,12 @@ class GroupedQueryAttentionPrefillFwdOp(Op):
             q_bshd = q.view(self.batch, self.max_seqlen_q, self.heads, self.dim)
             k_bshd = k.view(self.batch, self.max_seqlen_kv, self.heads_kv, self.dim)
             v_bshd = v.view(self.batch, self.max_seqlen_kv, self.heads_kv, self.dim)
-            out = _attention_output(self._get_dense_kernel()(q_bshd, k_bshd, v_bshd))
+            kernel = (
+                self._get_square_dense_kernel()
+                if self._uses_square_dense_fast_path()
+                else self._get_dense_kernel()
+            )
+            out = _attention_output(kernel(q_bshd, k_bshd, v_bshd))
             self._record_roofline(q, k, cu_seqlens_q, cu_seqlens_kv)
             return out.reshape(q.shape)
 
@@ -1337,7 +1387,7 @@ class GroupedQueryAttentionDecodeWithKVCacheFwdOp(Op):
         self.softcap = _score_softcap(softcap)
 
         self.dispatch_kernel(kernel_map)
-        self.kernel = self.kernel_map["gqa_decode_kernel"](
+        self.kernel = self.kernel_map[self._select_decode_kernel_key()](
             batch,
             heads,
             heads_kv,
@@ -1351,7 +1401,32 @@ class GroupedQueryAttentionDecodeWithKVCacheFwdOp(Op):
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
-        return {"gqa_decode_kernel": GQADecodeKernel}
+        # The batch=1 warp-specialized decode kernel is Hopper-only; only expose it on
+        # Hopper so the op stays constructible (falling back to the architecture-agnostic
+        # GQADecodeKernel) on sm80/sm89.
+        kernel_map: Dict[str, Kernel] = {"gqa_decode_kernel": GQADecodeKernel}
+        if is_hopper():
+            kernel_map["gqa_decode_bs1_kernel"] = GQADecodeBs1Kernel
+        return kernel_map
+
+    def _uses_bs1_fast_path(self) -> bool:
+        """Ctor-time gate for the batch=1 warp-specialized decode kernel.
+
+        Any batch=1 fp16 Hopper request with dim 128 and a query-per-KV-head group that fits
+        one wgmma tile routes to GQADecodeBs1Kernel, which then switches on the runtime KV
+        length in forward().
+        """
+        if not (self.batch == 1 and is_hopper() and self.dtype == torch.float16
+                and self.dim == 128 and self.softcap == 0.0):
+            return False
+        if self.heads % self.heads_kv != 0:
+            return False
+        return 1 <= self.heads // self.heads_kv <= 64
+
+    def _select_decode_kernel_key(self) -> str:
+        if self._uses_bs1_fast_path():
+            return "gqa_decode_bs1_kernel"
+        return "gqa_decode_kernel"
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         real_seqlen_kv = k.shape[1]

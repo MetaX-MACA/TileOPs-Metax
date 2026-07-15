@@ -34,6 +34,7 @@ from .attention import (
     NSATopkVarlenKernel,
     SparseMlaKernel,
 )
+from .bmm import BmmKernel
 from .convolution import (
     Conv1dKernel,
     Conv1dPointwiseKernel,
@@ -52,13 +53,17 @@ from .engram import EngramDecodeKernel, EngramGateConvBwdKernel, EngramGateConvF
 from .fft import FFTC2CKernel
 from .fp8_lighting_indexer import FP8LightingIndexerKernel
 from .fp8_quant import FP8QuantKernel
-from .gated_deltanet import GatedDeltaNetBwdKernel, GatedDeltaNetFwdKernel
+from .gated_deltanet import (
+    GatedDeltaNetBwdKernel,
+    GatedDeltaNetFwdKernel,
+    GatedDeltaNetPrefillFwdKernel,
+)
 from .gated_deltanet_recurrence import (
     GatedDeltaNetDecodeFP32Kernel,
     GatedDeltaNetDecodeKernel,
     GatedDeltaNetDecodeRawCudaFlaStyleKernel,
 )
-from .gemm import GemmKernel, GemvKernel
+from .gemm import GemmFp8BlockScaledKernel, GemmFp8EpilogueKernel, GemmKernel, GemvKernel
 from .gla import GLABwdKernel, GLAFwdKernel
 from .gla_recurrence import GLADecodeFP32Kernel, GLADecodeKernel
 from .grouped_gemm import GroupedGemmKernel
@@ -92,6 +97,7 @@ __all__ = [
     "BatchNormFwdInferKernel",
     "BatchNormFwdTrainKernel",
     "BinaryKernel",
+    "BmmKernel",
     "Conv1dKernel",
     "Conv1dPointwiseKernel",
     "Conv2d1x1Kernel",
@@ -139,6 +145,9 @@ __all__ = [
     "GatedDeltaNetDecodeKernel",
     "GatedDeltaNetDecodeRawCudaFlaStyleKernel",
     "GatedDeltaNetFwdKernel",
+    "GatedDeltaNetPrefillFwdKernel",
+    "GemmFp8BlockScaledKernel",
+    "GemmFp8EpilogueKernel",
     "GemmKernel",
     "GemvKernel",
     "GroupConv1dKernel",
