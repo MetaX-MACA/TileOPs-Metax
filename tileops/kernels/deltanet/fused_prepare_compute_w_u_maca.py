@@ -52,9 +52,19 @@ def fused_prepare_compute_w_u_tl_maca(
     # P_shared is [BC, BC]. For w/u, use the first block_R columns as
     # one RHS tile and zero-fill the remaining columns.
     block_R = math.gcd(block_C, math.gcd(dim_k, dim_v))
+
+    # RHS GEMM uses block_R as its feature/N tile. Keep it aligned for
+    # MACA matrix instructions and fail early for unsupported shapes.
+    if block_R < 16 or block_R % 16 != 0:
+        raise ValueError(
+            "DeltaNet MACA fused forward requires a Tensor-Core-friendly "
+            f"common RHS tile, but got block_R={block_R} from "
+            f"chunk_size={block_C}, dim_k={dim_k}, dim_v={dim_v}. "
+            "The common tile must be a multiple of 16."
+        )
+
     num_w_tiles = dim_k // block_R
     num_u_tiles = dim_v // block_R
-
     num_rounds = int(math.ceil(math.log2(chunk_size))) if chunk_size > 1 else 0
 
     @tilelang.jit(
@@ -157,12 +167,14 @@ def fused_prepare_compute_w_u_tl_maca(
                 for _r in T.Serial(num_rounds):
                     T.clear(mat_frag)
                     T.gemm(P_shared, S_shared, mat_frag)
+                    T.sync_threads()
 
                     for i, j in T.Parallel(block_C, block_C):
                         S_shared[i, j] = S_shared[i, j] + mat_frag[i, j]
 
                     T.clear(mat_frag)
                     T.gemm(P_shared, P_shared, mat_frag)
+                    T.sync_threads()
                     T.copy(mat_frag, P_shared)
 
                     # Both S_shared and P_shared are consumed in the next
