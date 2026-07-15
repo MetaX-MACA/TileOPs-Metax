@@ -823,7 +823,7 @@ class GQAFwdWsPersistentKernel(Kernel):
 
 
 class GQAFwdWsPersistentCausalKernel(Kernel):
-    supported_archs: list[int] = [90]
+    supported_archs: list[int] = [80, 90]
 
     def __init__(
         self,
