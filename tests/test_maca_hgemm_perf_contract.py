@@ -134,12 +134,14 @@ def test_hgemm_driver_supports_direct_and_compiler_packed_backends(
         "TILEOPS_GEMM_PACKED_B_TILE": "1",
         "TILELANG_MACA_GEMM_USE_TEMPLATE": None,
         "TILELANG_MACA_GEMM_K_PACK": None,
+        "TILELANG_MACA_GEMM_CONSUMER_SURFACE": None,
     }
     assert driver.compiler_splitk_packed_env() == {
         "TILEOPS_GEMM_SPLIT_K": "2",
         "TILEOPS_GEMM_PACKED_B_TILE": "1",
         "TILELANG_MACA_GEMM_USE_TEMPLATE": "1",
         "TILELANG_MACA_GEMM_K_PACK": "1",
+        "TILELANG_MACA_GEMM_CONSUMER_SURFACE": None,
     }
     assert "_precondition_compiler_splitk_packed" in source
     assert "m, n, k = (128, 128, 256)" in source
@@ -157,9 +159,11 @@ def test_hgemm_driver_supports_direct_and_compiler_packed_backends(
     )
     monkeypatch.setenv("TILELANG_MACA_GEMM_USE_TEMPLATE", "1")
     monkeypatch.setenv("TILELANG_MACA_GEMM_K_PACK", "1")
+    monkeypatch.setenv("TILELANG_MACA_GEMM_CONSUMER_SURFACE", "wsm_aware")
     with driver._temporary_env(driver.compiler_packed_b_env()):
         assert os.environ.get("TILELANG_MACA_GEMM_USE_TEMPLATE") is None
         assert os.environ.get("TILELANG_MACA_GEMM_K_PACK") is None
+        assert os.environ.get("TILELANG_MACA_GEMM_CONSUMER_SURFACE") is None
 
 
 def test_gemm_kernel_has_first_class_long_k_compiler_fast_path() -> None:

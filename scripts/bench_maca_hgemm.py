@@ -64,15 +64,17 @@ def compiler_packed_b_env() -> dict[str, str | None]:
         "TILEOPS_GEMM_PACKED_B_TILE": "1",
         "TILELANG_MACA_GEMM_USE_TEMPLATE": None,
         "TILELANG_MACA_GEMM_K_PACK": None,
+        "TILELANG_MACA_GEMM_CONSUMER_SURFACE": None,
     }
 
 
-def compiler_splitk_packed_env() -> dict[str, str]:
+def compiler_splitk_packed_env() -> dict[str, str | None]:
     return {
         "TILEOPS_GEMM_SPLIT_K": "2",
         "TILEOPS_GEMM_PACKED_B_TILE": "1",
         "TILELANG_MACA_GEMM_USE_TEMPLATE": "1",
         "TILELANG_MACA_GEMM_K_PACK": "1",
+        "TILELANG_MACA_GEMM_CONSUMER_SURFACE": None,
     }
 
 
