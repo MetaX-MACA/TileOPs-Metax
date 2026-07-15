@@ -21,7 +21,7 @@ import torch
 
 from tileops.kernels.kernel_base import Kernel
 
-from .fused_prepare_compute_w_u import fused_prepare_compute_w_u_tl
+from .fused_prepare_compute_w_u_maca import fused_prepare_compute_w_u_tl_maca
 
 __all__ = ["DeltaNetFwdKernel"]
 
@@ -218,7 +218,7 @@ def _deltanet_fwd_wrapped_kernel(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     beta: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    fused_fn = fused_prepare_compute_w_u_tl(
+    fused_fn = fused_prepare_compute_w_u_tl_maca(
         batch, head, seq_len, chunk_size, dim_k, dim_v, dtype,
     )(fused_num_stages, fused_threads)
     h_fn = _h_recurrence_tl(
@@ -306,7 +306,7 @@ class DeltaNetFwdKernel(Kernel):
             for ns in [1, 2] for t in [128, 256]
         ]
         print(f"Autotuning fused_prepare_compute_w_u ({len(fused_configs)} configs)...")
-        fused_jit = fused_prepare_compute_w_u_tl(B, H, S, BC, DK, DV, dt)
+        fused_jit = fused_prepare_compute_w_u_tl_maca(B, H, S, BC, DK, DV, dt)
         _fused_at = dict(configs=fused_configs, warmup=warmup, rep=rep)
         _fused_dns = list(self._autotune_initial_kwargs(fused_jit, fused_configs[0]).keys())
         if _fused_dns:
