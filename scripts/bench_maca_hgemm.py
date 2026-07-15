@@ -170,9 +170,7 @@ def _time_hot_path(torch_module, fn, warmup: int, repeat: int) -> tuple[float, o
                 if backend == "event":
                     kwargs["return_mode"] = "median"
                 trial_count = CUPTI_BENCH_TRIALS if backend == "cupti" else 1
-                latencies = [
-                    float(do_bench(timed_fn, **kwargs)) for _ in range(trial_count)
-                ]
+                latencies = [float(do_bench(timed_fn, **kwargs)) for _ in range(trial_count)]
                 latency_ms = min(latency for latency in latencies if latency > 0)
                 if latency_ms > 0:
                     out = timed_fn()
@@ -322,13 +320,15 @@ def format_markdown(results: list[HgemmResult], meta: dict[str, object]) -> str:
     ]
     for key, value in meta.items():
         lines.append(f"- **{key}**: {value}")
-    lines.extend([
-        "",
-        "## Results",
-        "",
-        "| backend | m | n | k | latency_ms | tflops | max_abs_diff | mean_abs_diff |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- |",
-    ])
+    lines.extend(
+        [
+            "",
+            "## Results",
+            "",
+            "| backend | m | n | k | latency_ms | tflops | max_abs_diff | mean_abs_diff |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+    )
     for row in results:
         lines.append(
             f"| {row.backend} | {row.m} | {row.n} | {row.k} | "

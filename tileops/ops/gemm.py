@@ -67,7 +67,7 @@ class GemmOp(Op):
         self.N = self.n
         self.K = self.k
         self.trans_a = trans_a
-        self.trans_b = (False if shape_args else True) if trans_b is None else trans_b
+        self.trans_b = not shape_args if trans_b is None else trans_b
         self.dtype = dtype
         self._tune = tune
         self.dispatch_kernel(kernel_map)
@@ -89,7 +89,8 @@ class GemmOp(Op):
             raise ValueError(
                 f"GEMM contraction dim mismatch: a contributes K={k_a}, b contributes K={k_b} "
                 f"(a.shape={tuple(a.shape)}, b.shape={tuple(b.shape)}, "
-                f"trans_a={self.trans_a}, trans_b={self.trans_b})")
+                f"trans_a={self.trans_a}, trans_b={self.trans_b})"
+            )
         return m, n, k_a
 
     def _get_kernel(self, m: int, n: int, k: int, dtype: torch.dtype) -> Tuple[str, Kernel]:
@@ -98,8 +99,8 @@ class GemmOp(Op):
         ``mode`` is ``"lhs_row"``/``"rhs_col"`` for the GEMV fast path, else
         ``"gemm"`` for the selected GEMM backend.
         """
-        gemv_lhs_row = (m == 1 and not self.trans_a and self.trans_b)
-        gemv_rhs_col = (n == 1 and not self.trans_a and not self.trans_b)
+        gemv_lhs_row = m == 1 and not self.trans_a and self.trans_b
+        gemv_rhs_col = n == 1 and not self.trans_a and not self.trans_b
         gemv_cls = self.kernel_map.get("gemv_kernel")
         if (gemv_lhs_row or gemv_rhs_col) and gemv_cls is not None:
             mode = "lhs_row" if gemv_lhs_row else "rhs_col"
@@ -114,7 +115,8 @@ class GemmOp(Op):
         kernel = self._kernel_cache.get(key)
         if kernel is None:
             kernel = self.kernel_map["gemm_kernel"](
-                m, n, k, dtype, tune=self._tune, trans_a=self.trans_a, trans_b=self.trans_b)
+                m, n, k, dtype, tune=self._tune, trans_a=self.trans_a, trans_b=self.trans_b
+            )
             self._kernel_cache[key] = kernel
         return "gemm", kernel
 
@@ -149,7 +151,8 @@ class GemmOp(Op):
             if self._active is None:
                 raise ValueError(
                     "prepared GEMM APIs require explicit GemmOp(m, n, k, ...) construction "
-                    "or a prior forward() call")
+                    "or a prior forward() call"
+                )
             return self._active[1]
 
         dtype = self.dtype or tensor.dtype
@@ -163,7 +166,8 @@ class GemmOp(Op):
             return getattr(kernel, name)
         except AttributeError:
             raise NotImplementedError(
-                f"{kernel.__class__.__name__} does not expose {capability}") from None
+                f"{kernel.__class__.__name__} does not expose {capability}"
+            ) from None
 
     def prepare_b(self, b: torch.Tensor) -> torch.Tensor:
         kernel = self._prepared_kernel(b)
@@ -176,14 +180,16 @@ class GemmOp(Op):
     def forward_with_prepared_b(self, a: torch.Tensor, b_prepared: torch.Tensor) -> torch.Tensor:
         kernel = self._prepared_kernel(a)
         return self._kernel_method(kernel, "forward_with_prepared_b", "prepared-B execution")(
-            a, b_prepared)
+            a, b_prepared
+        )
 
-    def forward_with_prepared_a_and_b(self, a_prepared: torch.Tensor,
-                                      b_prepared: torch.Tensor) -> torch.Tensor:
+    def forward_with_prepared_a_and_b(
+        self, a_prepared: torch.Tensor, b_prepared: torch.Tensor
+    ) -> torch.Tensor:
         kernel = self._prepared_kernel(a_prepared)
         return self._kernel_method(
-            kernel, "forward_with_prepared_a_and_b", "prepared-A/B execution")(
-                a_prepared, b_prepared)
+            kernel, "forward_with_prepared_a_and_b", "prepared-A/B execution"
+        )(a_prepared, b_prepared)
 
     def autotune(self) -> None:
         for kernel in self._kernel_cache.values():
@@ -207,8 +213,7 @@ class GemmFp8Op(Op):
         if isinstance(out_dtype, str):
             out_dtype = getattr(torch, out_dtype)
         if out_dtype not in (torch.float16, torch.bfloat16):
-            raise ValueError(
-                f"GemmFp8Op outputs torch.float16 or torch.bfloat16, got {out_dtype}")
+            raise ValueError(f"GemmFp8Op outputs torch.float16 or torch.bfloat16, got {out_dtype}")
         self.out_dtype = out_dtype
         self._tune = tune
         self.dispatch_kernel(kernel_map)
@@ -237,21 +242,20 @@ class GemmFp8Op(Op):
         bias: Optional[torch.Tensor] = None,
     ) -> None:
         if a.dtype != torch.float8_e4m3fn:
-            raise ValueError(
-                f"GemmFp8Op only supports torch.float8_e4m3fn, got {a.dtype}")
+            raise ValueError(f"GemmFp8Op only supports torch.float8_e4m3fn, got {a.dtype}")
         if b.dtype != a.dtype:
             raise ValueError(f"GemmFp8Op expects b dtype {a.dtype}, got {b.dtype}")
         if scale_a.dtype != torch.float32 or scale_b.dtype != torch.float32:
             raise ValueError("GemmFp8Op expects scale_a and scale_b to be torch.float32")
-        out_dtype = getattr(torch, self.out_dtype) if isinstance(self.out_dtype, str) else self.out_dtype
+        out_dtype = (
+            getattr(torch, self.out_dtype) if isinstance(self.out_dtype, str) else self.out_dtype
+        )
         if bias is not None and bias.dtype != out_dtype:
-            raise ValueError(
-                f"GemmFp8Op expects bias dtype {out_dtype}, got {bias.dtype}")
+            raise ValueError(f"GemmFp8Op expects bias dtype {out_dtype}, got {bias.dtype}")
 
     def _infer_mnk(self, a: torch.Tensor, b: torch.Tensor) -> Tuple[int, int, int]:
         if a.ndim != 2 or b.ndim != 2:
-            raise ValueError(
-                f"GemmFp8Op expects 2D a/b, got a.ndim={a.ndim}, b.ndim={b.ndim}")
+            raise ValueError(f"GemmFp8Op expects 2D a/b, got a.ndim={a.ndim}, b.ndim={b.ndim}")
         m, k = a.shape
         n, k_b = b.shape
         if k != k_b:
@@ -287,10 +291,7 @@ class GemmFp8Op(Op):
             )
         per_tensor = (tuple(scale_a.shape), tuple(scale_b.shape)) == ((1, 1), (1, 1))
         scale_k = (k + 127) // 128
-        block128 = (
-            tuple(scale_a.shape) == (m, scale_k)
-            and tuple(scale_b.shape) == (n, scale_k)
-        )
+        block128 = tuple(scale_a.shape) == (m, scale_k) and tuple(scale_b.shape) == (n, scale_k)
         if not per_tensor and not block128:
             raise ValueError(
                 "GemmFp8Op supports scale shapes (1, 1)/(1, 1) or "
@@ -333,8 +334,7 @@ class GemmFp8Op(Op):
         key = (kernel_name, m, n, k, dtype, scale_a_shape, scale_b_shape, self.out_dtype)
         kernel = self._kernel_cache.get(key)
         if kernel is None:
-            kernel = self.kernel_map[kernel_name](
-                m, n, k, dtype, self.out_dtype, tune=self._tune)
+            kernel = self.kernel_map[kernel_name](m, n, k, dtype, self.out_dtype, tune=self._tune)
             self._kernel_cache[key] = kernel
         return kernel
 
@@ -368,7 +368,8 @@ class GemmFp8Op(Op):
             self.has_bias = bias is not None
             kernel_name = self._select_kernel_name(scale_a, scale_b, m, n, k)
             kernel = self._get_kernel(
-                kernel_name, m, n, k, a.dtype, tuple(scale_a.shape), tuple(scale_b.shape))
+                kernel_name, m, n, k, a.dtype, tuple(scale_a.shape), tuple(scale_b.shape)
+            )
             self.kernel = kernel
             self._active = kernel
             self._active_sig = sig

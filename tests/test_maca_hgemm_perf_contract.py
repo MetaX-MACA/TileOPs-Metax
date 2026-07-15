@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib.util
 import os
 import re
@@ -37,15 +38,37 @@ def _load_driver_module():
     return module
 
 
-def _long_k_compiler_config_body(source: str) -> str:
-    match = re.search(
-        r"if \(self\._use_split_k_path and self\._use_packed_b_tile_path\s+"
-        r"and self\.k >= 131072\):\s+return \{(?P<body>[^}]+)\}",
-        source,
-        re.DOTALL,
+def _long_k_compiler_config(source: str) -> dict[str, object]:
+    module = ast.parse(source)
+    gemm_kernel = next(
+        node for node in module.body if isinstance(node, ast.ClassDef) and node.name == "GemmKernel"
     )
-    assert match is not None
-    return match.group("body")
+    default_config = next(
+        node
+        for node in gemm_kernel.body
+        if isinstance(node, ast.FunctionDef) and node.name == "default_config"
+    )
+    expected_terms = {
+        "self._use_split_k_path",
+        "self._use_packed_b_tile_path",
+        "self.k >= 131072",
+    }
+    for node in ast.walk(default_config):
+        if not isinstance(node, ast.If) or not isinstance(node.test, ast.BoolOp):
+            continue
+        if not isinstance(node.test.op, ast.And):
+            continue
+        if {ast.unparse(term) for term in node.test.values} != expected_terms:
+            continue
+        returned = next(
+            (statement for statement in node.body if isinstance(statement, ast.Return)), None
+        )
+        assert returned is not None and isinstance(returned.value, ast.Dict)
+        return {
+            ast.literal_eval(key): ast.literal_eval(value)
+            for key, value in zip(returned.value.keys, returned.value.values, strict=True)
+        }
+    raise AssertionError("missing long-K split-K packed-B compiler configuration")
 
 
 def _splitk_packed_kernel_body(source: str) -> str:
@@ -95,7 +118,7 @@ def test_bench_gemm_includes_production_hgemm_shapes_and_prepacked_case() -> Non
     assert '"backend": "compiler-splitk-packed"' in compiler_splitk_body
     assert "compiler split-K benchmark selected" in compiler_splitk_body
     assert compiler_splitk_body.index("prepared_b = op.prepare_b(b)") < compiler_splitk_body.index(
-        "execution = getattr(op.kernel, \"execution_info\", None)"
+        'execution = getattr(op.kernel, "execution_info", None)'
     )
     assert "test_maca_hgemm_direct_hpp_bench" in source
     assert "MacaHGemmKernel" in source
@@ -121,11 +144,10 @@ def test_hgemm_driver_declares_exact_table_and_long_k_shape_sets() -> None:
     assert driver.resolve_shapes("all") == (LONG_K_SHAPE,) + TABLE_SHAPES
 
 
-def test_hgemm_driver_supports_direct_and_compiler_packed_backends(
-        monkeypatch) -> None:
+def test_hgemm_driver_supports_direct_and_compiler_packed_backends(monkeypatch) -> None:
     driver = _load_driver_module()
     source = HGEMM_DRIVER.read_text()
-    run_one_body = source[source.index("def run_one("):source.index("\ndef metadata(")]
+    run_one_body = source[source.index("def run_one(") : source.index("\ndef metadata(")]
 
     assert driver.BACKENDS == ("direct-hpp", "compiler-packed-b", "compiler-splitk-packed")
     assert driver.resolve_backends("both") == driver.BACKENDS
@@ -168,7 +190,7 @@ def test_hgemm_driver_supports_direct_and_compiler_packed_backends(
 
 def test_gemm_kernel_has_first_class_long_k_compiler_fast_path() -> None:
     source = GEMM_KERNEL.read_text()
-    long_k_config = _long_k_compiler_config_body(source)
+    long_k_config = _long_k_compiler_config(source)
 
     assert "_should_auto_use_maca_compiler_splitk_packed" in source
     assert "k >= 131072" in source
@@ -177,12 +199,14 @@ def test_gemm_kernel_has_first_class_long_k_compiler_fast_path() -> None:
     assert "TILELANG_MACA_GEMM_USE_TEMPLATE" in source
     assert "TILELANG_MACA_GEMM_K_PACK" in source
     assert "compiler split-K packed-B path" in source
-    assert '"block_m": 128' in long_k_config
-    assert '"block_n": 128' in long_k_config
-    assert '"block_k": 128' in long_k_config
-    assert '"num_stages": 0' in long_k_config
-    assert '"threads": 256' in long_k_config
-    assert '"enable_rasterization": True' in long_k_config
+    assert long_k_config == {
+        "block_m": 128,
+        "block_n": 128,
+        "block_k": 128,
+        "num_stages": 0,
+        "threads": 256,
+        "enable_rasterization": True,
+    }
     assert "def execution_info" in source
     assert '"specialized_reduce": self._use_split_k_path' in source
 
@@ -202,8 +226,8 @@ def test_splitk_reduce_has_specialized_two_way_sum() -> None:
 
     assert "items_per_thread = 16" in source
     assert "if split_k == 2:" in source
-    assert "T.cast(partial_c[0, row, col], \"float32\")" in source
-    assert "T.cast(partial_c[1, row, col], \"float32\")" in source
+    assert 'T.cast(partial_c[0, row, col], "float32")' in source
+    assert 'T.cast(partial_c[1, row, col], "float32")' in source
 
 
 def test_splitk_packed_compiler_kernel_preserves_opt_in_wsm_annotations() -> None:
@@ -231,9 +255,7 @@ def test_hgemm_workflow_runs_dedicated_driver() -> None:
     job = workflow["jobs"]["maca-hgemm-performance"]
     assert job["runs-on"] == "tileops-metax-runner"
 
-    run_blocks = "\n".join(
-        step.get("run", "") for step in job["steps"] if isinstance(step, dict)
-    )
+    run_blocks = "\n".join(step.get("run", "") for step in job["steps"] if isinstance(step, dict))
     assert "scripts/bench_maca_hgemm.py" in run_blocks
     assert "TILELANG_DISABLE_CACHE=1" in run_blocks
     assert "--backend both" in run_blocks
