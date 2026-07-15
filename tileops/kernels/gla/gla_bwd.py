@@ -124,6 +124,11 @@ def _gla_bwd_dh_kernel(
                             * T.exp2(g_cumsum_s[i_t, i_k] * LOG2_E),
                             dtype)
 
+                    # Store dh BEFORE decay
+                    for i_k, i_v in T.Parallel(dim_k, dim_v_part):
+                        dh_out[i_b, i_c, i_h, i_k,
+                               v_offset + i_v] = dh_s[i_k, i_v]
+
                     # dh += scale * q_gated^T @ do_slice
                     dh_delta = T.alloc_fragment([dim_k, dim_v_part],
                                                accum_dtype)
@@ -133,11 +138,6 @@ def _gla_bwd_dh_kernel(
                     for i_k, i_v in T.Parallel(dim_k, dim_v_part):
                         dh_s[i_k, i_v] = (dh_s[i_k, i_v]
                                           + scale * dh_delta[i_k, i_v])
-
-                    # Store dh BEFORE decay
-                    for i_k, i_v in T.Parallel(dim_k, dim_v_part):
-                        dh_out[i_b, i_c, i_h, i_k,
-                               v_offset + i_v] = dh_s[i_k, i_v]
 
                     # Decay for next (earlier) chunk
                     for i_k, i_v in T.Parallel(dim_k, dim_v_part):
