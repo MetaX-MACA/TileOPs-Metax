@@ -164,7 +164,21 @@ class FusedMoEExpertsNopadPersistent3WGFwdOp(FusedMoEExpertsModular):
         # applies uniformly through the unfused path.
         gemm_override = (kernel_map or {}).get("moe_grouped_gemm_kernel")
         self.use_fused_activation = use_fused_activation
-        if use_fused_activation:
+        if use_fused_activation and is_maca():
+            ok = (
+                kernel_cls is GroupedGemmPersistentMACAKernel
+                and (gemm_override is None
+                     or gemm_override is GroupedGemmPersistentMACAKernel)
+            )
+            if not ok:
+                _logger.warning(
+                    "use_fused_activation=True not eligible on MACA (requires "
+                    "GroupedGemmPersistentMACAKernel with no conflicting "
+                    "moe_grouped_gemm_kernel override); falling back to unfused "
+                    "activation.",
+                )
+                self.use_fused_activation = False
+        elif use_fused_activation:
             fused_block_n = _FUSED_ACT_DEFAULT_CONFIG["block_n"]
             ok = (
                 torch.cuda.is_available()

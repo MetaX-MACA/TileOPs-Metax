@@ -4,7 +4,11 @@ from typing import Dict, Optional
 import torch
 
 from tileops.kernels.kernel_base import Kernel
-from tileops.kernels.moe import MoeGroupedGemmPersistent3WGFusedActKernel
+from tileops.kernels.moe import (
+    MoeGroupedGemmPersistent3WGFusedActKernel,
+    MoeGroupedGemmPersistentFusedActMACAKernel,
+)
+from tileops.utils import is_maca
 
 from ...op_base import Op
 
@@ -59,7 +63,11 @@ class MoeGroupedGemmNopad3WGFusedActFwdOp(Op):
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
-        return {"moe_grouped_gemm_fused_act_kernel": MoeGroupedGemmPersistent3WGFusedActKernel}
+        cls = (
+            MoeGroupedGemmPersistentFusedActMACAKernel if is_maca()
+            else MoeGroupedGemmPersistent3WGFusedActKernel
+        )
+        return {"moe_grouped_gemm_fused_act_kernel": cls}
 
     def forward(
         self,
