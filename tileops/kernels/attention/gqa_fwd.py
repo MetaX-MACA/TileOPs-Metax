@@ -1831,8 +1831,7 @@ def _gqa_prefill_paged_with_kv_cache_fwd_kernel(batch: int,
             tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
             tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
             tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        },
-        compile_flags=_FAST_COMPILE_FLAGS)
+        })
     def _gqa_prefill_paged_with_kv_cache_fwd_func(
             block_m: int, block_n: int, num_stages: int, threads: int) -> Callable:
 
@@ -2190,8 +2189,7 @@ def _gqa_prefill_paged_with_fp8_kv_cache_fwd_kernel(batch: int,
             tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
             tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
             tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        },
-        compile_flags=_FAST_COMPILE_FLAGS)
+        })
     def _gqa_prefill_paged_with_fp8_kv_cache_fwd_func(
             block_m: int, block_n: int, num_stages: int, threads: int) -> Callable:
 
@@ -2745,8 +2743,7 @@ def _gqa_prefill_paged_with_kv_cache_rope_fwd_kernel(batch: int,
             tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
             tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
             tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        },
-        compile_flags=_FAST_COMPILE_FLAGS)
+        })
     def _gqa_prefill_paged_with_kv_cache_rope_fwd_func(
             block_m: int, block_n: int, num_stages: int, threads: int) -> Callable:
 
