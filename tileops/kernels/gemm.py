@@ -1227,16 +1227,20 @@ class GemmKernel(Kernel):
             and self._use_packed_b_tile_path
             and _get_maca_bsm_packed_b_async_pipeline()
         )
-        self._compiler_env = (
-            {
-                "TILELANG_MACA_GEMM_USE_TEMPLATE": "1",
-                "TILELANG_MACA_GEMM_K_PACK": "1",
-            }
-            if self._use_split_k_path
+        self._compiler_env: dict[str, str] = {}
+        if self._use_maca_bsm_path:
+            self._compiler_env["TILELANG_DEFAULT_TARGET"] = "maca"
+        if (
+            self._use_split_k_path
             and self._use_packed_b_tile_path
             and not self._use_packed_b_async_pipeline_path
-            else {}
-        )
+        ):
+            self._compiler_env.update(
+                {
+                    "TILELANG_MACA_GEMM_USE_TEMPLATE": "1",
+                    "TILELANG_MACA_GEMM_K_PACK": "1",
+                }
+            )
 
         if self._use_wgmma_path:
             self.kernel = _gemm_kernel(m, n, k, trans_a, trans_b, self.dtype_str)
@@ -1385,7 +1389,7 @@ class GemmKernel(Kernel):
             "backend": backend,
             "split_k": self.split_k,
             "packed_b_tile": self._use_packed_b_tile_path,
-            "template": bool(self._compiler_env),
+            "template": self._compiler_env.get("TILELANG_MACA_GEMM_USE_TEMPLATE") == "1",
             "specialized_reduce": self._use_split_k_path,
         }
 
@@ -1465,7 +1469,8 @@ class GemmKernel(Kernel):
     def _get_compiled_reduce_kernel(self):
         if self._compiled_reduce_kernel is None:
             assert self.reduce_kernel is not None
-            self._compiled_reduce_kernel = self.reduce_kernel()
+            with _temporary_env(self._compiler_env):
+                self._compiled_reduce_kernel = self.reduce_kernel()
         return self._compiled_reduce_kernel
 
     def forward_with_prepared_b(self, a: torch.Tensor, b_prepared: torch.Tensor) -> torch.Tensor:

@@ -211,6 +211,17 @@ def test_gemm_kernel_has_first_class_long_k_compiler_fast_path() -> None:
     assert '"specialized_reduce": self._use_split_k_path' in source
 
 
+def test_gemm_kernel_compiles_c500_bsm_paths_with_the_maca_target() -> None:
+    source = GEMM_KERNEL.read_text()
+    reduce_body = source.split("def _get_compiled_reduce_kernel(self):", 1)[1].split(
+        "\n    def forward_with_prepared_b", 1
+    )[0]
+
+    assert 'self._compiler_env["TILELANG_DEFAULT_TARGET"] = "maca"' in source
+    assert '"template": self._compiler_env.get("TILELANG_MACA_GEMM_USE_TEMPLATE") == "1"' in source
+    assert "with _temporary_env(self._compiler_env):" in reduce_body
+
+
 def test_gemm_kernel_caches_compiled_hot_path_wrappers() -> None:
     source = GEMM_KERNEL.read_text()
 
