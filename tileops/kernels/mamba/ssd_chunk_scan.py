@@ -364,54 +364,69 @@ def _ssd_chunk_scan_fwd_kernel(
 
                             # Anchor point: dA[l0 + M] (start of second micro-row)
                             anchor_idx = T.min(l0 + M, Q - 1)
-                            anchor = dA_smem[anchor_idx]
+                            micro_anchor = dA_smem[anchor_idx]
 
                             # Precompute factors only for lower block (1,0)
                             for i in T.Parallel(M):
                                 # Row factor: for l = M..M+31 (second micro-row)
                                 safe_l = T.min(l0 + M + i, Q - 1)
-                                row_factor[i] = T.exp(dA_smem[safe_l] - anchor)
+                                row_factor[i] = T.exp(dA_smem[safe_l] - micro_anchor)
 
                                 # Column factor: for s = 0..31 (first micro-column)
                                 safe_s = T.min(s0 + i, Q - 1)
-                                col_factor[i] = T.exp(anchor - dA_smem[safe_s]) * dt_smem[safe_s]
+                                col_factor[i] = (
+                                    T.exp(micro_anchor - dA_smem[safe_s]) * dt_smem[safe_s]
+                                )
 
                             T.sync_threads()
 
-                            # Python static unrolling: 4 micro-blocks
-                            # mr=0, mc=0: diagonal block (direct exp)
-                            for ll, ss in T.Parallel(M, M):
+                            # Keep one full fragment domain so its ownership mapping remains
+                            # consistent on both 32-lane and 64-lane GPU backends.
+                            for ll, ss in T.Parallel(2 * M, 2 * M):
                                 l_abs = l0 + ll
                                 s_abs = s0 + ss
                                 valid = (l_abs < Q) and (s_abs < Q) and (s_abs <= l_abs)
                                 safe_l = T.min(l_abs, Q - 1)
                                 safe_s = T.min(s_abs, Q - 1)
-                                exp_factor = T.exp(dA_smem[safe_l] - dA_smem[safe_s])
-                                value = T.cast(cb_tile[ll, ss], accum_dtype) * exp_factor * dt_smem[safe_s]
-                                lcb_cast[ll, ss] = T.if_then_else(valid, T.cast(value, dtype), T.cast(T.float32(0.0), dtype))
-
-                            # mr=0, mc=1: upper block (all zeros due to causality)
-                            for ll, ss in T.Parallel(M, M):
-                                lcb_cast[ll, M + ss] = T.cast(T.float32(0.0), dtype)
-
-                            # mr=1, mc=0: lower block (factorized - NO direct exp!)
-                            for ll, ss in T.Parallel(M, M):
-                                l_abs = l0 + M + ll
-                                s_abs = s0 + ss
-                                valid = (l_abs < Q) and (s_abs < Q) and (s_abs <= l_abs)
-                                value = T.cast(cb_tile[M + ll, ss], accum_dtype) * row_factor[ll] * col_factor[ss]
-                                lcb_cast[M + ll, ss] = T.if_then_else(valid, T.cast(value, dtype), T.cast(T.float32(0.0), dtype))
-
-                            # mr=1, mc=1: diagonal block (direct exp)
-                            for ll, ss in T.Parallel(M, M):
-                                l_abs = l0 + M + ll
-                                s_abs = s0 + M + ss
-                                valid = (l_abs < Q) and (s_abs < Q) and (s_abs <= l_abs)
-                                safe_l = T.min(l_abs, Q - 1)
-                                safe_s = T.min(s_abs, Q - 1)
-                                exp_factor = T.exp(dA_smem[safe_l] - dA_smem[safe_s])
-                                value = T.cast(cb_tile[M + ll, M + ss], accum_dtype) * exp_factor * dt_smem[safe_s]
-                                lcb_cast[M + ll, M + ss] = T.if_then_else(valid, T.cast(value, dtype), T.cast(T.float32(0.0), dtype))
+                                if ll < M:
+                                    if ss < M:
+                                        exp_factor = T.exp(dA_smem[safe_l] - dA_smem[safe_s])
+                                        direct_value = (
+                                            T.cast(cb_tile[ll, ss], accum_dtype)
+                                            * exp_factor
+                                            * dt_smem[safe_s]
+                                        )
+                                        lcb_cast[ll, ss] = T.if_then_else(
+                                            valid,
+                                            T.cast(direct_value, dtype),
+                                            T.cast(T.float32(0.0), dtype),
+                                        )
+                                    else:
+                                        lcb_cast[ll, ss] = T.cast(T.float32(0.0), dtype)
+                                else:
+                                    if ss < M:
+                                        factorized_value = (
+                                            T.cast(cb_tile[ll, ss], accum_dtype)
+                                            * row_factor[ll - M]
+                                            * col_factor[ss]
+                                        )
+                                        lcb_cast[ll, ss] = T.if_then_else(
+                                            valid,
+                                            T.cast(factorized_value, dtype),
+                                            T.cast(T.float32(0.0), dtype),
+                                        )
+                                    else:
+                                        exp_factor = T.exp(dA_smem[safe_l] - dA_smem[safe_s])
+                                        diagonal_value = (
+                                            T.cast(cb_tile[ll, ss], accum_dtype)
+                                            * exp_factor
+                                            * dt_smem[safe_s]
+                                        )
+                                        lcb_cast[ll, ss] = T.if_then_else(
+                                            valid,
+                                            T.cast(diagonal_value, dtype),
+                                            T.cast(T.float32(0.0), dtype),
+                                        )
                         else:
                             # Original diagonal path (fallback)
                             for ll, ss in T.Parallel(block_l, block_s):
