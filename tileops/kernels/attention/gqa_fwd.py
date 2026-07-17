@@ -39,7 +39,6 @@ _FAST_COMPILE_FLAGS = [
     "-U__CUDA_NO_HALF_CONVERSIONS__",
     "-U__CUDA_NO_HALF2_OPERATORS__",
     "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-    "--expt-relaxed-constexpr",
     "--expt-extended-lambda",
     "-DENABLE_BF16",
 ]
