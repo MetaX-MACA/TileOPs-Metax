@@ -364,18 +364,18 @@ def _ssd_chunk_scan_fwd_kernel(
 
                             # Anchor point: dA[l0 + M] (start of second micro-row)
                             anchor_idx = T.min(l0 + M, Q - 1)
-                            micro_anchor = dA_smem[anchor_idx]
+                            anchor = dA_smem[anchor_idx]
 
                             # Precompute factors only for lower block (1,0)
                             for i in T.Parallel(M):
                                 # Row factor: for l = M..M+31 (second micro-row)
                                 safe_l = T.min(l0 + M + i, Q - 1)
-                                row_factor[i] = T.exp(dA_smem[safe_l] - micro_anchor)
+                                row_factor[i] = T.exp(dA_smem[safe_l] - anchor)
 
                                 # Column factor: for s = 0..31 (first micro-column)
                                 safe_s = T.min(s0 + i, Q - 1)
                                 col_factor[i] = (
-                                    T.exp(micro_anchor - dA_smem[safe_s]) * dt_smem[safe_s]
+                                    T.exp(anchor - dA_smem[safe_s]) * dt_smem[safe_s]
                                 )
 
                             T.sync_threads()
