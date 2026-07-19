@@ -14,7 +14,7 @@ memory instructions.
 
 import functools
 import itertools
-from typing import Optional
+from typing import List, Optional
 
 import tilelang
 import tilelang.language as T
@@ -132,7 +132,7 @@ def _fused_add_layer_norm_wrapped(
     residual: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     return list(
         _fused_add_layer_norm_kernel(M, N, eps, dtype_str)(block_m, threads)(
             x, residual, weight, bias
@@ -207,7 +207,7 @@ class FusedAddLayerNormKernel(Kernel):
         residual: torch.Tensor,
         weight: torch.Tensor,
         bias: torch.Tensor,
-    ) -> list[torch.Tensor]:
+    ) -> List[torch.Tensor]:
         return _fused_add_layer_norm_wrapped(
             self.M,
             self.N,
@@ -308,7 +308,7 @@ def _fused_add_rms_norm_wrapped(
     x: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     return list(
         _fused_add_rms_norm_kernel(M, N, eps, dtype_str)(block_m, threads)(
             x, residual, weight
@@ -381,7 +381,7 @@ class FusedAddRMSNormKernel(Kernel):
         x: torch.Tensor,
         residual: torch.Tensor,
         weight: torch.Tensor,
-    ) -> list[torch.Tensor]:
+    ) -> List[torch.Tensor]:
         return _fused_add_rms_norm_wrapped(
             self.M,
             self.N,

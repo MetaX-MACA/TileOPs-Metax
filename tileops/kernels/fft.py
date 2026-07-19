@@ -1,6 +1,6 @@
 import functools
 import math
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Tuple
 
 import tilelang
 import tilelang.language as T
@@ -451,7 +451,7 @@ def _fft_c2c_wrapped_kernel(
     x_imag: torch.Tensor,
     lut_real: torch.Tensor,
     lut_imag: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     return _fft_c2c_kernel(n, batch_size, dtype)(block_size, threads)(
         x_real, x_imag, lut_real, lut_imag
     )
@@ -464,8 +464,8 @@ def _(
     dtype: str,
     block_size: int,
     threads: int,
-    *inputs: tuple[torch.Tensor, ...]
-) -> tuple[torch.Tensor, torch.Tensor]:
+    *inputs: Tuple[torch.Tensor, ...]
+) -> Tuple[torch.Tensor, torch.Tensor]:
     real_dtype = inputs[0].dtype
     device = inputs[0].device
     return (

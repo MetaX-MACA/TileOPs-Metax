@@ -104,3 +104,11 @@ def is_maca() -> bool:
         return False
     ver = getattr(version, "__version__", "") or ""
     return "metax" in ver or hasattr(version, "maca")
+
+
+@functools.lru_cache(maxsize=1)
+def is_metax_c500() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return "MetaX C500" in getattr(props, "name", "")

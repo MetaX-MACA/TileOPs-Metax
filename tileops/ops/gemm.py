@@ -1,3 +1,4 @@
+import os
 from typing import Dict, Hashable, Optional, Tuple
 
 import torch
@@ -16,65 +17,72 @@ from .op_base import Op
 __all__ = ["GemmFp8Op", "GemmOp"]
 
 
+def _select_gemm_kernel() -> type[Kernel]:
+    backend = os.environ.get("TILEOPS_GEMM_BACKEND", "").strip().lower()
+    if backend in {"maca_hgemm", "maca_auto"}:
+        raise RuntimeError(
+            "TILEOPS_GEMM_BACKEND no longer accepts direct HPP backends for GemmOp; "
+            "use the TileLang DSL/compiler path instead."
+        )
+    if backend in {"tilelang", "default", "", "auto"}:
+        return GemmKernel
+    return GemmKernel
+
+
 class GemmOp(Op):
     """Dense GEMM, input-inferred and aligned to DeepGEMM's call-time JIT.
 
-    The logical dims ``m, n, k`` and the dtype are derived from the ``forward``
-    inputs; nothing is committed at construction. The dtype-specialized kernel
-    is built (and cached) on first use for each ``(m, n, k, dtype)`` — mirroring
-    DeepGEMM's compile-on-first-call + per-config cache.
-
-    Layouts via ``(trans_a, trans_b)`` (== DeepGEMM ``nt``/``nn``/``tn``/``tt``):
-      - ``(False, True)``  NT (default): ``A @ Bᵀ``
-      - ``(False, False)`` NN:           ``A @ B``
-      - ``(True,  False)`` TN:           ``Aᵀ @ B``
-      - ``(True,  True)``  TT:           ``Aᵀ @ Bᵀ``
-
-    Args:
-        trans_a: Whether ``a`` is stored transposed (``[K, M]``).
-        trans_b: Whether ``b`` is stored transposed (``[N, K]``). Default ``True`` (NT).
-        kernel_map: Optional kernel override dict.
-        tune: Whether to autotune (applied when a kernel is first built).
-
-    Example:
-        >>> op = GemmOp()                       # NT by default
-        >>> d = op(a, b)                         # a=[M,K], b=[N,K] -> d=[M,N]
-        >>> flops, nbytes = op.eval_roofline()   # valid after the forward
+    The logical dims ``m, n, k`` and dtype are normally derived from the
+    ``forward`` inputs and kernels are built lazily. Passing ``m, n, k`` as the
+    first three positional arguments is also supported for prepared-weight
+    paths that must build a kernel before the first ``forward`` call. The
+    input-inferred form keeps the upstream NT default, while the shaped
+    compatibility form keeps the legacy NN default used by prepared-B HGEMM
+    benchmarks.
     """
 
     def __init__(
         self,
+        *shape_args: int,
         trans_a: bool = False,
-        trans_b: bool = True,
+        trans_b: Optional[bool] = None,
+        dtype: Optional[torch.dtype] = None,
         kernel_map: Optional[Dict[str, Kernel]] = None,
         tune: bool = False,
     ) -> None:
+        if len(shape_args) not in {0, 3}:
+            raise TypeError("GemmOp accepts either no shape args or m, n, k")
+
+        self.m: Optional[int]
+        self.n: Optional[int]
+        self.k: Optional[int]
+        if shape_args:
+            self.m, self.n, self.k = (int(shape_args[0]), int(shape_args[1]), int(shape_args[2]))
+        else:
+            self.m = None
+            self.n = None
+            self.k = None
+
+        self.M = self.m
+        self.N = self.n
+        self.K = self.k
         self.trans_a = trans_a
-        self.trans_b = trans_b
+        self.trans_b = not shape_args if trans_b is None else trans_b
+        self.dtype = dtype
         self._tune = tune
         self.dispatch_kernel(kernel_map)
-        # (m, n, k, dtype) -> Kernel instance; built lazily on first use.
         self._kernel_cache: Dict[Hashable, Kernel] = {}
-        # Fast path: skip re-inference when the input signature is unchanged.
-        # _active_sig = (a.shape, b.shape, dtype); _active = (mode, kernel, n, m).
         self._active_sig: Optional[tuple] = None
         self._active: Optional[tuple] = None
-        # Roofline / dtype bindings, populated on the first forward().
-        self.m: Optional[int] = None
-        self.n: Optional[int] = None
-        self.k: Optional[int] = None
-        self.dtype: Optional[torch.dtype] = None
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
-        kernels: Dict[str, Kernel] = {"gemm_kernel": GemmKernel}
-        # GemvKernel is SM90-only; only advertise it where it can install.
+        kernels: Dict[str, Kernel] = {"gemm_kernel": _select_gemm_kernel()}
         if get_sm_version() in (GemvKernel.supported_archs or []):
             kernels["gemv_kernel"] = GemvKernel
         return kernels
 
     def _infer_mnk(self, a: torch.Tensor, b: torch.Tensor) -> Tuple[int, int, int]:
-        """Derive logical ``(m, n, k)`` from input shapes per the trans flags."""
         k_a, m = (a.shape[0], a.shape[1]) if self.trans_a else (a.shape[1], a.shape[0])
         n, k_b = (b.shape[0], b.shape[1]) if self.trans_b else (b.shape[1], b.shape[0])
         if k_a != k_b:
@@ -85,27 +93,20 @@ class GemmOp(Op):
             )
         return m, n, k_a
 
-    def _cache_key(self, *input_shapes: Tuple[int, ...]) -> Hashable:
-        """Project onto the dims the kernel actually specializes on."""
-        return (self.m, self.n, self.k, self.trans_a, self.trans_b,
-                None if self.dtype is None else str(self.dtype))
-
     def _get_kernel(self, m: int, n: int, k: int, dtype: torch.dtype) -> Tuple[str, Kernel]:
         """Return ``(mode, kernel)`` for the given dims, building/caching lazily.
 
         ``mode`` is ``"lhs_row"``/``"rhs_col"`` for the GEMV fast path, else
-        ``"gemm"`` — the hand-written warp-specialized ``GemmKernel`` (SM90),
-        covering all four ``(trans_a, trans_b)`` layouts.
+        ``"gemm"`` for the selected GEMM backend.
         """
-        gemv_lhs_row = (m == 1 and not self.trans_a and self.trans_b)
-        gemv_rhs_col = (n == 1 and not self.trans_a and not self.trans_b)
+        gemv_lhs_row = m == 1 and not self.trans_a and self.trans_b
+        gemv_rhs_col = n == 1 and not self.trans_a and not self.trans_b
         gemv_cls = self.kernel_map.get("gemv_kernel")
         if (gemv_lhs_row or gemv_rhs_col) and gemv_cls is not None:
             mode = "lhs_row" if gemv_lhs_row else "rhs_col"
             key = (mode, m, n, k, dtype)
             kernel = self._kernel_cache.get(key)
             if kernel is None:
-                # lhs_row: a is [1, K], reduce over K -> use (n, k); rhs_col uses (m, k).
                 kernel = gemv_cls(n if mode == "lhs_row" else m, k, dtype, tune=self._tune)
                 self._kernel_cache[key] = kernel
             return mode, kernel
@@ -114,27 +115,27 @@ class GemmOp(Op):
         kernel = self._kernel_cache.get(key)
         if kernel is None:
             kernel = self.kernel_map["gemm_kernel"](
-                m, n, k, dtype, tune=self._tune, trans_a=self.trans_a, trans_b=self.trans_b)
+                m, n, k, dtype, tune=self._tune, trans_a=self.trans_a, trans_b=self.trans_b
+            )
             self._kernel_cache[key] = kernel
         return "gemm", kernel
 
+    def _bind_active_kernel(self, m: int, n: int, k: int, dtype: torch.dtype) -> Tuple[str, Kernel]:
+        self.m, self.n, self.k = m, n, k
+        self.M, self.N, self.K = m, n, k
+        self.dtype = dtype
+        mode, kernel = self._get_kernel(m, n, k, dtype)
+        self.kernel = kernel
+        return mode, kernel
+
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        # Fast path: same input signature as the last call → reuse the already
-        # built/JIT'd kernel directly, skipping dtype validation, shape
-        # inference, and the cache lookup (this is the steady state in
-        # benchmarking / serving, where per-call Python overhead matters).
         sig = (a.shape, b.shape, a.dtype)
         if sig != self._active_sig:
             self._validate_dtypes(a, b)
             m, n, k = self._infer_mnk(a, b)
-            # Bind dims/dtype for the manifest func-mode roofline (read post-forward).
-            self.m, self.n, self.k = m, n, k
-            self.dtype = a.dtype
             self.a_shape = tuple(a.shape)
             self.b_shape = tuple(b.shape)
-            mode, kernel = self._get_kernel(m, n, k, a.dtype)
-            # Expose the active kernel so autotune()/introspection can find it.
-            self.kernel = kernel
+            mode, kernel = self._bind_active_kernel(m, n, k, a.dtype)
             self._active = (mode, kernel, n, m)
             self._active_sig = sig
 
@@ -145,13 +146,52 @@ class GemmOp(Op):
             return kernel(b.reshape(-1), a).reshape(m, 1)
         return kernel(a, b)
 
-    def autotune(self) -> None:
-        """Autotune every kernel built so far.
+    def _prepared_kernel(self, tensor: torch.Tensor) -> Kernel:
+        if self.m is None or self.n is None or self.k is None:
+            if self._active is None:
+                raise ValueError(
+                    "prepared GEMM APIs require explicit GemmOp(m, n, k, ...) construction "
+                    "or a prior forward() call"
+                )
+            return self._active[1]
 
-        ``GemmOp`` caches kernels lazily in ``self._kernel_cache`` rather than as
-        direct attributes, so the base ``Op.autotune`` (which scans ``dir(self)``)
-        would miss them. Tune each cached kernel instead.
-        """
+        dtype = self.dtype or tensor.dtype
+        mode, kernel = self._bind_active_kernel(self.m, self.n, self.k, dtype)
+        if mode != "gemm":
+            raise NotImplementedError("prepared GEMM APIs are only supported for GEMM kernels")
+        return kernel
+
+    def _kernel_method(self, kernel: Kernel, name: str, capability: str):
+        try:
+            return getattr(kernel, name)
+        except AttributeError:
+            raise NotImplementedError(
+                f"{kernel.__class__.__name__} does not expose {capability}"
+            ) from None
+
+    def prepare_b(self, b: torch.Tensor) -> torch.Tensor:
+        kernel = self._prepared_kernel(b)
+        return self._kernel_method(kernel, "prepare_b", "prepared-B support")(b)
+
+    def prepare_a(self, a: torch.Tensor) -> torch.Tensor:
+        kernel = self._prepared_kernel(a)
+        return self._kernel_method(kernel, "prepare_a", "prepared-A support")(a)
+
+    def forward_with_prepared_b(self, a: torch.Tensor, b_prepared: torch.Tensor) -> torch.Tensor:
+        kernel = self._prepared_kernel(a)
+        return self._kernel_method(kernel, "forward_with_prepared_b", "prepared-B execution")(
+            a, b_prepared
+        )
+
+    def forward_with_prepared_a_and_b(
+        self, a_prepared: torch.Tensor, b_prepared: torch.Tensor
+    ) -> torch.Tensor:
+        kernel = self._prepared_kernel(a_prepared)
+        return self._kernel_method(
+            kernel, "forward_with_prepared_a_and_b", "prepared-A/B execution"
+        )(a_prepared, b_prepared)
+
+    def autotune(self) -> None:
         for kernel in self._kernel_cache.values():
             kernel.autotune()
 
@@ -173,8 +213,7 @@ class GemmFp8Op(Op):
         if isinstance(out_dtype, str):
             out_dtype = getattr(torch, out_dtype)
         if out_dtype not in (torch.float16, torch.bfloat16):
-            raise ValueError(
-                f"GemmFp8Op outputs torch.float16 or torch.bfloat16, got {out_dtype}")
+            raise ValueError(f"GemmFp8Op outputs torch.float16 or torch.bfloat16, got {out_dtype}")
         self.out_dtype = out_dtype
         self._tune = tune
         self.dispatch_kernel(kernel_map)
@@ -203,21 +242,20 @@ class GemmFp8Op(Op):
         bias: Optional[torch.Tensor] = None,
     ) -> None:
         if a.dtype != torch.float8_e4m3fn:
-            raise ValueError(
-                f"GemmFp8Op only supports torch.float8_e4m3fn, got {a.dtype}")
+            raise ValueError(f"GemmFp8Op only supports torch.float8_e4m3fn, got {a.dtype}")
         if b.dtype != a.dtype:
             raise ValueError(f"GemmFp8Op expects b dtype {a.dtype}, got {b.dtype}")
         if scale_a.dtype != torch.float32 or scale_b.dtype != torch.float32:
             raise ValueError("GemmFp8Op expects scale_a and scale_b to be torch.float32")
-        out_dtype = getattr(torch, self.out_dtype) if isinstance(self.out_dtype, str) else self.out_dtype
+        out_dtype = (
+            getattr(torch, self.out_dtype) if isinstance(self.out_dtype, str) else self.out_dtype
+        )
         if bias is not None and bias.dtype != out_dtype:
-            raise ValueError(
-                f"GemmFp8Op expects bias dtype {out_dtype}, got {bias.dtype}")
+            raise ValueError(f"GemmFp8Op expects bias dtype {out_dtype}, got {bias.dtype}")
 
     def _infer_mnk(self, a: torch.Tensor, b: torch.Tensor) -> Tuple[int, int, int]:
         if a.ndim != 2 or b.ndim != 2:
-            raise ValueError(
-                f"GemmFp8Op expects 2D a/b, got a.ndim={a.ndim}, b.ndim={b.ndim}")
+            raise ValueError(f"GemmFp8Op expects 2D a/b, got a.ndim={a.ndim}, b.ndim={b.ndim}")
         m, k = a.shape
         n, k_b = b.shape
         if k != k_b:
@@ -253,10 +291,7 @@ class GemmFp8Op(Op):
             )
         per_tensor = (tuple(scale_a.shape), tuple(scale_b.shape)) == ((1, 1), (1, 1))
         scale_k = (k + 127) // 128
-        block128 = (
-            tuple(scale_a.shape) == (m, scale_k)
-            and tuple(scale_b.shape) == (n, scale_k)
-        )
+        block128 = tuple(scale_a.shape) == (m, scale_k) and tuple(scale_b.shape) == (n, scale_k)
         if not per_tensor and not block128:
             raise ValueError(
                 "GemmFp8Op supports scale shapes (1, 1)/(1, 1) or "
@@ -299,8 +334,7 @@ class GemmFp8Op(Op):
         key = (kernel_name, m, n, k, dtype, scale_a_shape, scale_b_shape, self.out_dtype)
         kernel = self._kernel_cache.get(key)
         if kernel is None:
-            kernel = self.kernel_map[kernel_name](
-                m, n, k, dtype, self.out_dtype, tune=self._tune)
+            kernel = self.kernel_map[kernel_name](m, n, k, dtype, self.out_dtype, tune=self._tune)
             self._kernel_cache[key] = kernel
         return kernel
 
@@ -334,7 +368,8 @@ class GemmFp8Op(Op):
             self.has_bias = bias is not None
             kernel_name = self._select_kernel_name(scale_a, scale_b, m, n, k)
             kernel = self._get_kernel(
-                kernel_name, m, n, k, a.dtype, tuple(scale_a.shape), tuple(scale_b.shape))
+                kernel_name, m, n, k, a.dtype, tuple(scale_a.shape), tuple(scale_b.shape)
+            )
             self.kernel = kernel
             self._active = kernel
             self._active_sig = sig

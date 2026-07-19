@@ -25,6 +25,7 @@ All conclusions are scoped to this configuration. Re-validate when any component
 
 ## Tools & Guides
 
-| Guide                                  | What it covers                                            |
-| -------------------------------------- | --------------------------------------------------------- |
+| Guide | What it covers |
+| --- | --- |
 | [trace-timeline.md](trace-timeline.md) | In-kernel timeline tracer: annotate, build, run, and read |
+| [hgemm-codegen-delta-loop.md](hgemm-codegen-delta-loop.md) | Compiler-path MetaX C500 HGEMM codegen workflow |

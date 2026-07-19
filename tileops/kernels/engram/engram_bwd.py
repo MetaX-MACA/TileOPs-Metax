@@ -14,7 +14,7 @@ Three-pass design:
 """
 
 import functools
-from typing import Optional
+from typing import List, Optional
 
 import tilelang
 import tilelang.language as T
@@ -355,7 +355,7 @@ def _engram_gate_conv_bwd_wrapped(
     rrms_h: torch.Tensor,
     rrms_k: torch.Tensor,
     rrms_v: torch.Tensor,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     results = _engram_gate_conv_bwd_kernel(M, seq_len, d, eps, dtype_str)(
         threads,
     )(dY, H, k, v, rms_w_h, rms_w_v, conv_w,
@@ -436,7 +436,7 @@ class EngramGateConvBwdKernel(Kernel):
         rrms_h: torch.Tensor,
         rrms_k: torch.Tensor,
         rrms_v: torch.Tensor,
-    ) -> list[torch.Tensor]:
+    ) -> List[torch.Tensor]:
         return _engram_gate_conv_bwd_wrapped(
             self.M, self.seq_len, self.d, self.eps,
             self.dtype_str, self.config["threads"],
