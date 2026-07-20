@@ -374,9 +374,7 @@ def _ssd_chunk_scan_fwd_kernel(
 
                                 # Column factor: for s = 0..31 (first micro-column)
                                 safe_s = T.min(s0 + i, Q - 1)
-                                col_factor[i] = (
-                                    T.exp(anchor - dA_smem[safe_s]) * dt_smem[safe_s]
-                                )
+                                col_factor[i] = (T.exp(anchor - dA_smem[safe_s]) * dt_smem[safe_s])
 
                             T.sync_threads()
 
