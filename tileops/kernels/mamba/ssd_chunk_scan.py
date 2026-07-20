@@ -192,6 +192,7 @@ def _ssd_chunk_scan_fwd_kernel(
                     T.gemm(c_tile, state_tile, hist_acc)
 
 
+
                 # =====================================================
                 # Cache dA_cumsum and dt for this chunk in shared memory.
                 # Eliminates repeated L2 round-trips in the exp_l/exp_s and
