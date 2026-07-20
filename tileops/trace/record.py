@@ -109,7 +109,7 @@ def pack_w1_tir(event_id: int, kind: int, lane: int, payload_expr: PrimExpr) -> 
     The ``event_id`` / ``kind`` / ``lane`` fields are compile-time Python ints
     and fold into a constant base occupying the low 32 bits. ``payload_expr`` is a
     runtime i32 PrimExpr whose raw bits are shifted into bits 32..63. The i32 is
-    reinterpreted as uint32 before widening so a negative i32 does not
+    converted to uint32 before widening so a negative i32 does not
     sign-extend into the high half.
 
     Args:
@@ -133,7 +133,7 @@ def pack_w1_tir(event_id: int, kind: int, lane: int, payload_expr: PrimExpr) -> 
         raise ValueError(f"lane {lane} does not fit {_LANE_BITS} bits")
 
     base = (event_id << _EVENT_ID_SHIFT) | (kind << _KIND_SHIFT) | (lane << _LANE_SHIFT)
-    payload_u32 = T.reinterpret(payload_expr, "uint32")
+    payload_u32 = T.Cast("uint32", payload_expr)
     payload_i64 = T.Cast("int64", payload_u32)
     payload_hi = T.shift_left(payload_i64, T.Cast("int64", _PAYLOAD_SHIFT))
     return T.bitwise_or(T.Cast("int64", base), payload_hi)
