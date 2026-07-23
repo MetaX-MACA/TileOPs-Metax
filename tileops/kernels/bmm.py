@@ -151,7 +151,7 @@ class BmmKernel(Kernel):
     ``blockIdx.z`` so all batches run in a single kernel launch.
     """
 
-    supported_archs: list[int] = [90]
+    supported_archs: list[int] = [80, 90]
 
     def __init__(self,
                  batch: int,
