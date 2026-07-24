@@ -4,6 +4,7 @@ import torch
 
 from tileops.kernels.gated_deltanet import (
     GatedDeltaNetBwdKernel,
+    GatedDeltaNetBwdMACAKernel,
     GatedDeltaNetFwdKernel,
     GatedDeltaNetPrefillFwdKernel,
     GatedDeltaNetPrefillFwdMACAKernel,
@@ -362,7 +363,9 @@ class GatedDeltaNetBwdOp(Op):
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
         return {
-            "GatedDeltaNetBwdKernel": GatedDeltaNetBwdKernel,
+            "GatedDeltaNetBwdKernel": (
+                GatedDeltaNetBwdMACAKernel if is_maca() else GatedDeltaNetBwdKernel
+            ),
         }
 
     def forward(
@@ -479,7 +482,9 @@ class GatedDeltaNetOp(Op):
     def default_kernel_map(self) -> Dict[str, Kernel]:
         return {
             "GatedDeltaNetFwdKernel": GatedDeltaNetFwdKernel,
-            "GatedDeltaNetBwdKernel": GatedDeltaNetBwdKernel,
+            "GatedDeltaNetBwdKernel": (
+                GatedDeltaNetBwdMACAKernel if is_maca() else GatedDeltaNetBwdKernel
+            ),
         }
 
     def forward(
