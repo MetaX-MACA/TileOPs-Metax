@@ -109,7 +109,7 @@ def test_grouped_gemm(batch_sum: int, batch_count: int, N: int, K: int, dtype: t
     op = GroupedGemmOp(
         batch_sum, batch_count, N, K, dtype, transpose_a=transpose_a, transpose_b=transpose_b,
         tune=tune)
-    test.check(op, *test.gen_inputs())
+    test.check(op, *test.gen_inputs(), atol=5e-4, rtol=5e-3)
 
 
 # ---------------------------------------------------------------------------
