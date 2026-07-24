@@ -322,7 +322,6 @@ class GatedDeltaNetVsFlaBwdFixture(FixtureBase):
         ]),
     ]
 
-@pytest.mark.xfail
 @GatedDeltaNetVsFlaBwdFixture
 def test_gated_deltanet_vs_fla_bwd(
     batch: int,
@@ -428,7 +427,6 @@ class GatedDeltaNetVsFlaFwdBwdFixture(FixtureBase):
         ]),
     ]
 
-@pytest.mark.xfail
 @GatedDeltaNetVsFlaFwdBwdFixture
 def test_gated_deltanet_vs_fla_fwdbwd(
     batch: int,

@@ -66,7 +66,7 @@ def _bwd_parallel_tl(
                 do_c = T.alloc_shared([block_C, BV], dtype)
                 h_c = T.alloc_shared([dim_k, BV], dtype)
                 v_new_c = T.alloc_shared([block_C, BV], dtype)
-                o_part = T.alloc_shared([block_C, BV], dtype)
+                o_part = u_c
                 d_v_new_c = T.alloc_shared([block_C, BV], dtype)
                 attn = T.alloc_shared([block_C, block_C], dtype)
                 d_attn = T.alloc_shared([block_C, block_C], dtype)
