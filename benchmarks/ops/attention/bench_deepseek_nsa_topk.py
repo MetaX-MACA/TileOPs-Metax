@@ -3,7 +3,7 @@ from typing import Optional
 import pytest
 import torch
 
-from benchmarks.benchmark_base import BenchmarkBase, BenchmarkReport
+from benchmarks.benchmark_base import BenchmarkBase, BenchmarkReport, bench_kernel
 from tileops.ops import NSATopkVarlenOp
 from workloads.attention.deepseek import NsaTopkTest
 
@@ -195,7 +195,10 @@ def test_nsa_topk_bench(seq_num: int, c_seq_len: int, heads: int, dim: int, grou
     result = bm.profile(op, *inputs)
     BenchmarkReport.record(op, locals(), result, tag="tileops")
 
-    result_bl = bm.profile(test.ref_program, *inputs)
+    with torch.no_grad():
+        latency_bl = bench_kernel(
+            test.ref_program, args=inputs, n_warmup=1, n_repeat=1, n_trials=1)
+    result_bl = bm._build_result(latency_bl)
     BenchmarkReport.record(op, locals(), result_bl, tag="torch-ref")
 
 

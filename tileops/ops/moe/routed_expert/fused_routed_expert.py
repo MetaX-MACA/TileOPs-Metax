@@ -10,6 +10,7 @@ from torch import Tensor
 
 from tileops.kernels.grouped_gemm import (
     GroupedGemmPersistent3WGKernel,
+    GroupedGemmPersistentMACAKernel,
 )
 from tileops.kernels.grouped_gemm.grouped_gemm_persistent_3wg import (
     _DEFAULT_CONFIG as _3WG_DEFAULT_CONFIG,
@@ -24,7 +25,7 @@ from tileops.kernels.moe.moe_grouped_gemm_persistent_3wg_fused_act import (
     _DEFAULT_CONFIG as _FUSED_ACT_DEFAULT_CONFIG,
 )
 from tileops.ops.moe._activation import build_activation_op
-from tileops.utils import get_sm_version
+from tileops.utils import get_sm_version, is_maca
 
 from .abc import (
     FusedMoEExpertsModular,
@@ -130,7 +131,10 @@ class FusedMoEExpertsNopadPersistent3WGFwdOp(FusedMoEExpertsModular):
             int((expert_map >= 0).sum().item()) if expert_map is not None else num_experts
         )
 
-        kernel_cls = gemm_kernel or GroupedGemmPersistent3WGKernel
+        if is_maca():
+            kernel_cls = gemm_kernel or GroupedGemmPersistentMACAKernel
+        else:
+            kernel_cls = gemm_kernel or GroupedGemmPersistent3WGKernel
 
         # 3WG requires N and K aligned to its default block dimensions.
         # Fall back to tile scheduler kernel for small/unaligned dimensions.
@@ -160,7 +164,21 @@ class FusedMoEExpertsNopadPersistent3WGFwdOp(FusedMoEExpertsModular):
         # applies uniformly through the unfused path.
         gemm_override = (kernel_map or {}).get("moe_grouped_gemm_kernel")
         self.use_fused_activation = use_fused_activation
-        if use_fused_activation:
+        if use_fused_activation and is_maca():
+            ok = (
+                kernel_cls is GroupedGemmPersistentMACAKernel
+                and (gemm_override is None
+                     or gemm_override is GroupedGemmPersistentMACAKernel)
+            )
+            if not ok:
+                _logger.warning(
+                    "use_fused_activation=True not eligible on MACA (requires "
+                    "GroupedGemmPersistentMACAKernel with no conflicting "
+                    "moe_grouped_gemm_kernel override); falling back to unfused "
+                    "activation.",
+                )
+                self.use_fused_activation = False
+        elif use_fused_activation:
             fused_block_n = _FUSED_ACT_DEFAULT_CONFIG["block_n"]
             ok = (
                 torch.cuda.is_available()

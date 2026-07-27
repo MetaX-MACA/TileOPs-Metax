@@ -1,3 +1,5 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 import functools
 import itertools
 from typing import Optional
@@ -226,7 +228,7 @@ def _(
 
 
 class FP8LightningIndexerKernel(Kernel):
-    supported_archs: list[int] = [90]
+    supported_archs: list[int] = [80, 90]
 
     def __init__(self,
                  batch,

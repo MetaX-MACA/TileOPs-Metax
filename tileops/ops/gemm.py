@@ -8,8 +8,9 @@ from tileops.kernels.gemm import (
     GemmKernel,
     GemvKernel,
 )
+from tileops.kernels.gemm_maca import GemmMACAKernel
 from tileops.kernels.kernel_base import Kernel
-from tileops.utils import get_sm_version
+from tileops.utils import get_sm_version, is_maca
 
 from .op_base import Op
 
@@ -67,7 +68,11 @@ class GemmOp(Op):
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
-        kernels: Dict[str, Kernel] = {"gemm_kernel": GemmKernel}
+        # Hopper WS (TMA/WGMMA/mbarrier) only on SM90 CUDA; otherwise Pipelined+T.gemm.
+        gemm_cls = (
+            GemmMACAKernel if (is_maca() or get_sm_version() < 90) else GemmKernel
+        )
+        kernels: Dict[str, Kernel] = {"gemm_kernel": gemm_cls}
         # GemvKernel is SM90-only; only advertise it where it can install.
         if get_sm_version() in (GemvKernel.supported_archs or []):
             kernels["gemv_kernel"] = GemvKernel
@@ -94,8 +99,8 @@ class GemmOp(Op):
         """Return ``(mode, kernel)`` for the given dims, building/caching lazily.
 
         ``mode`` is ``"lhs_row"``/``"rhs_col"`` for the GEMV fast path, else
-        ``"gemm"`` — the hand-written warp-specialized ``GemmKernel`` (SM90),
-        covering all four ``(trans_a, trans_b)`` layouts.
+        ``"gemm"`` — ``GemmMACAKernel`` on MACA or warp-specialized ``GemmKernel``
+        (SM90) otherwise, covering all four ``(trans_a, trans_b)`` layouts.
         """
         gemv_lhs_row = (m == 1 and not self.trans_a and self.trans_b)
         gemv_rhs_col = (n == 1 and not self.trans_a and not self.trans_b)

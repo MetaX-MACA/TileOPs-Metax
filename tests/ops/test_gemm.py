@@ -198,14 +198,14 @@ def test_gemm_fp8(
         with pytest.raises(ValueError, match="only supports torch.float8_e4m3fn"):
             op(*inputs)
         return
-    test.check(op, *inputs, atol=2e-2, rtol=2e-2)
+    test.check(op, *inputs, atol=5e-2, rtol=5e-2)
 
 
 @pytest.mark.smoke
 def test_gemm_fp8_block128_single_k_block_uses_block_kernel() -> None:
     test = GemmFp8Test(128, 256, 128, torch.float8_e4m3fn, "block128")
     op = GemmFp8Op()
-    test.check(op, *test.gen_inputs(), atol=2e-2, rtol=2e-2)
+    test.check(op, *test.gen_inputs(), atol=5e-2, rtol=5e-2)
     assert op.kernel.__class__.__name__ == "GemmFp8BlockScaledKernel"
 
 

@@ -370,7 +370,8 @@ class LogicalReduceKernel(Kernel):
 
     def _tile_n_for_block_m(self, block_m: int) -> int:
         """Return tile_n for a given block_m (0 means no tiling needed)."""
-        budget = self._smem_budget
+        # Reserve AllReduce workspace (threads * sizeof(fp32)) injected by T.reduce_*.
+        budget = self._smem_budget - 128 * 4
         if self.N_padded <= MAX_SINGLE_TILE_COLS:
             single = compute_tile_n(
                 block_m, self._elem_bytes, self.N_padded, budget=budget,
@@ -389,7 +390,8 @@ class LogicalReduceKernel(Kernel):
         """Select default block_m based on shared memory budget."""
         if not self._needs_tiling:
             smem_per_row = self.N_padded * self._elem_bytes
-            max_block_m = self._smem_budget // smem_per_row
+            # Reserve AllReduce workspace (threads * sizeof(fp32)) injected by T.reduce_*.
+            max_block_m = (self._smem_budget - 128 * 4) // smem_per_row
             block_m = 1
             for bm in [1, 2, 4, 8]:
                 if bm <= max_block_m:

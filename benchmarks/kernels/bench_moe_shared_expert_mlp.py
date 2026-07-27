@@ -1,10 +1,10 @@
-"""Benchmark for SharedExpertMLPKernel vs PyTorch MLP."""
+"""Benchmark for SharedExpertMLPMACAKernel vs PyTorch MLP."""
 
 import pytest
 import torch
 
 from benchmarks.benchmark_base import BenchmarkBase, BenchmarkReport
-from tileops.kernels.moe import SharedExpertMLPKernel
+from tileops.kernels.moe import SharedExpertMLPMACAKernel
 from workloads.workload_base import FixtureBase, WorkloadBase
 
 
@@ -54,7 +54,7 @@ def test_shared_mlp_bench(num_tokens, hidden_size, ffn_size, dtype):
     hidden, w_gate_up, w_down = test.gen_inputs()
 
     # TileLang kernel
-    kernel = SharedExpertMLPKernel(num_tokens=num_tokens, hidden_size=hidden_size,
+    kernel = SharedExpertMLPMACAKernel(num_tokens=num_tokens, hidden_size=hidden_size,
                                    ffn_size=ffn_size, dtype=dtype)
     kernel(hidden, w_gate_up, w_down)  # warmup
     torch.cuda.synchronize()

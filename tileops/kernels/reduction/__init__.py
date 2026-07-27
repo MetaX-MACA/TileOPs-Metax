@@ -15,6 +15,7 @@ from ._primitives import (
     make_welford_update,
 )
 from .argreduce import ArgreduceKernel
+from .argreduce_maca import ArgreduceMACAKernel
 from .cumulative import CumulativeKernel
 from .logical_reduce import LogicalReduceKernel
 from .logsumexp import LogSumExpKernel
@@ -29,6 +30,7 @@ __all__: list[str] = [
     "DEFAULT_ALIGNMENT",
     "SHARED_MEMORY_BUDGET_BYTES",
     "ArgreduceKernel",
+    "ArgreduceMACAKernel",
     "CumulativeKernel",
     "LogSumExpKernel",
     "LogicalReduceKernel",

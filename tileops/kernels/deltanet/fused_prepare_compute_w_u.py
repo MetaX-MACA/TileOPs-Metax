@@ -57,11 +57,12 @@ def fused_prepare_compute_w_u_tl(
                 # Shared buffers
                 k_shared = T.alloc_shared([block_C, dim_k], dtype)
                 v_shared = T.alloc_shared([block_C, dim_v], dtype)
-                beta_shared = T.alloc_shared([block_C], dtype)
-                k_beta_shared = T.alloc_shared([block_C, dim_k], dtype)
-                v_beta_shared = T.alloc_shared([block_C, dim_v], dtype)
-                S_shared = T.alloc_shared([block_C, block_C], dtype)
-                P_shared = T.alloc_shared([block_C, block_C], dtype)
+                beta_shared = T.alloc_shared([block_C], accum_dtype)
+                S_shared = T.alloc_shared([block_C, block_C], accum_dtype)
+                P_shared = T.alloc_shared([block_C, block_C], accum_dtype)
+                # After Neumann, P is dead: reuse it as k_beta/v_beta when BC==DK==DV (MACA 64KB smem).
+                k_beta_shared = P_shared if (block_C == dim_k and dim_k == dim_v) else T.alloc_shared([block_C, dim_k], accum_dtype)
+                v_beta_shared = k_beta_shared if (block_C == dim_k and dim_k == dim_v) else T.alloc_shared([block_C, dim_v], accum_dtype)
                 # Fragments (fp32 accumulators)
                 gram_frag = T.alloc_fragment([block_C, block_C], accum_dtype)
                 temp_frag = T.alloc_fragment([block_C, block_C], accum_dtype)

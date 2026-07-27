@@ -7,10 +7,10 @@ permissions:
 
 on:
   push:
-    branches: [main, testbed]
+    branches: [dev, testbed]
     tags: ["v*"]
   pull_request:
-    branches: [main, testbed]
+    branches: [dev, testbed]
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
@@ -144,7 +144,7 @@ jobs:
             exit 0
           fi
           case "$TARGET_BRANCH" in
-            main|testbed) ;;
+            dev|testbed) ;;
             *) echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
           esac
 
@@ -185,7 +185,7 @@ jobs:
 
   pre-commit:
     needs: [validate-pr-title, ci-gate]
-    if: ${{ github.repository == 'tile-ai/TileOPs' && needs.ci-gate.outputs.skip != 'true' }}
+    if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && needs.ci-gate.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -205,7 +205,7 @@ jobs:
 
   gitleaks:
     needs: [validate-pr-title, ci-gate]
-    if: ${{ github.repository == 'tile-ai/TileOPs' && needs.ci-gate.outputs.skip != 'true' }}
+    if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && needs.ci-gate.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -233,7 +233,7 @@ jobs:
 
   validate-manifest:
     needs: [validate-pr-title, ci-gate, detect-changes]
-    if: ${{ github.repository == 'tile-ai/TileOPs' && needs.ci-gate.outputs.skip != 'true' && needs.detect-changes.outputs.manifest == 'true' }}
+    if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && needs.ci-gate.outputs.skip != 'true' && needs.detect-changes.outputs.manifest == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -254,7 +254,7 @@ jobs:
 
   actionlint:
     needs: [validate-pr-title, ci-gate]
-    if: ${{ github.repository == 'tile-ai/TileOPs' && needs.ci-gate.outputs.skip != 'true' }}
+    if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && needs.ci-gate.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -308,7 +308,7 @@ jobs:
     # Scoped to `benchmarks/tests/` so the GPU-bound `benchmarks/ops/`
     # suites (nightly-only) are NOT collected on PR CI.
     needs: [validate-pr-title, ci-gate, detect-changes]
-    if: ${{ github.repository == 'tile-ai/TileOPs' && needs.ci-gate.outputs.skip != 'true' && needs.detect-changes.outputs.benchmark == 'true' }}
+    if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && needs.ci-gate.outputs.skip != 'true' && needs.detect-changes.outputs.benchmark == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code

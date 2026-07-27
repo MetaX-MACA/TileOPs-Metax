@@ -1,3 +1,5 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 import functools
 import itertools
 from typing import Optional
@@ -52,6 +54,9 @@ def _mhc_pre_kernel(batch: int, n_expand: int, c_x: int, x_dtype: str = 'bfloat1
 
                 for i, j in T.Parallel(block_x_b, phi_dim):
                     acc_x_phi[i, j] = 0
+
+                for i, j in T.Parallel(block_x_b, block_C):
+                    xsqr[i, j] = 0
 
                 for i in T.Parallel(block_x_b):
                     acc_r_sqr[i] = 0
@@ -119,26 +124,28 @@ def _mhc_pre_kernel(batch: int, n_expand: int, c_x: int, x_dtype: str = 'bfloat1
 
                 for i, j in T.Parallel(block_x_b, n_expand * n_expand + 2 * n_expand):
                     if j < n_expand:
-                        alpha = alpha_pre
-                        _x = 1 / r[bx * block_x_b + i] * alpha * h_pre_shared[i, j] + b_shared[j]
-                        h_pre_shared[i, j] = 1 / (1 + T.exp2(-_x * LOG2E))
+                        h_pre_shared[i, j] = 1 / (
+                            1 + T.exp2(
+                                -(1 / r[bx * block_x_b + i] * alpha_pre * h_pre_shared[i, j] +
+                                  b_shared[j]) * LOG2E))
                         H_pre[bx * block_x_b + i, j] = h_pre_shared[i, j]
 
                     elif j < 2 * n_expand:
-                        alpha = alpha_post
-                        _x = (1 / r[bx * block_x_b + i] * alpha *
-                              h_post_shared[i, j - n_expand] + b_shared[j])
                         h_post_shared[i, j -
-                                      n_expand] = 2 / (1 + T.exp2(-_x * LOG2E))
+                                      n_expand] = 2 / (
+                                          1 + T.exp2(
+                                              -(1 / r[bx * block_x_b + i] * alpha_post *
+                                                h_post_shared[i, j - n_expand] + b_shared[j]) *
+                                              LOG2E))
                         H_post[bx * block_x_b + i, j - n_expand] = h_post_shared[i, j - n_expand]
 
                     else:
-                        alpha = alpha_res
                         j_tmp = j - 2 * n_expand
                         row_res = j_tmp // n_expand
                         col_res = j_tmp % n_expand
                         h_res_shared[i, row_res, col_res] = (
-                            1 / r[bx * block_x_b + i] * alpha * h_res_shared[i, row_res, col_res] +
+                            1 / r[bx * block_x_b + i] * alpha_res *
+                            h_res_shared[i, row_res, col_res] +
                             b_shared[j])
                         H_res_0[bx * block_x_b + i, row_res, col_res] = h_res_shared[i, row_res,
                                                                                      col_res]

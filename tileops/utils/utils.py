@@ -24,3 +24,12 @@ def is_h200():
 def get_sm_version():
     major, minor = torch.cuda.get_device_capability()
     return major * 10 + minor
+
+
+def is_maca() -> bool:
+    """Return True when running on MetaX MACA."""
+    version = getattr(torch, "version", None)
+    if version is None:
+        return False
+    ver = getattr(version, "__version__", "") or ""
+    return "metax" in ver or hasattr(version, "maca")

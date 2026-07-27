@@ -431,7 +431,7 @@ class GroupedQueryAttentionPrefillFwdOp(Op):
             "gqa_prefill_varlen_fwd_kernel": _select_gqa_prefill_varlen_fwd_kernel_cls(),
             "gqa_sliding_window_varlen_fwd": sliding_kernel_cls,
             "gqa_prefill_fp8_tensor_core_fwd_kernel":
-                GQAFwdFP8Fa3ContractPtxAccBN224WsTmaVKernel,
+                GQAFwdFP8Fa3ContractPtxAccBN224WsTmaVKernel if is_hopper() else None,
         }
 
     def _infer_output_shapes(
@@ -627,6 +627,9 @@ class GroupedQueryAttentionPrefillFwdOp(Op):
 
     def _get_fp8_kernel(self) -> Kernel:
         if self._fp8_kernel is None:
+            kernel_cls = self.kernel_map["gqa_prefill_fp8_tensor_core_fwd_kernel"]
+            if kernel_cls is None:
+                raise NotImplementedError("FP8 prefill is only supported on Hopper (sm90) GPUs.")
             self._fp8_kernel = self.kernel_map["gqa_prefill_fp8_tensor_core_fwd_kernel"](
                 self.batch,
                 self.heads,

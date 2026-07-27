@@ -7,10 +7,10 @@ permissions:
 
 on:
   push:
-    branches: [main, testbed]
+    branches: [dev, testbed]
     tags: ["v*"]
   pull_request:
-    branches: [main, testbed]
+    branches: [dev, testbed]
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
@@ -136,7 +136,7 @@ jobs:
 
   security-policy:
     needs: ci-prereq
-    if: ${{ github.repository == 'tile-ai/TileOPs' && needs.ci-prereq.outputs.skip != 'true' }}
+    if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && needs.ci-prereq.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     outputs:
       is_fork: ${{ steps.policy.outputs.is_fork }}
@@ -371,11 +371,11 @@ jobs:
 
   gpu-smoke:
     needs: [ci-prereq, security-policy]
-    if: ${{ github.repository == 'tile-ai/TileOPs' && needs.ci-prereq.outputs.skip != 'true' && needs.security-policy.outputs.skip_gpu_smoke != 'true' }}
+    if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' && needs.ci-prereq.outputs.skip != 'true' && needs.security-policy.outputs.skip_gpu_smoke != 'true' }}
     # Trust-level routing: untrusted (external) PRs go to the on-demand `fork` pool whose
     # runner mounts an overlay cache (read-only shared lower + throwaway upper) so their cache
     # writes never reach the shared cache. Trusted runs use the resident shared-cache pool.
-    runs-on: ${{ needs.security-policy.outputs.is_fork == 'true' && fromJSON('["self-hosted", "tile-ops", "fork"]') || fromJSON('["self-hosted", "tile-ops", "nightly"]') }}
+    runs-on: tileops-metax-runner
     # Hard backstop so a wedged kernel can never hold the single runner indefinitely; the
     # per-test --timeout below is the first line of defense, this is the ceiling.
     timeout-minutes: 90
@@ -388,6 +388,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
           fetch-depth: 1
+          submodules: recursive
 
       - name: Checkout code for trusted branch
         if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
@@ -397,6 +398,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
           fetch-depth: 1
+          submodules: recursive
 
       # Trusted actions checkout: must run AFTER the workspace checkouts so
       # their `git clean -ffdx` pass does not wipe `.trusted/`. Anything
@@ -441,6 +443,7 @@ jobs:
           skip-atomic-age-trim: "true"
 
       - name: Validate GPU frequency
+        if: ${{ github.repository == 'tile-ai/TileOPs' }}
         run: |
           set -euo pipefail
           TARGET_CLOCK_MHZ=1500
@@ -482,6 +485,10 @@ jobs:
             sleep "$SLEEP_SECONDS"
             attempt=$((attempt + 1))
           done
+
+      - name: Install tilelang-metax
+        if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' }}
+        run: bash scripts/ci/install_tilelang.sh
 
       - name: Install TileOPs (image-baked stack, --no-deps)
         # tilelang + the full runtime/dev stack are baked into the runner image; this installs

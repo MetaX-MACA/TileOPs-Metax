@@ -23,6 +23,7 @@ from tileops.ops import (
     Conv3dBiasFwdOp,
     Conv3dFwdOp,
 )
+from tileops.utils import is_maca
 
 
 class Conv1dFixture(FixtureBase):
@@ -138,6 +139,18 @@ class Conv1dTest(TestBase):
         weight: torch.Tensor,
         bias: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        # MACA: GPU F.conv backend disagrees with CPU f32 for bf16+stride>1
+        if is_maca() and self.stride > 1 and self.dtype == torch.bfloat16:
+            out = F.conv1d(
+                x.cpu(),
+                weight.cpu(),
+                bias=bias.cpu() if bias is not None else None,
+                stride=self.stride,
+                padding=self.padding,
+                dilation=self.dilation,
+                groups=self.groups,
+            )
+            return out.to(device=x.device, dtype=x.dtype).contiguous()
         out = F.conv1d(
             x,
             weight,
@@ -226,15 +239,26 @@ def test_conv1d_dilation_matches_torch(op_cls, dilation, use_bias: bool) -> None
         if use_bias else None
     )
     out = op(x, weight, bias) if use_bias else op(x, weight)
-    ref = F.conv1d(
-        x,
-        weight,
-        bias=bias,
-        stride=stride,
-        padding=padding,
-        dilation=2,
-    )
-    ref = ref.contiguous()
+    # MACA: GPU F.conv backend disagrees with CPU f32 for dilation>1 + randn bias
+    if is_maca() and use_bias and dilation > 1:
+        ref = F.conv1d(
+            x.cpu(),
+            weight.cpu(),
+            bias=bias.cpu(),
+            stride=stride,
+            padding=padding,
+            dilation=2,
+        ).to(device=x.device, dtype=x.dtype).contiguous()
+    else:
+        ref = F.conv1d(
+            x,
+            weight,
+            bias=bias,
+            stride=stride,
+            padding=padding,
+            dilation=2,
+        )
+        ref = ref.contiguous()
     torch.testing.assert_close(out, ref, atol=2e-3, rtol=3e-3)
 
 
@@ -412,6 +436,20 @@ class Conv2dTest(TestBase):
         weight: torch.Tensor,
         bias: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        # MACA: GPU F.conv backend disagrees with CPU f32 for fp16+stride>1+c_in>=128
+        if is_maca() and self.dtype == torch.float16 and self.c_in >= 128:
+            s = self.stride if isinstance(self.stride, tuple) else (self.stride, self.stride)
+            if any(si > 1 for si in s):
+                out = F.conv2d(
+                    x.cpu(),
+                    weight.cpu(),
+                    bias=bias.cpu() if bias is not None else None,
+                    stride=self.stride,
+                    padding=self.padding,
+                    dilation=self.dilation,
+                    groups=self.groups,
+                )
+                return out.to(device=x.device, dtype=x.dtype).contiguous()
         out = F.conv2d(
             x,
             weight,
@@ -632,6 +670,18 @@ class Conv3dTest(TestBase):
         weight: torch.Tensor,
         bias: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        # MACA: GPU F.conv backend disagrees with CPU f32 when c_in > 3
+        if is_maca() and self.c_in > 3:
+            out = F.conv3d(
+                x.cpu(),
+                weight.cpu(),
+                bias=bias.cpu() if bias is not None else None,
+                stride=self.stride,
+                padding=self.padding,
+                dilation=self.dilation,
+                groups=self.groups,
+            )
+            return out.to(device=x.device, dtype=x.dtype).contiguous()
         out = F.conv3d(
             x,
             weight,
@@ -684,15 +734,25 @@ def test_conv3d_no_bias_matches_torch() -> None:
     x = torch.randn(1, 8, 8, 16, 16, device="cuda", dtype=torch.float16).contiguous()
     weight = torch.randn(16, 8, 3, 3, 3, device="cuda", dtype=torch.float16).contiguous()
     out = op(x, weight)
-    ref = F.conv3d(
-        x,
-        weight,
-        bias=None,
-        stride=2,
-        padding=2,
-        dilation=2,
-    )
-    ref = ref.contiguous()
+    if is_maca():
+        ref = F.conv3d(
+            x.cpu(),
+            weight.cpu(),
+            bias=None,
+            stride=2,
+            padding=2,
+            dilation=2,
+        ).to(device=x.device, dtype=x.dtype).contiguous()
+    else:
+        ref = F.conv3d(
+            x,
+            weight,
+            bias=None,
+            stride=2,
+            padding=2,
+            dilation=2,
+        )
+        ref = ref.contiguous()
     torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
 
 
@@ -720,14 +780,23 @@ def test_conv3d_accepts_zero_bias() -> None:
     weight = torch.randn(16, 8, 3, 3, 3, device="cuda", dtype=torch.float16).contiguous()
     bias = torch.zeros(16, device="cuda", dtype=torch.float16).contiguous()
     out = op(x, weight, bias)
-    ref = F.conv3d(
-        x,
-        weight,
-        bias=bias,
-        stride=2,
-        padding=1,
-    )
-    ref = ref.contiguous()
+    if is_maca():
+        ref = F.conv3d(
+            x.cpu(),
+            weight.cpu(),
+            bias=bias.cpu(),
+            stride=2,
+            padding=1,
+        ).to(device=x.device, dtype=x.dtype).contiguous()
+    else:
+        ref = F.conv3d(
+            x,
+            weight,
+            bias=bias,
+            stride=2,
+            padding=1,
+        )
+        ref = ref.contiguous()
     torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
 
 

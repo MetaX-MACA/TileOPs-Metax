@@ -47,7 +47,7 @@ from tileops.kernels.kernel_base import Kernel
 
 __all__ = ["MoeGroupedGemmNopadKernel"]
 
-_DEFAULT_CONFIG = {"block_m": 64, "block_n": 256, "block_k": 64, "num_stages": 3, "threads": 128,
+_DEFAULT_CONFIG = {"block_m": 64, "block_n": 256, "block_k": 64, "num_stages": 1, "threads": 128,
                    "group_size_m": 1}
 _SCHED_THREADS = 256  # threads per block in the tile scheduler kernel
 

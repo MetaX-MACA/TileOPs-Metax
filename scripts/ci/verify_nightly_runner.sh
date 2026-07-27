@@ -22,7 +22,7 @@ for var in "${required_vars[@]}"; do
   fi
 done
 
-nvidia-smi -L
+mx-smi -L
 
 echo "Nightly runner environment:"
 for var in "${required_vars[@]}"; do

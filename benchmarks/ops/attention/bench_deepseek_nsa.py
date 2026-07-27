@@ -3,7 +3,7 @@ from typing import Optional
 import pytest
 import torch
 
-from benchmarks.benchmark_base import BenchmarkBase, BenchmarkReport
+from benchmarks.benchmark_base import BenchmarkBase, BenchmarkReport, bench_kernel
 from tileops.ops import NSAFwdVarlenOp
 from workloads.attention.deepseek import NsaFwdTest
 
@@ -89,7 +89,10 @@ def test_nsa_fwd_bench(batch: int, heads: int, c_seq_len: int, dim: int, is_caus
     BenchmarkReport.record(op, locals(), result, tag="tileops")
 
     # Use reduced warmup/rep for the slow Python-loop baseline to avoid timeouts.
-    result_bl = bm.profile(test.ref_program, *inputs, warmup=5, rep=10)
+    with torch.no_grad():
+        latency_bl = bench_kernel(
+            test.ref_program, args=inputs, n_warmup=1, n_repeat=1, n_trials=1)
+    result_bl = bm._build_result(latency_bl)
     BenchmarkReport.record(op, locals(), result_bl, tag="torch-ref")
 
 

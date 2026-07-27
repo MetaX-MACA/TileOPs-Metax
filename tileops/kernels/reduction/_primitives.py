@@ -56,6 +56,11 @@ def device_smem_budget(device_index: int | None = None) -> int:
     indices are not silently masked -- only the ``None`` (auto-detect)
     case falls back gracefully.
     """
+    from tileops.utils import is_maca
+
+    if is_maca():
+        return 65536
+
     explicit = device_index is not None
     try:
         import torch
@@ -187,7 +192,7 @@ def compute_tile_n(
     if best_dividing > 0:
         div_tiles = N_padded // best_dividing  # exact division
         max_tiles = (N_padded + tile_n_max - 1) // tile_n_max
-        if div_tiles <= max_tiles:
+        if div_tiles <= max_tiles + 1:
             return best_dividing
     return tile_n_max
 

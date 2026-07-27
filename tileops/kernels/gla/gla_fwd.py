@@ -1,3 +1,5 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 import functools
 from typing import Any, Callable, Optional
 
@@ -258,71 +260,80 @@ def _gla_fwd_o_kernel(
                 i_h = (bx // num_chunks) % heads
                 i_c = bx % num_chunks
                 chunk_start = i_c * chunk_size
-
+                sub_chunk_size = 16
+                NS = chunk_size // sub_chunk_size
+                sub_dimk_size = 16
+                KS = dim_k // sub_dimk_size
                 # h cast to native dtype for tensor core
                 h_cast_s = T.alloc_shared([dim_k, dim_v], dtype)
 
                 # Input buffers
-                q_s = T.alloc_shared([chunk_size, dim_k], dtype)
-                k_s = T.alloc_shared([chunk_size, dim_k], dtype)
+                q_s = T.alloc_shared([sub_chunk_size, dim_k], dtype)
+                k_s = T.alloc_shared([chunk_size, sub_dimk_size], dtype)
                 v_s = T.alloc_shared([chunk_size, dim_v], dtype)
-                g_cumsum_s = T.alloc_shared([chunk_size, dim_k], accum_dtype)
+                g_cumsum_s = T.alloc_shared([chunk_size, sub_dimk_size], accum_dtype)
 
                 # Compute buffers
-                q_gated_s = T.alloc_shared([chunk_size, dim_k], dtype)
-                A_s = T.alloc_shared([chunk_size, chunk_size], dtype)
+                q_gated_s = T.alloc_shared([sub_chunk_size, dim_k], dtype)
+                A_s = T.alloc_shared([sub_chunk_size, chunk_size], dtype)
 
                 # Load inputs via T.copy
-                T.copy(q[i_b, chunk_start:chunk_start + chunk_size, i_h, :],
-                       q_s, disable_tma=True)
-                T.copy(k[i_b, chunk_start:chunk_start + chunk_size, i_h, :],
-                       k_s, disable_tma=True)
                 T.copy(v[i_b, chunk_start:chunk_start + chunk_size, i_h, :],
                        v_s, disable_tma=True)
-                T.copy(g_cumsum[i_b, chunk_start:chunk_start + chunk_size, i_h, :],
-                       g_cumsum_s, disable_tma=True)
 
                 # Load h[i_c] and cast to native dtype
                 for i_k, i_v in T.Parallel(dim_k, dim_v):
                     h_cast_s[i_k, i_v] = T.cast(h[i_b, i_c, i_h, i_k, i_v], dtype)
+                for s_i in range(NS):
+                    T.copy(q[i_b, chunk_start + s_i*sub_chunk_size:chunk_start + (s_i+1)*sub_chunk_size, i_h, :],
+                       q_s, disable_tma=True)
+                    # ---- Gated q (inter-chunk term, exp(g_cumsum) <= 1) ----
+                    for s_k in T.Pipelined(KS, num_stages=2):
+                        current_k = s_k * sub_dimk_size
+                        T.copy(g_cumsum[i_b, chunk_start:chunk_start + chunk_size, i_h, current_k:current_k + sub_dimk_size],
+                            g_cumsum_s, disable_tma=True)
+                        for i_t, i_k in T.Parallel(sub_chunk_size, sub_dimk_size):
+                            q_gated_s[i_t, s_k*sub_dimk_size + i_k] = T.cast(
+                                T.cast(q_s[i_t, s_k*sub_dimk_size + i_k], accum_dtype)
+                                * T.exp2(g_cumsum_s[i_t ,s_i*sub_chunk_size +  i_k] * LOG2_E),
+                                dtype)
 
-                # ---- Gated q (inter-chunk term, exp(g_cumsum) <= 1) ----
-                for i_t, i_k in T.Parallel(chunk_size, dim_k):
-                    q_gated_s[i_t, i_k] = T.cast(
-                        T.cast(q_s[i_t, i_k], accum_dtype)
-                        * T.exp2(g_cumsum_s[i_t, i_k] * LOG2_E),
-                        dtype)
+                    # ---- A[i,j] = sum_k q[i,k]*k[j,k]*exp(g[i,k]-g[j,k]) ----
+                    A_frag = T.alloc_fragment([sub_chunk_size, chunk_size], accum_dtype)
+                    T.fill(A_frag, 0.0)
+                    for s_k in T.Pipelined(KS, num_stages=2):
+                        current_k = s_k*sub_dimk_size
+                        T.copy(k[i_b, chunk_start:chunk_start + chunk_size, i_h, current_k:current_k + sub_dimk_size],
+                            k_s, disable_tma=True)
+                        T.copy(g_cumsum[i_b, chunk_start:chunk_start + chunk_size, i_h, current_k:current_k + sub_dimk_size],
+                            g_cumsum_s, disable_tma=True)
+                        for i_k in T.Serial(sub_dimk_size):
+                            for i_t, i_j in T.Parallel(sub_chunk_size, chunk_size):
+                                A_frag[i_t, i_j] = A_frag[i_t, i_j] + (
+                                    T.cast(q_s[i_t, current_k + i_k], accum_dtype)
+                                    * T.cast(k_s[i_j, i_k], accum_dtype)
+                                    * T.exp2((g_cumsum_s[i_t + s_i*sub_chunk_size, i_k]
+                                            - g_cumsum_s[i_j, i_k]) * LOG2_E))
+                    for i_t, i_j in T.Parallel(sub_chunk_size, chunk_size):
+                        A_s[i_t, i_j] = T.cast(
+                            T.if_then_else(
+                                i_j <= i_t + s_i*sub_chunk_size,
+                                A_frag[i_t, i_j] * scale,
+                                0.0),
+                            dtype)
 
-                # ---- A[i,j] = sum_k q[i,k]*k[j,k]*exp(g[i,k]-g[j,k]) ----
-                A_frag = T.alloc_fragment([chunk_size, chunk_size], accum_dtype)
-                T.fill(A_frag, 0.0)
-                for i_k in T.Serial(dim_k):
-                    for i_t, i_j in T.Parallel(chunk_size, chunk_size):
-                        A_frag[i_t, i_j] = A_frag[i_t, i_j] + (
-                            T.cast(q_s[i_t, i_k], accum_dtype)
-                            * T.cast(k_s[i_j, i_k], accum_dtype)
-                            * T.exp2((g_cumsum_s[i_t, i_k]
-                                      - g_cumsum_s[i_j, i_k]) * LOG2_E))
-                for i_t, i_j in T.Parallel(chunk_size, chunk_size):
-                    A_s[i_t, i_j] = T.cast(
-                        T.if_then_else(
-                            i_j <= i_t,
-                            A_frag[i_t, i_j] * scale,
-                            0.0),
-                        dtype)
+                    # ---- o = scale * q_gated @ h + A @ v ----
+                    acc = T.alloc_fragment([sub_chunk_size, dim_v], accum_dtype)
+                    T.fill(acc, 0.0)
+                    T.gemm(q_gated_s, h_cast_s, acc,
+                        policy=T.GemmWarpPolicy.FullRow)
+                    for i_t, i_v in T.Parallel(sub_chunk_size, dim_v):
+                        acc[i_t, i_v] = acc[i_t, i_v] * scale
+                    T.gemm(A_s, v_s, acc, policy=T.GemmWarpPolicy.FullRow)
 
-                # ---- o = scale * q_gated @ h + A @ v ----
-                acc = T.alloc_fragment([chunk_size, dim_v], accum_dtype)
-                T.fill(acc, 0.0)
-                T.gemm(q_gated_s, h_cast_s, acc,
-                       policy=T.GemmWarpPolicy.FullRow)
-                for i_t, i_v in T.Parallel(chunk_size, dim_v):
-                    acc[i_t, i_v] = acc[i_t, i_v] * scale
-                T.gemm(A_s, v_s, acc, policy=T.GemmWarpPolicy.FullRow)
-
-                for i_t, i_v in T.Parallel(chunk_size, dim_v):
-                    o[i_b, chunk_start + i_t, i_h, i_v] = T.cast(
-                        acc[i_t, i_v], dtype)
+                    for i_t, i_v in T.Parallel(sub_chunk_size, dim_v):
+                        o[i_b, chunk_start + i_t + s_i*sub_chunk_size, i_h, i_v] = T.cast(
+                            acc[i_t, i_v], dtype)
 
         return _main
 
@@ -432,7 +443,7 @@ class GLAFwdKernel(Kernel):
     def default_config(self) -> dict:
         return {
             "num_stages": 3, "threads": 64,
-            "num_v_partitions": 4, "num_k_partitions": 2,
+            "num_v_partitions": 4, "num_k_partitions": 4,
         }
 
     @property

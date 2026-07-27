@@ -25,9 +25,12 @@ __all__ = [
 # Shared helpers
 
 def get_shared_memory_limit_bytes() -> int:
-    return torch.cuda.get_device_properties(
-        torch.cuda.current_device()
-    ).shared_memory_per_block_optin
+    if "metax" in torch.version.__version__:
+            return 65536
+    else:
+        return torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).shared_memory_per_block_optin
 
 
 def conv_shared_memory_bytes(
@@ -688,7 +691,7 @@ class Conv1dPointwiseKernel(Kernel):
             "block_m": 64,
             "block_n": 128,
             "block_k": 128,
-            "num_stages": 2,
+            "num_stages": 1,
             "threads": 128,
             "enable_rasterization": True,
         }
@@ -815,7 +818,7 @@ class Conv1dKernel(Kernel):
             "block_m": 64,
             "block_n": 128,
             "block_k": 128,
-            "num_stages": 2,
+            "num_stages": 1,
             "threads": 128,
             "enable_rasterization": True,
         }
@@ -1956,7 +1959,7 @@ class Conv2dSymmetricKernel(Kernel):
             "block_m": 64,
             "block_n": 256,
             "block_k": 32,
-            "num_stages": 3,
+            "num_stages": 1,
             "threads": 256,
             "enable_rasterization": True,
         }

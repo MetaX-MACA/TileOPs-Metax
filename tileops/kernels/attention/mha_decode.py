@@ -1,3 +1,5 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 import functools
 import itertools
 from typing import Optional
@@ -284,7 +286,7 @@ def _mha_decode_split_kernel(batch, heads, seqlen_q, seqlen_kv, dim, is_causal, 
                         lse_logsum_local[i] += T.exp2(lse_local_split[i] - lse_max_local[i])
                 for i in T.Parallel(block_M):
                     lse_logsum_local[i] = T.log2(lse_logsum_local[i]) + lse_max_local[i]
-                for k in T.Pipelined(num_split, num_stages=2):
+                for k in T.Pipelined(num_split):
                     T.copy(
                         Output_partial[bz, bx * block_M:(bx + 1) * block_M, by, k, :],
                         po_shared,
@@ -431,8 +433,8 @@ class MHADecodeKernel(Kernel):
     @property
     def default_config(self) -> dict:
         return {
-            "block_M": 128,
-            "block_N": 64 if self.dim <= 128 else 32,
+            "block_M": 64,
+            "block_N": 32 if self.dim <= 128 else 32,
             "num_split": 4,
             "num_stages": 2,
             "threads": 128
@@ -441,9 +443,9 @@ class MHADecodeKernel(Kernel):
     @property
     def autotune_configs(self) -> list[dict]:
         block_M = [64, 128]
-        block_N = [64, 128]
-        num_split = [2, 4]
-        num_stages = [2, 3]
+        block_N = [32, 64]
+        num_split = [1, 2, 4]
+        num_stages = [1, 2]
         threads = [128, 256]
         _configs = list(itertools.product(block_M, block_N, num_split, num_stages, threads))
 

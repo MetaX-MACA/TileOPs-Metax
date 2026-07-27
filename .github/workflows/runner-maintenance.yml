@@ -24,10 +24,10 @@ concurrency:
 
 jobs:
   reclaim-disk:
-    if: ${{ github.repository == 'tile-ai/TileOPs' }}
+    if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' }}
     # `nightly` (not `fork`) keeps maintenance on the resident shared-cache runners; the
     # destructive autotuner age-trim must never run against a fork pool's overlay cache.
-    runs-on: [self-hosted, tile-ops, nightly]
+    runs-on: tileops-metax-runner
     timeout-minutes: 60
     steps:
       # Invoke the action directly via owner/repo/path@ref so this workflow
@@ -37,6 +37,6 @@ jobs:
       # running. `@main` is trusted because this workflow only triggers on
       # schedule / workflow_dispatch; no fork-PR code path reaches it.
       - name: Reclaim runner disk
-        uses: tile-ai/TileOPs/.github/actions/reclaim-runner-disk@main
+        uses: MetaX-MACA/TileOPs-Metax/.github/actions/reclaim-runner-disk@dev
         with:
           force-reclaim: "true"

@@ -1,3 +1,5 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 import functools
 import itertools
 from typing import Optional
@@ -303,20 +305,20 @@ class MLADecodeKernel(Kernel):
     @property
     def default_config(self) -> dict:
         return {
-            "block_H": min(64, self.heads // self.kv_head_num),
-            "block_N": 64,
+            "block_H": min(16, self.heads // self.kv_head_num),
+            "block_N": 16,
             "num_split": 1,
-            "num_stages": 2,
-            "threads": 128
+            "num_stages": 0,
+            "threads": 64
         }
 
     @property
     def autotune_configs(self) -> list[dict]:
-        block_H = [64, 128]
-        block_N = [64, 128]
+        block_H = [16, 32]
+        block_N = [16, 32]
         num_split = [1, 2, 4, 8]
-        num_stages = [2, 3]
-        threads = [128, 256]
+        num_stages = [1]
+        threads = [64, 128]
         _configs = list(itertools.product(block_H, block_N, num_split, num_stages, threads))
 
         configs = [{

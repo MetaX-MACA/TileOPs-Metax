@@ -1,3 +1,5 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 """
 Gated DeltaNet forward: (q, k, v, g, beta) -> output o.
 
@@ -179,10 +181,10 @@ def _output_o_tl(
             with T.Kernel(num_chunks, batch, head, threads=threads) as (tid, bid, hid):
                 q_c = T.alloc_shared([block_C, dim_k], dtype)
                 k_c = T.alloc_shared([block_C, dim_k], dtype)
-                g_c = T.alloc_shared([block_C], dtype)
+                g_c = T.alloc_shared([block_C], accum_dtype)
                 h_c = T.alloc_shared([dim_k, dim_v], dtype)
-                v_new_c = T.alloc_shared([block_C, dim_v], dtype)
-                attn = T.alloc_shared([block_C, block_C], dtype)
+                v_new_c = T.alloc_shared([block_C, dim_v], accum_dtype)
+                attn = T.alloc_shared([block_C, block_C], accum_dtype)
 
                 o_frag = T.alloc_fragment([block_C, dim_v], accum_dtype)
                 attn_frag = T.alloc_fragment([block_C, block_C], accum_dtype)
@@ -307,7 +309,7 @@ class GatedDeltaNetFwdKernel(Kernel):
         return {
             "fused_num_stages": 2,
             "fused_threads": 256,
-            "h_num_stages": 2,
+            "h_num_stages": 0,
             "h_threads": 256,
             "h_block_v": h_block_v,
             "o_threads": 256,

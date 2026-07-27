@@ -4,9 +4,11 @@ import torch
 
 from tileops.kernels.deltanet import (
     DeltaNetBwdKernel,
+    DeltaNetBwdMACAKernel,
     DeltaNetFwdKernel,
 )
 from tileops.kernels.kernel_base import Kernel
+from tileops.utils import is_maca
 
 from .op_base import Op
 
@@ -186,8 +188,9 @@ class DeltaNetBwdOp(Op):
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
+        bwd_cls = DeltaNetBwdMACAKernel if is_maca() else DeltaNetBwdKernel
         return {
-            "DeltaNetBwdKernel": DeltaNetBwdKernel,
+            "DeltaNetBwdKernel": bwd_cls,
         }
 
     def _get_kernel(
@@ -350,9 +353,10 @@ class DeltaNetOp(Op):
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
+        bwd_cls = DeltaNetBwdMACAKernel if is_maca() else DeltaNetBwdKernel
         return {
             "DeltaNetFwdKernel": DeltaNetFwdKernel,
-            "DeltaNetBwdKernel": DeltaNetBwdKernel,
+            "DeltaNetBwdKernel": bwd_cls,
         }
 
     def _bind_from_inputs(

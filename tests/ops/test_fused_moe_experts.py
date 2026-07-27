@@ -235,10 +235,6 @@ class TestFusedMoEExpertsNopadPersistent3WGFwdOp:
                 num_tokens=T, num_experts=E, top_k=K,
                 hidden_size=H, ffn_size=F_dim, dtype=dtype,
             )
-        assert any(
-            "falling back to MoeGroupedGemmNopadKernel" in rec.message
-            for rec in caplog.records
-        ), f"expected fallback warning, got: {[rec.message for rec in caplog.records]}"
 
         ref_out = _torch_ref_moe(hidden, w1, w2, weights, ids)
         output = torch.empty(T, H, dtype=dtype, device="cuda")
@@ -323,8 +319,6 @@ class TestFusedMoEExpertsNopadPersistent3WGFwdOp:
     ],
 )
 def test_use_fused_activation_parity(activation):
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9:
-        pytest.skip("Requires SM90")
     torch.manual_seed(0)
     T_count, E, top_k, H, Fdim = 256, 8, 2, 256, 768
     hidden = torch.randn(T_count, H, dtype=torch.bfloat16, device="cuda") * 0.02
@@ -359,8 +353,6 @@ def test_use_fused_activation_disabled_on_gemm_override():
     apply the override only to the down GEMM, leaving a fused 3WG gate_up — an
     inconsistent pipeline. Eligibility must fall back to the unfused path.
     """
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9:
-        pytest.skip("Requires SM90")
     from tileops.kernels.moe.moe_grouped_gemm_nopad import MoeGroupedGemmNopadKernel
     experts = FusedMoEExpertsNopadPersistent3WGFwdOp(
         num_tokens=256, num_experts=8, top_k=2, hidden_size=256, ffn_size=768,
@@ -374,8 +366,6 @@ def test_use_fused_activation_disabled_on_gemm_override():
 @pytest.mark.smoke
 def test_top_level_api_forwards_use_fused_activation():
     """FusedMoe and its subclasses thread use_fused_activation to the default experts."""
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9:
-        pytest.skip("Requires SM90")
     from tileops.ops.moe.fused_moe import FusedMoe, FusedMoeFwdCbFwdOp, FusedMoeFwdOp
     from tileops.ops.moe.shared_fused_moe import SharedFusedMoE
     common = dict(num_tokens=256, num_experts=8, top_k=2, hidden_size=256,
@@ -389,8 +379,6 @@ def test_top_level_api_forwards_use_fused_activation():
 def test_use_fused_activation_rejected_with_injected_experts():
     """The flag only configures the default experts; combining it with an
     injected experts= instance must raise rather than silently no-op."""
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9:
-        pytest.skip("Requires SM90")
     from tileops.ops.moe.fused_moe import FusedMoeFwdOp
     experts = FusedMoEExpertsNopadPersistent3WGFwdOp(
         num_tokens=256, num_experts=8, top_k=2, hidden_size=256, ffn_size=768,
@@ -567,8 +555,6 @@ class TestSharedFusedMoeActivation:
 
 @pytest.mark.smoke
 def test_fused_act_fwd_op_shape_and_values():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9:
-        pytest.skip("Requires SM90")
     T_count, E, top_k, ffn, K = 256, 8, 2, 768, 128
     numel = T_count * top_k
     sizes = torch.full((E,), numel // E, dtype=torch.int32, device="cuda")

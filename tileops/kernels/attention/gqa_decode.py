@@ -13,6 +13,7 @@ from tileops.kernels.online_softmax import (
     make_online_softmax,
     make_rescale,
 )
+from tileops.utils import is_maca
 
 __all__ = ["GQADecodeKernel"]
 
@@ -396,13 +397,16 @@ class GQADecodeKernel(Kernel):
 
     @property
     def default_config(self) -> dict:
-        return {
+        config = {
             "block_H": 64,
             "block_N": 128,
             "num_split": self._default_num_split(),
             "num_stages": 2,
             "threads": 128,
         }
+        if is_maca():
+            config.update(block_N=64, num_stages=0)
+        return config
 
     def _default_num_split(self) -> int:
         """Choose a conservative default split policy for GQA decode.

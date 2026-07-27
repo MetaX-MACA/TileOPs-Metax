@@ -1,3 +1,5 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 import functools
 from typing import Any, Callable, Optional
 
@@ -133,7 +135,7 @@ def _(
 
 
 class MeanPoolingFwdKernel(Kernel):
-    supported_archs: list[int] = [90]
+    supported_archs: list[int] = [80]
 
     def __init__(self,
                  batch_size: int,

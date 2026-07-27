@@ -1,3 +1,5 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 import functools
 from typing import Any, Callable, Optional, Tuple
 
@@ -72,7 +74,7 @@ def _nsa_cmp_fwd_varlen_kernel(
 
                 T.copy(q[bos + i_t, i_h * group:(i_h + 1) * group, :bk], q_shared)
 
-                b_o = T.alloc_fragment([group, bv], dtype)
+                b_o = T.alloc_fragment([group, bv], accum_dtype)
                 b_lse = T.alloc_fragment([group], dtype)
                 acc_s = T.alloc_fragment([group, bc], accum_dtype)
                 acc_s_cast = T.alloc_fragment([group, bc], dtype)
@@ -207,7 +209,7 @@ def _(
 
 
 class NSACmpFwdVarlenKernel(Kernel):
-    supported_archs: list[int] = [90]
+    supported_archs: list[int] = [80]
 
     def __init__(self,
                  seq_num: int,
@@ -247,7 +249,7 @@ class NSACmpFwdVarlenKernel(Kernel):
     @property
     def default_config(self) -> dict:
         return {
-            "threads": 32,
+            "threads": 64,
         }
 
     @property

@@ -37,8 +37,9 @@ from typing import Dict, Optional
 import torch
 
 from tileops.kernels.kernel_base import Kernel
-from tileops.kernels.moe import SharedExpertMLPKernel
+from tileops.kernels.moe import SharedExpertMLPKernel, SharedExpertMLPMACAKernel
 from tileops.ops.moe.fused_moe import FusedMoe
+from tileops.utils import is_maca
 
 __all__ = ["SharedFusedMoE"]
 
@@ -132,8 +133,9 @@ class SharedFusedMoE(FusedMoe):
         self.tp_rank = tp_rank
 
         # Kernel operates on the local shard size
+        kernel_cls = SharedExpertMLPMACAKernel if is_maca() else SharedExpertMLPKernel
         self._shared_mlp_kernel = (
-            SharedExpertMLPKernel(
+            kernel_cls(
                 num_tokens=num_tokens,
                 hidden_size=hidden_size,
                 ffn_size=shared_ffn_size // tp_size,

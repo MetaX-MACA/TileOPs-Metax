@@ -68,6 +68,7 @@ from .gated_deltanet_recurrence import (
     GatedDeltaNetDecodeRawCudaFlaStyleKernel,
 )
 from .gemm import GemmFp8BlockScaledKernel, GemmFp8EpilogueKernel, GemmKernel, GemvKernel
+from .gemm_maca import GemmMACAKernel
 from .gla import GLABwdKernel, GLAFwdKernel
 from .gla_recurrence import GLADecodeFP32Kernel, GLADecodeKernel
 from .grouped_gemm import GroupedGemmKernel
@@ -171,6 +172,7 @@ __all__ = [
     "GemmFp8BlockScaledKernel",
     "GemmFp8EpilogueKernel",
     "GemmKernel",
+    "GemmMACAKernel",
     "GemvKernel",
     "GroupConv1dKernel",
     "GroupConv2dKernel",

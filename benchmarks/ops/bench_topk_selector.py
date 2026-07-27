@@ -1,3 +1,5 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+
 from typing import Optional
 
 import pytest
@@ -36,9 +38,9 @@ class TopkSelectorBenchmark(BenchmarkBase[TopkSelectorTest]):
 _TOPK_SELECTOR_BENCH_PARAMS = [
     pytest.param(1, 32 * 1024, 64 * 1024, 1, 1024, torch.float32, torch.int32, True, id="base-topk1024"),
     pytest.param(1, 32 * 1024, 64 * 1024, 1, 2048, torch.float32, torch.int32, True, id="base-topk2048"),
-    pytest.param(1, 65535, 128 * 1024, 1, 1024, torch.float32, torch.int32, True,
+    pytest.param(1, 32 * 1024, 128 * 1024, 1, 1024, torch.float32, torch.int32, True,
                  id="large-batch-topk1024"),
-    pytest.param(1, 65535, 128 * 1024, 1, 2048, torch.float32, torch.int32, True,
+    pytest.param(1, 32 * 1024, 128 * 1024, 1, 2048, torch.float32, torch.int32, True,
                  id="large-batch-topk2048"),
 ]
 

@@ -6,6 +6,7 @@ from tileops.kernels.gated_deltanet import (
     GatedDeltaNetBwdKernel,
     GatedDeltaNetFwdKernel,
     GatedDeltaNetPrefillFwdKernel,
+    GatedDeltaNetPrefillFwdMACAKernel,
 )
 from tileops.kernels.gated_deltanet_recurrence import (
     GatedDeltaNetDecodeFP32Kernel,
@@ -13,7 +14,7 @@ from tileops.kernels.gated_deltanet_recurrence import (
     GatedDeltaNetDecodeRawCudaFlaStyleKernel,
 )
 from tileops.kernels.kernel_base import Kernel
-from tileops.utils import get_sm_version
+from tileops.utils import get_sm_version, is_maca
 
 from .op_base import Op
 
@@ -224,7 +225,11 @@ class GatedDeltaNetPrefillFwdOp(Op):
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
         return {
-            "GatedDeltaNetPrefillFwdKernel": GatedDeltaNetPrefillFwdKernel,
+            "GatedDeltaNetPrefillFwdKernel": (
+                GatedDeltaNetPrefillFwdMACAKernel
+                if is_maca()
+                else GatedDeltaNetPrefillFwdKernel
+            ),
         }
 
     @staticmethod
