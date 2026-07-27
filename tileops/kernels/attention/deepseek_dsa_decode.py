@@ -461,7 +461,7 @@ class SparseMlaKernel(Kernel):
                         the first chunk of data (i.e., whether `cp_rank == 0`).
     """
 
-    supported_archs: list[int] = [90]
+    supported_archs: list[int] = [89, 90]
 
     def __init__(self,
                  batch: int,

@@ -30,9 +30,7 @@ __all__ = [
     "BatchNormFwdTrainKernel",
 ]
 
-# ---------------------------------------------------------------------------
 # Config helpers
-# ---------------------------------------------------------------------------
 
 # L threshold for the persistent (single global read) training path.
 # x_shared uses L * sizeof(dtype) bytes per block:
@@ -77,9 +75,7 @@ def _find_best_block_l(L: int) -> dict:
     )
 
 
-# ---------------------------------------------------------------------------
 # Training forward
-# ---------------------------------------------------------------------------
 
 @functools.lru_cache(maxsize=32)
 def _batch_norm_fwd_train_kernel(
@@ -110,7 +106,7 @@ def _batch_norm_fwd_train_kernel(
     accum_dtype = "float32"
 
     @tilelang.jit(out_idx=[-1], compile_flags=["-O3", "-DENABLE_BF16"])
-    def _bn_fwd_train_func(block_l: int, num_stages: int, threads: int) -> Callable:
+    def _bn_fwd_train_func(block_l: int, threads: int) -> Callable:
 
         @T.prim_func
         def _bn_fwd_train(
@@ -135,13 +131,13 @@ def _batch_norm_fwd_train_kernel(
 
                 # Pass 1 – accumulate sum(x) and sum(x^2) over all tiles.
                 if block_l >= L:
-                    # Persistent path: T.copy into x_shared, single global read.
-                    for l_tile in T.Pipelined(L // block_l, num_stages=num_stages):
-                        T.copy(x[bc, l_tile * block_l:(l_tile + 1) * block_l], x_shared)
-                        for _i, j in T.Parallel(1, block_l):
-                            xval = T.cast(x_shared[j], accum_dtype)
-                            xsum_frag[_i, j] += xval
-                            xsq_frag[_i, j] += xval * xval
+                    # Persistent path has exactly one tile, so a pipelined loop
+                    # cannot overlap producer/consumer work.
+                    T.copy(x[bc, 0:block_l], x_shared)
+                    for _i, j in T.Parallel(1, block_l):
+                        xval = T.cast(x_shared[j], accum_dtype)
+                        xsum_frag[_i, j] += xval
+                        xsq_frag[_i, j] += xval * xval
                 else:
                     # Non-persistent path: direct global memory access avoids async-copy
                     # data race that occurs when T.copy is used inside T.Pipelined.
@@ -172,8 +168,10 @@ def _batch_norm_fwd_train_kernel(
                 # (Bessel's correction: biased_var * L / (L - 1)).
                 mom = T.cast(momentum, accum_dtype)
                 unbiased_var = var_val * T.cast(L, accum_dtype) / (T.cast(L, accum_dtype) - T.cast(1.0, accum_dtype))
-                running_mean[bc] = (T.cast(1.0, accum_dtype) - mom) * running_mean[bc] + mom * mean_val
-                running_var[bc] = (T.cast(1.0, accum_dtype) - mom) * running_var[bc] + mom * unbiased_var
+                # One writer per block: this running-stat RMW races if every thread runs it.
+                if T.get_thread_binding() == 0:
+                    running_mean[bc] = (T.cast(1.0, accum_dtype) - mom) * running_mean[bc] + mom * mean_val
+                    running_var[bc] = (T.cast(1.0, accum_dtype) - mom) * running_var[bc] + mom * unbiased_var
 
                 # Pass 2 – normalize.
                 if block_l >= L:
@@ -235,9 +233,10 @@ class BatchNormFwdTrainKernel(Kernel):
         if self.L <= _PERSISTENT_THRESHOLD:
             # Persistent path: block_l = L, single global read.
             t = _find_best_threads(self.L)
-            return {"block_l": self.L, "num_stages": 1, "threads": t}
+            return {"block_l": self.L, "threads": t}
         # Non-persistent path: find best block_l with non-power-of-2 thread counts.
-        return _find_best_block_l(self.L)
+        cfg = _find_best_block_l(self.L)
+        return {"block_l": cfg["block_l"], "threads": cfg["threads"]}
 
     @property
     def autotune_configs(self) -> list[dict]:
@@ -245,7 +244,7 @@ class BatchNormFwdTrainKernel(Kernel):
         configs = []
 
         def _add(cfg: dict) -> None:
-            key = (cfg["block_l"], cfg["num_stages"], cfg["threads"])
+            key = (cfg["block_l"], cfg["threads"])
             if key not in seen:
                 seen.add(key)
                 configs.append(cfg)
@@ -254,7 +253,7 @@ class BatchNormFwdTrainKernel(Kernel):
         if self.L <= _PERSISTENT_THRESHOLD:
             for t in [256, 128, 64, 32]:
                 if self.L % t == 0:
-                    _add({"block_l": self.L, "num_stages": 1, "threads": t})
+                    _add({"block_l": self.L, "threads": t})
 
         # Non-persistent configs: power-of-2 threads, block_l can be non-power-of-2.
         # num_stages=0 disables T.Pipelined's async prefetch, which is required for
@@ -264,7 +263,7 @@ class BatchNormFwdTrainKernel(Kernel):
                 bl = threads * k
                 if bl >= self.L or self.L % bl != 0:
                     continue
-                _add({"block_l": bl, "num_stages": 0, "threads": threads})
+                _add({"block_l": bl, "threads": threads})
 
         return configs if configs else [self.default_config]
 
@@ -287,15 +286,12 @@ class BatchNormFwdTrainKernel(Kernel):
         rstd_out = torch.empty(self.C, device=x.device, dtype=torch.float32)
         y = self.kernel(
             self.config["block_l"],
-            self.config["num_stages"],
             self.config["threads"],
         )(x, weight, bias, running_mean, running_var, mean_out, rstd_out)
         return y, mean_out, rstd_out
 
 
-# ---------------------------------------------------------------------------
 # Inference forward
-# ---------------------------------------------------------------------------
 
 @functools.lru_cache(maxsize=32)
 def _batch_norm_fwd_infer_kernel(
@@ -410,9 +406,7 @@ class BatchNormFwdInferKernel(Kernel):
         )(x, weight, bias, running_mean, running_var)
 
 
-# ---------------------------------------------------------------------------
 # Backward
-# ---------------------------------------------------------------------------
 
 @functools.lru_cache(maxsize=32)
 def _batch_norm_bwd_kernel(
@@ -443,7 +437,7 @@ def _batch_norm_bwd_kernel(
     accum_dtype = "float32"
 
     @tilelang.jit(out_idx=[-1], compile_flags=["-O3", "-DENABLE_BF16"])
-    def _bn_bwd_func(block_l: int, num_stages: int, threads: int) -> Callable:
+    def _bn_bwd_func(block_l: int, threads: int) -> Callable:
 
         @T.prim_func
         def _bn_bwd(
@@ -472,15 +466,15 @@ def _batch_norm_bwd_kernel(
 
                 # Pass 1 – accumulate grad_bias and grad_weight contributions.
                 if block_l >= L:
-                    # Persistent path: T.copy into shared memory, single global read.
-                    for l_tile in T.Pipelined(L // block_l, num_stages=num_stages):
-                        T.copy(grad_out[bc, l_tile * block_l:(l_tile + 1) * block_l], go_shared)
-                        T.copy(x[bc, l_tile * block_l:(l_tile + 1) * block_l], x_shared)
-                        for _i, j in T.Parallel(1, block_l):
-                            go_val = T.cast(go_shared[j], accum_dtype)
-                            x_hat = (T.cast(x_shared[j], accum_dtype) - mean_val) * rstd_val
-                            do_frag[_i, j] += go_val
-                            do_xhat_frag[_i, j] += go_val * x_hat
+                    # Persistent path has exactly one tile, so a pipelined loop
+                    # cannot overlap producer/consumer work.
+                    T.copy(grad_out[bc, 0:block_l], go_shared)
+                    T.copy(x[bc, 0:block_l], x_shared)
+                    for _i, j in T.Parallel(1, block_l):
+                        go_val = T.cast(go_shared[j], accum_dtype)
+                        x_hat = (T.cast(x_shared[j], accum_dtype) - mean_val) * rstd_val
+                        do_frag[_i, j] += go_val
+                        do_xhat_frag[_i, j] += go_val * x_hat
                 else:
                     # Non-persistent path: direct global memory access avoids async-copy
                     # data race that occurs when T.copy is used inside T.Pipelined.
@@ -569,8 +563,9 @@ class BatchNormBwdKernel(Kernel):
             # Persistent path: block_l = L, single global read.
             # go_shared and x_shared together use 2 * L * sizeof(dtype) SMEM.
             t = _find_best_threads(self.L)
-            return {"block_l": self.L, "num_stages": 1, "threads": t}
-        return _find_best_block_l(self.L)
+            return {"block_l": self.L, "threads": t}
+        cfg = _find_best_block_l(self.L)
+        return {"block_l": cfg["block_l"], "threads": cfg["threads"]}
 
     @property
     def autotune_configs(self) -> list[dict]:
@@ -578,7 +573,7 @@ class BatchNormBwdKernel(Kernel):
         configs = []
 
         def _add(cfg: dict) -> None:
-            key = (cfg["block_l"], cfg["num_stages"], cfg["threads"])
+            key = (cfg["block_l"], cfg["threads"])
             if key not in seen:
                 seen.add(key)
                 configs.append(cfg)
@@ -587,7 +582,7 @@ class BatchNormBwdKernel(Kernel):
         if self.L <= _PERSISTENT_THRESHOLD:
             for t in [256, 128, 64, 32]:
                 if self.L % t == 0:
-                    _add({"block_l": self.L, "num_stages": 1, "threads": t})
+                    _add({"block_l": self.L, "threads": t})
 
         # Non-persistent configs: power-of-2 threads, block_l can be non-power-of-2.
         # num_stages=0 disables pipelining for correctness in multi-tile loops.
@@ -596,7 +591,7 @@ class BatchNormBwdKernel(Kernel):
                 bl = threads * k
                 if bl >= self.L or self.L % bl != 0:
                     continue
-                _add({"block_l": bl, "num_stages": 0, "threads": threads})
+                _add({"block_l": bl, "threads": threads})
 
         return configs if configs else [self.default_config]
 
@@ -619,7 +614,6 @@ class BatchNormBwdKernel(Kernel):
         grad_bias = torch.empty(self.C, device=grad_out.device, dtype=torch.float32)
         grad_x = self.kernel(
             self.config["block_l"],
-            self.config["num_stages"],
             self.config["threads"],
         )(grad_out, x, weight, mean, rstd, grad_weight, grad_bias)
         return grad_x, grad_weight, grad_bias

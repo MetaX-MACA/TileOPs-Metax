@@ -22,7 +22,7 @@ import torch
 
 from benchmarks.benchmark_base import BenchmarkBase, BenchmarkReport
 from tileops.ops import GatedDeltaNetBwdOp, GatedDeltaNetFwdOp, GatedDeltaNetOp
-from workloads.gated_deltanet import GatedDeltaNetFwdTest
+from workloads.linear_attention import GatedDeltaNetFwdTest
 from workloads.workload_base import FixtureBase
 
 
@@ -192,9 +192,7 @@ def _to_fla_layout(q, k, v, g, beta):
     )
 
 
-# =============================================================================
 # Forward benchmark
-# =============================================================================
 
 class GatedDeltaNetFwdBenchmark(BenchmarkBase[GatedDeltaNetFwdTest]):
 
@@ -256,7 +254,7 @@ def test_gated_deltanet_vs_fla_fwd(
     inputs = test.gen_inputs()  # q, k, v, g, beta  (BHSD)
 
     # --- TileOPs (BHSD) ---
-    op = GatedDeltaNetFwdOp(batch, heads, seq_len, dim_k, dim_v, chunk_size, dtype, tune=tune)
+    op = GatedDeltaNetFwdOp(chunk_size=chunk_size, tune=tune)
     result = bm.profile(op, *inputs)
     BenchmarkReport.record(op, locals(), result, tag="tileops")
 
@@ -277,9 +275,7 @@ def test_gated_deltanet_vs_fla_fwd(
         BenchmarkReport.record(op, locals(), result_bl, tag="torch")
 
 
-# =============================================================================
 # Backward benchmark
-# =============================================================================
 
 class GatedDeltaNetBwdBenchmark(BenchmarkBase[GatedDeltaNetFwdTest]):
 
@@ -346,10 +342,10 @@ def test_gated_deltanet_vs_fla_bwd(
     do = torch.randn(B, H, S, DV, device="cuda", dtype=dtype) * 0.1
 
     # --- TileOPs: fwd to get S, then profile bwd only ---
-    fwd_op = GatedDeltaNetFwdOp(B, H, S, DK, DV, BC, dtype)
+    fwd_op = GatedDeltaNetFwdOp(chunk_size=BC)
     _o, S_fwd, _Aw, _Au = fwd_op.forward(q, k, v, g, beta)
 
-    bwd_op = GatedDeltaNetBwdOp(B, H, S, DK, DV, BC, dtype, tune=tune)
+    bwd_op = GatedDeltaNetBwdOp(chunk_size=BC, tune=tune)
     result = bm.profile(bwd_op.forward, do, q, k, v, g, beta, S_fwd)
     BenchmarkReport.record(bwd_op, locals(), result, tag="tileops")
 
@@ -383,9 +379,7 @@ def test_gated_deltanet_vs_fla_bwd(
         BenchmarkReport.record(bwd_op, locals(), result_bl, tag="torch")
 
 
-# =============================================================================
 # Combined fwd+bwd benchmark (fair comparison: both measure fwd+bwd total)
-# =============================================================================
 
 class GatedDeltaNetFwdBwdBenchmark(BenchmarkBase[GatedDeltaNetFwdTest]):
 
@@ -446,7 +440,7 @@ def test_gated_deltanet_vs_fla_fwdbwd(
     B, H, S, DK, DV, BC = batch, heads, seq_len, dim_k, dim_v, chunk_size
 
     # --- TileOPs: combined fwd+bwd via GatedDeltaNetOp ---
-    op = GatedDeltaNetOp(B, H, S, DK, DV, BC, dtype, tune=tune)
+    op = GatedDeltaNetOp(chunk_size=BC, tune=tune)
 
     q = (torch.randn(B, H, S, DK, device="cuda", dtype=dtype) * 0.1).detach().requires_grad_(True)
     k = (torch.randn(B, H, S, DK, device="cuda", dtype=dtype) * 0.1).detach().requires_grad_(True)

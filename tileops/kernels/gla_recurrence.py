@@ -28,9 +28,7 @@ _LOG2E = 1.4426950408889634
 _DEFAULT_K_TILE = 16
 
 
-# =============================================================================
 # Low-precision decode kernel — bf16 / fp16, fp32 accumulation
-# =============================================================================
 
 @functools.lru_cache(maxsize=32)
 def _gla_decode_tl(
@@ -70,6 +68,7 @@ def _gla_decode_tl(
         ):
             with T.Kernel(batch, head, threads=threads) as (bid, hid):
                 h_tile = T.alloc_shared([k_tile, dim_v], dtype)
+                h_tile_o = T.alloc_shared([k_tile, dim_v], dtype)
                 v_shared = T.alloc_shared([dim_v], accum_dtype)
                 sq_frag = T.alloc_fragment([dim_v], accum_dtype)
                 qk_dot = T.alloc_local([1], accum_dtype)
@@ -95,15 +94,17 @@ def _gla_decode_tl(
                 # TODO: restore a tensor-core fast path once fragment copies
                 # lower reliably without sacrificing recurrent decode numerics.
                 T.fill(sq_frag, 0.0)
-                for kk in T.Serial(dim_k):
-                    gk_val = gk_shared[kk]
-                    alpha_i = T.exp2(gk_val * _LOG2E)
-                    q_gated = q_shared[kk] * alpha_i
-                    for j in T.Parallel(dim_v):
-                        sq_frag[j] = (
-                            sq_frag[j]
-                            + q_gated * T.cast(state[bid, hid, kk, j], accum_dtype)
-                        )
+                for kt in T.Pipelined(dim_k // k_tile, num_stages=num_stages):
+                    T.copy(state[bid, hid, kt * k_tile, 0], h_tile_o)
+                    for kk in T.Serial(k_tile):
+                        gk_val = gk_shared[kt * k_tile + kk]
+                        alpha_i = T.exp2(gk_val * _LOG2E)
+                        q_gated = q_shared[kt * k_tile + kk] * alpha_i
+                        for j in T.Parallel(dim_v):
+                            sq_frag[j] = (
+                                sq_frag[j]
+                                + q_gated * T.cast(h_tile_o[kk, j], accum_dtype)
+                            )
 
                 # Keep this scalar reduction separate from the matvec's
                 # dim_v-parallel inner loop.
@@ -280,9 +281,7 @@ class GLADecodeKernel(Kernel):
         return self._kernel_fn(q, k, v, gk, state)
 
 
-# =============================================================================
 # FP32-precision decode kernel (no T.gemm → avoids TF32 mantissa truncation)
-# =============================================================================
 
 @functools.lru_cache(maxsize=32)
 def _gla_decode_fp32_tl(

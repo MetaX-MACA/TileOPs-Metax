@@ -5,7 +5,7 @@ import torch
 
 from tests.test_base import FixtureBase, TestBase
 from tileops.ops import GLADecodeOp
-from workloads.gla import GLADecodeTest as _GLADecodeTestWorkload
+from workloads.linear_attention import GLADecodeTest as _GLADecodeTestWorkload
 
 
 def gla_decode_torch(
@@ -50,14 +50,10 @@ try:
 except ImportError:
     fused_recurrent_gla = None
 
-# =============================================================================
 # Torch reference implementation (test-only)
-# =============================================================================
 
 
-# =============================================================================
 # Correctness tests
-# =============================================================================
 
 
 def _get_tolerances(dtype: torch.dtype) -> dict:
@@ -94,7 +90,7 @@ def test_gla_decode(
 ) -> None:
     torch.manual_seed(42)
     test = GLADecodeTest(batch, heads, dim_k, dim_v, dtype)
-    op = GLADecodeOp(batch, heads, dim_k, dim_v, dtype=dtype, tune=tune)
+    op = GLADecodeOp(tune=tune)
     tols = _get_tolerances(dtype)
     test.check(op, *test.gen_inputs(), **tols)
 
@@ -113,7 +109,7 @@ def test_gla_decode_multi_step(
     num_steps = 8
     B, H, DK, DV = batch, heads, dim_k, dim_v
 
-    op = GLADecodeOp(B, H, DK, DV, dtype=dtype, tune=tune)
+    op = GLADecodeOp(tune=tune)
     tols = _get_tolerances(dtype)
 
     state_op = torch.zeros(B, H, DK, DV, device="cuda", dtype=dtype)
@@ -160,7 +156,7 @@ def test_gla_decode_vs_fla(
     state = torch.randn(B, H, DK, DV, device="cuda", dtype=dtype) * 0.1
 
     # TileOPs
-    op = GLADecodeOp(B, H, DK, DV, scale=scale, dtype=dtype, tune=tune)
+    op = GLADecodeOp(scale=scale, tune=tune)
     with torch.no_grad():
         o_tile, s_tile = op(q, k, v, gk, state)
 
@@ -181,6 +177,26 @@ def test_gla_decode_vs_fla(
     tols = _get_tolerances(dtype)
     torch.testing.assert_close(o_tile, o_fla, **tols)
     torch.testing.assert_close(s_tile, s_fla.to(dtype), **tols)
+
+
+@pytest.mark.smoke
+def test_gla_decode_rejects_manifest_shape_mismatch() -> None:
+    op = object.__new__(GLADecodeOp)
+    op.batch = 2
+    op.heads = 3
+    op.dim_k = 4
+    op.dim_v = 5
+    op.scale = -1.0
+    op.dtype = torch.float32
+
+    q = torch.empty(2, 3, 4)
+    k = torch.empty(2, 3, 4)
+    v = torch.empty(2, 3, 5)
+    gk = torch.empty(2, 3, 5)
+    state = torch.empty(2, 3, 4, 5)
+
+    with pytest.raises(ValueError, match="gk must have shape"):
+        op.forward(q, k, v, gk, state)
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ SiluAndMulFwdOp:
   family: elementwise
   status: implemented
 
+  torch_compile_fullgraph: true
   signature:
     inputs:
       x: {dtype: "float16 | bfloat16 | float32", shape: "[M, two_N]"}
@@ -45,7 +46,7 @@ SiluAndMulFwdOp:
     kernel: tileops/kernels/elementwise.py
     kernel_map:
       silu_and_mul: SiluAndMulFwdKernel
-    op: tileops/ops/elementwise/fused_gated.py
+    op: tileops/ops/elementwise/activations.py
     test: tests/ops/test_fused_gated.py
     bench: benchmarks/ops/bench_binary_elementwise.py
     bench_manifest_driven: false
@@ -58,6 +59,7 @@ GeluAndMulFwdOp:
   family: elementwise
   status: implemented
 
+  torch_compile_fullgraph: true
   signature:
     inputs:
       x: {dtype: "float16 | bfloat16 | float32", shape: "[M, two_N]"}
@@ -85,7 +87,7 @@ GeluAndMulFwdOp:
     kernel: tileops/kernels/elementwise.py
     kernel_map:
       gelu_and_mul: GeluAndMulFwdKernel
-    op: tileops/ops/elementwise/fused_gated.py
+    op: tileops/ops/elementwise/activations.py
     test: tests/ops/test_fused_gated.py
     bench: benchmarks/ops/bench_binary_elementwise.py
     bench_manifest_driven: false
@@ -98,6 +100,7 @@ GeluTanhAndMulFwdOp:
   family: elementwise
   status: implemented
 
+  torch_compile_fullgraph: true
   signature:
     inputs:
       x: {dtype: "float16 | bfloat16 | float32", shape: "[M, two_N]"}
@@ -126,7 +129,7 @@ GeluTanhAndMulFwdOp:
     kernel: tileops/kernels/elementwise.py
     kernel_map:
       gelu_tanh_and_mul: GeluTanhAndMulFwdKernel
-    op: tileops/ops/elementwise/fused_gated.py
+    op: tileops/ops/elementwise/activations.py
     test: tests/ops/test_fused_gated.py
     bench: benchmarks/ops/bench_binary_elementwise.py
     bench_manifest_driven: false

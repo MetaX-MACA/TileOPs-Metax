@@ -18,9 +18,7 @@ from tileops.kernels.online_softmax import (
 
 __all__ = ["GQADecodePagedKernel"]
 
-# ---------------------------------------------------------------------------
 # JIT kernel: no-split variant (paged)
-# ---------------------------------------------------------------------------
 
 
 @functools.lru_cache(maxsize=32)
@@ -130,9 +128,7 @@ def _gqa_decode_no_split_paged_kernel(
     return _func
 
 
-# ---------------------------------------------------------------------------
 # JIT kernel: split variant (paged, split + combine)
-# ---------------------------------------------------------------------------
 
 
 @functools.lru_cache(maxsize=32)
@@ -326,9 +322,7 @@ def _gqa_decode_split_paged_kernel(
     return _func
 
 
-# ---------------------------------------------------------------------------
 # Custom ops (torch.compile compatible wrappers)
-# ---------------------------------------------------------------------------
 
 
 @torch.library.custom_op("top::gqa_decode_paged_no_split_op", mutates_args=())
@@ -379,9 +373,7 @@ def _(batch: int, heads: int, groups: int, seqlen_kv: int, dim: int, page_size: 
     return torch.empty_like(Q)
 
 
-# ---------------------------------------------------------------------------
 # Kernel class
-# ---------------------------------------------------------------------------
 
 
 class GQADecodePagedKernel(Kernel):

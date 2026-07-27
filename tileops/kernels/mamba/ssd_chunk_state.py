@@ -7,7 +7,7 @@ Inputs (pre-reshaped to chunked view):
   Bmat:       (batch, seq_len, n_groups, d_state)
               -- State Space Model (SSM) B matrix, grouped over heads
   dt:         (batch, n_heads, num_chunks, chunk_len)
-              -- per-position discretization factor (float32)
+              -- per-position discretization factor (dtype, cast to float32 internally for accumulation)
   dA_cumsum:  (batch, n_heads, num_chunks, chunk_len)
               -- chunk-local prefix sums of dA = dt * A (float32)
   seq_idx:    (batch, seq_len)  int32, optional
@@ -113,7 +113,7 @@ def _ssd_chunk_state_fwd_kernel(
         def main(
             x: T.Tensor((B, S, H, P), dtype),                # type: ignore
             Bmat: T.Tensor((B, S, G, N), dtype),              # type: ignore
-            dt: T.Tensor((B, H, C, Q), accum_dtype),          # type: ignore
+            dt: T.Tensor((B, H, C, Q), dtype),                # type: ignore  Accept dtype, cast on load
             dA_cumsum: T.Tensor((B, H, C, Q), accum_dtype),   # type: ignore
             seq_idx: T.Tensor((B, S), "int32"),               # type: ignore
             out: T.Tensor((B, C, H, P, N), accum_dtype),      # type: ignore
@@ -129,7 +129,6 @@ def _ssd_chunk_state_fwd_kernel(
                 threads=threads,
             ) as (bhc, bp, bn):
 
-                # --------------------------------------------------------
                 # 1. Decode fused axis  (b, c, h — h is fastest-changing)
                 #
                 # Consecutive CTAs share the same (b, c), so they cover the
@@ -141,7 +140,6 @@ def _ssd_chunk_state_fwd_kernel(
                 # HEADS_PER_GROUP×.  The alternative b,h,c order (c fastest)
                 # shifts chunk_start on every CTA step so no Bmat rows are
                 # reused between consecutive CTAs.
-                # --------------------------------------------------------
                 bz = bhc // (C * H)
                 bc = (bhc % (C * H)) // H
                 bh = bhc % H
@@ -155,20 +153,15 @@ def _ssd_chunk_state_fwd_kernel(
                 # starting token index of this chunk in the full sequence
                 chunk_start = bc * Q
 
-                # --------------------------------------------------------
                 # 2. Allocate accumulator for one output tile (P x N)
-                # --------------------------------------------------------
                 acc = T.alloc_fragment((block_p, block_n), accum_dtype)
                 T.clear(acc)
 
-                # --------------------------------------------------------
                 # 3. Load chunk-end cumulative decay scalar and seq_idx
                 #    dA_end = dA_cumsum[bz, bh, bc, Q-1]
-                # --------------------------------------------------------
                 dA_end = dA_cumsum[bz, bh, bc, Q - 1]
                 seq_end = seq_idx[bz, chunk_start + Q - 1] if has_seq_idx else T.int32(0)
 
-                # --------------------------------------------------------
                 # 4. Allocate tiles once outside the reduction loop
                 #
                 #    x_scaled[l, p] = x[l, p] * w(l)   (row-scaled x, dtype)
@@ -193,14 +186,11 @@ def _ssd_chunk_state_fwd_kernel(
                 #    GEMM:  acc[p, n] += x_scaled^T @ b_tile
                 #           i.e. (block_l x block_p)^T @ (block_l x block_n)
                 #                = (block_p x block_l) @ (block_l x block_n)
-                # --------------------------------------------------------
                 w_tile   = T.alloc_shared((block_l,), accum_dtype)
                 x_scaled = T.alloc_shared((block_l, block_p), dtype)
                 b_tile   = T.alloc_shared((block_l, block_n), dtype)
 
-                # --------------------------------------------------------
                 # 5. Reduce over chunk positions in L-tiles
-                # --------------------------------------------------------
                 for l_blk in T.Serial(T.ceildiv(Q, block_l)):
                     l0 = l_blk * block_l
 
@@ -215,7 +205,7 @@ def _ssd_chunk_state_fwd_kernel(
                         )
                         dt_l = T.if_then_else(
                             l_idx < Q,
-                            dt[bz, bh, bc, l_idx],
+                            T.cast(dt[bz, bh, bc, l_idx], accum_dtype),  # Cast dtype to float32
                             T.float32(0.0),
                         )
                         if has_seq_idx:
@@ -262,9 +252,7 @@ def _ssd_chunk_state_fwd_kernel(
                     #     shapes: (block_l x block_p)^T @ (block_l x block_n)
                     T.gemm(x_scaled, b_tile, acc, transpose_A=True)
 
-                # --------------------------------------------------------
                 # 6. Write back output tile: out[bz, bc, bh, p0:p0+block_p, n0:n0+block_n]
-                # --------------------------------------------------------
                 for pp, nn in T.Parallel(block_p, block_n):
                     p_idx = p0 + pp
                     n_idx = n0 + nn
@@ -341,8 +329,20 @@ class SSDChunkStateFwdKernel(Kernel):
               * dt[b, h, c, l]
               * (1 if not has_seq_idx else (seq_idx[b,c*Q+Q-1] >= 0 and seq_idx[b,c*Q+l] == seq_idx[b,c*Q+Q-1]))
 
-    Inputs:  x, Bmat, dt, dA_cumsum[, seq_idx]
-    Output:  out  (batch, num_chunks, n_heads, d_head, d_state), float32
+    Inputs:
+        x:         (batch, seqlen, n_heads, d_head)           dtype
+        Bmat:      (batch, seqlen, n_groups, d_state)         dtype
+        dt:        (batch, n_heads, num_chunks, chunk_len)    dtype — accepts target dtype,
+                   will be cast to fp32 internally for accumulation
+        dA_cumsum: (batch, n_heads, num_chunks, chunk_len)    float32
+        seq_idx:   (batch, seqlen)                            int32 (optional)
+
+    Output:
+        out:       (batch, num_chunks, n_heads, d_head, d_state) float32
+
+    Note: If dt.dtype != self.dtype, forward() will silently cast it. This incurs an
+    extra kernel launch. For best performance, callers should ensure dt is already in
+    the target dtype.
     """
 
     supported_archs: list[int] = [80, 86, 89, 90]
@@ -421,6 +421,23 @@ class SSDChunkStateFwdKernel(Kernel):
         dA_cumsum: torch.Tensor,
         seq_idx: torch.Tensor,
     ) -> torch.Tensor:
+        """Compute chunk-end SSM states.
+
+        Args:
+            x: (batch, seqlen, n_heads, d_head) dtype
+            Bmat: (batch, seqlen, n_groups, d_state) dtype
+            dt: (batch, n_heads, num_chunks, chunk_len) dtype — will be cast to fp32 internally
+            dA_cumsum: (batch, n_heads, num_chunks, chunk_len) float32
+            seq_idx: (batch, seqlen) int32
+
+        Returns:
+            out: (batch, num_chunks, n_heads, d_head, d_state) float32
+
+        Note: If dt.dtype != self.dtype, this method silently casts dt, which incurs an
+        extra kernel launch. For best performance, ensure dt is already in self.dtype.
+        """
+        if dt.dtype != self.dtype:
+            dt = dt.to(self.dtype)
         return _ssd_chunk_state_fwd_wrapped(
             self.batch, self.num_chunks, self.chunk_len, self.n_heads, self.d_head,
             self.d_state, self.n_groups, self.has_seq_idx, self.dtype_str,
