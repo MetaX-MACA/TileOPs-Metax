@@ -2,9 +2,9 @@ from typing import Dict, Optional
 
 import torch
 
-from tileops.kernels.attention import SparseMlaKernel
+from tileops.kernels.attention import SparseMlaKernel, SparseMlaMACAKernel
 from tileops.kernels.kernel_base import Kernel
-from tileops.utils import is_hopper
+from tileops.utils import is_hopper, is_maca
 
 from ..op_base import Op
 
@@ -107,12 +107,18 @@ class DeepSeekSparseAttentionDecodeWithKVCacheFwdOp(Op):
             Dict[str, Kernel]: A dictionary mapping kernel names to kernel functions.
             The default map includes the "sparse_mla_kernel".
         """
-        if not is_hopper():
+        if is_maca():
+            kernel_cls = SparseMlaMACAKernel
+        elif is_hopper():
+            kernel_cls = SparseMlaKernel
+
+        else:
             raise RuntimeError(
-                "DeepSeekSparseAttentionDecodeWithKVCacheFwdOp requires a Hopper GPU "
-                "(SM90) because the underlying SparseMlaKernel uses WGMMA instructions."
+                "DeepSeekSparseAttentionDecodeWithKVCacheFwdOp "
+                "currently supports MACA and Hopper SM90."
             )
-        return {"sparse_mla_kernel": SparseMlaKernel}
+
+        return {"sparse_mla_kernel": kernel_cls}
 
     def forward(self, q: torch.Tensor, kv: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
         """
