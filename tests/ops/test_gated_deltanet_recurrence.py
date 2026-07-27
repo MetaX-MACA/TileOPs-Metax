@@ -7,7 +7,7 @@ import tileops.ops.gated_deltanet as gated_deltanet_ops
 from tests.test_base import FixtureBase, TestBase
 from tileops.kernels.gated_deltanet_recurrence import GatedDeltaNetDecodeRawCudaFlaStyleKernel
 from tileops.ops import GatedDeltaNetDecodeOp
-from workloads.gated_deltanet import (
+from workloads.linear_attention import (
     GatedDeltaNetDecodeTest as _GatedDeltaNetDecodeTestWorkload,
 )
 
@@ -56,14 +56,10 @@ class GatedDeltaNetDecodeTest(_GatedDeltaNetDecodeTestWorkload, TestBase):
         return o.to(self.dtype), new_state.to(self.dtype)
 
 
-# =============================================================================
 # Torch reference implementation (test-only)
-# =============================================================================
 
 
-# =============================================================================
 # Correctness tests
-# =============================================================================
 
 
 def _get_tolerances(dtype: torch.dtype) -> dict:
@@ -103,7 +99,7 @@ def test_gated_deltanet_decode(
 ) -> None:
     torch.manual_seed(42)
     test = GatedDeltaNetDecodeTest(batch, heads, dim_k, dim_v, dtype)
-    op = GatedDeltaNetDecodeOp(batch, heads, dim_k, dim_v, dtype, tune=tune)
+    op = GatedDeltaNetDecodeOp(tune=tune)
     tols = _get_tolerances(dtype)
     test.check(op, *test.gen_inputs(), **tols)
 
@@ -122,7 +118,7 @@ def test_gated_deltanet_decode_multi_step(
     num_steps = 8
     B, H, DK, DV = batch, heads, dim_k, dim_v
 
-    op = GatedDeltaNetDecodeOp(B, H, DK, DV, dtype, tune=tune)
+    op = GatedDeltaNetDecodeOp(tune=tune)
     tols = _get_tolerances(dtype)
 
     state_op = torch.zeros(B, H, DK, DV, device="cuda", dtype=dtype)
@@ -229,6 +225,26 @@ def test_gated_deltanet_decode_raw_cuda_dispatch_rejects_unsupported_sm100(
         torch.bfloat16,
         tune=False,
     )
+
+
+@pytest.mark.smoke
+def test_gated_deltanet_decode_rejects_manifest_shape_mismatch() -> None:
+    op = object.__new__(GatedDeltaNetDecodeOp)
+    op.batch = 2
+    op.heads = 3
+    op.dim_k = 4
+    op.dim_v = 5
+    op.dtype = torch.float32
+
+    q = torch.empty(2, 3, 4)
+    k = torch.empty(2, 3, 4)
+    v = torch.empty(2, 3, 5)
+    g = torch.empty(2, 4)
+    beta = torch.empty(2, 3)
+    state = torch.empty(2, 3, 4, 5)
+
+    with pytest.raises(ValueError, match="g must have shape"):
+        op.forward(q, k, v, g, beta, state)
 
 
 if __name__ == "__main__":

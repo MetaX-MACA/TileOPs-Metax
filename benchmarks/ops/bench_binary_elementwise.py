@@ -12,6 +12,11 @@ import torch
 import torch.nn.functional as F
 
 from benchmarks.benchmark_base import BenchmarkBase, BenchmarkReport
+from tileops.kernels.elementwise import (
+    GeluAndMulFwdKernel,
+    GeluTanhAndMulFwdKernel,
+    SiluAndMulFwdKernel,
+)
 from tileops.ops.elementwise import (
     BitwiseAndFwdOp,
     BitwiseOrFwdOp,
@@ -39,13 +44,11 @@ from workloads.workload_base import FixtureBase
 _SHAPES = ((1024, 4096), (1024, 10240), (1024, 11008))
 
 
-# ---------------------------------------------------------------------------
-# Benchmark harness
-# ---------------------------------------------------------------------------
+# Workloads
 
 
 class BinaryBenchCase:
-    """Minimal test harness for binary ops."""
+    """Minimal workload for binary ops."""
 
     def __init__(
         self,
@@ -78,7 +81,7 @@ class BinaryBenchmark(BenchmarkBase[BinaryBenchCase]):
 
 
 class FusedGatedBenchCase:
-    """Minimal test harness for fused gated ops."""
+    """Minimal workload for fused gated ops."""
 
     def __init__(self, M: int, N: int, dtype: torch.dtype):
         self.M = M
@@ -105,9 +108,7 @@ class FusedGatedBenchmark(BenchmarkBase[FusedGatedBenchCase]):
         return t.n_total * 3 * elem
 
 
-# ---------------------------------------------------------------------------
 # Input generators
-# ---------------------------------------------------------------------------
 
 
 def _randn_pair(shape: tuple, dtype: torch.dtype):
@@ -134,9 +135,7 @@ def _bool_pair(shape: tuple, dtype: torch.dtype):
     return a, b
 
 
-# ---------------------------------------------------------------------------
 # Binary arithmetic ops (9)
-# ---------------------------------------------------------------------------
 
 
 class BinaryArithBenchFixture(FixtureBase):
@@ -200,9 +199,7 @@ def test_binary_arith_bench(
     BenchmarkReport.record(op_name, locals(), result_bl, tag="torch")
 
 
-# ---------------------------------------------------------------------------
 # Comparison ops (6)
-# ---------------------------------------------------------------------------
 
 
 class ComparisonBenchFixture(FixtureBase):
@@ -247,9 +244,7 @@ def test_comparison_bench(
     BenchmarkReport.record(f"cmp_{op_name}", locals(), result_bl, tag="torch")
 
 
-# ---------------------------------------------------------------------------
 # Logical ops (2)
-# ---------------------------------------------------------------------------
 
 
 class LogicalBenchFixture(FixtureBase):
@@ -285,9 +280,7 @@ def test_logical_bench(
     BenchmarkReport.record(op_name, locals(), result_bl, tag="torch")
 
 
-# ---------------------------------------------------------------------------
 # Bitwise ops (3)
-# ---------------------------------------------------------------------------
 
 
 class BitwiseBenchFixture(FixtureBase):
@@ -321,9 +314,7 @@ def test_bitwise_bench(
     BenchmarkReport.record(op_name, locals(), result_bl, tag="torch")
 
 
-# ---------------------------------------------------------------------------
 # Fused gated ops (2)
-# ---------------------------------------------------------------------------
 
 
 class FusedGatedBenchFixture(FixtureBase):
@@ -339,6 +330,11 @@ class FusedGatedBenchFixture(FixtureBase):
     ]
 
 
+def _silu_and_mul_baseline(x: torch.Tensor) -> torch.Tensor:
+    half = x.shape[-1] // 2
+    return F.silu(x[..., :half]) * x[..., half:]
+
+
 def _gelu_and_mul_baseline(x: torch.Tensor) -> torch.Tensor:
     half = x.shape[-1] // 2
     return F.gelu(x[..., :half]) * x[..., half:]
@@ -350,6 +346,7 @@ def _gelu_tanh_and_mul_baseline(x: torch.Tensor) -> torch.Tensor:
 
 
 _FUSED_BASELINES = {
+    "silu_and_mul": _silu_and_mul_baseline,
     "gelu_and_mul": _gelu_and_mul_baseline,
     "gelu_tanh_and_mul": _gelu_tanh_and_mul_baseline,
 }
@@ -379,35 +376,35 @@ def test_fused_gated_bench(
     BenchmarkReport.record(op_name, locals(), result_bl, tag="torch-ref")
 
 
-# ---------------------------------------------------------------------------
 # Fused gated strategy benchmark (direct vs explicit_parallel)
-# ---------------------------------------------------------------------------
 
 
 _STRATEGY_SHAPES = [(1024, 4096), (1024, 11008), (4096, 4096)]
 _STRATEGY_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
-_STRATEGY_OPS = [
-    ("silu_and_mul", SiluAndMulFwdOp),
-    ("gelu_and_mul", GeluAndMulFwdOp),
-    ("gelu_tanh_and_mul", GeluTanhAndMulFwdOp),
+_STRATEGY_KERNELS = [
+    ("silu_and_mul", SiluAndMulFwdKernel),
+    ("gelu_and_mul", GeluAndMulFwdKernel),
+    ("gelu_tanh_and_mul", GeluTanhAndMulFwdKernel),
 ]
 
 
 def _strategy_params():
     """3 ops × 3 shapes × 3 dtypes × 2 strategies = 54 rows."""
     params = []
-    for op_name, op_cls in _STRATEGY_OPS:
+    for op_name, kernel_cls in _STRATEGY_KERNELS:
         for M, N in _STRATEGY_SHAPES:
             for dtype in _STRATEGY_DTYPES:
                 for strategy in ("direct", "explicit_parallel"):
                     is_smoke = _STRATEGY_SHAPES[0] == (M, N) and dtype == torch.float16
                     mark = pytest.mark.smoke if is_smoke else pytest.mark.full
-                    params.append(pytest.param(op_name, M, N, dtype, op_cls, strategy, marks=mark))
+                    params.append(
+                        pytest.param(op_name, M, N, dtype, kernel_cls, strategy, marks=mark)
+                    )
     return params
 
 
 class FusedGatedStrategyBenchFixture(FixtureBase):
-    PARAMS = [("op_name, M, N, dtype, op_cls, strategy", _strategy_params())]
+    PARAMS = [("op_name, M, N, dtype, kernel_cls, strategy", _strategy_params())]
 
 
 @FusedGatedStrategyBenchFixture
@@ -416,7 +413,7 @@ def test_fused_gated_strategy_bench(
     M: int,
     N: int,
     dtype: torch.dtype,
-    op_cls,
+    kernel_cls,
     strategy: str,
 ) -> None:
     """Benchmark each fused gated strategy to validate DEFAULT_STRATEGY choice."""
@@ -425,16 +422,16 @@ def test_fused_gated_strategy_bench(
     inputs = test.gen_inputs()
 
     shape = (M, N)
-    op = op_cls(M=M, N=N, dtype=dtype, strategy=strategy)
-    result = bm.profile(op, *inputs)
-    BenchmarkReport.record(
-        f"{op_name}_strategy", locals(), result, tag=f"tileops-{strategy}",
-    )
+    kernel = kernel_cls(M=M, N=N, dtype=dtype, config={"strategy": strategy})
+    result = bm.profile(kernel, *inputs)
+    BenchmarkReport.record(kernel, locals(), result, tag=f"tileops-{strategy}")
+
+    baseline_fn = _FUSED_BASELINES[op_name]
+    result_bl = bm.profile(baseline_fn, *inputs)
+    BenchmarkReport.record(kernel, locals(), result_bl, tag="torch")
 
 
-# ---------------------------------------------------------------------------
 # Broadcast benchmark (bias-add pattern)
-# ---------------------------------------------------------------------------
 
 # DNN bias-add: (tokens, hidden_dim) + (1, hidden_dim). Includes a non-pow2
 # hidden (LLaMA-7B intermediate=11008) to exercise tail handling.
@@ -446,7 +443,7 @@ _BROADCAST_SHAPES = [
 
 
 class BroadcastBenchCase:
-    """Test harness for broadcast binary ops with asymmetric shapes."""
+    """Workload for broadcast binary ops with asymmetric shapes."""
 
     def __init__(
         self,

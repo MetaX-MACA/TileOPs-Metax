@@ -34,7 +34,7 @@ from .attention import (
     NSATopkVarlenKernel,
     SparseMlaKernel,
 )
-from .bmm import BmmKernel
+from .bmm import BmmFp8Kernel, BmmKernel
 from .convolution import (
     Conv1dKernel,
     Conv1dPointwiseKernel,
@@ -46,12 +46,16 @@ from .convolution import (
     GroupConv3dKernel,
 )
 from .deltanet import DeltaNetBwdKernel, DeltaNetFwdKernel
-from .deltanet_recurrence import DeltaNetDecodeFP32Kernel, DeltaNetDecodeKernel
+from .deltanet_recurrence import (
+    DeltaNetDecodeFP32Kernel,
+    DeltaNetDecodeKernel,
+    DeltaNetDecodeRawCudaFlaStyleKernel,
+)
 from .dropout import DropoutKernel
 from .elementwise import BinaryKernel, FusedGatedKernel, UnaryKernel
 from .engram import EngramDecodeKernel, EngramGateConvBwdKernel, EngramGateConvFwdKernel
 from .fft import FFTC2CKernel
-from .fp8_lighting_indexer import FP8LightingIndexerKernel
+from .fp8_lightning_indexer import FP8LightningIndexerKernel
 from .fp8_quant import FP8QuantKernel
 from .gated_deltanet import (
     GatedDeltaNetBwdKernel,
@@ -79,7 +83,20 @@ from .norm import (
     LayerNormKernel,
     RMSNormKernel,
 )
-from .pool import AvgPool1dKernel, AvgPool2dKernel, AvgPool3dKernel
+from .pool import (
+    AvgPool1dKernel,
+    AvgPool1dSpatialKernel,
+    AvgPool2dKernel,
+    AvgPool2dSpatialKernel,
+    AvgPool3dKernel,
+    AvgPool3dSpatialKernel,
+    MaxPool1dKernel,
+    MaxPool1dWithIndicesKernel,
+    MaxPool2dKernel,
+    MaxPool2dWithIndicesKernel,
+    MaxPool3dKernel,
+    MaxPool3dWithIndicesKernel,
+)
 from .rope import (
     RopeLlama31Kernel,
     RopeLongRopeKernel,
@@ -92,12 +109,16 @@ from .topk_selector import TopkSelectorKernel
 
 __all__ = [
     "AvgPool1dKernel",
+    "AvgPool1dSpatialKernel",
     "AvgPool2dKernel",
+    "AvgPool2dSpatialKernel",
     "AvgPool3dKernel",
+    "AvgPool3dSpatialKernel",
     "BatchNormBwdKernel",
     "BatchNormFwdInferKernel",
     "BatchNormFwdTrainKernel",
     "BinaryKernel",
+    "BmmFp8Kernel",
     "BmmKernel",
     "Conv1dKernel",
     "Conv1dPointwiseKernel",
@@ -107,13 +128,14 @@ __all__ = [
     "DeltaNetBwdKernel",
     "DeltaNetDecodeFP32Kernel",
     "DeltaNetDecodeKernel",
+    "DeltaNetDecodeRawCudaFlaStyleKernel",
     "DeltaNetFwdKernel",
     "DropoutKernel",
     "EngramDecodeKernel",
     "EngramGateConvBwdKernel",
     "EngramGateConvFwdKernel",
     "FFTC2CKernel",
-    "FP8LightingIndexerKernel",
+    "FP8LightningIndexerKernel",
     "FP8QuantKernel",
     "FlashAttnBwdPostprocessKernel",
     "FlashAttnBwdPreprocessKernel",
@@ -169,6 +191,12 @@ __all__ = [
     "MHCPreKernel",
     "MLADecodeKernel",
     "MLADecodeWsKernel",
+    "MaxPool1dKernel",
+    "MaxPool1dWithIndicesKernel",
+    "MaxPool2dKernel",
+    "MaxPool2dWithIndicesKernel",
+    "MaxPool3dKernel",
+    "MaxPool3dWithIndicesKernel",
     "MeanPoolingFwdKernel",
     "MoePermuteAlignKernel",
     "NSACmpFwdVarlenKernel",

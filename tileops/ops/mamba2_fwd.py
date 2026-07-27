@@ -25,37 +25,15 @@ Design notes
 * All intermediate tensors remain on-device; no host syncs between sub-ops.
 """
 
-import functools
 from typing import Optional, Tuple
 
 import torch
 
+from .cb_producer import CBProducerOp
 from .da_cumsum import DaCumsumFwdOp
 from .ssd_chunk_scan import SSDChunkScanFwdOp
 from .ssd_chunk_state import SSDChunkStateFwdOp
 from .ssd_state_passing import SSDStatePassingFwdOp
-
-
-@functools.lru_cache(maxsize=32)
-def _get_cb_fn(dtype: torch.dtype):
-    """Return a torch.compile-fused CB-matrix builder.
-
-    Computes the causal C@B coupling matrix for one group:
-      cb[b, c, g, l, s] = C[b, c*Q+l, g, :] @ B[b, c*Q+s, g, :]^T,  for s <= l
-                         = 0                                           for s > l
-
-    This is a lower-triangular batched outer product in state-space dimension N,
-    matching _bmm_chunk_fwd from mamba_ssm. The kernel then multiplies cb by
-    exp(dA[l] - dA[s]) * dt[s] — so cb must not include any decay factor.
-    """
-    def _build_cb(C_g: torch.Tensor, B_g: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        # C_g, B_g: (B, C, G, Q, N)  in storage dtype
-        # mask:     (1, 1, 1, Q, Q)  lower-triangular bool
-        cb = torch.einsum("bcgln,bcgsn->bcgls", C_g.float(), B_g.float())  # (B, C, G, Q, Q)
-        return torch.where(mask, cb, 0.0).to(dtype)
-
-    return torch.compile(_build_cb, fullgraph=True)
-
 
 __all__ = ["Mamba2FwdOp"]
 
@@ -83,58 +61,27 @@ class Mamba2FwdOp:
 
     def __init__(
         self,
-        batch: int,
-        seqlen: int,
-        n_heads: int,
-        d_head: int,
-        d_state: int,
-        n_groups: int,
-        dtype: torch.dtype,
         chunk_size: int = 256,
         dt_softplus: bool = True,
         has_initial_states: bool = False,
         tune: bool = False,
     ):
-        if seqlen % chunk_size != 0:
-            raise ValueError(f"seqlen ({seqlen}) must be divisible by chunk_size ({chunk_size})")
-        if n_heads % n_groups != 0:
-            raise ValueError(f"n_heads ({n_heads}) must be divisible by n_groups ({n_groups})")
-
-        self.batch = batch
-        self.seqlen = seqlen
+        self.batch = None
+        self.seqlen = None
         self.chunk_size = chunk_size
-        self.num_chunks = seqlen // chunk_size
-        self.n_heads = n_heads
-        self.d_head = d_head
-        self.d_state = d_state
-        self.n_groups = n_groups
-        self.dtype = dtype
+        self.num_chunks = None
+        self.n_heads = None
+        self.d_head = None
+        self.d_state = None
+        self.n_groups = None
+        self.dtype = None
         self.dt_softplus = dt_softplus
         self.has_initial_states = has_initial_states
-        self._heads_per_group = n_heads // n_groups
+        self._heads_per_group = None
+        self.tune = tune
 
-        num_chunks = self.num_chunks
-
-        self._da_cumsum_op = DaCumsumFwdOp(
-            batch=batch,
-            num_chunks=num_chunks,
-            chunk_len=chunk_size,
-            n_heads=n_heads,
-            seq_len=seqlen,
-            dt_softplus=dt_softplus,
-            has_dt_bias=True,   # always pass dt_bias; caller passes zeros if unused
-            tune=tune,
-        )
-
+        self._da_cumsum_ops: dict[torch.dtype, DaCumsumFwdOp] = {}
         self._chunk_state_op = SSDChunkStateFwdOp(
-            batch=batch,
-            num_chunks=num_chunks,
-            chunk_len=chunk_size,
-            n_heads=n_heads,
-            d_head=d_head,
-            d_state=d_state,
-            n_groups=n_groups,
-            dtype=dtype,
             has_seq_idx=False,
             tune=tune,
         )
@@ -143,52 +90,53 @@ class Mamba2FwdOp:
         # Flatten P*N into a single state dim so SSDStatePassingFwdOp is used
         # instead of a Python loop, keeping everything on the GPU.
         self._state_passing_op = SSDStatePassingFwdOp(
-            batch=batch,
-            num_chunks=num_chunks,
-            n_heads=n_heads,
-            d_state=d_head * d_state,   # flat state: P*N
-            dtype=torch.float32,
             has_initial_states=has_initial_states,
             tune=tune,
         )
 
-        self._chunk_scan_op = SSDChunkScanFwdOp(
-            batch=batch,
-            num_chunks=num_chunks,
-            chunk_len=chunk_size,
-            n_heads=n_heads,
-            d_head=d_head,
-            d_state=d_state,
-            n_groups=n_groups,
-            dtype=dtype,
-            tune=tune,
-        )
-
-        # Causal mask for CB construction — lower-triangular (Q, Q), broadcast
-        # over (B, C, G, Q, Q).  Allocated once; moved to GPU on first forward.
-        mask = torch.ones(chunk_size, chunk_size, dtype=torch.bool).tril()
-        self._cb_mask_cpu = mask
-        self._cb_fn = _get_cb_fn(dtype)  # compiled fused C@B kernel
+        self._chunk_scan_op = SSDChunkScanFwdOp(tune=tune)
+        self._cb_producer_ops: dict[tuple, CBProducerOp] = {}
 
         # Pre-allocated zero tensors — avoids FillFunctor kernel launches on the
         # hot path for optional inputs that are commonly omitted.
-        # Allocated on CPU here; moved to the right CUDA device on first forward.
-        self._zero_dt_bias_cpu = torch.zeros(n_heads, dtype=torch.float32)
-        self._zero_init_flat_cpu = torch.zeros(
-            batch, n_heads, d_head * d_state, dtype=torch.float32,
-        )
-        # seq_idx placeholder for SSDChunkStateFwdOp (has_seq_idx=False path still
-        # passes the tensor; pre-allocating avoids a FillFunctor<int> each call).
-        self._zero_seq_idx_cpu = torch.zeros(batch, seqlen, dtype=torch.int32)
-
         self._zero_dt_bias: Optional[torch.Tensor]   = None
         self._zero_init_flat: Optional[torch.Tensor] = None
         self._zero_seq_idx: Optional[torch.Tensor]   = None
-        self._cb_mask: Optional[torch.Tensor]        = None
 
-    # ------------------------------------------------------------------
+    def _get_da_cumsum_op(self, dtype: torch.dtype) -> DaCumsumFwdOp:
+        if dtype not in self._da_cumsum_ops:
+            self._da_cumsum_ops[dtype] = DaCumsumFwdOp(
+                chunk_len=self.chunk_size,
+                dtype=dtype,
+                dt_softplus=self.dt_softplus,
+                has_dt_bias=True,
+                tune=self.tune,
+            )
+        return self._da_cumsum_ops[dtype]
+
+    def _get_cb_producer_op(
+        self,
+        batch: int,
+        num_chunks: int,
+        n_groups: int,
+        d_state: int,
+        dtype: torch.dtype,
+        device_index: int | None,
+    ) -> CBProducerOp:
+        key = (batch, num_chunks, n_groups, self.chunk_size, d_state, dtype, device_index, self.tune)
+        if key not in self._cb_producer_ops:
+            self._cb_producer_ops[key] = CBProducerOp(
+                batch=batch,
+                num_chunks=num_chunks,
+                n_groups=n_groups,
+                chunk_len=self.chunk_size,
+                d_state=d_state,
+                dtype=dtype,
+                tune=self.tune,
+            )
+        return self._cb_producer_ops[key]
+
     # Forward
-    # ------------------------------------------------------------------
 
     def forward(
         self,
@@ -223,33 +171,76 @@ class Mamba2FwdOp:
                 "has_initial_states=False — the kernel ignores it, which would "
                 "silently produce wrong results.  Reconstruct with has_initial_states=True."
             )
+        if not x.is_cuda:
+            raise ValueError("x must be a CUDA tensor")
+        if x.ndim != 4:
+            raise ValueError("x must have shape [batch, seqlen, n_heads, d_head]")
         batch, seqlen, n_heads, d_head = x.shape
-        chunk_size   = self.chunk_size
-        num_chunks   = seqlen // chunk_size
-        d_state      = self.d_state
-        dev          = x.device
+        chunk_size = self.chunk_size
+        if seqlen % chunk_size != 0:
+            raise ValueError(f"seqlen ({seqlen}) must be divisible by chunk_size ({chunk_size})")
+        num_chunks = seqlen // chunk_size
+        if B.ndim != 4 or B.shape[0] != batch or B.shape[1] != seqlen:
+            raise ValueError("B must have shape [batch, seqlen, n_groups, d_state]")
+        n_groups, d_state = B.shape[2], B.shape[3]
+        if n_heads % n_groups != 0:
+            raise ValueError(f"n_heads ({n_heads}) must be divisible by n_groups ({n_groups})")
+        if C.shape != (batch, seqlen, n_groups, d_state):
+            raise ValueError("C must have shape [batch, seqlen, n_groups, d_state]")
+        if dt.shape != (batch, seqlen, n_heads):
+            raise ValueError("dt must have shape [batch, seqlen, n_heads]")
+        if A.shape != (n_heads,):
+            raise ValueError("A must have shape [n_heads]")
+        if dt_bias is not None and dt_bias.shape != (n_heads,):
+            raise ValueError("dt_bias must have shape [n_heads]")
+        if initial_states is not None and initial_states.shape != (batch, n_heads, d_head, d_state):
+            raise ValueError("initial_states must have shape [batch, n_heads, d_head, d_state]")
+        if B.dtype != x.dtype:
+            raise ValueError(f"B.dtype must be {x.dtype}, got {B.dtype}")
+        if C.dtype != x.dtype:
+            raise ValueError(f"C.dtype must be {x.dtype}, got {C.dtype}")
+        dev = x.device
 
-        # Ensure pre-allocated tensors live on the right device.
-        if self._zero_dt_bias is None or self._zero_dt_bias.device != dev:
-            self._zero_dt_bias    = self._zero_dt_bias_cpu.to(dev)
-            self._zero_init_flat  = self._zero_init_flat_cpu.to(dev)
-            self._zero_seq_idx    = self._zero_seq_idx_cpu.to(dev)
-            self._cb_mask         = self._cb_mask_cpu.to(dev).view(1, 1, 1, chunk_size, chunk_size)
+        self.batch = batch
+        self.seqlen = seqlen
+        self.num_chunks = num_chunks
+        self.n_heads = n_heads
+        self.d_head = d_head
+        self.d_state = d_state
+        self.n_groups = n_groups
+        self.dtype = x.dtype
+        self._heads_per_group = n_heads // n_groups
+
+        if self._zero_dt_bias is None or self._zero_dt_bias.shape != (n_heads,) or self._zero_dt_bias.device != dev:
+            self._zero_dt_bias = torch.zeros(n_heads, dtype=torch.float32, device=dev)
+        init_shape = (batch, n_heads, d_head * d_state)
+        if (
+            self._zero_init_flat is None
+            or self._zero_init_flat.shape != init_shape
+            or self._zero_init_flat.device != dev
+        ):
+            self._zero_init_flat = torch.zeros(init_shape, dtype=torch.float32, device=dev)
+        seq_idx_shape = (batch, seqlen)
+        if (
+            self._zero_seq_idx is None
+            or self._zero_seq_idx.shape != seq_idx_shape
+            or self._zero_seq_idx.device != dev
+        ):
+            self._zero_seq_idx = torch.zeros(seq_idx_shape, dtype=torch.int32, device=dev)
         # ── 1. DaCumsum ──────────────────────────────────────────────────────
         if dt_bias is None:
             dt_bias = self._zero_dt_bias
 
-        dt_out, dA_cumsum = self._da_cumsum_op.forward(dt, A, dt_bias)
-        # dt_out:    (B, H, C, Q)  float32
+        dt_out, dA_cumsum = self._get_da_cumsum_op(x.dtype).forward(dt, A, dt_bias)
+        # dt_out:    (B, H, C, Q)  dtype
         # dA_cumsum: (B, H, C, Q)  float32
 
         # ── 2. CB matrix ─────────────────────────────────────────────────────
         # cb[b,c,g,l,s] = C[b,c*Q+l,g,:] @ B[b,c*Q+s,g,:]^T  for s <= l, else 0.
-        # Reshape seqlen-fused B/C into (B, C, G, Q, N) for the batched matmul.
-        n_groups  = self.n_groups
-        C_chunked = C.reshape(batch, num_chunks, chunk_size, n_groups, d_state).permute(0, 1, 3, 2, 4)  # (B, C, G, Q, N)
-        B_chunked = B.reshape(batch, num_chunks, chunk_size, n_groups, d_state).permute(0, 1, 3, 2, 4)  # (B, C, G, Q, N)
-        cb = self._cb_fn(C_chunked, B_chunked, self._cb_mask)  # (B, C, G, Q, Q)  dtype
+        # Pass contiguous C and B directly to avoid reshape/permute/contiguous overhead
+        cb_producer_op = self._get_cb_producer_op(
+            batch, num_chunks, n_groups, d_state, x.dtype, x.device.index)
+        cb = cb_producer_op.forward(C, B)  # (B, C, G, Q, Q)  dtype (direct output, no cast needed)
 
         # ── 3. SSDChunkState ─────────────────────────────────────────────────
         # Pass pre-allocated seq_idx zeros; avoids a FillFunctor<int> per call.
@@ -260,8 +251,9 @@ class Mamba2FwdOp:
 
         # ── 4. SSDStatePassing ───────────────────────────────────────────────
         chunk_states_flat = chunk_states.reshape(batch, num_chunks, n_heads, d_head * d_state)
-        # Standard slice + clone: contiguous tensor, portable across all PyTorch versions.
-        dA_chunk_cumsum = dA_cumsum[..., chunk_size - 1].clone()  # (B, H, C)
+        # Extract last dA value per chunk - use contiguous() to ensure a contiguous layout
+        # Note: since this is a slice of a 4D tensor, it is non-contiguous and will always copy
+        dA_chunk_cumsum = dA_cumsum[..., chunk_size - 1].contiguous()  # (B, H, C)
 
         if initial_states is None:
             init_flat = self._zero_init_flat
@@ -274,10 +266,10 @@ class Mamba2FwdOp:
 
         # Unflatten to (B, C, H, P, N) in float32 (accum_dtype) for chunk_scan.
         prev_states  = prev_states_flat.reshape(batch, num_chunks, n_heads, d_head, d_state)
-        dt_out_typed = dt_out.to(self.dtype)
+        # dt_out is now in dtype (no cast needed) - DaCumsum outputs typed dt directly
 
         # ── 5. SSDChunkScan ──────────────────────────────────────────────────
-        y = self._chunk_scan_op.forward(x, cb, dA_cumsum, C, prev_states, dt_out_typed)
+        y = self._chunk_scan_op.forward(x, cb, dA_cumsum, C, prev_states, dt_out)
         # y: (B, S, H, P)  float32
 
         if return_final_states:

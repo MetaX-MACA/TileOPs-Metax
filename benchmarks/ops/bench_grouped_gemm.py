@@ -100,9 +100,7 @@ class GroupedGemmBenchmark(BenchmarkBase[GroupedGemmTest]):
         return memory_A + memory_B + memory_C
 
 
-# ---------------------------------------------------------------------------
 # Complete (GroupedGemmFunc) benchmark
-# ---------------------------------------------------------------------------
 
 class GroupedGemmCompleteBenchmark(BenchmarkBase[GroupedGemmCompleteTest]):
 
@@ -122,9 +120,7 @@ class GroupedGemmCompleteBenchmark(BenchmarkBase[GroupedGemmCompleteTest]):
         return (mem_nt + mem_nn + mem_tn) * t.dtype.itemsize
 
 
-# ---------------------------------------------------------------------------
 # Helper for individual variant benchmarks
-# ---------------------------------------------------------------------------
 
 def _run_variant_bench(name: str, batch_sum: int, batch_count: int, N: int, K: int,
                        dtype: torch.dtype, transpose_a: bool, transpose_b: bool,
@@ -134,8 +130,7 @@ def _run_variant_bench(name: str, batch_sum: int, batch_count: int, N: int, K: i
     bm = GroupedGemmBenchmark(test)
     inputs = test.gen_inputs()
 
-    op = GroupedGemmOp(batch_sum, batch_count, N, K, dtype,
-                       transpose_a=transpose_a, transpose_b=transpose_b, tune=tune)
+    op = GroupedGemmOp(transpose_a=transpose_a, transpose_b=transpose_b, tune=tune)
     result = bm.profile(op, *inputs)
     BenchmarkReport.record(name, locals(), result, tag="tileops")
 
@@ -143,9 +138,7 @@ def _run_variant_bench(name: str, batch_sum: int, batch_count: int, N: int, K: i
     BenchmarkReport.record(name, locals(), result_bl, tag="torch-ref")
 
 
-# ---------------------------------------------------------------------------
 # Test functions
-# ---------------------------------------------------------------------------
 
 _GROUPED_GEMM_BENCH_PARAMS = [
     pytest.param(16384, 4, 4864, 4096, torch.float16, False, True, True, id="nt-fp16"),
@@ -208,8 +201,7 @@ def test_grouped_gemm_complete_bench(batch_sum: int, batch_count: int, N: int, K
         variant_test = _GroupedGemmTestBaseline(batch_sum, batch_count, N, K, dtype,
                                        transpose_a, transpose_b)
         inputs = variant_test.gen_inputs()
-        op = GroupedGemmOp(batch_sum, batch_count, N, K, dtype,
-                           transpose_a=transpose_a, transpose_b=transpose_b, tune=tune)
+        op = GroupedGemmOp(transpose_a=transpose_a, transpose_b=transpose_b, tune=tune)
         tileops_results.append(bm.profile(op, *inputs))
         baseline_results.append(bm.profile(variant_test.ref_program, *inputs))
 

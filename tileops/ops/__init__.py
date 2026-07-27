@@ -19,7 +19,7 @@ from .attention import (
     NSAFwdVarlenOp,
     NSATopkVarlenOp,
 )
-from .bmm import BmmFwdOp
+from .bmm import BmmFp8Op, BmmFwdOp
 from .convolution import (
     Conv1dBiasFwdOp,
     Conv1dFwdOp,
@@ -34,7 +34,7 @@ from .deltanet_recurrence import DeltaNetDecodeOp
 from .dropout import DropoutOp
 from .elementwise import BinaryOp, FusedGatedOp, UnaryOp
 from .fft import FFTC2COp
-from .fp8_lighting_indexer import FP8LightingIndexerOp
+from .fp8_lightning_indexer import FP8LightningIndexerOp
 from .fp8_quant import FP8QuantOp
 from .gated_deltanet import (
     GatedDeltaNetBwdOp,
@@ -63,7 +63,17 @@ from .norm import (
     RMSNormFwdOp,
 )
 from .op_base import Op
-from .pool import AvgPool1dFwdOp, AvgPool2dFwdOp, AvgPool3dFwdOp
+from .pool import (
+    AvgPool1dFwdOp,
+    AvgPool2dFwdOp,
+    AvgPool3dFwdOp,
+    MaxPool1dFwdOp,
+    MaxPool1dIndicesFwdOp,
+    MaxPool2dFwdOp,
+    MaxPool2dIndicesFwdOp,
+    MaxPool3dFwdOp,
+    MaxPool3dIndicesFwdOp,
+)
 
 # --- Reduction ops (uncomment as sub-category PRs land) ---
 from .reduction import (
@@ -114,6 +124,7 @@ __all__ = [
     "AdaLayerNormZeroFwdOp",
     "BatchNormBwdOp",
     "BatchNormFwdOp",
+    "BmmFp8Op",
     "BmmFwdOp",
     "Conv1dBiasFwdOp",
     "Conv1dFwdOp",
@@ -125,7 +136,7 @@ __all__ = [
     "DeepSeekSparseAttentionDecodeWithKVCacheFwdOp",
     "DropoutOp",
     "FFTC2COp",
-    "FP8LightingIndexerOp",
+    "FP8LightningIndexerOp",
     "FP8QuantOp",
     "FusedAddLayerNormFwdOp",
     "FusedAddRMSNormFwdOp",
@@ -159,6 +170,12 @@ __all__ = [
     "LayerNormFwdOp",
     "MHCPostOp",
     "MHCPreOp",
+    "MaxPool1dFwdOp",
+    "MaxPool1dIndicesFwdOp",
+    "MaxPool2dFwdOp",
+    "MaxPool2dIndicesFwdOp",
+    "MaxPool3dFwdOp",
+    "MaxPool3dIndicesFwdOp",
     "MeanPoolingForwardOp",
     "MultiHeadAttentionBwdOp",
     "MultiHeadAttentionDecodePagedWithKVCacheFwdOp",

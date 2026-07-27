@@ -20,7 +20,7 @@ import torch
 
 from benchmarks.benchmark_base import BenchmarkBase, BenchmarkReport
 from tileops.ops import DeltaNetBwdOp, DeltaNetFwdOp, DeltaNetOp
-from workloads.deltanet import DeltaNetFwdTest
+from workloads.linear_attention import DeltaNetFwdTest
 from workloads.workload_base import FixtureBase
 
 
@@ -168,9 +168,7 @@ def _to_fla_layout(q, k, v, beta):
     )
 
 
-# =============================================================================
 # Forward benchmark
-# =============================================================================
 
 class DeltaNetFwdBenchmark(BenchmarkBase[DeltaNetFwdTest]):
 
@@ -221,7 +219,7 @@ def test_deltanet_vs_fla_fwd(
     inputs = test.gen_inputs()  # q, k, v, beta (BHSD)
 
     # --- TileOPs (BHSD) ---
-    op = DeltaNetFwdOp(batch, heads, seq_len, dim_k, dim_v, chunk_size, dtype, tune=tune)
+    op = DeltaNetFwdOp(chunk_size=chunk_size, tune=tune)
     result = bm.profile(op, *inputs)
     BenchmarkReport.record(op, locals(), result, tag="tileops")
 
@@ -242,9 +240,7 @@ def test_deltanet_vs_fla_fwd(
         BenchmarkReport.record(op, locals(), result_bl, tag="torch")
 
 
-# =============================================================================
 # Backward benchmark
-# =============================================================================
 
 class DeltaNetBwdBenchmark(BenchmarkBase[DeltaNetFwdTest]):
 
@@ -299,10 +295,10 @@ def test_deltanet_vs_fla_bwd(
     do = torch.randn(B, H, S, DV, device="cuda", dtype=dtype) * 0.1
 
     # --- TileOPs: fwd to get S, Aw, Au, w, u; then profile bwd only ---
-    fwd_op = DeltaNetFwdOp(B, H, S, DK, DV, BC, dtype)
+    fwd_op = DeltaNetFwdOp(chunk_size=BC)
     _o, S_fwd, Aw, Au, w_fwd, u_fwd = fwd_op.forward(q, k, v, beta)
 
-    bwd_op = DeltaNetBwdOp(B, H, S, DK, DV, BC, dtype, tune=tune)
+    bwd_op = DeltaNetBwdOp(chunk_size=BC, tune=tune)
     result = bm.profile(bwd_op.forward, do, q, k, v, beta, S_fwd, Aw, Au, w_fwd, u_fwd)
     BenchmarkReport.record(bwd_op, locals(), result, tag="tileops")
 
@@ -335,9 +331,7 @@ def test_deltanet_vs_fla_bwd(
         BenchmarkReport.record(bwd_op, locals(), result_bl, tag="torch")
 
 
-# =============================================================================
 # Combined fwd+bwd benchmark (fair comparison: both measure fwd+bwd total)
-# =============================================================================
 
 class DeltaNetFwdBwdBenchmark(BenchmarkBase[DeltaNetFwdTest]):
 
@@ -387,7 +381,7 @@ def test_deltanet_vs_fla_fwdbwd(
     B, H, S, DK, DV, BC = batch, heads, seq_len, dim_k, dim_v, chunk_size
 
     # --- TileOPs: combined fwd+bwd via DeltaNetOp ---
-    op = DeltaNetOp(B, H, S, DK, DV, BC, dtype, tune=tune)
+    op = DeltaNetOp(chunk_size=BC, tune=tune)
 
     q = (torch.randn(B, H, S, DK, device="cuda", dtype=dtype) * 0.1).detach().requires_grad_(True)
     k = (torch.randn(B, H, S, DK, device="cuda", dtype=dtype) * 0.1).detach().requires_grad_(True)

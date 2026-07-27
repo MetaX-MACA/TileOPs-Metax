@@ -28,9 +28,7 @@ __all__ = ["GatedDeltaNetFwdKernel"]
 _LOG2E = 1.4426950408889634
 
 
-# =============================================================================
 # Split kernel: h_recurrence  (sequential over chunks, state update only)
-# =============================================================================
 
 
 @functools.lru_cache(maxsize=32)
@@ -142,9 +140,7 @@ def _h_recurrence_tl(
     return _func
 
 
-# =============================================================================
 # Split kernel: output_o  (fully parallel over chunks)
-# =============================================================================
 
 @functools.lru_cache(maxsize=32)
 def _output_o_tl(

@@ -13,10 +13,10 @@ import torch
 
 from tests.test_base import FixtureBase, TestBase
 from tileops.ops.norm.batch_norm import BatchNormBwdOp, BatchNormFwdOp
-from workloads.batch_norm import (
+from workloads.normalization import (
     BatchNormBwdTest as _BatchNormBwdTestWorkload,
 )
-from workloads.batch_norm import (
+from workloads.normalization import (
     BatchNormFwdTest as _BatchNormFwdTestWorkload,
 )
 
@@ -52,9 +52,7 @@ class BatchNormFwdTest(_BatchNormFwdTestWorkload, TestBase):
         return (y,)
 
 
-# ---------------------------------------------------------------------------
 # Fixtures
-# ---------------------------------------------------------------------------
 
 class BatchNormFwdFixture(FixtureBase):
     """(N, C, *spatial, dtype, training)"""
@@ -76,6 +74,8 @@ class BatchNormFwdFixture(FixtureBase):
             # Non-aligned spatial: H*W=900, exercises partial-tile path
             pytest.param(8, 64, (30, 30), torch.float16, True, marks=pytest.mark.full),
             pytest.param(8, 64, (30, 30), torch.bfloat16, True, marks=pytest.mark.full),
+            # High channel count oversubscribes the SMs, exposing the running-stat update race.
+            pytest.param(16, 1024, (512,), torch.float16, True, marks=pytest.mark.full),
         ]),
     ]
 
@@ -97,14 +97,10 @@ class BatchNormBwdFixture(FixtureBase):
     ]
 
 
-# ---------------------------------------------------------------------------
 # Test helpers
-# ---------------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
 # Test functions
-# ---------------------------------------------------------------------------
 
 @BatchNormFwdFixture
 def test_batch_norm_fwd(N, C, spatial, dtype, training):
@@ -115,7 +111,7 @@ def test_batch_norm_fwd(N, C, spatial, dtype, training):
     running_mean_ref = running_mean.clone()
     running_var_ref = running_var.clone()
 
-    op = BatchNormFwdOp(N, C, tuple(spatial), dtype=dtype, training=training)
+    op = BatchNormFwdOp(training=training)
     # Manifest input order: (x, running_mean, running_var, weight, bias).
     y = op(x, running_mean, running_var, weight, bias)
 
@@ -129,6 +125,13 @@ def test_batch_norm_fwd(N, C, spatial, dtype, training):
         f"fwd mismatch (training={training}): max_err={max_err:.4e}"
 
     if training:
+        # allclose is masked when running_mean starts near the batch mean; check determinism.
+        rm2, rv2 = running_mean_ref.clone(), running_var_ref.clone()
+        op(x, rm2, rv2, weight, bias)
+        det_err = (running_mean.float() - rm2.float()).abs().max()
+        assert torch.equal(running_mean, rm2) and torch.equal(running_var, rv2), \
+            f"running stats non-deterministic across runs: max_err={det_err:.4e}"
+
         rm_err = (running_mean.float() - ref_rm.float()).abs().max()
         assert torch.allclose(running_mean.float(), ref_rm.float(), atol=atol, rtol=rtol), \
             f"running_mean mismatch: max_err={rm_err:.4e}"
@@ -136,7 +139,6 @@ def test_batch_norm_fwd(N, C, spatial, dtype, training):
         assert torch.allclose(running_var.float(), ref_rv.float(), atol=atol, rtol=rtol), \
             f"running_var mismatch: max_err={rv_err:.4e}"
 
-    print(f"test_batch_norm_fwd passed [training={training}]: max_err={max_err:.4e}")
 
 
 @BatchNormBwdFixture
@@ -144,7 +146,7 @@ def test_batch_norm_bwd(N, C, spatial, dtype):
     test = BatchNormBwdTest(N, C, spatial, dtype)
     grad_out, x, weight, mean, rstd = test.gen_inputs()
 
-    op = BatchNormBwdOp(N, C, *spatial, dtype=dtype)
+    op = BatchNormBwdOp()
     grad_x, grad_weight, grad_bias = op(grad_out, x, weight, mean, rstd)
 
     ref_gx, ref_gw, ref_gb = test.ref_program(grad_out, x, weight, mean, rstd)
@@ -159,7 +161,6 @@ def test_batch_norm_bwd(N, C, spatial, dtype):
         max_err = (got - ref).abs().max()
         assert torch.allclose(got, ref, atol=atol, rtol=rtol), \
             f"bwd {name} mismatch: max_err={max_err:.4e}"
-    print("test_batch_norm_bwd passed: grad_x/weight/bias all match")
 
 
 @pytest.mark.smoke
@@ -171,7 +172,7 @@ def test_batch_norm_fwd_returns_single_tensor() -> None:
         pytest.skip("CUDA required for forward call")
 
     N, C, H, W = 4, 8, 4, 4
-    op = BatchNormFwdOp(N, C, (H, W), dtype=torch.float16, training=False)
+    op = BatchNormFwdOp(training=False)
     x = torch.randn(N, C, H, W, device="cuda", dtype=torch.float16)
     weight = torch.randn(C, device="cuda", dtype=torch.float32)
     bias = torch.randn(C, device="cuda", dtype=torch.float32)

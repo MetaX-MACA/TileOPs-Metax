@@ -209,7 +209,7 @@ def _(
 
 
 class NSACmpFwdVarlenKernel(Kernel):
-    supported_archs: list[int] = [80]
+    supported_archs: list[int] = [80, 89]
 
     def __init__(self,
                  seq_num: int,

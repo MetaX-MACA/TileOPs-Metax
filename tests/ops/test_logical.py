@@ -11,9 +11,7 @@ import torch
 from tests.test_base import FixtureBase, TestBase, exact_compare
 from tileops.ops.elementwise import LogicalAndFwdOp, LogicalNotFwdOp, LogicalOrFwdOp
 
-# ---------------------------------------------------------------------------
 # Shared helpers
-# ---------------------------------------------------------------------------
 
 
 def _bool_compare(output: torch.Tensor, output_ref: torch.Tensor) -> None:
@@ -43,9 +41,7 @@ class LogicalTest(TestBase):
         return self.ref_fn(a.bool(), b.bool())
 
 
-# ---------------------------------------------------------------------------
 # LogicalAnd op
-# ---------------------------------------------------------------------------
 
 
 class LogicalAndFixture(FixtureBase):
@@ -66,9 +62,7 @@ def test_logical_and_op(n_total: int, dtype: torch.dtype) -> None:
     test.check(op, *test.gen_inputs(), compare=_bool_compare)
 
 
-# ---------------------------------------------------------------------------
 # LogicalOr op
-# ---------------------------------------------------------------------------
 
 
 class LogicalOrFixture(FixtureBase):
@@ -89,9 +83,7 @@ def test_logical_or_op(n_total: int, dtype: torch.dtype) -> None:
     test.check(op, *test.gen_inputs(), compare=_bool_compare)
 
 
-# ---------------------------------------------------------------------------
 # Broadcast pattern tests for binary logical ops (L3)
-# ---------------------------------------------------------------------------
 
 _BROADCAST_PATTERNS = [
     ((2, 64, 128), (1, 1, 128)),   # bias-add
@@ -131,9 +123,21 @@ def test_logical_broadcast(
     _bool_compare(out, ref)
 
 
-# ---------------------------------------------------------------------------
+@pytest.mark.smoke
+def test_logical_and_bool_broadcast() -> None:
+    """Bool-input binary broadcast path uses uint8 storage internally."""
+    a_shape = (2, 512, 768)
+    b_shape = (1, 1, 768)
+    a = torch.randint(0, 2, a_shape, device="cuda").to(torch.bool)
+    b = torch.randint(0, 2, b_shape, device="cuda").to(torch.bool)
+    op = LogicalAndFwdOp(a_shape=a_shape, b_shape=b_shape, dtype=torch.bool)
+    ref = torch.logical_and(a, b)
+    with torch.no_grad():
+        out = op(a, b)
+    _bool_compare(out, ref)
+
+
 # LogicalNot op
-# ---------------------------------------------------------------------------
 
 
 class LogicalFixture(FixtureBase):
@@ -155,7 +159,7 @@ class LogicalFixture(FixtureBase):
 
 
 class LogicalNotTest(TestBase):
-    """Test harness for logical_not."""
+    """Test fixture for logical_not."""
 
     def __init__(self, n_total: int, dtype: torch.dtype):
         self.n_total = n_total
@@ -188,14 +192,12 @@ def test_logical_not(n_total: int, dtype: torch.dtype) -> None:
     test.check(op, *test.gen_inputs(), compare=exact_compare)
 
 
-# ---------------------------------------------------------------------------
 # Per-dtype correctness across the manifest dtype union for binary logical
 # ops. The manifest declares
 # ``bool | uint8 | int8 | int16 | int32 | int64 | float16 | bfloat16 | float32``
 # for both LogicalAndFwdOp and LogicalOrFwdOp; the float path is covered
 # above. The int / bool cells exercise the kernel's non-zero truthiness
 # path on every manifest-declared integral dtype.
-# ---------------------------------------------------------------------------
 
 _INT_DTYPES = [torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64]
 _LOGICAL_OP_CASES = [
