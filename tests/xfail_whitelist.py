@@ -1,6 +1,7 @@
 """Exact-node allowlist for known failures on MetaX MACA."""
 
 _UNSUPPORTED_ARCHITECTURE = "kernel is not supported on the current MACA architecture"
+_COMPILATION_FAILURE = "known MACA xcore1000 compilation failure"
 _NUMERICAL_MISMATCH = "known MACA numerical mismatch"
 _RUNTIME_LAUNCH_ERROR = "known MACA runtime launch error"
 _NON_INJECTIVE_LAYOUT = "TileLang rejects the generated loop layout as non-injective"
@@ -34,6 +35,22 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "tests/ops/test_bmm.py::test_bmm_fp8_nk_view_when_k_eq_n",
             "tests/ops/test_bmm.py::test_bmm_fp8_contiguous_nk_square_when_k_eq_n",
             "tests/ops/test_bmm.py::test_bmm_fp8_persistent_default_tile_boundary",
+        ),
+    ),
+    (
+        _COMPILATION_FAILURE,
+        (
+            "tests/ops/test_deltanet_chunkwise_bwd.py::test_deltanet_bwd[2-64-2-64-64-32-dtype0-False]",
+            "tests/ops/test_deltanet_chunkwise_bwd.py::test_deltanet_bwd[2-64-2-64-64-32-dtype1-False]",
+            "tests/ops/test_deltanet_chunkwise_bwd.py::test_deltanet_bwd[2-64-2-64-64-32-dtype2-False]",
+            "tests/ops/test_deltanet_fwd.py::test_deltanet_fwd[2-64-2-64-64-32-dtype0-False]",
+            "tests/ops/test_deltanet_fwd.py::test_deltanet_fwd[2-64-2-64-64-32-dtype1-False]",
+            "tests/ops/test_deltanet_fwd.py::test_deltanet_fwd[2-64-2-64-64-32-dtype2-False]",
+            "tests/ops/test_gated_deltanet_fwd.py::test_gated_deltanet_fwd[2-64-2-64-64-32-dtype0-False]",
+            "tests/ops/test_gated_deltanet_fwd.py::test_gated_deltanet_fwd[2-64-2-64-64-32-dtype1-False]",
+            "tests/ops/test_gated_deltanet_fwd.py::test_gated_deltanet_fwd[2-64-2-64-64-32-dtype2-False]",
+            "tests/ops/test_gated_deltanet_prefill.py::test_gated_deltanet_prefill_fwd[1-64-2-64-64-32-dtype0-False]",
+            "tests/ops/test_gla_chunkwise_fwd.py::test_gla_fwd[2-64-2-64-64-64-dtype0-False]",
         ),
     ),
     (
