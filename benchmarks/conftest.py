@@ -4,6 +4,8 @@ import pytest
 import torch
 
 from benchmarks.benchmark_base import BenchmarkReport, _bench_results
+from benchmarks.xfail_whitelist import MACA_XFAILS
+from tileops.utils import is_maca
 
 # Skip NSA benchmarks until the underlying op failures are resolved.
 collect_ignore_glob = [
@@ -31,6 +33,18 @@ def _release_cuda_cache_after_case() -> None:
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def _apply_maca_xfails(items: list[pytest.Item]) -> None:
+    """Mark exact-node known failures on MACA benchmark runs."""
+    if not is_maca():
+        return
+
+    for item in items:
+        nodeid = _normalized_benchmark_nodeid(item)
+        reason = MACA_XFAILS.get(nodeid)
+        if reason is not None:
+            item.add_marker(pytest.mark.xfail(reason=f"MACA: {reason}", strict=True))
 
 
 @pytest.fixture(autouse=True)
@@ -66,6 +80,8 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             and _is_fp8_e4m3_benchmark(item)
         ):
             item.add_marker(fp8_e4m3_skip)
+
+    _apply_maca_xfails(items)
 
 
 @pytest.hookimpl(hookwrapper=True)

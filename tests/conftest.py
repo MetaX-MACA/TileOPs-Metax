@@ -4,6 +4,8 @@ import pytest
 import torch
 
 from tests.test_base import _check_result
+from tests.xfail_whitelist import MACA_XFAILS
+from tileops.utils import is_maca
 
 
 def _under_repo_tests(item: pytest.Item) -> bool:
@@ -104,6 +106,17 @@ def _without_dtype(params: dict) -> tuple[tuple[str, object], ...]:
     return tuple(
         sorted((key, _freeze_value(value)) for key, value in params.items() if key != "dtype")
     )
+
+
+def _apply_maca_xfails(items: list[pytest.Item]) -> None:
+    """Mark exact-node known failures without weakening source-level tier checks."""
+    if not is_maca():
+        return
+
+    for item in items:
+        reason = MACA_XFAILS.get(item.nodeid)
+        if reason is not None:
+            item.add_marker(pytest.mark.xfail(reason=f"MACA: {reason}", strict=True))
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
@@ -246,6 +259,8 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         raise pytest.UsageError(
             "Invalid explicit test tier assignments detected:\n" + "\n".join(tier_errors)
         )
+
+    _apply_maca_xfails(items)
 
 
 @pytest.hookimpl(hookwrapper=True)
