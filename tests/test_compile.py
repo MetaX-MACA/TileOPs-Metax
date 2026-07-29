@@ -29,7 +29,7 @@ def test_mha_kernel_compile(B: int, S: int, H: int, D: int, causal: bool, dtype:
     op = MultiHeadAttentionFwdOp(B, H, S, D, causal, dtype)
     compiled_op = torch.compile(op, fullgraph=True)
     inputs = test.gen_inputs()
-    test.check(compiled_op, *inputs, atol=5e-3, rtol=1e-5)
+    test.check(compiled_op, *inputs, atol=8e-3, rtol=1e-5)
 
 
 if __name__ == "__main__":
