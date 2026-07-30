@@ -56,7 +56,6 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         _NUMERICAL_MISMATCH,
         (
-            "tests/ops/attention/test_gqa.py::test_gqa_bwd[4-2048-64-4-128-False-dtype3-False]",
             "tests/ops/test_convolution.py::test_conv1d[full-padding-valid-fp16]",
             "tests/ops/test_convolution.py::test_conv1d_same_padding_even_kernel_matches_torch[bias]",
             "tests/ops/test_fused_moe_experts.py::TestFusedMoEExpertsNopadPersistent3WGFwdOp::test_forward_matches_torch_ref_activation[float16-gelu_and_mul]",
