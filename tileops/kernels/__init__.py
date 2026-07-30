@@ -59,6 +59,7 @@ from .fp8_lightning_indexer import FP8LightningIndexerKernel
 from .fp8_quant import FP8QuantKernel
 from .gated_deltanet import (
     GatedDeltaNetBwdKernel,
+    GatedDeltaNetBwdMACAKernel,
     GatedDeltaNetFwdKernel,
     GatedDeltaNetPrefillFwdKernel,
 )
@@ -164,6 +165,7 @@ __all__ = [
     "GQASlidingWindowVarlenFwdKernel",
     "GQASlidingWindowVarlenFwdWgmmaPipelinedKernel",
     "GatedDeltaNetBwdKernel",
+    "GatedDeltaNetBwdMACAKernel",
     "GatedDeltaNetDecodeFP32Kernel",
     "GatedDeltaNetDecodeKernel",
     "GatedDeltaNetDecodeRawCudaFlaStyleKernel",
