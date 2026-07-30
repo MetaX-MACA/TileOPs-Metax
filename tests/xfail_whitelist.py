@@ -84,7 +84,6 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         _CI_EXPECTATION_MISMATCH,
         (
-            "tests/test_reclaim_action.py::test_security_policy_routes_trust_by_collaborator_permission",
         ),
     ),
     (
