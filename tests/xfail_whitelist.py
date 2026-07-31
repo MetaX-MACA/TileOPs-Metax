@@ -18,7 +18,6 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         _UNSUPPORTED_ARCHITECTURE,
         (
-            "tests/ops/attention/test_deepseek_dsa_decode.py::test_sparse_mla_decode[1-128-1024-2048-512-64-2048-1-1-1024-None-dtype0-False]",
             "tests/ops/attention/test_deepseek_dsa_decode.py::test_sparse_mla_decode[full-fp16-tuned]",
             "tests/ops/test_bmm.py::test_bmm_fp8[smoke-fp8-b4-per-tensor]",
             "tests/ops/test_bmm.py::test_bmm_fp8[full-fp8-b8-per-tensor]",
@@ -59,7 +58,6 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "tests/ops/test_convolution.py::test_conv1d[full-padding-valid-fp16]",
             "tests/ops/test_convolution.py::test_conv1d_same_padding_even_kernel_matches_torch[bias]",
             "tests/ops/test_fused_moe_experts.py::TestFusedMoEExpertsNopadPersistent3WGFwdOp::test_forward_matches_torch_ref_activation[float16-gelu_and_mul]",
-            "tests/ops/test_grouped_gemm.py::test_grouped_gemm[16384-4-4864-4096-dtype0-False-True-False]",
             "tests/ops/test_grouped_gemm.py::test_grouped_gemm[16384-4-4864-4096-dtype1-False-False-False]",
             "tests/ops/test_grouped_gemm.py::test_grouped_gemm[16384-4-4864-4096-dtype3-True-True-False]",
             "tests/ops/test_mamba.py::test_da_cumsum_fwd[2-4-128-16-True-True-dtype6-False]",
