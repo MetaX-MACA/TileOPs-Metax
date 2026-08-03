@@ -18,11 +18,6 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         (
             "benchmarks/ops/attention/bench_deepseek_dsa_decode.py::test_dsa_decode_bench[single-batch-mainstream-float16]",
             "benchmarks/ops/attention/bench_deepseek_dsa_decode.py::test_dsa_decode_bench[longer-kv-lower-topk-float16]",
-            "benchmarks/ops/bench_bmm.py::test_bmm_fp8_bench[square-b4-1k-per-tensor-float8_e4m3fn]",
-            "benchmarks/ops/bench_bmm.py::test_bmm_fp8_bench[square-b8-2k-per-tensor-float8_e4m3fn]",
-            "benchmarks/ops/bench_bmm.py::test_bmm_fp8_bench[mha-decode-b32-pv-per-tensor-float8_e4m3fn]",
-            "benchmarks/ops/bench_bmm.py::test_bmm_fp8_bench[mha-decode-b64-qk-per-tensor-float8_e4m3fn]",
-            "benchmarks/ops/bench_bmm.py::test_bmm_fp8_bench[moe-prefill-b128-per-tensor-float8_e4m3fn]",
         ),
     ),
     (
