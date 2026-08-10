@@ -161,8 +161,11 @@ def test_gqa_decode_bench(batch: int, heads: int, heads_kv: int, seq_len_kv: int
 
     fi_fn = _flashinfer_gqa_decode_fwd(test, *inputs)
     if fi_fn is not None:
-        result_fi = bm.profile(fi_fn, *inputs)
-        BenchmarkReport.record(op, locals(), result_fi, tag="flashinfer")
+        try:
+            result_fi = bm.profile(fi_fn, *inputs)
+            BenchmarkReport.record(op, locals(), result_fi, tag="flashinfer")
+        except RuntimeError as exc:
+            print(f"  [skip] flashinfer: {str(exc).splitlines()[0]}")
 
     if fa3_fn is None and fi_fn is None:
         result_bl = bm.profile(test.ref_program, *inputs)

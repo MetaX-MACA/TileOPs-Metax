@@ -93,7 +93,7 @@ def _engram_decode_kernel(batch, d_mem, d, max_conv_len, conv_kernel_size, dilat
         ):
             with T.Kernel(batch, threads=threads) as (bid,):
                 # --- Registers ---
-                e_local = T.alloc_fragment((d_mem,), accum_dtype)
+                e_local = T.alloc_fragment((d_mem,), accum_dtype) if (d_mem <= 512) else T.alloc_shared((d_mem,), accum_dtype)
                 k_local = T.alloc_fragment((d_padded,), accum_dtype)
                 v_local = T.alloc_fragment((d_padded,), accum_dtype)
                 h_local = T.alloc_fragment((d_padded,), accum_dtype)

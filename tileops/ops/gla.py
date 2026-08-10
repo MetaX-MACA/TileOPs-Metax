@@ -2,8 +2,9 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
-from tileops.kernels.gla import GLABwdKernel, GLAFwdKernel
+from tileops.kernels.gla import GLABwdKernel, GLABwdMACAKernel, GLAFwdKernel
 from tileops.kernels.kernel_base import Kernel
+from tileops.utils import is_maca
 
 from .op_base import Op
 
@@ -209,8 +210,9 @@ class GLABwdOp(Op):
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
+        bwd_cls = GLABwdMACAKernel if is_maca() else GLABwdKernel
         return {
-            "GLABwdKernel": GLABwdKernel,
+            "GLABwdKernel": bwd_cls,
         }
 
     def _get_kernel(

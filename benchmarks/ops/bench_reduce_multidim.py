@@ -520,9 +520,7 @@ def _make_cumulative_op(M, N, dtype, op_kind):
 
     op_map = {"cumsum": CumsumFwdOp, "cumprod": CumprodFwdOp}
     cls = op_map[op_kind]
-    if "M" in inspect.signature(cls.__init__).parameters:
-        return cls(M=M, N=N, dtype=dtype)
-    return cls(N=N, dtype=dtype, dim=-1)
+    return cls(dtype=dtype, dim=-1)
 
 
 @CumulativeMultidimFixture
