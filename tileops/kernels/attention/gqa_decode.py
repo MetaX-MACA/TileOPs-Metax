@@ -424,10 +424,10 @@ class GQADecodeKernel(Kernel):
 
     @property
     def autotune_configs(self) -> list[dict]:
-        block_N = [64, 128]
+        block_N = [64]
         block_H = [64]
         num_split = [ns for ns in [2, 4, 8, 16, 32] if ns <= self.seqlen_kv] or [1]
-        num_stages = [1, 2, 3]
+        num_stages = [0, 1, 2]
         threads = [128]
         _configs = list(itertools.product(block_N, block_H, num_split, num_stages, threads))
 

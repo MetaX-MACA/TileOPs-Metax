@@ -90,7 +90,7 @@ class ArgminFwdOp(_ReduceOpBase):
 
     _op_kind = "argmin"
     _kernel_key = "argreduce"
-    _kernel_cls = ArgreduceKernel
+    _kernel_cls = ArgreduceMACAKernel if is_maca() else ArgreduceKernel
 
     def __init__(
         self,

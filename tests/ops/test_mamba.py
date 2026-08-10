@@ -51,7 +51,12 @@ def da_cumsum_fwd_ref(
     if dt_bias is not None:
         dt_val = dt_val + dt_bias.float()
     if dt_softplus:
-        dt_val = F.softplus(dt_val)
+        # Match kernel: log(1+exp(x)) with bypass for x > 20 (not F.softplus).
+        dt_val = torch.where(
+            dt_val <= 20.0,
+            torch.log(1.0 + torch.exp(dt_val)),
+            dt_val,
+        )
     dt_val = torch.clamp(dt_val, min=dt_min, max=dt_max)
     dt_chunked = dt_val.reshape(b, C, Q, h)           # (b, C, Q, h)
     dt_out = dt_chunked.permute(0, 3, 1, 2).contiguous().to(dtype)  # (b, h, C, Q) in target dtype

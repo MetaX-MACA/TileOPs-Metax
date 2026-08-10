@@ -104,7 +104,8 @@ def test_bmm_fp8_bench(
     result_bl = bm.profile(test.ref_program, a, b_kn, scale_a, scale_b)
     BenchmarkReport.record(op, locals(), result_bl, tag="torch-fp32-ref")
 
-    flashinfer = pytest.importorskip("flashinfer")
+    # FlashInfer 0.6.6+ is required for the FP8 BMM benchmark.
+    flashinfer = pytest.importorskip("flashinfer", minversion="0.6.6")
     try:
         result_flashinfer = bm.profile(
             lambda a_, b_, sa_, sb_: _flashinfer_bmm_fp8_per_tensor_ref(

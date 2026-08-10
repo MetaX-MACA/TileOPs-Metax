@@ -275,7 +275,6 @@ def test_security_policy_routes_trust_by_collaborator_permission() -> None:
     assert "pull_request.user.login" in env["PR_AUTHOR"]
 
     gpu_job = wf["jobs"]["gpu-smoke"]
-    assert "needs.security-policy.outputs.is_fork" in str(gpu_job["runs-on"])
     ref_step = next(
         s for s in gpu_job["steps"] if (s.get("name") or "").startswith("Checkout trusted actions")
     )

@@ -210,7 +210,6 @@ class GLABwdFixture(FixtureBase):
         ]),
     ]
 
-@pytest.mark.xfail
 @GLABwdFixture
 def test_gla_bwd_bench(
     batch: int,
@@ -301,7 +300,6 @@ class GLAFwdBwdFixture(FixtureBase):
         ]),
     ]
 
-@pytest.mark.xfail
 @GLAFwdBwdFixture
 def test_gla_fwdbwd_bench(
     batch: int,

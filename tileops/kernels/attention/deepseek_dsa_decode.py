@@ -839,7 +839,7 @@ class SparseMlaMACAKernel(Kernel):
     WGMMA / TMA / mbarrier / T.alloc_barrier.
     """
 
-    supported_archs: list[int] = [80]
+    supported_archs: list[int] = [80, 89]
 
     def __init__(self,
                  batch: int,

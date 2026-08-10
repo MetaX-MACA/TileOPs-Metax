@@ -9,8 +9,9 @@ from typing import Dict, Hashable, Optional, Set, Tuple
 
 import torch
 
-from tileops.kernels.bmm import BmmFp8Kernel, BmmKernel
+from tileops.kernels.bmm import BmmFp8Kernel, BmmFp8MACAKernel, BmmKernel
 from tileops.kernels.kernel_base import Kernel
+from tileops.utils import is_maca
 
 from .op_base import Op
 
@@ -197,7 +198,7 @@ class BmmFp8Op(Op):
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
         return {
-            "bmm_fp8_kernel": BmmFp8Kernel,
+            "bmm_fp8_kernel": BmmFp8MACAKernel if is_maca() else BmmFp8Kernel,
         }
 
     def _validate_dtypes(
