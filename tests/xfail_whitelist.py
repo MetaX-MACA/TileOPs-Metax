@@ -133,8 +133,6 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         _NUMERICAL_MISMATCH,
         (
             "tests/ops/test_fused_moe_experts.py::TestFusedMoEExpertsNopadPersistent3WGFwdOp::test_forward_matches_torch_ref_activation[float16-gelu_and_mul]",
-            "tests/kernels/test_linear_attn_autotune.py::test_default_config_width_is_one_the_kernel_builds[DeltaNetFwdKernel]",
-            "tests/kernels/test_linear_attn_autotune.py::test_default_config_width_is_one_the_kernel_builds[GatedDeltaNetFwdKernel]",
             "tests/ops/test_argreduce.py::test_argreduce_large_n[argmax-dtype0]",
             "tests/ops/test_argreduce.py::test_argreduce_large_n[argmin-dtype1]",
             "tests/ops/test_argreduce.py::test_argreduce_first_index_and_nan_semantics[argmax]",

@@ -26,7 +26,7 @@ __all__ = [
 #: ``num_stages`` / ``threads`` candidates for the two matmul-heavy sub-kernels.
 PIPELINE_CONFIGS: Tuple[Dict[str, int], ...] = tuple(
     {"num_stages": num_stages, "threads": threads}
-    for num_stages in (1, 2)
+    for num_stages in (0, 1, 2)
     for threads in (128, 256)
 )
 
