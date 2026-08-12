@@ -4,7 +4,9 @@ import torch
 import torch.nn.functional as F
 
 from tileops.kernels.attention import (
+    FlashAttnBwdPostprocessKernel,
     FlashAttnBwdPreprocessKernel,
+    GQABwdKernel,
     GQABwdWgmmaPipelinedKernel,
     GQADecodeBs1Kernel,
     GQADecodeKernel,
@@ -1095,8 +1097,17 @@ class GroupedQueryAttentionBwdOp(Op):
         self.tune = tune
         self.dispatch_kernel(kernel_map)
 
-    def _get_kernels(self, dtype: torch.dtype) -> tuple[Kernel, Kernel]:
-        """Return (preprocess, backward) kernels for *dtype*, building once each."""
+    def _get_kernels(self, dtype: torch.dtype) -> tuple[Kernel, Kernel, Optional[Kernel]]:
+        """Return preprocess, backward, and optional postprocess kernels for *dtype*."""
+
+        backward_type = self.kernel_map["gqa_bwd_kernel"]
+        use_generic = (
+            backward_type is GQABwdWgmmaPipelinedKernel
+            and "gqa_bwd_kernel" not in self._overridden_keys
+            and not is_hopper()
+        )
+        if use_generic:
+            backward_type = GQABwdKernel
 
         def build_preprocess() -> Kernel:
             return self.kernel_map["gqa_bwd_preprocess_kernel"](
@@ -1105,14 +1116,22 @@ class GroupedQueryAttentionBwdOp(Op):
             )
 
         def build_backward() -> Kernel:
-            return self.kernel_map["gqa_bwd_kernel"](
+            return backward_type(
                 self.batch, self.heads, self.heads_kv, self.seq_len,
                 self.dim, self.is_causal, dtype, tune=self.tune,
+            )
+
+        def build_postprocess() -> Kernel:
+            return FlashAttnBwdPostprocessKernel(
+                self.batch, self.heads, self.seq_len, self.dim, dtype,
+                tune=self.tune,
             )
 
         return (
             self.get_or_build_kernel("gqa_bwd_preprocess_kernel", dtype, build_preprocess),
             self.get_or_build_kernel("gqa_bwd_kernel", dtype, build_backward),
+            self.get_or_build_kernel("gqa_bwd_postprocess_kernel", dtype, build_postprocess)
+            if use_generic else None,
         )
 
     @property
@@ -1130,13 +1149,13 @@ class GroupedQueryAttentionBwdOp(Op):
         do = do.contiguous()
         self._validate_dtypes(q, k, v, o, do, lse)
         self.dtype = q.dtype
-        prep_kernel, kernel = self._get_kernels(q.dtype)
+        prep_kernel, kernel, post_kernel = self._get_kernels(q.dtype)
         delta = prep_kernel(o, do)
         dq = torch.zeros_like(q, dtype=torch.float32)
         dk = torch.zeros_like(k, dtype=torch.float32)
         dv = torch.zeros_like(v, dtype=torch.float32)
         kernel(q, k, v, do, lse, delta, dq, dk, dv)
-        dq = dq.to(q.dtype)
+        dq = post_kernel(dq) if post_kernel is not None else dq.to(q.dtype)
         dk, dv = dk.to(q.dtype), dv.to(q.dtype)
         return dq, dk, dv
 

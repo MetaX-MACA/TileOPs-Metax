@@ -4,7 +4,9 @@ from .deepseek_nsa_cmp_fwd import NSACmpFwdVarlenKernel
 from .deepseek_nsa_fwd import NSAFwdVarlenKernel
 from .deepseek_nsa_topk import NSATopkVarlenKernel
 from .gqa_bwd import (
+    FlashAttnBwdPostprocessKernel,
     FlashAttnBwdPreprocessKernel,
+    GQABwdKernel,
     GQABwdWgmmaPipelinedKernel,
 )
 from .gqa_decode import GQADecodeKernel
@@ -33,7 +35,9 @@ from .mha_decode import MHADecodeKernel
 from .mha_decode_paged import MHADecodePagedKernel
 
 __all__ = [
+    "FlashAttnBwdPostprocessKernel",
     "FlashAttnBwdPreprocessKernel",
+    "GQABwdKernel",
     "GQABwdWgmmaPipelinedKernel",
     "GQADecodeBs1Kernel",
     "GQADecodeKernel",
