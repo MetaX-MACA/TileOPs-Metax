@@ -4,9 +4,9 @@ import torch
 import torch.nn.functional as F
 
 from tileops.kernels.attention import (
-    FlashAttnBwdPostprocessKernel,
+    FlashAttnBwdPostprocessMACAKernel,
     FlashAttnBwdPreprocessKernel,
-    GQABwdKernel,
+    GQABwdMACAKernel,
     GQABwdWgmmaPipelinedKernel,
     GQADecodeBs1Kernel,
     GQADecodeKernel,
@@ -24,7 +24,7 @@ from tileops.kernels.attention import (
     GQASlidingWindowVarlenFwdWgmmaPipelinedKernel,
 )
 from tileops.kernels.kernel_base import Kernel
-from tileops.utils import is_hopper
+from tileops.utils import is_hopper, is_maca
 
 from ..op_base import Op
 from ..rope import _base_freqs
@@ -1101,13 +1101,7 @@ class GroupedQueryAttentionBwdOp(Op):
         """Return preprocess, backward, and optional postprocess kernels for *dtype*."""
 
         backward_type = self.kernel_map["gqa_bwd_kernel"]
-        use_generic = (
-            backward_type is GQABwdWgmmaPipelinedKernel
-            and "gqa_bwd_kernel" not in self._overridden_keys
-            and not is_hopper()
-        )
-        if use_generic:
-            backward_type = GQABwdKernel
+        use_maca = backward_type is GQABwdMACAKernel
 
         def build_preprocess() -> Kernel:
             return self.kernel_map["gqa_bwd_preprocess_kernel"](
@@ -1122,7 +1116,7 @@ class GroupedQueryAttentionBwdOp(Op):
             )
 
         def build_postprocess() -> Kernel:
-            return FlashAttnBwdPostprocessKernel(
+            return FlashAttnBwdPostprocessMACAKernel(
                 self.batch, self.heads, self.seq_len, self.dim, dtype,
                 tune=self.tune,
             )
@@ -1131,7 +1125,7 @@ class GroupedQueryAttentionBwdOp(Op):
             self.get_or_build_kernel("gqa_bwd_preprocess_kernel", dtype, build_preprocess),
             self.get_or_build_kernel("gqa_bwd_kernel", dtype, build_backward),
             self.get_or_build_kernel("gqa_bwd_postprocess_kernel", dtype, build_postprocess)
-            if use_generic else None,
+            if use_maca else None,
         )
 
     @property
@@ -1140,7 +1134,7 @@ class GroupedQueryAttentionBwdOp(Op):
             "gqa_bwd_preprocess_kernel":
                 FlashAttnBwdPreprocessKernel,
             "gqa_bwd_kernel":
-                GQABwdWgmmaPipelinedKernel,
+                GQABwdMACAKernel if is_maca() else GQABwdWgmmaPipelinedKernel,
         }
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, o: torch.Tensor,
