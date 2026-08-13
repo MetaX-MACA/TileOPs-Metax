@@ -4,6 +4,18 @@ set -euo pipefail
 SITE_PACKAGES="${SITE_PACKAGES:-/ci-cache/site-packages}"
 TVM_FFI_SRC="3rdparty/tilelang-metax/3rdparty/tvm/3rdparty/tvm-ffi"
 
+python3 -m pip install --quiet --no-cache-dir \
+  "transformers==4.45.2" \
+  -i https://repos.metax-tech.com/r/maca-pypi/simple \
+  --trusted-host repos.metax-tech.com
+python3 - <<'PY'
+import transformers
+assert transformers.__version__ == "4.45.2", transformers.__version__
+from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+assert mamba_chunk_scan_combined is not None
+print("mamba_ssm baseline import OK")
+PY
+
 # Build apache-tvm-ffi from source below; skip the PyPI pin in requirements.txt
 # so it cannot overwrite the SITE_PACKAGES install (plain 0.1.11 has no +g<sha>).
 grep -vE '^apache-tvm-ffi' "3rdparty/tilelang-metax/requirements.txt" | pip install -r /dev/stdin

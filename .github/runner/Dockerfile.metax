@@ -16,6 +16,17 @@ RUN python -m pip install \
         setuptools wheel ninja scikit-build-core patchelf cmake \
         triton apache-tvm-ffi cloudpickle ml_dtypes numpy psutil tqdm \
         typing_extensions Cython z3-solver torch_c_dlpack_ext einops "PyYAML>=6.0"
+RUN python -m pip install --no-cache-dir \
+    "transformers==4.45.2" \
+    -i https://repos.metax-tech.com/r/maca-pypi/simple \
+    --trusted-host repos.metax-tech.com
+RUN python - <<'PY'
+import transformers
+assert transformers.__version__ == "4.45.2", transformers.__version__
+from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+assert mamba_chunk_scan_combined is not None
+print("mamba_ssm Triton baseline import OK")
+PY
 ARG MAX_JOBS=64
 ENV MAX_JOBS=${MAX_JOBS}
 
