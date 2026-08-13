@@ -5,6 +5,7 @@ import torch
 from tests.test_base import FixtureBase, TestBase
 from tileops.kernels.attention.gqa_decode import GQADecodeKernel
 from tileops.ops import GroupedQueryAttentionDecodeWithKVCacheFwdOp
+from tileops.utils import is_hopper
 from workloads.attention.gqa import (
     GroupedQueryAttentionDecodeWorkload,
 )
@@ -118,16 +119,19 @@ def test_gqa_decode_rejects_non_positive_seqlen_kv() -> None:
 
 @pytest.mark.smoke
 def test_gqa_decode_bs1_dispatch() -> None:
-    """batch=1 fp16 dim-128 requests select the WS kernel; other dtypes/shapes fall back."""
+    """Batch-1 fp16 dim-128 uses the WS kernel where supported, otherwise the generic path."""
     op = GroupedQueryAttentionDecodeWithKVCacheFwdOp(1, 32, 4, 8192, 128)
     kernel = op._get_kernel(torch.float16)
-    assert kernel.__class__.__name__ == "GQADecodeBs1Kernel"
-    assert kernel._select_tier(6000) == "ctx"
-    assert kernel._select_tier(1024) == "ctx"
-    assert kernel._select_tier(512) == "no_split"
-    assert kernel._ctx_splits_for(8192) == 32
-    assert kernel._ctx_splits_for(2048) == 16
-    assert kernel._ctx_splits_for(3072) == 8
+    if is_hopper():
+        assert kernel.__class__.__name__ == "GQADecodeBs1Kernel"
+        assert kernel._select_tier(6000) == "ctx"
+        assert kernel._select_tier(1024) == "ctx"
+        assert kernel._select_tier(512) == "no_split"
+        assert kernel._ctx_splits_for(8192) == 32
+        assert kernel._ctx_splits_for(2048) == 16
+        assert kernel._ctx_splits_for(3072) == 8
+    else:
+        assert isinstance(kernel, GQADecodeKernel)
 
     # The same instance falls back for bfloat16 — the element type is an input
     # to the choice, so one op serves both paths.
@@ -146,10 +150,12 @@ def test_gqa_decode_bs1_runtime_context_switch() -> None:
     """
     op = GroupedQueryAttentionDecodeWithKVCacheFwdOp(1, 32, 4, 8192, 128)
     kernel = op._get_kernel(torch.float16)
-    assert kernel.__class__.__name__ == "GQADecodeBs1Kernel"
+    expected_kernel = "GQADecodeBs1Kernel" if is_hopper() else "GQADecodeKernel"
+    assert kernel.__class__.__name__ == expected_kernel
     for real, tier in ((6000, "ctx"), (3072, "ctx"), (2048, "ctx"), (1024, "ctx"),
                        (512, "no_split")):
-        assert kernel._select_tier(real) == tier
+        if is_hopper():
+            assert kernel._select_tier(real) == tier
         test = GroupedQueryAttentionDecodeTest(1, 32, 4, real, 128, torch.float16)
         test.check(op, *test.gen_inputs(), atol=1e-2, rtol=1e-2)
 
@@ -158,7 +164,8 @@ def test_gqa_decode_bs1_runtime_context_switch() -> None:
 def test_gqa_decode_bs1_group4() -> None:
     """The WS kernel generalizes to a query-per-KV-head group other than 8 (here 4)."""
     op = GroupedQueryAttentionDecodeWithKVCacheFwdOp(1, 32, 8, 4096, 128)
-    assert op._get_kernel(torch.float16).__class__.__name__ == "GQADecodeBs1Kernel"
+    expected_kernel = "GQADecodeBs1Kernel" if is_hopper() else "GQADecodeKernel"
+    assert op._get_kernel(torch.float16).__class__.__name__ == expected_kernel
     test = GroupedQueryAttentionDecodeTest(1, 32, 8, 4096, 128, torch.float16)
     test.check(op, *test.gen_inputs(), atol=1e-2, rtol=1e-2)
 

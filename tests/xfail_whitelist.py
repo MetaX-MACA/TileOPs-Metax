@@ -177,9 +177,6 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         _CI_EXPECTATION_MISMATCH,
         (
-            "tests/ops/attention/test_gqa_decode.py::test_gqa_decode_bs1_dispatch",
-            "tests/ops/attention/test_gqa_decode.py::test_gqa_decode_bs1_runtime_context_switch",
-            "tests/ops/attention/test_gqa_decode.py::test_gqa_decode_bs1_group4",
             "tests/ops/attention/test_gqa_decode_paged.py::test_gqa_decode_paged_bs1_fixed_tier_correctness[no-split]",
             "tests/ops/attention/test_gqa_decode_paged.py::test_gqa_decode_paged_bs1_fixed_tier_correctness[ctx-reversed-pages]",
             "tests/ops/attention/test_gqa_decode_paged.py::test_gqa_decode_paged_bs1_dispatch",
