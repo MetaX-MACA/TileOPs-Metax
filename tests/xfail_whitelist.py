@@ -18,7 +18,6 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         _UNSUPPORTED_ARCHITECTURE,
         (
-            "tests/ops/attention/test_deepseek_mla_decode.py::test_mla_decode[32-128-1-8192-512-64-dtype0-False]",
             "tests/ops/attention/test_gqa_prefill_paged.py::test_gqa_prefill_paged_with_fp8_kv_cache_fwd[causal-fp16-page64]",
             "tests/ops/attention/test_gqa_prefill_paged.py::test_gqa_prefill_paged_with_fp8_kv_cache_fwd[noncausal-fp16-page64]",
             "tests/ops/attention/test_gqa_prefill_paged.py::test_gqa_prefill_paged_with_fp8_kv_cache_fwd[causal-softcap-fp16-page64]",

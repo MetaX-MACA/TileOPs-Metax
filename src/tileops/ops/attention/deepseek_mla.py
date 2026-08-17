@@ -2,8 +2,9 @@ from typing import Dict, Optional
 
 import torch
 
-from tileops.kernels.attention import MLADecodeWsKernel
+from tileops.kernels.attention import MLADecodeMacaKernel, MLADecodeWsKernel
 from tileops.kernels.kernel_base import Kernel
+from tileops.utils import is_maca
 
 from ..op_base import Op
 
@@ -33,7 +34,7 @@ class MultiHeadLatentAttentionDecodeWithKVCacheFwdOp(Op):
         self.dispatch_kernel(kernel_map)
 
     def _get_kernel(self, dtype: torch.dtype) -> Kernel:
-        return self.get_or_build_kernel(
+       return self.get_or_build_kernel(
             "mla_decode_kernel",
             dtype,
             lambda: self.kernel_map["mla_decode_kernel"](
@@ -43,7 +44,7 @@ class MultiHeadLatentAttentionDecodeWithKVCacheFwdOp(Op):
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
-        return {"mla_decode_kernel": MLADecodeWsKernel}
+        return {"mla_decode_kernel": MLADecodeMacaKernel if is_maca() else MLADecodeWsKernel}
 
     def forward(self, q: torch.Tensor, q_pe: torch.Tensor, k: torch.Tensor,
                 k_pe: torch.Tensor) -> torch.Tensor:

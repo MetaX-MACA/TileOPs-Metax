@@ -11,7 +11,7 @@ import torch
 from tileops.kernels.kernel_base import Kernel
 from tileops.kernels.online_softmax import LOG2E
 
-__all__ = ["MLADecodeWsKernel"]
+__all__ = ["MLADecodeMacaKernel", "MLADecodeWsKernel"]
 
 
 @functools.lru_cache(maxsize=32)
@@ -565,6 +565,112 @@ def _mla_decode_ws_kernel(batch, heads, kv_head_num, seqlen_kv, dim, pe_dim, dty
 
     return _mla_decode_ws_func
 
+@functools.lru_cache(maxsize=32)
+def _mla_decode_maca_kernel(batch, heads, kv_head_num, seqlen_kv, dim, pe_dim,
+                            dtype='float16'):
+    sm_scale = (1.0 / (dim + pe_dim))**0.5 * LOG2E
+    accum_dtype = "float"
+    kv_group_num = heads // kv_head_num
+    if kv_head_num != 1:
+        raise ValueError("kv_head_num must be 1")
+
+    @tilelang.jit(
+        out_idx=[4],
+        pass_configs={
+            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+        },
+        compile_flags=[
+            "-O3", "-Wno-deprecated-declarations", "-U__CUDA_NO_HALF_OPERATORS__",
+            "-U__CUDA_NO_HALF_CONVERSIONS__", "-U__CUDA_NO_HALF2_OPERATORS__",
+            "-U__CUDA_NO_BFLOAT16_CONVERSIONS__", "-DNDEBUG"
+        ],
+    )
+    def _mla_decode_maca_func(block_H, block_N, num_stages, threads=128):
+        VALID_BLOCK_H = min(block_H, kv_group_num)
+
+        @T.prim_func
+        def maca_main(
+                Q: T.Tensor([batch, heads, dim], dtype),
+                Q_pe: T.Tensor([batch, heads, pe_dim], dtype),
+                KV: T.Tensor([batch, seqlen_kv, kv_head_num, dim], dtype),
+                K_pe: T.Tensor([batch, seqlen_kv, kv_head_num, pe_dim], dtype),
+                Output: T.Tensor([batch, heads, dim], dtype),
+        ):
+            with T.Kernel(heads // VALID_BLOCK_H, batch,
+                          threads=threads) as (hid, bid):
+                Q_shared = T.alloc_shared([block_H, dim], dtype)
+                Q_pe_shared = T.alloc_shared([block_H, pe_dim], dtype)
+                KV_shared = T.alloc_shared([block_N, dim], dtype)
+                K_pe_shared = T.alloc_shared([block_N, pe_dim], dtype)
+                S_shared = T.alloc_shared([block_H, block_N], dtype)
+                O_shared = T.alloc_shared([block_H, dim], dtype)
+
+                acc_s = T.alloc_fragment([block_H, block_N], accum_dtype)
+                acc_o = T.alloc_fragment([block_H, dim], accum_dtype)
+                scores_max = T.alloc_fragment([block_H], accum_dtype)
+                scores_max_prev = T.alloc_fragment([block_H], accum_dtype)
+                scores_scale = T.alloc_fragment([block_H], accum_dtype)
+                scores_sum = T.alloc_fragment([block_H], accum_dtype)
+                logsum = T.alloc_fragment([block_H], accum_dtype)
+
+                cur_kv_head = hid // (kv_group_num // VALID_BLOCK_H)
+
+                T.copy(Q[bid, hid * VALID_BLOCK_H:(hid + 1) * VALID_BLOCK_H, :],
+                       Q_shared)
+                T.copy(Q_pe[bid, hid * VALID_BLOCK_H:(hid + 1) * VALID_BLOCK_H, :],
+                       Q_pe_shared)
+                T.fill(acc_o, 0)
+                T.fill(logsum, 0)
+                T.fill(scores_max, -T.infinity(accum_dtype))
+
+                for k in T.Pipelined(T.ceildiv(seqlen_kv, block_N),
+                                     num_stages=num_stages):
+                    T.copy(KV[bid, k * block_N:(k + 1) * block_N, cur_kv_head, :],
+                           KV_shared)
+                    T.copy(K_pe[bid, k * block_N:(k + 1) * block_N, cur_kv_head, :],
+                           K_pe_shared)
+
+                    T.clear(acc_s)
+                    T.gemm(Q_shared, KV_shared, acc_s, transpose_B=True,
+                           policy=T.GemmWarpPolicy.FullCol)
+                    T.gemm(Q_pe_shared, K_pe_shared, acc_s, transpose_B=True,
+                           policy=T.GemmWarpPolicy.FullCol)
+
+                    T.copy(scores_max, scores_max_prev)
+                    T.fill(scores_max, -T.infinity(accum_dtype))
+                    T.reduce_max(acc_s, scores_max, dim=1, clear=False)
+
+                    for i in T.Parallel(block_H):
+                        scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
+                        scores_scale[i] = T.exp2(
+                            (scores_max_prev[i] - scores_max[i]) * sm_scale)
+
+                    for i, j in T.Parallel(block_H, block_N):
+                        acc_s[i, j] = T.exp2(
+                            (acc_s[i, j] - scores_max[i]) * sm_scale)
+
+                    T.reduce_sum(acc_s, scores_sum, dim=1)
+                    T.copy(acc_s, S_shared)
+
+                    for i in T.Parallel(block_H):
+                        logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
+
+                    for i, j in T.Parallel(block_H, dim):
+                        acc_o[i, j] *= scores_scale[i]
+
+                    T.gemm(S_shared, KV_shared, acc_o,
+                           policy=T.GemmWarpPolicy.FullCol)
+
+                for i, j in T.Parallel(block_H, dim):
+                    acc_o[i, j] /= logsum[i]
+
+                T.copy(acc_o, O_shared)
+                T.copy(O_shared,
+                       Output[bid, hid * VALID_BLOCK_H:(hid + 1) * VALID_BLOCK_H, :])
+
+        return maca_main
+
+    return _mla_decode_maca_func
 
 @torch.library.custom_op("top::mla_decode_ws_wrapped_kernel", mutates_args=())
 def _mla_decode_ws_wrapped_kernel(batch: int, heads: int, kv_head_num: int, seqlen_kv: int,
@@ -600,6 +706,36 @@ def _(
 ) -> torch.Tensor:
     return torch.empty((batch, heads, dim), dtype=Q.dtype, device=Q.device)
 
+@torch.library.custom_op("top::mla_decode_maca_wrapped_kernel", mutates_args=())
+def _mla_decode_maca_wrapped_kernel(batch: int, heads: int, kv_head_num: int,
+                                    seqlen_kv: int, dim: int, pe_dim: int, dtype: str,
+                                    block_H: int, block_N: int, num_stages: int,
+                                    threads: int, Q: torch.Tensor, Q_pe: torch.Tensor,
+                                    Kv: torch.Tensor, K_pe: torch.Tensor) -> torch.Tensor:
+    return _mla_decode_maca_kernel(
+        batch, heads, kv_head_num, seqlen_kv, dim, pe_dim, dtype
+    )(block_H, block_N, num_stages, threads)(Q, Q_pe, Kv, K_pe)
+
+
+@_mla_decode_maca_wrapped_kernel.register_fake
+def _(
+        batch: int,
+        heads: int,
+        kv_head_num: int,
+        seqlen_kv: int,
+        dim: int,
+        pe_dim: int,
+        dtype: str,
+        block_H: int,
+        block_N: int,
+        num_stages: int,
+        threads: int,
+        Q: torch.Tensor,
+        Q_pe: torch.Tensor,
+        Kv: torch.Tensor,
+        K_pe: torch.Tensor
+) -> torch.Tensor:
+    return torch.empty((batch, heads, dim), dtype=Q.dtype, device=Q.device)
 
 class MLADecodeWsKernel(Kernel):
     supported_archs: list[int] = [90]
@@ -669,3 +805,52 @@ class MLADecodeWsKernel(Kernel):
                                              self.config["num_stages"], self.config["threads"],
                                              self.config["num_split"], q, q_pe, k, k_pe, glse,
                                              Output_partial)
+
+class MLADecodeMacaKernel(Kernel):
+    supported_archs: list[int] = [80]
+
+    def __init__(self,
+                 batch,
+                 heads,
+                 kv_head_num,
+                 seqlen_kv,
+                 dim,
+                 pe_dim,
+                 dtype,
+                 config: Optional[dict] = None,
+                 tune=False):
+        super().__init__()
+        self.batch = batch
+        self.heads = heads
+        self.kv_head_num = kv_head_num
+        self.seqlen_kv = seqlen_kv
+        self.dim = dim
+        self.pe_dim = pe_dim
+        self.dtype = dtype
+
+        self.kernel = _mla_decode_maca_kernel(
+            self.batch, self.heads, self.kv_head_num, self.seqlen_kv,
+            self.dim, self.pe_dim, self.dtype_str)
+
+        self.init_config(config, tune)
+
+    @property
+    def default_config(self) -> dict:
+        return {
+            "block_H": min(16, self.heads // self.kv_head_num),
+            "block_N": 32,
+            "num_stages": 1,
+            "threads": 128
+        }
+
+    @property
+    def autotune_configs(self) -> list[dict]:
+        return [self.default_config]
+
+    def forward(self, q: torch.Tensor, q_pe: torch.Tensor, k: torch.Tensor,
+                k_pe: torch.Tensor):
+        return _mla_decode_maca_wrapped_kernel(
+            self.batch, self.heads, self.kv_head_num, self.seqlen_kv,
+            self.dim, self.pe_dim, self.dtype_str, self.config["block_H"],
+            self.config["block_N"], self.config["num_stages"],
+            self.config["threads"], q, q_pe, k, k_pe)

@@ -1,5 +1,5 @@
 from .deepseek_dsa_decode import SparseMlaKernel, SparseMlaMACAKernel
-from .deepseek_mla_decode import MLADecodeWsKernel
+from .deepseek_mla_decode import MLADecodeMacaKernel, MLADecodeWsKernel
 from .deepseek_nsa_cmp_fwd import NSACmpFwdVarlenKernel
 from .deepseek_nsa_fwd import NSAFwdVarlenKernel
 from .deepseek_nsa_topk import NSATopkVarlenKernel
@@ -60,6 +60,7 @@ __all__ = [
     "GQASlidingWindowVarlenFwdWgmmaPipelinedKernel",
     "MHADecodeKernel",
     "MHADecodePagedKernel",
+    "MLADecodeMacaKernel",
     "MLADecodeWsKernel",
     "NSACmpFwdVarlenKernel",
     "NSAFwdVarlenKernel",
