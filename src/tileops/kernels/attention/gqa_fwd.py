@@ -1156,7 +1156,7 @@ def _(batch: int, heads: int, heads_kv: int, total_q: int, physical_tokens: int,
 class GQAPrefillPagedWithFP8KVCacheFwdKernel(PagedPrefillKernel):
     """Paged prefill against an FP8 cache, dequantized by the stored descales."""
 
-    supported_archs: list[int] = [89, 90]
+    supported_archs: list[int] = [80, 89, 90]
 
     @classmethod
     def applies(cls, call) -> bool:

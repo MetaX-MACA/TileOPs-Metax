@@ -22,9 +22,6 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "benchmarks/ops/attention/bench_deepseek_mla_decode.py::test_mla_decode_bench[deepseek-v2-32k-bfloat16]",
             "benchmarks/ops/attention/bench_deepseek_mla_decode.py::test_mla_decode_bench[deepseek-v3-4k-bfloat16]",
             "benchmarks/ops/attention/bench_deepseek_mla_decode.py::test_mla_decode_bench[deepseek-v3-32k-bfloat16]",
-            "benchmarks/ops/attention/bench_gqa.py::test_gqa_prefill_paged_with_kv_cache_fwd_bench[qwen35-9b-prefill-paged-fp8-cache-b8-prefix32k-chunk1k-p64-fp16-float16]",
-            "benchmarks/ops/attention/bench_gqa.py::test_gqa_prefill_paged_with_kv_cache_fwd_bench[llama31-8b-prefill-paged-fp8-cache-b8-prefix4k-chunk512-p64-fp16-float16]",
-            "benchmarks/ops/attention/bench_gqa.py::test_gqa_prefill_paged_with_kv_cache_fwd_bench[gqa-prefill-paged-fp8-cache-softcap50-b4-prefix4k-chunk512-p64-fp16-float16]",
         ),
     ),
     (
@@ -132,14 +129,6 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         _AUTOTUNE_FAILURE,
         (
-            "benchmarks/ops/attention/bench_gqa.py::test_gqa_bwd_bench[llama-3.1-8b-short-float16]",
-            "benchmarks/ops/attention/bench_gqa.py::test_gqa_bwd_bench[llama-3.1-8b-short-bfloat16]",
-            "benchmarks/ops/attention/bench_gqa.py::test_gqa_bwd_bench[llama-3.1-8b-long-float16]",
-            "benchmarks/ops/attention/bench_gqa.py::test_gqa_bwd_bench[llama-3.1-8b-long-bfloat16]",
-            "benchmarks/ops/attention/bench_gqa.py::test_gqa_bwd_bench[llama-3.1-70b-short-float16]",
-            "benchmarks/ops/attention/bench_gqa.py::test_gqa_bwd_bench[llama-3.1-70b-short-bfloat16]",
-            "benchmarks/ops/attention/bench_gqa.py::test_gqa_bwd_bench[llama-3.1-70b-long-float16]",
-            "benchmarks/ops/attention/bench_gqa.py::test_gqa_bwd_bench[llama-3.1-70b-long-bfloat16]",
             "benchmarks/ops/attention/bench_gqa_sliding_window.py::test_gqa_sliding_window_fwd_bench[llama-3.1-8b-short-w256-float16]",
             "benchmarks/ops/attention/bench_gqa_sliding_window.py::test_gqa_sliding_window_fwd_bench[llama-3.1-8b-short-w256-bfloat16]",
             "benchmarks/ops/attention/bench_gqa_sliding_window.py::test_gqa_sliding_window_fwd_bench[llama-3.1-8b-long-w1024-float16]",

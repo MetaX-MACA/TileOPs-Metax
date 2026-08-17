@@ -18,12 +18,6 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         _UNSUPPORTED_ARCHITECTURE,
         (
-            "tests/ops/attention/test_gqa_prefill_paged.py::test_gqa_prefill_paged_with_fp8_kv_cache_fwd[causal-fp16-page64]",
-            "tests/ops/attention/test_gqa_prefill_paged.py::test_gqa_prefill_paged_with_fp8_kv_cache_fwd[noncausal-fp16-page64]",
-            "tests/ops/attention/test_gqa_prefill_paged.py::test_gqa_prefill_paged_with_fp8_kv_cache_fwd[causal-softcap-fp16-page64]",
-            "tests/ops/attention/test_gqa_prefill_paged.py::test_gqa_prefill_paged_with_fp8_kv_cache_fwd[causal-bf16-page64]",
-            "tests/ops/attention/test_gqa_prefill_paged.py::test_gqa_prefill_paged_with_fp8_kv_cache_fwd[causal-fp16-page16]",
-            "tests/ops/attention/test_gqa_prefill_paged.py::test_gqa_prefill_paged_with_fp8_kv_cache_fwd[causal-fp16-page128]",
             "tests/ops/attention/test_gqa_sliding_window.py::test_gqa_sliding_window_fwd_op[2-512-8-2-64-True--1--1-dtype0-False]",
             "tests/ops/attention/test_gqa_sliding_window.py::test_gqa_sliding_window_fwd_op[2-512-8-2-64-True--1--1-dtype1-False]",
             "tests/ops/attention/test_gqa_sliding_window.py::test_gqa_sliding_window_fwd_op[2-512-8-2-64-True-128--1-dtype2-False]",
@@ -55,7 +49,6 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "tests/ops/attention/test_gqa_sliding_window_varlen.py::test_gqa_sliding_window_varlen_fwd_op[2-seqlens_q13-seqlens_k13-8-2-64-True-0--1-dtype13-False]",
             "tests/ops/attention/test_mha.py::test_mha_bwd[full-bwd-fp16-large]",
             "tests/ops/attention/test_mha.py::test_mha_bwd[full-bwd-bf16-tuned]",
-            "tests/ops/test_kernel_selection.py::test_paged_prefill_fp8_cache_dispatch_is_unchanged",
         ),
     ),
     (
