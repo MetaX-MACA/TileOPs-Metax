@@ -8,7 +8,9 @@ import torch
 import torch.nn.functional as F
 
 from tests.test_base import FixtureBase, TestBase
+from tileops.kernels.attention.gqa_decode_paged import GQADecodePagedKernel
 from tileops.ops import GroupedQueryAttentionDecodePagedWithKVCacheFwdOp
+from tileops.utils import is_hopper
 from workloads.attention.gqa import (
     GroupedQueryAttentionDecodePagedWorkload,
 )
@@ -181,7 +183,7 @@ def test_gqa_decode_paged_bs1_fixed_tier_correctness(
     real_seqlen_kv_value: int,
     reverse_pages: bool,
 ) -> None:
-    """Check both runtime tiers, including output-distinguishing page translation."""
+    """Check both runtime paths, including output-distinguishing page translation."""
     torch.manual_seed(0)
     batch, heads, heads_kv, seqlen_kv, dim, page_size = 1, 32, 4, 4096, 128, 256
     dtype = torch.float16
@@ -197,10 +199,13 @@ def test_gqa_decode_paged_bs1_fixed_tier_correctness(
         block_table = block_table.flip(-1).contiguous()
 
     kernel = op._get_kernel(torch.float16)
-    assert kernel.__class__.__name__ == "GQADecodePagedBs1Kernel"
-    assert kernel._select_tier(real_seqlen_kv_value) == (
-        "ctx" if real_seqlen_kv_value >= 1024 else "no_split"
-    )
+    if is_hopper():
+        assert kernel.__class__.__name__ == "GQADecodePagedBs1Kernel"
+        assert kernel._select_tier(real_seqlen_kv_value) == (
+            "ctx" if real_seqlen_kv_value >= 1024 else "no_split"
+        )
+    else:
+        assert isinstance(kernel, GQADecodePagedKernel)
     test.check(
         op,
         q,
@@ -214,16 +219,19 @@ def test_gqa_decode_paged_bs1_fixed_tier_correctness(
 
 @pytest.mark.smoke
 def test_gqa_decode_paged_bs1_dispatch() -> None:
-    """Eligible Hopper requests select the paged TMA/WGMMA kernel."""
+    """Eligible requests use the Hopper fast path or the generic kernel elsewhere."""
     op = GroupedQueryAttentionDecodePagedWithKVCacheFwdOp(
         1, 32, 4, 8192, 128, 256)
     kernel = op._get_kernel(torch.float16)
-    assert kernel.__class__.__name__ == "GQADecodePagedBs1Kernel"
-    assert kernel._select_tier(1024) == "ctx"
-    assert kernel._select_tier(512) == "no_split"
-    assert kernel._ctx_splits_for(8192) == 32
-    assert kernel._ctx_splits_for(2048) == 16
-    assert kernel._ctx_splits_for(3072) == 8
+    if is_hopper():
+        assert kernel.__class__.__name__ == "GQADecodePagedBs1Kernel"
+        assert kernel._select_tier(1024) == "ctx"
+        assert kernel._select_tier(512) == "no_split"
+        assert kernel._ctx_splits_for(8192) == 32
+        assert kernel._ctx_splits_for(2048) == 16
+        assert kernel._ctx_splits_for(3072) == 8
+    else:
+        assert isinstance(kernel, GQADecodePagedKernel)
 
 
 @pytest.mark.smoke

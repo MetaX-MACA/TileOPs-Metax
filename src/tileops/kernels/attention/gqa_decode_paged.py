@@ -15,6 +15,7 @@ from tileops.kernels.online_softmax import (
     make_online_softmax,
     make_rescale,
 )
+from tileops.utils import is_maca
 
 __all__ = ["GQADecodePagedKernel"]
 
@@ -136,9 +137,6 @@ def _gqa_decode_no_split_paged_kernel(
                     online_softmax(acc_s, scores_max, scores_max_prev, scores_scale, scores_sum, logsum)
                     T.copy(acc_s, acc_s_cast)
                     rescale(acc_o, scores_scale)
-                    T.copy(
-                        V[blockn_num_offset * block_N:(blockn_num_offset + 1) * block_N,
-                          cur_kv_head, :], V_shared)
                     T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
                 for i, j in T.Parallel(block_H, dim):
                     acc_o[i, j] = T.if_then_else(logsum[i] == 0, 0, acc_o[i, j] / logsum[i])
@@ -280,9 +278,6 @@ def _gqa_decode_split_paged_kernel(
                     online_softmax(acc_s, scores_max, scores_max_prev, scores_scale, scores_sum, logsum)
                     T.copy(acc_s, acc_s_cast)
                     rescale(acc_o, scores_scale)
-                    T.copy(
-                        V[blockn_num_offset * block_N:(blockn_num_offset + 1) * block_N,
-                          cur_kv_head, :], V_shared)
                     T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
                 for i, j in T.Parallel(block_H, dim):
                     # When loop_range was 0 (split entirely beyond real_seqlen_kv), logsum=0 -> avoid 0/0
@@ -518,7 +513,19 @@ class GQADecodePagedKernel(Kernel):
     @property
     def default_config(self) -> dict:
         block_N = gqa_decode_paged_block_n(self.page_size)
-        return {"block_H": 64, "block_N": block_N, "num_split": 16, "num_stages": 2, "threads": 128}
+        config = {
+            "block_H": 64,
+            "block_N": block_N,
+            "num_split": 16,
+            "num_stages": 2,
+            "threads": 128,
+        }
+        if is_maca():
+            config.update(
+                block_N=min(block_N, 64),
+                num_stages=0,
+            )
+        return config
 
     @property
     def autotune_configs(self) -> list[dict]:
@@ -527,6 +534,9 @@ class GQADecodePagedKernel(Kernel):
         num_split = [2, 4, 8]
         num_stages = [1, 2, 3]
         threads = [128]
+        if is_maca():
+            block_N = tuple(block_n for block_n in block_N if block_n <= 64)
+            num_stages = [0]
         _configs = list(itertools.product(block_N, block_H, num_split, num_stages, threads))
 
         configs = [{
