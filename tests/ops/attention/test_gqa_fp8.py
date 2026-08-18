@@ -11,7 +11,7 @@ from workloads.gqa_fp8_utils import (
 
 
 def _has_sm90() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0)
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9
 
 
 def _run_canonical_fp8_prefill(
