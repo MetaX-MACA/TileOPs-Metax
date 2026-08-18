@@ -10,7 +10,7 @@ from workloads.gqa_fp8_utils import (
 
 
 def _has_sm90() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0)
 
 
 def _run_canonical_fp8_prefill(
@@ -176,7 +176,11 @@ def test_gqa_prefill_canonical_op_dispatches_fp8_tensor_core_path() -> None:
 
 @pytest.mark.parametrize("seq_len", [224, 672])
 @pytest.mark.smoke
-def test_gqa_prefill_fp8_tensor_core_rejects_unaligned_q_tiles(seq_len: int) -> None:
+def test_gqa_prefill_fp8_tensor_core_rejects_unaligned_q_tiles(
+    seq_len: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("tileops.utils.get_sm_version", lambda: 90)
     with pytest.raises(ValueError, match="max_seqlen_q % 128 == 0"):
         GQAFwdFP8Fa3ContractPtxAccBN224WsTmaVKernel(
             1, 8, 2, seq_len, seq_len, 128, False, torch.float16)

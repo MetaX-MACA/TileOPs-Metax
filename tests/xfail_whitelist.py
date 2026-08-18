@@ -136,8 +136,6 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         _CI_EXPECTATION_MISMATCH,
         (
-            "tests/ops/attention/test_gqa_fp8.py::test_gqa_prefill_fp8_tensor_core_rejects_unaligned_q_tiles[224]",
-            "tests/ops/attention/test_gqa_fp8.py::test_gqa_prefill_fp8_tensor_core_rejects_unaligned_q_tiles[672]",
             "tests/ops/test_deltanet_recurrence.py::test_deltanet_decode_raw_cuda_config_requires_full_warp_mapping",
             "tests/ops/test_deltanet_recurrence.py::test_deltanet_decode_raw_cuda_config_requires_two_lane_group",
             "tests/ops/test_family_dispatch.py::test_gemm_is_refused_where_neither_implementation_runs",
