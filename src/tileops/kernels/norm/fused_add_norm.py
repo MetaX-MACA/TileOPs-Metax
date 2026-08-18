@@ -248,7 +248,6 @@ def _fused_add_rms_norm_kernel(M, N, eps, dtype):
         ):
             with T.Kernel(T.ceildiv(M, block_m), threads=threads) as pid_m:
                 shared_x = T.alloc_shared((block_m, N_padded), dtype)
-                shared_r = T.alloc_shared((block_m, N_padded), dtype)
                 x_local = T.alloc_fragment((block_m, N_padded), dtype)
                 r_local = T.alloc_fragment((block_m, N_padded), dtype)
                 xsq_f32 = T.alloc_fragment((block_m, N_padded), "float32")
@@ -258,8 +257,8 @@ def _fused_add_rms_norm_kernel(M, N, eps, dtype):
                 # Load x and residual via shared memory
                 T.copy(x[pid_m * block_m, 0], shared_x)
                 T.copy(shared_x, x_local)
-                T.copy(residual[pid_m * block_m, 0], shared_r)
-                T.copy(shared_r, r_local)
+                T.copy(residual[pid_m * block_m, 0], shared_x)
+                T.copy(shared_x, r_local)
 
                 # Fused add: x_local <- (x + residual) in native dtype
                 for i, j in T.Parallel(block_m, N_padded):
@@ -294,8 +293,8 @@ def _fused_add_rms_norm_kernel(M, N, eps, dtype):
                 T.copy(shared_x, y[pid_m * block_m, 0])
 
                 # Write residual_out = x + residual
-                T.copy(x_local, shared_r)
-                T.copy(shared_r, residual_out[pid_m * block_m, 0])
+                T.copy(x_local, shared_x)
+                T.copy(shared_x, residual_out[pid_m * block_m, 0])
 
         return main
 

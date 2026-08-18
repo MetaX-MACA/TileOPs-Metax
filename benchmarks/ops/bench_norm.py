@@ -62,21 +62,13 @@ _FUSED_RMS_OP_NAME = "FusedAddRMSNormFwdOp"
 
 def _fused_rms_params():
     params = []
-    # Autotune has no valid configs for N=16384 (Llama-405B hidden_dim).
-    _XFAIL_LABELS = {"llama-3.1-405b-prefill", "llama-3.1-405b-decode"}
     for w in load_workloads(_FUSED_RMS_OP_NAME):
         m, n = w["x_shape"]
         label = w.get("label", f"{m}x{n}")
         for dtype_str in w["dtypes"]:
             dtype = getattr(torch, dtype_str)
-            marks = ()
-            if label in _XFAIL_LABELS:
-                marks = pytest.mark.xfail(
-                    reason="autotune has no valid configs for N=16384",
-                    strict=False)
             params.append(pytest.param(m, n, dtype, True,
-                                       id=f"{label}-{dtype_str}",
-                                       marks=marks))
+                                       id=f"{label}-{dtype_str}"))
     return params
 
 

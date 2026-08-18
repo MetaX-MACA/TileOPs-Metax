@@ -47,8 +47,6 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "tests/ops/attention/test_gqa_sliding_window_varlen.py::test_gqa_sliding_window_varlen_fwd_op[3-seqlens_q11-seqlens_k11-8-2-64-True--1--1-dtype11-False]",
             "tests/ops/attention/test_gqa_sliding_window_varlen.py::test_gqa_sliding_window_varlen_fwd_op[2-seqlens_q12-seqlens_k12-8-2-64-False--1-64-dtype12-False]",
             "tests/ops/attention/test_gqa_sliding_window_varlen.py::test_gqa_sliding_window_varlen_fwd_op[2-seqlens_q13-seqlens_k13-8-2-64-True-0--1-dtype13-False]",
-            "tests/ops/attention/test_mha.py::test_mha_bwd[full-bwd-fp16-large]",
-            "tests/ops/attention/test_mha.py::test_mha_bwd[full-bwd-bf16-tuned]",
         ),
     ),
     (
