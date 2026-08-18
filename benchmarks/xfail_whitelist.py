@@ -121,14 +121,6 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         _AUTOTUNE_FAILURE,
         (
-            "benchmarks/ops/attention/bench_mha.py::test_mha_bwd_bench[llama-3.1-8b-short-float16]",
-            "benchmarks/ops/attention/bench_mha.py::test_mha_bwd_bench[llama-3.1-8b-short-bfloat16]",
-            "benchmarks/ops/attention/bench_mha.py::test_mha_bwd_bench[llama-3.1-8b-long-float16]",
-            "benchmarks/ops/attention/bench_mha.py::test_mha_bwd_bench[llama-3.1-8b-long-bfloat16]",
-            "benchmarks/ops/attention/bench_mha.py::test_mha_bwd_bench[llama-3.1-70b-short-float16]",
-            "benchmarks/ops/attention/bench_mha.py::test_mha_bwd_bench[llama-3.1-70b-short-bfloat16]",
-            "benchmarks/ops/attention/bench_mha.py::test_mha_bwd_bench[llama-3.1-70b-long-float16]",
-            "benchmarks/ops/attention/bench_mha.py::test_mha_bwd_bench[llama-3.1-70b-long-bfloat16]",
         ),
     ),
 )
