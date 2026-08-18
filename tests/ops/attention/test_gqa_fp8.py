@@ -3,6 +3,7 @@ import torch
 
 from tileops.kernels.attention import GQAFwdFP8Fa3ContractPtxAccBN224WsTmaVKernel
 from tileops.ops import GroupedQueryAttentionPrefillFwdOp
+from tileops.utils import is_maca
 from workloads.gqa_fp8_utils import (
     quantize_kv_fa3_descale,
     quantize_q_fa3_gqa_descale,
@@ -174,13 +175,10 @@ def test_gqa_prefill_canonical_op_dispatches_fp8_tensor_core_path() -> None:
     assert torch.isfinite(out.float()).all()
 
 
+@pytest.mark.skipif(is_maca(), reason="requires Hopper FP8 WGMMA")
 @pytest.mark.parametrize("seq_len", [224, 672])
 @pytest.mark.smoke
-def test_gqa_prefill_fp8_tensor_core_rejects_unaligned_q_tiles(
-    seq_len: int,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("tileops.utils.get_sm_version", lambda: 90)
+def test_gqa_prefill_fp8_tensor_core_rejects_unaligned_q_tiles(seq_len: int) -> None:
     with pytest.raises(ValueError, match="max_seqlen_q % 128 == 0"):
         GQAFwdFP8Fa3ContractPtxAccBN224WsTmaVKernel(
             1, 8, 2, seq_len, seq_len, 128, False, torch.float16)
