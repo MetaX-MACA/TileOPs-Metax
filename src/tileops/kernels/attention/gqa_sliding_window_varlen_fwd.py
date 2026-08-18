@@ -22,6 +22,7 @@ from tileops.kernels.online_softmax import (
     make_online_softmax_with_mask_guard,
     make_rescale,
 )
+from tileops.utils import is_maca
 
 from .call_spec import uses_sliding_window
 from .packed_prefill import PackedPrefillKernel
@@ -153,6 +154,7 @@ def _gqa_sw_fwd_varlen_wgmma_pipelined_kernel(
     accum_dtype: str = "float",
 ) -> Callable:
     scale = make_log2e_scale(dim)
+    maca = is_maca()
     if heads % heads_kv != 0:
         raise ValueError("heads must be divisible by heads_kv")
     groups = heads // heads_kv
@@ -284,13 +286,19 @@ def _gqa_sw_fwd_varlen_wgmma_pipelined_kernel(
                 for i, j in T.Parallel(block_m, dim):
                     acc_o[i, j] = T.if_then_else(
                         logsum[i] > 0, acc_o[i, j] / logsum[i], 0.0)
-                T.sync_threads(3, threads)
-                T.copy(acc_o, o_shared)
-                T.sync_threads(3, threads)
-                for i, j in T.Parallel(block_m, dim):
-                    if bx * block_m + i < q_len:
-                        output[q_start + bx * block_m + i, by,
-                               j] = o_shared[i, j]
+                if maca:
+                    # The swizzled shared-memory store path is unstable on MACA.
+                    for i, j in T.Parallel(block_m, dim):
+                        if bx * block_m + i < q_len:
+                            output[q_start + bx * block_m + i, by, j] = acc_o[i, j]
+                else:
+                    T.sync_threads(3, threads)
+                    T.copy(acc_o, o_shared)
+                    T.sync_threads(3, threads)
+                    for i, j in T.Parallel(block_m, dim):
+                        if bx * block_m + i < q_len:
+                            output[q_start + bx * block_m + i, by,
+                                   j] = o_shared[i, j]
                 for i in T.Parallel(block_m):
                     if bx * block_m + i < q_len:
                         logsum[i] = T.log2(logsum[i]) + scores_max[i] * scale
@@ -348,6 +356,13 @@ class GQASlidingWindowVarlenFwdWgmmaPipelinedKernel(_GQASlidingWindowVarlenFwdKe
 
     @property
     def default_config(self) -> dict:
+        if is_maca():
+            return {
+                "block_m": 64,
+                "block_n": 64 if self.dim <= 64 else 32,
+                "num_stages": 1,
+                "threads": 128,
+            }
         return {
             "block_m": 128,
             "block_n": 128,
@@ -357,6 +372,8 @@ class GQASlidingWindowVarlenFwdWgmmaPipelinedKernel(_GQASlidingWindowVarlenFwdKe
 
     @property
     def autotune_configs(self) -> list[dict]:
+        if is_maca():
+            return [self.default_config]
         configs = list(
             itertools.product([64, 128], [64, 128], [2, 3], [128, 256]))
         return [{'block_m': c[0], 'block_n': c[1], 'num_stages': c[2],
