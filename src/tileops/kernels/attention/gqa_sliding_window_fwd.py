@@ -10,6 +10,7 @@ import torch
 
 from tileops.kernels.kernel_base import Kernel
 from tileops.kernels.online_softmax import make_log2e_scale
+from tileops.utils import is_maca
 
 __all__ = [
     'GQASlidingWindowFwdWgmmaPipelinedKernel',
@@ -29,6 +30,7 @@ def _gqa_sw_fwd_wgmma_pipelined_kernel(
     dtype: str = "float16",
 ) -> Callable:
     scale = make_log2e_scale(dim)
+    maca = is_maca()
     if heads % heads_kv != 0:
         raise ValueError("heads must be divisible by heads_kv")
     groups = heads // heads_kv
@@ -176,14 +178,20 @@ def _gqa_sw_fwd_wgmma_pipelined_kernel(
 
                 for i, j in T.Parallel(block_m, dim):
                     acc_o[i, j] /= logsum[i]
-                # Guard the swizzled o_shared round-trip against a shared-memory
-                # race under WGMMA pipelining. Any non-zero barrier slot works;
-                # a bare T.sync_threads() aliases the implicit barrier-0 and is
-                # elided.
-                T.sync_threads(3, threads)
-                T.copy(acc_o, o_shared)
-                T.sync_threads(3, threads)
-                T.copy(o_shared, output[bz, bx * block_m:(bx + 1) * block_m, by, :])
+                if maca:
+                    # The swizzled shared-memory store path is unstable on MACA.
+                    for i, j in T.Parallel(block_m, dim):
+                        if bx * block_m + i < seq_len:
+                            output[bz, bx * block_m + i, by, j] = acc_o[i, j]
+                else:
+                    # Guard the swizzled o_shared round-trip against a shared-memory
+                    # race under WGMMA pipelining. Any non-zero barrier slot works;
+                    # a bare T.sync_threads() aliases the implicit barrier-0 and is
+                    # elided.
+                    T.sync_threads(3, threads)
+                    T.copy(acc_o, o_shared)
+                    T.sync_threads(3, threads)
+                    T.copy(o_shared, output[bz, bx * block_m:(bx + 1) * block_m, by, :])
                 for i in T.Parallel(block_m):
                     logsum[i] = T.log2(logsum[i]) + scores_max[i] * scale
                 T.copy(logsum, lse[bz, by, bx * block_m:(bx + 1) * block_m])
@@ -256,6 +264,13 @@ class GQASlidingWindowFwdWgmmaPipelinedKernel(Kernel):
 
     @property
     def default_config(self) -> dict:
+        if is_maca():
+            return {
+                "block_m": 64,
+                "block_n": 64 if self.dim <= 64 else 32,
+                "num_stages": 1,
+                "threads": 128,
+            }
         return {
             "block_m": 128,
             "block_n": 128,
@@ -265,6 +280,8 @@ class GQASlidingWindowFwdWgmmaPipelinedKernel(Kernel):
 
     @property
     def autotune_configs(self) -> list[dict]:
+        if is_maca():
+            return [self.default_config]
         configs = list(itertools.product([64, 128], [64, 128],
                                          [2, 3], [128, 256]))
         return [{'block_m': c[0], 'block_n': c[1],

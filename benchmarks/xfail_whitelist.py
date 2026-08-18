@@ -129,14 +129,6 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         _AUTOTUNE_FAILURE,
         (
-            "benchmarks/ops/attention/bench_gqa_sliding_window.py::test_gqa_sliding_window_fwd_bench[llama-3.1-8b-short-w256-float16]",
-            "benchmarks/ops/attention/bench_gqa_sliding_window.py::test_gqa_sliding_window_fwd_bench[llama-3.1-8b-short-w256-bfloat16]",
-            "benchmarks/ops/attention/bench_gqa_sliding_window.py::test_gqa_sliding_window_fwd_bench[llama-3.1-8b-long-w1024-float16]",
-            "benchmarks/ops/attention/bench_gqa_sliding_window.py::test_gqa_sliding_window_fwd_bench[llama-3.1-8b-long-w1024-bfloat16]",
-            "benchmarks/ops/attention/bench_gqa_sliding_window.py::test_gqa_sliding_window_fwd_bench[llama-3.1-70b-short-w256-float16]",
-            "benchmarks/ops/attention/bench_gqa_sliding_window.py::test_gqa_sliding_window_fwd_bench[llama-3.1-70b-short-w256-bfloat16]",
-            "benchmarks/ops/attention/bench_gqa_sliding_window.py::test_gqa_sliding_window_fwd_bench[llama-3.1-70b-long-w1024-float16]",
-            "benchmarks/ops/attention/bench_gqa_sliding_window.py::test_gqa_sliding_window_fwd_bench[llama-3.1-70b-long-w1024-bfloat16]",
         ),
     ),
 )
