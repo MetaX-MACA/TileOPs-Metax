@@ -16,12 +16,6 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         _UNSUPPORTED_ARCHITECTURE,
         (
-            "benchmarks/ops/attention/bench_deepseek_mla_decode.py::test_mla_decode_bench[deepseek-v2-4k-float16]",
-            "benchmarks/ops/attention/bench_deepseek_mla_decode.py::test_mla_decode_bench[deepseek-v2-4k-bfloat16]",
-            "benchmarks/ops/attention/bench_deepseek_mla_decode.py::test_mla_decode_bench[deepseek-v2-32k-float16]",
-            "benchmarks/ops/attention/bench_deepseek_mla_decode.py::test_mla_decode_bench[deepseek-v2-32k-bfloat16]",
-            "benchmarks/ops/attention/bench_deepseek_mla_decode.py::test_mla_decode_bench[deepseek-v3-4k-bfloat16]",
-            "benchmarks/ops/attention/bench_deepseek_mla_decode.py::test_mla_decode_bench[deepseek-v3-32k-bfloat16]",
         ),
     ),
     (
@@ -99,14 +93,6 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "benchmarks/ops/bench_gla_chunkwise.py::test_gla_fwdbwd_bench[2-16384-4-64-64-64-dtype7-False]",
             "benchmarks/ops/bench_gla_chunkwise.py::test_gla_bwd_bench[2-4096-4-64-64-64-dtype4-False]",
             "benchmarks/ops/bench_gla_chunkwise.py::test_gla_fwdbwd_bench[2-4096-4-64-64-64-dtype4-False]",
-            "benchmarks/ops/attention/bench_gqa_decode_paged.py::test_gqa_decode_paged_bench[serving-8b-p64-float16]",
-            "benchmarks/ops/attention/bench_gqa_decode_paged.py::test_gqa_decode_paged_bench[serving-8b-long-p64-float16]",
-            "benchmarks/ops/attention/bench_gqa_decode_paged.py::test_gqa_decode_paged_bench[throughput-8b-p64-float16]",
-            "benchmarks/ops/attention/bench_gqa_decode_paged.py::test_gqa_decode_paged_bench[serving-70b-p64-float16]",
-            "benchmarks/ops/attention/bench_gqa_decode_paged.py::test_gqa_decode_paged_bench[serving-8b-p256-float16]",
-            "benchmarks/ops/attention/bench_gqa_decode_paged.py::test_gqa_decode_paged_bench[serving-70b-p256-float16]",
-            "benchmarks/ops/attention/bench_gqa_decode_paged.py::test_gqa_decode_paged_bench[serving-405b-p256-float16]",
-            "benchmarks/ops/attention/bench_gqa_decode_paged.py::test_gqa_decode_paged_bench[serving-8b-p64-softcap50-float16]",
             "benchmarks/ops/bench_ada_layer_norm.py::test_ada_layer_norm_bench[dit-xl-2-float16]",
             "benchmarks/ops/bench_ada_layer_norm.py::test_ada_layer_norm_bench[dit-xl-2-bfloat16]",
             "benchmarks/ops/bench_ada_layer_norm.py::test_ada_layer_norm_zero_bench[dit-xl-2-float16]",
