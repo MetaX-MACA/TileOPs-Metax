@@ -54,6 +54,11 @@ jobs:
         run: scripts/ci/verify_nightly_runner.sh
         shell: bash
 
+      - name: Install tilelang-metax
+        if: ${{ github.repository == 'MetaX-MACA/TileOPs-Metax' }}
+        run: bash scripts/ci/install_tilelang.sh
+        shell: bash
+
       - name: Install TileOPs (image-baked stack, --no-deps)
         run: bash scripts/ci/install_tileops.sh
         shell: bash
