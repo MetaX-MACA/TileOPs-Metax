@@ -40,6 +40,7 @@ _MAX_ITERS = 200
 _bench_meta = threading.local()
 _cuda_runtime = None
 _cuda_runtime_unavailable = False
+_torch_profiler_failed = False
 
 # CUPTI activity collection, via NVIDIA's cupti-python binding.
 
@@ -484,6 +485,11 @@ def _collect_torch_profiler(
         raise _CUPTIAttributionError(
             f"PyTorch profiler projected {n_regions}/{n_repeat} benchmark regions"
         )
+    if total_us <= 0:
+        raise _CUPTIAttributionError(
+            f"PyTorch profiler projected {n_regions}/{n_repeat} benchmark regions "
+            "but reported no device time"
+        )
     # Kineto event iteration above aggregates all kernels in the trace. Use the
     # profiler's per-region device time as a conservative common sample when the
     # backend does not expose correlation IDs (the normal MACA case).
@@ -609,6 +615,7 @@ def bench_kernel(
             "Check that gen_inputs() returns a tuple."
         )
 
+    global _torch_profiler_failed
     allow_fallback = _cuda_events_fallback_enabled()
     _bench_meta.timing = None
     _bench_meta.fallback_reason = None
@@ -654,7 +661,7 @@ def bench_kernel(
             samples = _collect_attributed(_run, n_repeat, _prepare_iteration)
         _bench_meta.timing = "cupti"
     except (_CUPTIAttributionError, CUPTIError) as exc:
-        if isinstance(exc, CUPTIError):
+        if isinstance(exc, CUPTIError) and not _torch_profiler_failed:
             try:
                 with _native_output_suppressor():
                     samples = _collect_torch_profiler(_run, n_repeat, _prepare_iteration)
@@ -663,6 +670,10 @@ def bench_kernel(
                 torch.cuda.empty_cache()
                 return samples
             except Exception as profiler_exc:  # noqa: BLE001
+                # Repeated profiler sessions can keep their CPU region count on
+                # MACA while losing every projected device event. Once observed,
+                # retrying it for every later implementation only doubles the run.
+                _torch_profiler_failed = True
                 _logger.warning(
                     "PyTorch profiler fallback failed (%s); original CUPTI error: %s",
                     profiler_exc,

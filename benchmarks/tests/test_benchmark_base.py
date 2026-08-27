@@ -1,16 +1,20 @@
 import ast
+import contextlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-from benchmarks.benchmark_base import workloads_to_params
+from benchmarks.benchmark_base import BenchmarkBase, workloads_to_params
 from benchmarks.timing import (
+    Sample,
     Trace,
     _attributed_samples,
     _bench_meta,
     _capture_bench_meta,
     _collect_attributed,
+    _collect_torch_profiler,
     _CUPTIAttributionError,
     _CUPTIRecordsLostError,
     _OffThreadLaunchError,
@@ -208,6 +212,80 @@ def test_a_call_that_launched_nothing_does_not_spend_the_retries(monkeypatch):
     with pytest.raises(_CUPTIAttributionError, match="CUPTI discarded nothing"):
         _collect_attributed(lambda i: None, 1, lambda i: None)
     assert len(attempts) == 1
+
+
+def test_torch_profiler_rejects_regions_with_no_device_time(monkeypatch):
+    """A CPU region count is not proof that Kineto projected it onto the device."""
+
+    class FakeProfiler:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def key_averages(self):
+            return [
+                SimpleNamespace(
+                    key="tileops.bench.kernel",
+                    device_time_total=0.0,
+                    count=2,
+                )
+            ]
+
+    monkeypatch.setattr(torch.profiler, "profile", lambda **kwargs: FakeProfiler())
+    monkeypatch.setattr(torch.profiler, "record_function", lambda name: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    with pytest.raises(_CUPTIAttributionError, match="reported no device time"):
+        _collect_torch_profiler(lambda i: None, 2, lambda i: None)
+
+
+def test_result_rejects_non_positive_device_time():
+    class Benchmark(BenchmarkBase):
+        def calculate_flops(self):
+            return 1.0
+
+        def calculate_memory(self):
+            return 1.0
+
+    with pytest.raises(RuntimeError, match="non-positive device_busy_ms=0.0"):
+        Benchmark(None)._build_result(
+            [Sample(device_busy_ms=0.0, latency_ms=0.0, n_kernels=None)],
+            {"timing": "torch-profiler"},
+        )
+
+
+def test_compare_remeasures_every_tag_after_timing_method_changes(monkeypatch):
+    class Benchmark(BenchmarkBase):
+        def calculate_flops(self):
+            return None
+
+        def calculate_memory(self):
+            return None
+
+    methods = iter(
+        [
+            "torch-profiler",
+            "torch-profiler",
+            "cuda-events",
+            "cuda-events",
+            "cuda-events",
+            "cuda-events",
+            "cuda-events",
+            "cuda-events",
+        ]
+    )
+
+    def fake_bench_kernel(*args, **kwargs):
+        _bench_meta.timing = next(methods)
+        return [Sample(device_busy_ms=1.0, latency_ms=1.0, n_kernels=None)]
+
+    monkeypatch.setattr("benchmarks.benchmark_base.bench_kernel", fake_bench_kernel)
+
+    results = Benchmark(None).compare({"tileops": lambda: None, "torch": lambda: None})
+
+    assert {result["timing"] for result in results.values()} == {"cuda-events"}
 
 
 @pytest.mark.smoke
