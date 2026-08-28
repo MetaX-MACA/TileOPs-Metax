@@ -18,6 +18,7 @@ from benchmarks.timing import (
     _CUPTIAttributionError,
     _CUPTIRecordsLostError,
     _OffThreadLaunchError,
+    _timestamped_samples,
     bench_kernel,
 )
 
@@ -116,6 +117,34 @@ def test_busy_counts_overlapping_kernels_once():
 
     assert sample.device_busy_ms == pytest.approx(0.008)
     assert sample.latency_ms == pytest.approx(0.008)
+
+
+def test_timestamp_windows_assign_mcpti_kernels_and_ignore_prepare():
+    kernels = [
+        _kernel(1_000, 2_000),  # prepare
+        _kernel(11_000, 13_000),
+        _kernel(15_000, 19_000),
+        _kernel(31_000, 35_000),
+    ]
+
+    first, second = _timestamped_samples(kernels, [(10_000, 20_000), (30_000, 40_000)], "MCPTI")
+
+    assert (first.device_busy_ms, first.latency_ms, first.n_kernels) == pytest.approx(
+        (0.006, 0.008, 2)
+    )
+    assert (second.device_busy_ms, second.latency_ms, second.n_kernels) == pytest.approx(
+        (0.004, 0.004, 1)
+    )
+
+
+def test_timestamp_windows_reject_a_kernel_crossing_the_boundary():
+    with pytest.raises(_CUPTIAttributionError, match="crosses a timing-window boundary"):
+        _timestamped_samples([_kernel(9_000, 11_000)], [(10_000, 20_000)], "MCPTI")
+
+
+def test_timestamp_windows_fail_when_an_iteration_has_no_kernel():
+    with pytest.raises(_CUPTIAttributionError, match="recorded no kernel"):
+        _timestamped_samples([], [(10_000, 20_000)], "MCPTI")
 
 
 def test_attribution_measures_a_call_whose_kernel_count_varies():

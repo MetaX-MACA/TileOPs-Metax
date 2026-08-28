@@ -4,11 +4,10 @@ The timing layer owns the measurement and nothing else -- it knows how to run a 
 n times and return each run's device latency. What the numbers mean, and where they are
 written, belong to the layers above.
 
-A kernel belongs to the iteration whose external correlation id it carries, so nothing
-is inferred from timestamps and a kernel shorter than the host overhead around it is
-attributed as reliably as a long one. CUPTI's id stack is per-thread, which is this
-protocol's one demand on a timed callable: it must launch its own work rather than hand
-it to another thread (``Tensor.backward`` hands it to autograd's engine thread;
+NVIDIA CUPTI assigns a kernel to the iteration whose external correlation id it carries.
+MetaX MCPTI does not expose that API in Python, so its synchronized calls are assigned by
+device-clock timestamp windows instead. A timed callable must launch its own work rather
+than hand it to another thread (``Tensor.backward`` hands it to autograd's engine thread;
 ``grad_fn.apply`` does not).
 """
 
@@ -47,6 +46,10 @@ _torch_profiler_failed = False
 _CUPTI = None
 _COLLECTOR_ACTIVE = False
 _CALLBACKS_REGISTERED = False
+_MCPTI = None
+_MCPTI_UNAVAILABLE = False
+_MCPTI_COLLECTOR_ACTIVE = False
+_MCPTI_CALLBACKS_REGISTERED = False
 # Whatever CUPTI does with a buffer between handing it back and asking for the next one
 # scales with its size and runs on this thread, inside a timed call. On a three-kernel
 # call whose kernels occupy 19.1 us: 8 MB stalls 23 of 60 iterations past 200 us, 32 MB
@@ -58,6 +61,7 @@ _BUFFER_ALIGN = 8
 _buffer_bytes = _BUFFER_BYTES
 _KERNELS: list[dict[str, Any]] = []
 _ITERATION_OF: dict[int, int] = {}
+_MCPTI_KERNELS: list[dict[str, Any]] = []
 _ATTRIBUTION_ATTEMPTS = 3
 _DROPPED_COUNT_UNREADABLE = False
 _DROP_COUNTER_LIVE: Optional[bool] = None
@@ -92,6 +96,10 @@ class CUPTIError(RuntimeError):
     """The CUPTI collector is unavailable or could not be operated."""
 
 
+class MCPTIError(RuntimeError):
+    """The MCPTI collector is unavailable or could not be operated."""
+
+
 def _load_cupti():
     global _CUPTI
     if _CUPTI is not None:
@@ -106,6 +114,21 @@ def _load_cupti():
         ) from exc
     _CUPTI = cupti
     return _CUPTI
+
+
+def _load_mcpti():
+    global _MCPTI, _MCPTI_UNAVAILABLE
+    if _MCPTI is not None:
+        return _MCPTI
+    if _MCPTI_UNAVAILABLE:
+        raise MCPTIError("mcpti-python is unavailable")
+    try:
+        from mcpti import mcpti
+    except Exception as exc:  # noqa: BLE001
+        _MCPTI_UNAVAILABLE = True
+        raise MCPTIError("mcpti-python is unavailable") from exc
+    _MCPTI = mcpti
+    return _MCPTI
 
 
 def _buffer_requested():
@@ -182,6 +205,22 @@ def _buffer_completed(records) -> None:
         elif kind == int(cupti.ActivityKind.EXTERNAL_CORRELATION):
             _ITERATION_OF[int(record.correlation_id)] = int(record.external_id)
         # Launch-API records are collected only so CUPTI emits the correlation above.
+
+
+def _mcpti_buffer_completed(records) -> None:
+    """Copy MCPTI kernel fields out before its callback-owned records expire."""
+    mcpti = _load_mcpti()
+    for record in records:
+        if int(record.kind) != int(mcpti.ActivityKind.CONCURRENT_KERNEL):
+            continue
+        _MCPTI_KERNELS.append(
+            {
+                "name": str(record.name),
+                "start_ns": int(record.start),
+                "end_ns": int(record.end),
+                "correlation_id": int(record.correlation_id),
+            }
+        )
 
 
 def _trace_launches_only(cupti) -> None:
@@ -265,6 +304,32 @@ def _flush() -> tuple[list[dict[str, Any]], dict[int, int]]:
     _KERNELS.clear()
     _ITERATION_OF.clear()
     return kernels, iteration_of
+
+
+@contextlib.contextmanager
+def _mcpti_session():
+    """Collect MetaX kernel activities for one measurement phase."""
+    global _MCPTI_CALLBACKS_REGISTERED, _MCPTI_COLLECTOR_ACTIVE
+    if _MCPTI_COLLECTOR_ACTIVE:
+        raise RuntimeError("MCPTI collector is already active")
+    mcpti = _load_mcpti()
+    try:
+        if not _MCPTI_CALLBACKS_REGISTERED:
+            mcpti.activity_register_callbacks(_buffer_requested, _mcpti_buffer_completed)
+            _MCPTI_CALLBACKS_REGISTERED = True
+        _MCPTI_KERNELS.clear()
+        mcpti.activity_enable(mcpti.ActivityKind.CONCURRENT_KERNEL)
+    except Exception as exc:  # noqa: BLE001
+        raise MCPTIError(f"MCPTI collector failed to start: {exc}") from exc
+    _MCPTI_COLLECTOR_ACTIVE = True
+    try:
+        yield mcpti
+    finally:
+        _MCPTI_COLLECTOR_ACTIVE = False
+        try:
+            mcpti.activity_disable(mcpti.ActivityKind.CONCURRENT_KERNEL)
+        except Exception as exc:  # noqa: BLE001
+            raise MCPTIError(f"MCPTI collector failed to stop: {exc}") from exc
 
 
 class Trace(NamedTuple):
@@ -352,11 +417,55 @@ def _kernel_busy_us(kernels: list[dict]) -> float:
     return (total + current_end - current_start) / 1000.0
 
 
+def _timestamped_samples(
+    kernels: list[dict], windows: list[tuple[int, int]], backend: str
+) -> list["Sample"]:
+    """Assign serialized kernel records to device-clock measurement windows."""
+    claimed: list[list[dict]] = [[] for _ in windows]
+    for kernel in kernels:
+        kernel_start = int(kernel["start_ns"])
+        kernel_end = int(kernel["end_ns"])
+        matches = [
+            index
+            for index, (window_start, window_end) in enumerate(windows)
+            if window_start <= kernel_start and kernel_end <= window_end
+        ]
+        if len(matches) == 1:
+            claimed[matches[0]].append(kernel)
+            continue
+        if len(matches) > 1:
+            raise _CUPTIAttributionError(
+                f"{backend} kernel {kernel['name']} belongs to multiple timing windows"
+            )
+        if any(
+            kernel_start < window_end and kernel_end > window_start
+            for window_start, window_end in windows
+        ):
+            raise _CUPTIAttributionError(
+                f"{backend} kernel {kernel['name']} crosses a timing-window boundary"
+            )
+        # Kernels wholly outside the windows belong to prepare_one.
+
+    unmeasured = [index for index, iteration in enumerate(claimed) if not iteration]
+    if unmeasured:
+        raise _CUPTIAttributionError(
+            f"{backend} recorded no kernel for {len(unmeasured)} of {len(windows)} "
+            f"iterations (first: iteration {unmeasured[0]})"
+        )
+    return [
+        Sample(
+            device_busy_ms=_kernel_busy_us(iteration) * 1e-3,
+            latency_ms=_kernel_span_us(iteration) * 1e-3,
+            n_kernels=len(iteration),
+        )
+        for iteration in claimed
+    ]
+
+
 def _cuda_events_fallback_enabled() -> bool:
-    # The standalone cupti-python binding is not present in many MACA images,
-    # even though PyTorch itself can still create CUDA-compatible events. Keep
-    # benchmarks runnable there; set the variable to 0 when strict CUPTI-only
-    # measurements are required.
+    # A native activity binding is not present in every runner image, even though
+    # PyTorch itself can still create CUDA-compatible events. Keep benchmarks
+    # runnable there; set the variable to 0 when strict activity timing is required.
     return os.getenv("TILEOPS_ALLOW_CUDA_EVENTS_FALLBACK", "1") == "1"
 
 
@@ -457,6 +566,33 @@ def _collect_attributed(
                 _ATTRIBUTION_ATTEMPTS,
             )
     raise AssertionError("the loop returns or raises on its last attempt")
+
+
+def _collect_mcpti(
+    run_one: Callable[[int], None],
+    n_repeat: int,
+    prepare_one: Callable[[int], None],
+) -> list[Sample]:
+    """Collect MetaX kernel timings in synchronized MCPTI timestamp windows."""
+    windows = []
+    try:
+        with _mcpti_session() as mcpti:
+            for i in range(n_repeat):
+                prepare_one(i)
+                start_ns = int(mcpti.get_timestamp())
+                run_one(i)
+                torch.cuda.synchronize()
+                end_ns = int(mcpti.get_timestamp())
+                windows.append((start_ns, end_ns))
+            mcpti.activity_flush_all(1)
+            kernels = list(_MCPTI_KERNELS)
+    except _CUPTIAttributionError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        if isinstance(exc, MCPTIError):
+            raise
+        raise MCPTIError(f"MCPTI collection failed: {exc}") from exc
+    return _timestamped_samples(kernels, windows, "MCPTI")
 
 
 def _collect_torch_profiler(
@@ -598,7 +734,7 @@ def bench_kernel(
     max_iters: int = _MAX_ITERS,
     min_iters: int = _MIN_ITERS,
 ) -> list[Sample]:
-    """Time *fn* through CUPTI, one :class:`Sample` per iteration.
+    """Time *fn* through a native activity collector, one sample per iteration.
 
     A calibration pass measures one cold-isolated iteration and the millisecond budgets
     divide into it, clamped to ``[min_iters, max_iters]``; an op faster than the L2 flush
@@ -661,12 +797,27 @@ def bench_kernel(
             samples = _collect_attributed(_run, n_repeat, _prepare_iteration)
         _bench_meta.timing = "cupti"
     except (_CUPTIAttributionError, CUPTIError) as exc:
+        fallback_exc = exc
+        if isinstance(exc, CUPTIError):
+            try:
+                with _native_output_suppressor():
+                    samples = _collect_mcpti(_run, n_repeat, _prepare_iteration)
+                _bench_meta.timing = "mcpti"
+                torch.cuda.empty_cache()
+                return samples
+            except (MCPTIError, _CUPTIAttributionError) as mcpti_exc:
+                fallback_exc = mcpti_exc
+                _logger.warning(
+                    "MCPTI fallback failed (%s); original CUPTI error: %s",
+                    mcpti_exc,
+                    exc,
+                )
         if isinstance(exc, CUPTIError) and not _torch_profiler_failed:
             try:
                 with _native_output_suppressor():
                     samples = _collect_torch_profiler(_run, n_repeat, _prepare_iteration)
                 _bench_meta.timing = "torch-profiler"
-                _bench_meta.fallback_reason = str(exc)
+                _bench_meta.fallback_reason = str(fallback_exc)
                 torch.cuda.empty_cache()
                 return samples
             except Exception as profiler_exc:  # noqa: BLE001
@@ -674,6 +825,7 @@ def bench_kernel(
                 # MACA while losing every projected device event. Once observed,
                 # retrying it for every later implementation only doubles the run.
                 _torch_profiler_failed = True
+                fallback_exc = profiler_exc
                 _logger.warning(
                     "PyTorch profiler fallback failed (%s); original CUPTI error: %s",
                     profiler_exc,
@@ -681,13 +833,13 @@ def bench_kernel(
                 )
         if not allow_fallback:
             raise RuntimeError(
-                f"CUPTI profiling failed: {exc}. CUDA-events fallback is disabled "
+                f"GPU profiling failed: {fallback_exc}. CUDA-events fallback is disabled "
                 "(TILEOPS_ALLOW_CUDA_EVENTS_FALLBACK=0), which keeps the run from "
                 "silently mixing two timing methods."
-            ) from exc
+            ) from fallback_exc
         _bench_meta.timing = "cuda-events"
-        _bench_meta.fallback_reason = str(exc)
-        _logger.warning("CUPTI timing failed (%s); falling back to CUDA events.", exc)
+        _bench_meta.fallback_reason = str(fallback_exc)
+        _logger.warning("GPU timing failed (%s); falling back to CUDA events.", fallback_exc)
         starts = [torch.cuda.Event(enable_timing=True) for _ in range(n_repeat)]
         ends = [torch.cuda.Event(enable_timing=True) for _ in range(n_repeat)]
         for i in range(n_repeat):
