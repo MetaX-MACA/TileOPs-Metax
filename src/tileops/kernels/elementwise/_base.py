@@ -636,9 +636,10 @@ def _make_fused_gated_explicit(
             with T.Kernel(T.ceildiv(N, block_N), M, threads=threads_arg) as (bx, by):
                 for i, j in T.Parallel(threads_arg, npt_arg):
                     col = (bx * threads_arg + i) * npt_arg + j
-                    gate = x[by, col]
-                    value = x[by, N + col]
-                    y[by, col] = op_func(gate, value)
+                    if col < N:
+                        gate = x[by, col]
+                        value = x[by, N + col]
+                        y[by, col] = op_func(gate, value)
 
         return main
 

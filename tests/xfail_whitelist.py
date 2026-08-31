@@ -80,14 +80,7 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         _NUMERICAL_MISMATCH,
-        (
-            "tests/ops/test_fused_moe_experts.py::TestFusedMoEExpertsNopadPersistent3WGFwdOp::test_forward_matches_torch_ref_activation[float16-gelu_and_mul]",
-            "tests/ops/attention/test_mha_decode_paged.py::test_mha_decode_paged_cache_shorter_than_bound[real_lengths2]",
-            "tests/ops/test_mamba.py::test_da_cumsum_fwd[2-4-128-16-True-True-dtype6-False]",
-            "tests/ops/test_mhc.py::test_mhc_pre_op[1-4-1280-dtype0-False]",
-            "tests/ops/test_mhc.py::test_mhc_pre_op[2-4-1920-dtype1-False]",
-            "tests/ops/test_mhc.py::test_mhc_pre_op[4-4-2560-dtype2-False]",
-        ),
+        (),
     ),
     (
         _RUNTIME_LAUNCH_ERROR,

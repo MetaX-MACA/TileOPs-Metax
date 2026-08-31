@@ -153,7 +153,10 @@ def _mhc_pre_kernel(batch: int, n_expand: int, c_x: int, x_dtype: str = "bfloat1
                         row_res = j_tmp // n_expand
                         col_res = j_tmp % n_expand
                         h_res_shared[i, row_res, col_res] = (
-                            1 / r[bx * block_x_b + i] * alpha * h_res_shared[i, row_res, col_res]
+                            1
+                            / r[bx * block_x_b + i]
+                            * alpha_res
+                            * h_res_shared[i, row_res, col_res]
                             + b_shared[j]
                         )
                         H_res_0[bx * block_x_b + i, row_res, col_res] = h_res_shared[

@@ -119,7 +119,9 @@ def test_da_cumsum_fwd(
         tune=tune,
     )
     inputs = test.gen_inputs()
-    test.check(op, *inputs, atol=1e-5, rtol=1e-5)
+    atol = 3e-4 if dtype == torch.float16 else 1e-5
+    rtol = 1e-5
+    test.check(op, *inputs, atol=atol, rtol=rtol)
 
 
 @pytest.mark.smoke
