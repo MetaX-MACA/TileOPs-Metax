@@ -158,7 +158,7 @@ class SharedFusedMoE(FusedMoe, UnmanifestedOp):
         self, inputs: "tuple[torch.Tensor | None, ...]", dtype: torch.dtype
     ) -> Kernel:
         """Return the shared-expert MLP kernel for *dtype*, building on first use."""
-        kernel_cls = SharedExpertMLPMACAKernel if is_maca() else SharedExpertMLPKernel
+        kernel_cls = self.kernel_map["shared_expert_mlp"]
         return self.get_or_build_kernel(
             "shared_expert_mlp",
             inputs,
@@ -175,7 +175,9 @@ class SharedFusedMoE(FusedMoe, UnmanifestedOp):
     def default_kernel_map(self) -> Dict[str, Kernel]:
         # The routed half's kernels belong to the sub-ops it builds; this one is the
         # op's own, so it is declared here and a replacement reaches it.
-        return {"shared_expert_mlp": SharedExpertMLPKernel}
+        return {
+            "shared_expert_mlp": (SharedExpertMLPMACAKernel if is_maca() else SharedExpertMLPKernel)
+        }
 
     def forward(
         self,

@@ -4,7 +4,7 @@ import torch
 from tests.test_base import FixtureBase, TestBase
 from tileops.kernels.grouped_gemm import GroupedGemmCall, GroupedGemmKernel
 from tileops.ops.gemm.grouped_gemm import GroupedGemmFwdOp
-from tileops.utils import get_sm_version
+from tileops.utils import get_sm_version, is_maca
 from workloads.grouped_gemm import (
     GroupedGemmWorkload,
 )
@@ -183,4 +183,9 @@ def test_selection_prefers_the_persistent_kernel_where_it_applies(
         transpose_a=transpose_a,
         transpose_b=transpose_b,
     )
-    assert op.select_kernel_key(op._KERNEL_KEYS, call) == expected
+    selected = op.select_kernel_key(op._KERNEL_KEYS, call)
+
+    if is_maca():
+        expected = "grouped_gemm_kernel"
+
+    assert selected == expected

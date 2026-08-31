@@ -252,11 +252,14 @@ def test_shared_fused_moe_tp_rejects_local_shards():
 @pytest.mark.smoke
 def test_a_replaced_shared_expert_kernel_is_the_one_built():
     """The shared half is reachable through kernel_map, like the routed half."""
-    from tileops.kernels.moe import SharedExpertMLPKernel
+    from tileops.kernels.moe import SharedExpertMLPKernel, SharedExpertMLPMACAKernel
+    from tileops.utils import is_maca
 
     built = []
 
-    class Replacement(SharedExpertMLPKernel):
+    ReplacementBase = SharedExpertMLPMACAKernel if is_maca() else SharedExpertMLPKernel
+
+    class Replacement(ReplacementBase):
         def __init__(self, **kwargs):
             built.append(kwargs)
             super().__init__(**kwargs)

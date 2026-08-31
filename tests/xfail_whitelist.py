@@ -132,10 +132,7 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         _CI_EXPECTATION_MISMATCH,
-        (
-            "tests/ops/test_grouped_gemm.py::test_selection_prefers_the_persistent_kernel_where_it_applies[4096-4096-False-True-grouped_gemm_persistent_3wg_kernel]",
-            "tests/ops/test_moe_shared_fused_moe.py::test_a_replaced_shared_expert_kernel_is_the_one_built",
-        ),
+        (),
     ),
     (
         _TRACE_RUNTIME_ERROR,
