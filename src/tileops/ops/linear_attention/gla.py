@@ -94,13 +94,16 @@ class GLAFwdOp(Op):
         dtype: torch.dtype,
         device_index: int | None,
     ) -> Kernel:
+        kernel_chunk_size = self.chunk_size
+        if is_maca() and dtype == torch.float32 and self.chunk_size == 64:
+            kernel_chunk_size = 32
         key = (
             batch,
             seq_len,
             heads,
             dim_k,
             dim_v,
-            self.chunk_size,
+            kernel_chunk_size,
             self.scale,
             dtype,
             device_index,
@@ -116,7 +119,7 @@ class GLAFwdOp(Op):
                 heads,
                 dim_k,
                 dim_v,
-                self.chunk_size,
+                kernel_chunk_size,
                 scale=self.scale,
                 output_final_state=True,
                 dtype=dtype,
@@ -231,13 +234,16 @@ class GLABwdOp(Op):
         dtype: torch.dtype,
         device_index: int | None,
     ) -> Kernel:
+        kernel_chunk_size = self.chunk_size
+        if is_maca() and dtype == torch.float32 and self.chunk_size == 64:
+            kernel_chunk_size = 32
         key = (
             batch,
             seq_len,
             heads,
             dim_k,
             dim_v,
-            self.chunk_size,
+            kernel_chunk_size,
             self.scale,
             dtype,
             device_index,
@@ -253,7 +259,7 @@ class GLABwdOp(Op):
                 heads,
                 dim_k,
                 dim_v,
-                self.chunk_size,
+                kernel_chunk_size,
                 scale=self.scale,
                 dtype=dtype,
                 tune=self.tune,
@@ -308,7 +314,10 @@ class GLABwdOp(Op):
             q, k, v, g, self.chunk_size, do=do
         )
         self._validate_dtypes(q, k, v, g, h, do, dht)
-        chunks = seq_len // self.chunk_size
+        kernel_chunk_size = self.chunk_size
+        if is_maca() and dtype == torch.float32 and self.chunk_size == 64:
+            kernel_chunk_size = 32
+        chunks = seq_len // kernel_chunk_size
         check_tensor_shape("h", h, (batch, chunks + 1, heads, dim_k, dim_v))
         check_tensor_shape("dht", dht, (batch, heads, dim_k, dim_v))
         self.batch = batch
