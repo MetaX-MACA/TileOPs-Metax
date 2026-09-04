@@ -80,6 +80,18 @@ def _topk_selector_kernel(batch, seq_len, seq_len_kv, kv_group, topk, in_dtype, 
                 for j in T.serial(RADIX + 1):
                     s_histogram[j] = 0
                 s_num_input[0] = 0
+                # No thread writes s_threshold_bin_id when the row holds at most topk
+                # valid elements. -1 then lets every element clear the threshold test,
+                # which is exactly the wanted behaviour for a short row.
+                s_threshold_bin_id[0] = -1
+
+                # A row with fewer than topk valid elements fills only that many output
+                # slots, and the output buffer is uninitialised, so the rest would carry
+                # whatever the allocator handed back. -1 marks them as empty.
+                for j in T.serial(T.ceildiv(topk, BLOCK_SIZE)):
+                    out_slot = j * BLOCK_SIZE + tx
+                    if out_slot < topk:
+                        index[bx, seq_row, g, out_slot] = -1
 
                 T.sync_threads()
 
@@ -150,6 +162,7 @@ def _topk_selector_kernel(batch, seq_len, seq_len_kv, kv_group, topk, in_dtype, 
                         s_histogram[j] = 0
                     if tx == 0:
                         s_num_input[r_idx ^ 1] = 0
+                        s_threshold_bin_id[0] = -1
                     T.sync_threads()
 
                     l_num_input = T.min(s_num_input[r_idx], SMEM_INPUT_SIZE)
