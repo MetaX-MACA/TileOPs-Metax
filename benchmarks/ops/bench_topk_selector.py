@@ -27,6 +27,7 @@ from benchmarks.benchmark_base import (
 )
 from tileops.manifest import load_workloads
 from tileops.ops import TopkSelectorFwdOp
+from tileops.utils import is_maca
 from workloads.topk_selector import TopkSelectorWorkload
 
 # Autotuning is a bench-run policy, not a workload property; manifest
@@ -48,6 +49,9 @@ def _flashinfer_topk(test: TopkSelectorWorkload, starts: torch.Tensor, ends: tor
     It selects over the last dimension, which is ``seq_len_kv`` only while
     ``kv_group`` is 1, and over the whole row, so a narrowed ``[start, end)`` is out.
     """
+    # MetaX's FlashInfer build does not expose ``flashinfer.top_k``.
+    if is_maca():
+        return None
     if test.kv_group != 1:
         return None
     if not (bool((starts == 0).all()) and bool((ends == test.seq_len_kv).all())):

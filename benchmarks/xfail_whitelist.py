@@ -216,8 +216,6 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "benchmarks/ops/bench_pool.py::test_max_pool3d_bench[medicalnet-stem-bfloat16]",
             "benchmarks/ops/bench_rope.py::test_rope_neox_position_ids_bench[position-ids-s2k-h32-d128-float16]",
             "benchmarks/ops/bench_rope.py::test_rope_neox_position_ids_bench[position-ids-s4k-h32-d128-bfloat16]",
-            "benchmarks/ops/bench_topk_selector.py::test_topk_selector_bench[topk1024-s32k-kv64k-float32]",
-            "benchmarks/ops/bench_topk_selector.py::test_topk_selector_bench[topk2048-s32k-kv64k-float32]",
         ),
     ),
 )
