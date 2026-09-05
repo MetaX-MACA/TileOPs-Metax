@@ -858,7 +858,12 @@ class RowTiledAutotuneMixin:
                         compute_tile_n(bm, self._elem_bytes, self.N_padded, budget=budget)
                     except ValueError:
                         continue
-                    bm_tile_n = self._tile_n_for_block_m(bm)
+                    try:
+                        bm_tile_n = self._tile_n_for_block_m(bm)
+                    except ValueError:
+                        # This block height cannot fit one aligned tiled slice
+                        # with every shared buffer required by the kernel.
+                        continue
                     if bm_tile_n != 0:
                         continue
                     if bm > max_block_m_no_tile:
