@@ -20,12 +20,18 @@ import torch
 
 from tileops.kernels.kernel_base import Kernel
 
-__all__ = ["GatedDeltaNetFwdMACAKernel"]
+__all__ = ["GatedDeltaNetFwdBTHDMACAKernel", "GatedDeltaNetFwdMACAKernel"]
 
 _LOG2E = 1.4426950408889634
 _MACA_SMEM_CAP = 65536
 _MACA_SMEM_SLACK = 2048
 _TILE_CANDIDATES = (64, 32, 16)
+# output_o can reuse a single low-precision attn tile across all V columns.
+# Unlike fused_prepare / h_recurrence, a 64x128 output tile fits in 64KB.
+_OUTPUT_TILE_CANDIDATES = (128, 64, 32, 16)
+_BLOCKWISE_INVERSE_CHUNK = 64
+_BLOCKWISE_INVERSE_TILE = 32
+_BLOCKWISE_INVERSE_STAGING_BYTES = 2 * _BLOCKWISE_INVERSE_TILE**2 * 4
 
 
 def _dtype_nbytes(dtype: str) -> int:
@@ -58,12 +64,23 @@ def _chunk_local_cumsum(g: torch.Tensor, chunk_size: int) -> torch.Tensor:
 def _fused_smem(chunk_size: int, bk: int, bv: int, dtype: str) -> int:
     elem = _dtype_nbytes(dtype)
     kv_w = bk if bk >= bv else bv
+    # ``P_shared`` is dead after the Neumann inverse has been formed.  When
+    # its [C, C] shape matches the widest K/V tile, it can subsequently hold
+    # k*beta or v*beta.  Count only the peak live allocation, not both buffers.
+    kv_beta_bytes = 0 if kv_w == chunk_size else chunk_size * kv_w * 4
+    # MACA GEMM does not accept a first-dimension-offset shared view.  The
+    # C=64 blockwise inverse stages its 32x32 operands through two zero-offset
+    # shared buffers before issuing each GEMM.
+    inverse_workspace_bytes = (
+        _BLOCKWISE_INVERSE_STAGING_BYTES if chunk_size == _BLOCKWISE_INVERSE_CHUNK else 0
+    )
     return (
         chunk_size * bk * elem
         + chunk_size * bv * elem
-        + chunk_size * kv_w * 4
+        + kv_beta_bytes
         + chunk_size * 4 * 2
         + chunk_size * chunk_size * 4 * 2
+        + inverse_workspace_bytes
     )
 
 
@@ -84,9 +101,25 @@ def _output_o_smem(chunk_size: int, bk: int, bv: int, dtype: str) -> int:
         chunk_size * bk * elem * 2
         + chunk_size * 4
         + bk * bv * elem
-        + chunk_size * bv * 4
-        + chunk_size * chunk_size * 4
+        # The final attn @ v_new GEMM uses MACA low-precision MMA inputs.
+        # Its fp32 accumulation remains in o_frag, not these shared buffers.
+        + chunk_size * bv * elem
+        + chunk_size * chunk_size * elem
     )
+
+
+def _select_h_block_v(
+    dim_k: int,
+    dim_v: int,
+    streams: int,
+    candidate_bv: int,
+) -> int:
+    """Split V only when h recurrence would otherwise underfill MACA."""
+    programs = int(streams) * (dim_v // candidate_bv)
+    min_programs = 64 if dim_k >= 128 and dim_v >= 128 else 32
+    if programs < min_programs and candidate_bv > 16 and dim_v % 16 == 0:
+        return 16
+    return candidate_bv
 
 
 def _pick_stage_tiles(
@@ -94,12 +127,13 @@ def _pick_stage_tiles(
     dim_v: int,
     smem_fn,
     stage: str,
+    candidates: Tuple[int, ...] = _TILE_CANDIDATES,
 ) -> Tuple[int, int]:
     best = None
-    for bk in _TILE_CANDIDATES:
+    for bk in candidates:
         if dim_k % bk != 0:
             continue
-        for bv in _TILE_CANDIDATES:
+        for bv in candidates:
             if dim_v % bv != 0:
                 continue
             used = smem_fn(bk, bv)
@@ -110,13 +144,19 @@ def _pick_stage_tiles(
                 best = (score, bk, bv)
     if best is None:
         raise ValueError(
-            f"MACA {stage}: no BK/BV in {_TILE_CANDIDATES} fits under "
+            f"MACA {stage}: no BK/BV in {candidates} fits under "
             f"{_MACA_SMEM_CAP} bytes for dim_k={dim_k} dim_v={dim_v}"
         )
     return best[1], best[2]
 
 
-def _plan_fwd_config(chunk_size: int, dim_k: int, dim_v: int, dtype: str) -> dict:
+def _plan_fwd_config(
+    chunk_size: int,
+    dim_k: int,
+    dim_v: int,
+    dtype: str,
+    streams: int = 1,
+) -> dict:
     if chunk_size % 16 != 0:
         raise ValueError(f"chunk_size={chunk_size} must be a multiple of 16")
     preferred = 256 if chunk_size >= 64 else 128
@@ -132,11 +172,13 @@ def _plan_fwd_config(chunk_size: int, dim_k: int, dim_v: int, dtype: str) -> dic
         lambda bk, bv: _h_recurrence_smem(chunk_size, dim_k, bk, bv, dtype),
         "h_recurrence",
     )
+    h_bv = _select_h_block_v(dim_k, dim_v, streams, h_bv)
     o_bk, o_bv = _pick_stage_tiles(
         dim_k,
         dim_v,
         lambda bk, bv: _output_o_smem(chunk_size, bk, bv, dtype),
         "output_o",
+        candidates=_OUTPUT_TILE_CANDIDATES,
     )
     kv_w = fused_bk if fused_bk >= fused_bv else fused_bv
     fused_threads = _maca_safe_threads(chunk_size, min(chunk_size, kv_w), preferred)
@@ -168,7 +210,13 @@ def _maca_thread_candidates(m: int, n: int) -> Tuple[int, ...]:
     return tuple(candidates)
 
 
-def _maca_fwd_autotune_configs(chunk_size: int, dim_k: int, dim_v: int, dtype: str) -> list[dict]:
+def _maca_fwd_autotune_configs(
+    chunk_size: int,
+    dim_k: int,
+    dim_v: int,
+    dtype: str,
+    streams: int = 1,
+) -> list[dict]:
     """Return the reachable MACA forward configs for one shape.
 
     ``BK`` and ``BV`` select the generated kernel layout, rather than a runtime
@@ -177,7 +225,7 @@ def _maca_fwd_autotune_configs(chunk_size: int, dim_k: int, dim_v: int, dtype: s
     generated kernels. This keeps a tune request bounded while guaranteeing
     every candidate has already passed the MACA 64KB shared-memory budget.
     """
-    default = _plan_fwd_config(chunk_size, dim_k, dim_v, dtype)
+    default = _plan_fwd_config(chunk_size, dim_k, dim_v, dtype, streams)
     fused_threads = _maca_thread_candidates(
         chunk_size,
         min(chunk_size, max(default["fused_block_k"], default["fused_block_v"])),
@@ -237,7 +285,24 @@ def _fused_prepare_compute_w_u_maca_tl(
     BV = dim_v if block_v <= 0 else block_v
     _require_tile(dim_k, BK, "dim_k")
     _require_tile(dim_v, BV, "dim_v")
+    # The C=64 inverse is the dominant work in the original forward path:
+    # six squaring rounds issue twelve 64x64 GEMMs per chunk.  ``P`` is
+    # strictly lower triangular, so invert its two 32x32 diagonal blocks
+    # independently, then use forward block substitution for the remaining
+    # off-diagonal block.  This is algebraically the same inverse of
+    # ``I - P`` but avoids the full-matrix powers.  Keep the old generic
+    # method for other chunk sizes.
+    use_blockwise_inverse = block_C == _BLOCKWISE_INVERSE_CHUNK
+    # 32x32 keeps each local MMA sufficiently large for the 256-thread fused
+    # kernel.  16x16 creates mostly-idle MACA warps in this mixed-size kernel.
+    inverse_block = _BLOCKWISE_INVERSE_TILE
+    inverse_parts = block_C // inverse_block if use_blockwise_inverse else 0
+    inverse_rounds = int(math.ceil(math.log2(inverse_block)))
     KV_W = BK if BK >= BV else BV
+    # Once the inverse is complete, P_shared is no longer live.  Reusing it
+    # for the widest K/V tile avoids a second [C, C] fp32 shared allocation.
+    # The alias is shape-safe only when KV_W equals C.
+    reuse_p_for_kv_beta = block_C == KV_W
     num_k_tiles = dim_k // BK
     num_v_tiles = dim_v // BV
 
@@ -265,14 +330,22 @@ def _fused_prepare_compute_w_u_maca_tl(
             with T.Kernel(batch, head, seq_len // block_C, threads=threads) as (bid, hid, by):
                 k_tile = T.alloc_shared([block_C, BK], dtype)
                 v_tile = T.alloc_shared([block_C, BV], dtype)
-                kv_beta = T.alloc_shared([block_C, KV_W], accum_dtype)
                 g_shared = T.alloc_shared([block_C], accum_dtype)
                 beta_shared = T.alloc_shared([block_C], accum_dtype)
                 S_shared = T.alloc_shared([block_C, block_C], accum_dtype)
                 P_shared = T.alloc_shared([block_C, block_C], accum_dtype)
+                kv_beta = (
+                    P_shared
+                    if reuse_p_for_kv_beta
+                    else T.alloc_shared([block_C, KV_W], accum_dtype)
+                )
                 gram_frag = T.alloc_fragment([block_C, block_C], accum_dtype)
                 temp_frag = T.alloc_fragment([block_C, block_C], accum_dtype)
                 kv_frag = T.alloc_fragment([block_C, KV_W], accum_dtype)
+                if use_blockwise_inverse:
+                    inverse_frag = T.alloc_fragment([inverse_block, inverse_block], accum_dtype)
+                    inverse_p = T.alloc_shared([inverse_block, inverse_block], accum_dtype)
+                    inverse_s = T.alloc_shared([inverse_block, inverse_block], accum_dtype)
 
                 T.copy(
                     g[bid, hid, by * block_C : (by + 1) * block_C],
@@ -311,14 +384,103 @@ def _fused_prepare_compute_w_u_maca_tl(
                 for i, j in T.Parallel(block_C, block_C):
                     S_shared[i, j] = T.if_then_else(i == j, T.float32(1.0), T.float32(0.0))
 
-                for _r in T.serial(0, num_rounds):
-                    T.clear(temp_frag)
-                    T.gemm(P_shared, S_shared, temp_frag)
-                    for i, j in T.Parallel(block_C, block_C):
-                        S_shared[i, j] = S_shared[i, j] + temp_frag[i, j]
-                    T.clear(temp_frag)
-                    T.gemm(P_shared, P_shared, temp_frag)
-                    T.copy(temp_frag, P_shared)
+                if use_blockwise_inverse:
+                    # Diagonal blocks: I + P_ii + ... + P_ii^31.  P_ii is
+                    # copied into zero-offset staging buffers because MACA's
+                    # GEMM lowering rejects a first-dimension-offset view.
+                    for bi in T.serial(0, inverse_parts):
+                        boff = bi * inverse_block
+                        T.copy(
+                            P_shared[
+                                boff : boff + inverse_block,
+                                boff : boff + inverse_block,
+                            ],
+                            inverse_p,
+                        )
+                        for _r in T.serial(0, inverse_rounds):
+                            T.copy(
+                                S_shared[
+                                    boff : boff + inverse_block,
+                                    boff : boff + inverse_block,
+                                ],
+                                inverse_s,
+                            )
+                            T.clear(inverse_frag)
+                            T.gemm(
+                                inverse_p,
+                                inverse_s,
+                                inverse_frag,
+                            )
+                            for i, j in T.Parallel(inverse_block, inverse_block):
+                                S_shared[boff + i, boff + j] = (
+                                    S_shared[boff + i, boff + j] + inverse_frag[i, j]
+                                )
+                            T.clear(inverse_frag)
+                            T.gemm(
+                                inverse_p,
+                                inverse_p,
+                                inverse_frag,
+                            )
+                            T.copy(inverse_frag, inverse_p)
+
+                    # Block forward substitution for S = (I - P)^-1:
+                    # S_ij = S_ii * sum(k=j..i-1) P_ik * S_kj.
+                    for bi in T.serial(1, inverse_parts):
+                        boff = bi * inverse_block
+                        for bj in T.serial(0, bi):
+                            joff = bj * inverse_block
+                            T.clear(inverse_frag)
+                            for bk in T.serial(bj, bi):
+                                koff = bk * inverse_block
+                                T.copy(
+                                    P_shared[
+                                        boff : boff + inverse_block,
+                                        koff : koff + inverse_block,
+                                    ],
+                                    inverse_p,
+                                )
+                                T.copy(
+                                    S_shared[
+                                        koff : koff + inverse_block,
+                                        joff : joff + inverse_block,
+                                    ],
+                                    inverse_s,
+                                )
+                                T.gemm(
+                                    inverse_p,
+                                    inverse_s,
+                                    inverse_frag,
+                                )
+                            T.copy(inverse_frag, inverse_p)
+                            T.copy(
+                                S_shared[
+                                    boff : boff + inverse_block,
+                                    boff : boff + inverse_block,
+                                ],
+                                inverse_s,
+                            )
+                            T.clear(inverse_frag)
+                            T.gemm(
+                                inverse_s,
+                                inverse_p,
+                                inverse_frag,
+                            )
+                            T.copy(
+                                inverse_frag,
+                                S_shared[
+                                    boff : boff + inverse_block,
+                                    joff : joff + inverse_block,
+                                ],
+                            )
+                else:
+                    for _r in T.serial(0, num_rounds):
+                        T.clear(temp_frag)
+                        T.gemm(P_shared, S_shared, temp_frag)
+                        for i, j in T.Parallel(block_C, block_C):
+                            S_shared[i, j] = S_shared[i, j] + temp_frag[i, j]
+                        T.clear(temp_frag)
+                        T.gemm(P_shared, P_shared, temp_frag)
+                        T.copy(temp_frag, P_shared)
 
                 T.copy(S_shared, temp_frag)
                 T.copy(
@@ -598,8 +760,10 @@ def _output_o_maca_tl(
                 k_c = T.alloc_shared([block_C, BK], dtype)
                 g_c = T.alloc_shared([block_C], accum_dtype)
                 h_c = T.alloc_shared([BK, BV], dtype)
-                v_new_c = T.alloc_shared([block_C, BV], accum_dtype)
-                attn = T.alloc_shared([block_C, block_C], accum_dtype)
+                # Keep GEMM inputs in the storage dtype so MACA lowers
+                # attn @ v_new to low-precision MMA; o_frag stays fp32.
+                v_new_c = T.alloc_shared([block_C, BV], dtype)
+                attn = T.alloc_shared([block_C, block_C], dtype)
 
                 o_frag = T.alloc_fragment([block_C, BV], accum_dtype)
                 attn_frag = T.alloc_fragment([block_C, block_C], accum_dtype)
@@ -633,8 +797,11 @@ def _output_o_maca_tl(
                 for i, j in T.Parallel(block_C, block_C):
                     attn[i, j] = T.if_then_else(
                         i >= j,
-                        attn_frag[i, j] * T.exp2((g_c[i] - g_c[j]) * _LOG2E),
-                        T.float32(0.0),
+                        T.cast(
+                            attn_frag[i, j] * T.exp2((g_c[i] - g_c[j]) * _LOG2E),
+                            dtype,
+                        ),
+                        T.cast(0, dtype),
                     )
 
                 T.clear(o_frag)
@@ -822,11 +989,23 @@ class GatedDeltaNetFwdMACAKernel(Kernel):
 
     @property
     def default_config(self) -> dict:
-        return _plan_fwd_config(self.chunk_size, self.dim_k, self.dim_v, self.dtype_str)
+        return _plan_fwd_config(
+            self.chunk_size,
+            self.dim_k,
+            self.dim_v,
+            self.dtype_str,
+            self.batch * self.head,
+        )
 
     @property
     def autotune_configs(self) -> list[dict]:
-        return _maca_fwd_autotune_configs(self.chunk_size, self.dim_k, self.dim_v, self.dtype_str)
+        return _maca_fwd_autotune_configs(
+            self.chunk_size,
+            self.dim_k,
+            self.dim_v,
+            self.dtype_str,
+            self.batch * self.head,
+        )
 
     def autotune(self, warmup: int = 10, rep: int = 10) -> None:
         """Tune the launch parameters of the three MACA forward stages.
@@ -956,4 +1135,30 @@ class GatedDeltaNetFwdMACAKernel(Kernel):
             v,
             g,
             beta,
+        )
+
+
+class GatedDeltaNetFwdBTHDMACAKernel(GatedDeltaNetFwdMACAKernel):
+    """MACA Gated DeltaNet forward with the public BTHD ABI."""
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        o, S, Aw, Au = super().forward(
+            q.permute(0, 2, 1, 3).contiguous(),
+            k.permute(0, 2, 1, 3).contiguous(),
+            v.permute(0, 2, 1, 3).contiguous(),
+            g.permute(0, 2, 1).contiguous(),
+            beta.permute(0, 2, 1).contiguous(),
+        )
+        return (
+            o.permute(0, 2, 1, 3).contiguous(),
+            S,
+            Aw.permute(0, 2, 1, 3).contiguous(),
+            Au.permute(0, 2, 1, 3).contiguous(),
         )

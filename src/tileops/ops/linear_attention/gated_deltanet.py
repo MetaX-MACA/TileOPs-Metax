@@ -8,6 +8,7 @@ from tileops.kernels.linear_attention.deltanet_call import DeltaNetDecodeCall
 from tileops.kernels.linear_attention.gated_deltanet import (
     GatedDeltaNetBwdKernel,
     GatedDeltaNetBwdMACAKernel,
+    GatedDeltaNetFwdBTHDMACAKernel,
     GatedDeltaNetFwdKernel,
     GatedDeltaNetFwdMACAKernel,
     GatedDeltaNetFwdProductionKernel,
@@ -136,6 +137,8 @@ def _bthd_production_gaps(
         gaps.append(f"dim_k must be 64 or 128, got {dim_k}")
     if dtype not in (torch.float16, torch.bfloat16):
         gaps.append(f"dtype must be float16 or bfloat16, got {dtype}")
+    if is_maca():
+        return gaps
     major, minor = _device_capability(device_index)
     if major != 9:
         gaps.append(
@@ -332,7 +335,8 @@ class GatedDeltaNetBTHDFwdOp(Op):
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
-        return {"GatedDeltaNetFwdProductionKernel": GatedDeltaNetFwdProductionKernel}
+        fwd_cls = GatedDeltaNetFwdBTHDMACAKernel if is_maca() else GatedDeltaNetFwdProductionKernel
+        return {"GatedDeltaNetFwdProductionKernel": fwd_cls}
 
     def _validate_dtypes(
         self,
