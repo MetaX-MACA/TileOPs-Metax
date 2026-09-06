@@ -1,4 +1,5 @@
 import dataclasses
+import math
 import warnings
 from abc import ABC, abstractmethod
 from types import MappingProxyType
@@ -27,6 +28,7 @@ from tileops.backend import (
 from tileops.backend.dispatch import registered_kernel_builder, select_target
 from tileops.backend.registry import ensure_loaded
 from tileops.kernels.kernel_base import Kernel
+from tileops.manifest import load_manifest
 
 from .compile_boundary import register_instance
 
@@ -350,6 +352,8 @@ class Op(ABC):
             OpNotAvailableError: A target serves this op but the call site handed over no
                 tensor at all; or there is no in-tree implementation and no target.
         """
+        self._refuse_empty_input(inputs)
+
         # Plain attribute reads and dict lookups, no ``self.__dict__``: this
         # runs inside a dynamo-traced forward on every cache hit, and dynamo
         # cannot trace a method call on an instance ``__dict__``.
@@ -604,6 +608,49 @@ class Op(ABC):
         except Exception:
             self._unsettle()
             raise
+
+    def _refuse_empty_input(self, inputs: "Sequence[torch.Tensor | None]") -> None:
+        """Raise for a call whose every declared output would hold no elements.
+
+        Such a call leaves the launch a zero-sized grid, which reports itself as an
+        internal assertion saying nothing about what is unsupported.
+
+        Kernel selection hosts this because both the eager and the traced path reach it.
+
+        The output decides, not the input: a zero-length axis on an input is legitimate
+        wherever the op still produces something.
+
+        Raises:
+            ValueError: The op cannot produce the empty output this call asks for.
+        """
+        if not any(t is not None and t.numel() == 0 for t in inputs):
+            return
+
+        entry = load_manifest().get(type(self).__name__)
+        if entry is None:
+            return
+        names = tuple(entry["signature"]["inputs"])
+        if len(names) != len(inputs):
+            return
+        try:
+            shapes = self._infer_output_shapes(
+                *(None if t is None else tuple(t.shape) for t in inputs)
+            )
+        except (TypeError, ValueError, KeyError):
+            return  # an op whose shape inference this order does not describe
+        declared = entry["signature"]["outputs"]
+        if any(name not in shapes for name in declared):
+            return
+        if any(math.prod(shapes[name]) for name in declared):
+            return
+
+        name, tensor = next(
+            (n, t) for n, t in zip(names, inputs, strict=True) if t is not None and t.numel() == 0
+        )
+        raise ValueError(
+            f"{type(self).__name__} does not support an empty tensor: input {name!r} has "
+            f"shape {tuple(tensor.shape)}, which holds no elements."
+        )
 
     def _unsettle(self) -> None:
         """Undo a settling whose call did not finish, dropping what it built."""
