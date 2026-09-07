@@ -9,11 +9,13 @@ from benchmarks.baselines import (
     assert_matches_reference,
     deepgemm_op,
     flaggems_op,
+    optional_baseline,
     reference_tolerance,
 )
 from benchmarks.benchmark_base import ManifestBenchmark, workload_params
 from tileops.manifest import load_workloads
 from tileops.ops import GemmFp8FwdOp, GemmFwdOp, GemmW4A16FwdOp
+from tileops.utils import is_maca
 from workloads.gemm import GemmFp8Workload, GemmW4A16Workload, GemmWorkload
 
 _OP_NAME = "GemmFwdOp"
@@ -323,18 +325,23 @@ def test_gemm_bench(
     # flag_gems' mm takes row-major operands; a transposed row is its own layout,
     # which its kernel does not express, so those rows carry cuBLAS alone.
     functors = {"tileops": op, "torch-cublas": workload.torch_matmul}
-    deepgemm_fn = _deepgemm_bf16_nt(workload, a, b)
-    if deepgemm_fn is not None:
-        assert_matches_reference(
-            deepgemm_fn, workload.torch_matmul, a, b, **reference_tolerance(dtype)
-        )
-        functors[DEEPGEMM_TAG] = deepgemm_fn
+
+    if not is_maca():
+        with optional_baseline(DEEPGEMM_TAG):
+            deepgemm_fn = _deepgemm_bf16_nt(workload, a, b)
+            if deepgemm_fn is not None:
+                assert_matches_reference(
+                    deepgemm_fn, workload.torch_matmul, a, b, **reference_tolerance(dtype)
+                )
+                functors[DEEPGEMM_TAG] = deepgemm_fn
+
     if not trans_a and not trans_b:
-        flaggems_mm = flaggems_op("mm")
-        assert_matches_reference(
-            flaggems_mm, workload.torch_matmul, a, b, **reference_tolerance(dtype)
-        )
-        functors[FLAGGEMS_TAG] = flaggems_mm
+        with optional_baseline(FLAGGEMS_TAG):
+            flaggems_mm = flaggems_op("mm")
+            assert_matches_reference(
+                flaggems_mm, workload.torch_matmul, a, b, **reference_tolerance(dtype)
+            )
+            functors[FLAGGEMS_TAG] = flaggems_mm
 
     bm.compare(functors, a, b, record_as=op, params=locals())
 
@@ -365,18 +372,20 @@ def test_gemm_fp8_bench(
 
     flashinfer = pytest.importorskip("flashinfer", minversion="0.6.6")
     if scale_mode == "per_tensor":
-        try:
-            deepgemm_fn = _deepgemm_fp8_per_tensor(workload, *inputs)
-        except ValueError as exc:
-            print(f"  [skip] {DEEPGEMM_TAG}: {exc}")
-        else:
-            assert_matches_reference(
-                deepgemm_fn,
-                workload.torch_scaled_matmul,
-                *inputs,
-                **reference_tolerance(out_dtype),
-            )
-            functors[DEEPGEMM_TAG] = (deepgemm_fn, inputs[:2])
+        if not is_maca():
+            with optional_baseline(DEEPGEMM_TAG):
+                try:
+                    deepgemm_fn = _deepgemm_fp8_per_tensor(workload, *inputs)
+                except ValueError as exc:
+                    print(f"  [skip] {DEEPGEMM_TAG}: {exc}")
+                else:
+                    assert_matches_reference(
+                        deepgemm_fn,
+                        workload.torch_scaled_matmul,
+                        *inputs,
+                        **reference_tolerance(out_dtype),
+                    )
+                    functors[DEEPGEMM_TAG] = (deepgemm_fn, inputs[:2])
 
         unsupported_reason = _flashinfer_fp8_per_tensor_unsupported_reason(inputs[0].device)
         if unsupported_reason is not None:
