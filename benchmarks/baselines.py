@@ -13,6 +13,7 @@ import contextlib
 import importlib
 import importlib.abc
 import sys
+import warnings
 from typing import Any, Callable, Optional
 
 import torch
@@ -30,6 +31,7 @@ __all__ = [
     "flaggems_group_norm",
     "flaggems_op",
     "flashinfer_op",
+    "optional_baseline",
     "reference_tolerance",
     "vllm_op",
 ]
@@ -269,4 +271,19 @@ def assert_matches_reference(
             expected_i,
             msg=lambda message, index=index: f"output {index}: {message}",
             **tolerances,
+        )
+
+
+@contextlib.contextmanager
+def optional_baseline(name: str):
+    """Warn and omit a baseline that is unavailable in this environment."""
+    try:
+        yield
+    except AssertionError:
+        raise
+    except Exception as exc:
+        warnings.warn(
+            f"{name} baseline unavailable (N/A): {type(exc).__name__}: {exc}",
+            RuntimeWarning,
+            stacklevel=2,
         )

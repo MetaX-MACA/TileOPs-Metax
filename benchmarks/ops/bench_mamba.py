@@ -382,10 +382,12 @@ def ssd_chunk_state_fwd_ref(
         same = ((seq_end >= 0) & (seq_chunked == seq_end)).unsqueeze(3)
         weight = weight * same.permute(0, 1, 3, 2)
 
-    w = weight.permute(0, 1, 3, 2).unsqueeze(-1).unsqueeze(-1)
-    contrib = w * B_heads.unsqueeze(-1) * x_chunked.unsqueeze(-2)
-    out = contrib.sum(dim=2)
-    return out.permute(0, 1, 2, 4, 3)
+    return torch.einsum(
+        "bchq,bcqhn,bcqhp->bchpn",
+        weight,
+        B_heads,
+        x_chunked,
+    )
 
 
 @pytest.mark.parametrize(
