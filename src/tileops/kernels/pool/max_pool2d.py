@@ -112,7 +112,7 @@ def _max_pool2d_kernel(
                                             (rows_inside or ((ih >= 0) and (ih < h_in)))
                                             and (cols_inside or ((iw >= 0) and (iw < w_in))),
                                             x[row, safe_h(ih), safe_w(iw)],
-                                            -T.infinity(dtype),
+                                            T.cast(-T.infinity("float32"), dtype),
                                         )
                             # Row maxima: the column pass below reads each one
                             # kernel_h times, so the band is read once.

@@ -32,6 +32,7 @@ from tileops.ops import (
     MaxPool3dFwdOp,
     MaxPool3dIndicesFwdOp,
 )
+from tileops.utils import is_maca
 from workloads.pool import (
     AdaptivePool2dWorkload,
     AvgPool1dBenchCase,
@@ -581,6 +582,11 @@ def pool_baseline(op_name: str, test, *inputs) -> tuple:
         return "torch-ref", test.ref_program
 
     choice, kind, ndim = selected
+
+    # cuDNN is unavailable on MACA; fall back to the PyTorch reference.
+    if choice == "cudnn" and is_maca():
+        return "torch-ref", test.ref_program
+
     kernel = _as_tuple(test.kernel_size, ndim)
     stride = kernel if test.stride is None else _as_tuple(test.stride, ndim)
     kwargs = dict(

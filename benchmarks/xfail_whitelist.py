@@ -181,17 +181,11 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         _AUTOTUNE_FAILURE,
-        (
-            "benchmarks/ops/bench_pool.py::test_max_pool2d_bench[resnet-stem-bfloat16]",
-            "benchmarks/ops/bench_softmax.py::test_log_softmax_bench[attn-weights-32k-bfloat16]",
-        ),
+        ("benchmarks/ops/bench_softmax.py::test_log_softmax_bench[attn-weights-32k-bfloat16]",),
     ),
     (
         _NUMERICAL_MISMATCH,
-        (
-            "benchmarks/ops/bench_bmm.py::test_bmm_bench[small-b8-128-float16]",
-            "benchmarks/ops/bench_bmm.py::test_bmm_bench[small-b8-128-bfloat16]",
-        ),
+        (),
     ),
     (
         _OUT_OF_MEMORY,
@@ -211,11 +205,6 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         _MISSING_BASELINE,
         (
-            "benchmarks/ops/bench_pool.py::test_avg_pool3d_bench[video-2x2x2-float16]",
-            "benchmarks/ops/bench_pool.py::test_avg_pool3d_bench[ceil-video-float16]",
-            "benchmarks/ops/bench_pool.py::test_max_pool3d_bench[c3d-pool1-float16]",
-            "benchmarks/ops/bench_pool.py::test_max_pool3d_bench[c3d-pool2-float16]",
-            "benchmarks/ops/bench_pool.py::test_max_pool3d_bench[medicalnet-stem-bfloat16]",
             "benchmarks/ops/bench_rope.py::test_rope_neox_position_ids_bench[position-ids-s2k-h32-d128-float16]",
             "benchmarks/ops/bench_rope.py::test_rope_neox_position_ids_bench[position-ids-s4k-h32-d128-bfloat16]",
             "benchmarks/ops/bench_topk_selector.py::test_topk_selector_bench[topk1024-s32k-kv64k-float32]",

@@ -1,3 +1,5 @@
+import warnings
+
 import pytest
 import torch
 
@@ -5,6 +7,7 @@ from benchmarks.baselines import (
     FLAGGEMS_TAG,
     assert_matches_reference,
     flaggems_op,
+    optional_baseline,
     reference_tolerance,
 )
 from benchmarks.benchmark_base import ManifestBenchmark, fields, workload_params
@@ -68,18 +71,31 @@ def test_bmm_bench(batch: int, m: int, n: int, k: int, dtype: torch.dtype) -> No
     # eval_roofline() is read lazily after profiling, by which point
     # forward() has bound the dims.
 
-    flaggems_bmm = flaggems_op("bmm")
-    assert_matches_reference(flaggems_bmm, torch.bmm, a, b, **reference_tolerance(a.dtype))
+    functors = {
+        "tileops": op,
+        "torch-cublas": torch.bmm,
+    }
 
-    bm.compare(
-        {
-            "tileops": op,
-            FLAGGEMS_TAG: flaggems_bmm,
-            "torch-cublas": torch.bmm,
-        },
-        a,
-        b,
-    )
+    try:
+        with optional_baseline(FLAGGEMS_TAG):
+            flaggems_bmm = flaggems_op("bmm")
+            assert_matches_reference(
+                flaggems_bmm,
+                torch.bmm,
+                a,
+                b,
+                **reference_tolerance(a.dtype),
+            )
+            functors[FLAGGEMS_TAG] = flaggems_bmm
+    except AssertionError as exc:
+        warnings.warn(
+            f"{FLAGGEMS_TAG} baseline unavailable (N/A): "
+            f"numerical mismatch with torch.bmm: {str(exc).splitlines()[0]}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    bm.compare(functors, a, b)
 
 
 @pytest.mark.parametrize(
