@@ -138,12 +138,14 @@ class BlockConfigPlanner:
         smem_budget: int,
         num_buffers: int = 1,
         frag_slots: int = 1,
+        smem_workspace_per_thread: int = 0,
     ):
         self.N_padded = N_padded
         self.elem_bytes = elem_bytes
         self.smem_budget = smem_budget
         self.num_buffers = num_buffers
         self.frag_slots = frag_slots
+        self.smem_workspace_per_thread = smem_workspace_per_thread
 
     @property
     def _row_bytes(self) -> int:
@@ -153,6 +155,16 @@ class BlockConfigPlanner:
         untiled kernels keep their second pass in fragments.
         """
         return self.N_padded * self.elem_bytes
+
+    def _usable_smem_budget(
+        self,
+        threads: int,
+        budget: int | None = None,
+    ) -> int:
+        """Return shared memory remaining after reduction workspace."""
+        total = self.smem_budget if budget is None else budget
+        workspace = threads * self.smem_workspace_per_thread
+        return max(0, total - workspace)
 
     def frag_elems(self, block_m: int, cols: int, threads: int) -> int:
         """Tile elements one thread holds across every live fragment."""
@@ -173,7 +185,7 @@ class BlockConfigPlanner:
         """
         return (
             self.N_padded > MAX_SINGLE_TILE_COLS
-            or self._row_bytes > self.smem_budget
+            or self._row_bytes > self._usable_smem_budget(DEFAULT_THREADS)
             or not self.frag_fits(1, self.N_padded, DEFAULT_THREADS)
         )
 
@@ -197,6 +209,7 @@ class BlockConfigPlanner:
         """
         # Single-tile probe: one buffer, because the single-tile kernels hold
         # the row in fragments and allocate no second shared copy.
+        budget = self._usable_smem_budget(threads)
         if self.N_padded <= MAX_SINGLE_TILE_COLS and self.frag_fits(
             block_m, self.N_padded, threads
         ):
@@ -204,7 +217,7 @@ class BlockConfigPlanner:
                 block_m,
                 self.elem_bytes,
                 self.N_padded,
-                budget=self.smem_budget,
+                budget=budget,
             )
             if single == self.N_padded:
                 return 0
@@ -218,13 +231,14 @@ class BlockConfigPlanner:
                 shared memory for this pair.
         """
         # The register budget bounds the untiled probe above, not the tile width.
+        budget = self._usable_smem_budget(threads)
         col_budget = MAX_SINGLE_TILE_COLS * self.num_buffers * block_m * self.elem_bytes
         return compute_tile_n(
             block_m,
             self.elem_bytes,
             self.N_padded,
             alignment=self._column_alignment(block_m, threads),
-            budget=min(self.smem_budget, col_budget),
+            budget=min(budget, col_budget),
             num_buffers=self.num_buffers,
         )
 
@@ -290,7 +304,8 @@ class BlockConfigPlanner:
             )
         if tile_n > MAX_SINGLE_TILE_COLS:
             return f"tile_n={tile_n} exceeds the {MAX_SINGLE_TILE_COLS} column cap"
-        held = self.num_buffers * block_m * tile_n * self.elem_bytes
+        workspace = threads * self.smem_workspace_per_thread
+        held = self.num_buffers * block_m * tile_n * self.elem_bytes + workspace
         if held > self.smem_budget:
             return (
                 f"tile_n={tile_n} with block_m={block_m} needs {held} bytes of "
@@ -318,7 +333,8 @@ class BlockConfigPlanner:
         and the sweep passes the device budget.  Capacity only, not a ranking:
         which of these to run untuned is ``default_config``'s call.
         """
-        max_block_m = (budget or self.smem_budget) // self._row_bytes
+        usable_budget = self._usable_smem_budget(threads, budget)
+        max_block_m = usable_budget // self._row_bytes
         return [
             bm
             for bm in self._BLOCK_MS

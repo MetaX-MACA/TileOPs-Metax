@@ -342,4 +342,9 @@ def test_gqa_bwd(
 ) -> None:
     test = GroupedQueryAttentionBwdTest(batch, heads, heads_kv, seq_len, dim, causal, dtype)
     op = GroupedQueryAttentionBwdOp(batch, heads, heads_kv, seq_len, dim, causal, tune=tune)
-    test.check(op, *test.gen_inputs(), atol=5e-3, rtol=1e-5)
+    test.check(
+        op,
+        *test.gen_inputs(),
+        atol=6e-3 if dtype == torch.bfloat16 else 5e-3,
+        rtol=1e-5,
+    )

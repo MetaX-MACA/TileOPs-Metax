@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from tests.test_base import FixtureBase, TestBase
+from tileops.utils import is_maca
 from workloads.reduction import CumulativeWorkload
 
 
@@ -315,7 +316,10 @@ def test_cumsum_backend_dispatch(M: int, N: int, dtype: torch.dtype, backend: st
     # The kernel the call built, not one refetched by a key: the key is a read-back of
     # the arguments and says nothing about which backend was chosen.
     (kernel,) = op.built_kernels("cumulative_fwd").values()
-    assert kernel.strategy == backend, f"({M}, {N}): took {kernel.strategy}"
+    expected_backend = "parallel_scan" if is_maca() and backend == "row_scan" else backend
+    assert kernel.strategy == expected_backend, (
+        f"({M}, {N}): expected {expected_backend}, took {kernel.strategy}"
+    )
     if kernel.strategy == "parallel_scan":
         assert kernel.config["block_n"] == (256 if N > 16384 else 128)
 

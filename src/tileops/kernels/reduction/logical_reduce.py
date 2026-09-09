@@ -36,6 +36,7 @@ from tileops.kernels.reduction._primitives import (
     reduce_down_rows,
     restore_reduced,
     rows_for_axes,
+    torch_dtype_nbytes,
     tune_by_forward,
 )
 from tileops.kernels.reduction.call_spec import (
@@ -43,7 +44,7 @@ from tileops.kernels.reduction.call_spec import (
     logical_edge_fused_region,
     logical_reduce_region,
 )
-from tileops.utils import WARP_LANES
+from tileops.utils import WARP_LANES, is_maca
 
 __all__ = [
     "LogicalReduceEdgeFusedKernel",
@@ -565,10 +566,17 @@ class LogicalReduceKernel(Kernel):
         self.N_padded = align_up(N, DEFAULT_ALIGNMENT)
         self._elem_bytes = torch.tensor([], dtype=self._kernel_dtype).element_size()
         self._smem_budget = device_smem_budget(device_index)
+
+        smem_workspace_per_thread = 0
+        if is_maca():
+            # MACA reduction lowering reserves one float32 workspace slot per thread.
+            smem_workspace_per_thread = torch_dtype_nbytes(torch.float32)
+
         self._planner = BlockConfigPlanner(
             self.N_padded,
             self._elem_bytes,
             self._smem_budget,
+            smem_workspace_per_thread=smem_workspace_per_thread,
         )
         self._needs_tiling = self._planner.needs_tiling
         self.kernel = None

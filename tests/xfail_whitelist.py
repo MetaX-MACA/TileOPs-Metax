@@ -75,7 +75,6 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         _NUMERICAL_MISMATCH,
         (
-            "tests/ops/attention/test_gqa.py::test_gqa_bwd[4-2048-64-4-128-False-dtype3-False]",
             "tests/ops/test_convolution.py::test_conv2d_batch_with_partial_tile_leaves_the_symmetric_kernel",
             "tests/ops/test_convolution.py::test_conv3d_does_not_dispatch_ndhwc_for_small_output",
             "tests/ops/test_vector_norm.py::test_vector_norm_long_sequence_tiled[inf]",
@@ -89,8 +88,6 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "tests/ops/test_convolution.py::test_conv3d[full-unet-encoder-k3-s1-bf16]",
             "tests/ops/test_convolution.py::test_conv3d_dispatches_ndhwc_kernel_no_bias",
             "tests/ops/test_convolution.py::test_conv3d_ndhwc_kernel_roofline_counts_layout_traffic",
-            "tests/ops/test_logical_reduce.py::test_logical_reduce_long_sequence_tiled[count_nonzero-dtype2]",
-            "tests/ops/test_logical_reduce.py::test_logical_reduce_tiled_autotune",
         ),
     ),
     (
@@ -113,8 +110,6 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "tests/ops/test_convolution.py::test_conv2d[smoke-bf16-3x3]",
             "tests/ops/test_convolution.py::test_conv2d[full-bf16-3x3-s2]",
             "tests/ops/test_convolution.py::test_conv2d[full-bf16-1x1]",
-            "tests/ops/test_cumulative.py::test_cumsum_backend_dispatch[64-16384-dtype0-row_scan]",
-            "tests/ops/test_cumulative.py::test_cumsum_backend_dispatch[64-32768-dtype1-row_scan]",
             "tests/ops/test_family_dispatch.py::test_gemm_vector_on_a_transposed_operand_is_refused[lhs-row-trans-a]",
             "tests/ops/test_family_dispatch.py::test_gemm_vector_on_a_transposed_operand_is_refused[rhs-col-trans-a]",
             "tests/ops/test_gemm.py::test_gemm_kernel_tune_falls_back_to_default",

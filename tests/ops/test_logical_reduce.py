@@ -149,16 +149,27 @@ class _TailBlockLogicalReduceKernel(LogicalReduceKernel):
     """Force tiled tests to cover tail-M masking with block_m > M."""
 
     _TAIL_BLOCK_M = 4
-    _TAIL_TILE_N = 8192
+    _TAIL_THREADS = 128
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         assert self._needs_tiling, "tail-M regression test must use the tiled kernel"
+        tile_n = self._planner.tile_n_for(
+            self._TAIL_BLOCK_M,
+            self._TAIL_THREADS,
+        )
         self.config = {
             "block_m": self._TAIL_BLOCK_M,
-            "threads": 128,
-            "tile_n": self._TAIL_TILE_N,
+            "threads": self._TAIL_THREADS,
+            "tile_n": tile_n,
         }
+
+        reason = self._planner.reject_tile_n(
+            self._TAIL_BLOCK_M,
+            tile_n,
+            self._TAIL_THREADS,
+        )
+        assert not reason, reason
 
 
 def _exact_compare(output: torch.Tensor, output_ref: torch.Tensor) -> None:
