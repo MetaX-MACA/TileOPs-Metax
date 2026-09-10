@@ -25,6 +25,7 @@ import torch
 
 from tileops.kernels.kernel_base import Kernel
 from tileops.kernels.reduction._primitives import (
+    AUTOTUNE_THREADS,
     DEFAULT_ALIGNMENT,
     BlockConfigPlanner,
     RowTiledAutotuneMixin,
@@ -46,6 +47,10 @@ from tileops.kernels.reduction._split_softmax import (
 # These two kernels bake tile_n in at build time and default to the wider
 # thread block; AUTOTUNE_THREADS still bounds what the sweep explores.
 _DEFAULT_TUNE_THREADS = 256
+
+# T.reduce_* uses one float32 shared-memory scratch slot per thread.
+# tile_n is shared across all autotune thread candidates, so reserve space for the largest candidate.
+_REDUCTION_SMEM_RESERVE_BYTES = max(AUTOTUNE_THREADS) * 4
 
 __all__ = ["SoftmaxKernel"]
 
@@ -655,7 +660,7 @@ class SoftmaxKernel(RowTiledAutotuneMixin, Kernel):
         self.norm_axis = norm_axis
         self.N_padded = align_up(N, DEFAULT_ALIGNMENT)
         self._elem_bytes = torch_dtype_nbytes(dtype)
-        self._smem_budget = device_smem_budget(device_index)
+        self._smem_budget = max(0, device_smem_budget(device_index) - _REDUCTION_SMEM_RESERVE_BYTES)
         self._split_target = split_target_blocks(device_index)
         self._planner = BlockConfigPlanner(
             self.N_padded,

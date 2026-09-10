@@ -155,12 +155,6 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "benchmarks/ops/bench_mamba2_e2e.py::test_mamba2_fwd_bench[mamba2-1p3b-b1-s8k-init-states-float16]",
             "benchmarks/ops/bench_mamba2_e2e.py::test_mamba2_fwd_bench[mamba2-2p7b-b1-s2k-dt-bias-init-states-bfloat16]",
             "benchmarks/ops/bench_mamba2_e2e.py::test_mamba2_fwd_bench[mamba2-1p3b-b1-s8k-dt-bias-init-states-float16]",
-            "benchmarks/ops/bench_softmax.py::test_softmax_bench[attn-weights-4k-float16]",
-            "benchmarks/ops/bench_softmax.py::test_softmax_bench[attn-weights-4k-bfloat16]",
-            "benchmarks/ops/bench_softmax.py::test_softmax_bench[attn-weights-4k-float32]",
-            "benchmarks/ops/bench_softmax.py::test_log_softmax_bench[attn-weights-4k-float16]",
-            "benchmarks/ops/bench_softmax.py::test_log_softmax_bench[attn-weights-4k-bfloat16]",
-            "benchmarks/ops/bench_softmax.py::test_log_softmax_bench[attn-weights-4k-float32]",
             "benchmarks/ops/bench_deltanet.py::test_deltanet_vs_fla_autograd[dn-autograd-b2-s2k-h4-d64-float16]",
             "benchmarks/ops/bench_deltanet.py::test_deltanet_vs_fla_autograd[dn-autograd-b2-s2k-h4-d64-bfloat16]",
             "benchmarks/ops/bench_deltanet.py::test_deltanet_vs_fla_autograd[dn-autograd-b2-s8k-h4-d64-float16]",
@@ -174,14 +168,11 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         _BENCHMARK_API_MISMATCH,
-        (
-            "benchmarks/tests/test_benchmark_base.py::test_result_rejects_non_positive_device_time",
-            "benchmarks/tests/test_benchmark_base.py::test_compare_remeasures_every_tag_after_timing_method_changes",
-        ),
+        (),
     ),
     (
         _AUTOTUNE_FAILURE,
-        ("benchmarks/ops/bench_softmax.py::test_log_softmax_bench[attn-weights-32k-bfloat16]",),
+        (),
     ),
     (
         _NUMERICAL_MISMATCH,
