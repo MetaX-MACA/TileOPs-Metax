@@ -852,6 +852,11 @@ def test_gemm_kernel_tune_falls_back_to_default() -> None:
     basic-grid sweep would downgrade shapes whose default is a structure-
     flagged config (coop2 / split-K). Construction only — no JIT compile.
     """
+    from tileops.utils import get_sm_version
+
+    if get_sm_version() not in (GemmKernel.supported_archs or []):
+        pytest.skip("GemmKernel is SM89/SM90-only")
+
     with pytest.warns(UserWarning, match="does not define autotune_configs"):
         kernel = GemmKernel(4096, 4096, 7168, torch.float16, tune=True, trans_a=False, trans_b=True)
     assert kernel.config == kernel.default_config
