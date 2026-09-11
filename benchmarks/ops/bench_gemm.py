@@ -1,4 +1,5 @@
 import contextlib
+import functools
 from typing import Any, Callable, Optional
 
 import pytest
@@ -477,7 +478,6 @@ def test_gemm_fp8_bench(
 
     functors = {"tileops": op, "torch-scaled-mm": workload.torch_scaled_matmul}
 
-    flashinfer = pytest.importorskip("flashinfer", minversion="0.6.6")
     if scale_mode == "per_tensor":
         if not is_maca():
             with optional_baseline(DEEPGEMM_TAG):
@@ -516,11 +516,28 @@ def test_gemm_fp8_bench(
     else:
         try:
             import flashinfer  # noqa: F401
-        except ImportError as exc:
-            print(f"  [skip] flashinfer-fp8-blockscale-sm90: {exc}")
+
+            blockscale_fn = functools.partial(
+                _flashinfer_fp8_blockscale_ref,
+                workload,
+            )
+            assert_matches_reference(
+                blockscale_fn,
+                workload.torch_scaled_matmul,
+                *inputs,
+                **reference_tolerance(out_dtype),
+            )
+        except (AttributeError, ImportError, RuntimeError, ValueError) as exc:
+            print(f"  [skip] flashinfer-fp8-blockscale-sm90: {str(exc).splitlines()[0]}")
+        except AssertionError as exc:
+            print(
+                "  [skip] flashinfer-fp8-blockscale-sm90: "
+                "disagrees with the reference "
+                f"({str(exc).splitlines()[0]})"
+            )
         else:
             functors["flashinfer-fp8-blockscale-sm90"] = (
-                lambda *args: _flashinfer_fp8_blockscale_ref(workload, *args),
+                blockscale_fn,
                 inputs,
             )
 
