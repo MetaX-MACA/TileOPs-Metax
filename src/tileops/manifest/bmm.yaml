@@ -93,7 +93,7 @@ BmmFp8KNFwdOp:
     bench: benchmarks/ops/bench_bmm.py
     bench_manifest_driven: true
     kernel_map:
-      bmm_fp8_kernel: BmmFp8Kernel
+      bmm_fp8_kernel: BmmFp8MACAKernel
 
 BmmFp8NKFwdOp:
   # K innermost, the order the fp8-TN kernel reads, so b arrives without a
@@ -144,4 +144,4 @@ BmmFp8NKFwdOp:
     bench: benchmarks/ops/bench_bmm.py
     bench_manifest_driven: true
     kernel_map:
-      bmm_fp8_kernel: BmmFp8Kernel
+      bmm_fp8_kernel: BmmFp8MACAKernel
