@@ -76,3 +76,29 @@ def test_topk_selector_op(
     test = TopkSelectorTest(batch, seq_len, seq_len_kv, kv_group, topk, in_dtype, out_dtype)
     op = TopkSelectorFwdOp(topk=topk, tune=tune)
     test.check(op, *test.gen_inputs(), compare=_set_compare)
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("valid_len", [4, 16, 17])
+def test_topk_selector_op_short_row(valid_len: int) -> None:
+    # starts/ends are per-row, so a row can hold fewer than topk valid elements.
+    # The shared workload pins them to the full kv range, which never exercises this.
+    batch, seq_len, seq_len_kv, kv_group, topk = 1, 1, 128, 1, 16
+
+    torch.manual_seed(0)
+    index_score = torch.randn(
+        batch, seq_len, seq_len_kv, kv_group, dtype=torch.float32, device="cuda"
+    )
+    starts = torch.zeros(batch, seq_len, dtype=torch.int32, device="cuda")
+    ends = torch.full((batch, seq_len), valid_len, dtype=torch.int32, device="cuda")
+
+    op = TopkSelectorFwdOp(topk=topk)
+    output = op(index_score, starts, ends)
+
+    k = min(topk, valid_len)
+    expected = torch.topk(index_score[0, 0, :valid_len, 0], k).indices.tolist()
+    assert set(output[0, 0, 0, :k].tolist()) == set(expected)
+
+    # The row cannot fill more than k slots, and the output buffer is uninitialised,
+    # so the remainder has to be marked rather than left as whatever was in memory.
+    assert (output[0, 0, 0, k:] == -1).all()
