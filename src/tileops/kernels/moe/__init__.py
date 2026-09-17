@@ -8,7 +8,7 @@ from .moe_grouped_gemm_persistent_fused_act_maca import (
     MoeGroupedGemmPersistentFusedActMACAKernel,
 )
 from .moe_grouped_gemm_separate_act import MoeGroupedGemmSeparateActKernel
-from .permute_align import MoePermuteAlignKernel
+from .permute_align import MoePermuteAlignKernel, MoePermuteAlignMACAKernel
 from .permute_contiguous import MoePrePermuteContiguousKernel
 from .shared_expert_mlp import SharedExpertMLPKernel
 from .shared_expert_mlp_maca import SharedExpertMLPMACAKernel
@@ -22,6 +22,7 @@ __all__ = [
     "MoeGroupedGemmPersistentFusedActMACAKernel",
     "MoeGroupedGemmSeparateActKernel",
     "MoePermuteAlignKernel",
+    "MoePermuteAlignMACAKernel",
     "MoePrePermuteContiguousKernel",
     "MoeUnpermuteKernel",
     "PostPermuteCall",

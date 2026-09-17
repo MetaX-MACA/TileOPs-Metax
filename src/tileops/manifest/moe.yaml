@@ -49,7 +49,7 @@ MoePermuteAlignFwdOp:
     bench: benchmarks/ops/bench_moe_permute_align.py
     bench_manifest_driven: true
     kernel_map:
-      permute_align_kernel: MoePermuteAlignKernel
+      permute_align_kernel: MoePermuteAlignMACAKernel
 
 MoeGroupedGemmNopadFwdOp:
   ref_api: "none"

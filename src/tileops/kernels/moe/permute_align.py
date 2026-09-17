@@ -31,7 +31,7 @@ import torch
 
 from tileops.kernels.kernel_base import Kernel
 
-__all__ = ["MoePermuteAlignKernel"]
+__all__ = ["MoePermuteAlignKernel", "MoePermuteAlignMACAKernel"]
 
 _THREADS = 1024
 _SCATTER_THREADS = 256
@@ -41,6 +41,8 @@ _SMALL_NUMEL_THRESHOLD = 1024
 # causes TileLang JIT to hang during compilation.
 _SMALL_EXPERTS_THRESHOLD = 32
 _FILL_THREADS = 256
+_MACA_PARALLEL_FINALIZE_NUMEL_THRESHOLD = 1024
+_MACA_FINALIZE_THREADS = 64
 
 
 @functools.lru_cache(maxsize=32)
@@ -160,6 +162,189 @@ def _make_align_kernel(numel: int, num_experts: int, block_size: int):
         return _align_main
 
     return _align
+
+
+@functools.lru_cache(maxsize=32)
+def _make_maca_align_kernel(
+    numel: int,
+    num_experts: int,
+    block_size: int,
+    parallel_finalize: bool,
+):
+    """K1: count → warp-scan; optionally finalize outputs inline. Does not scatter."""
+    max_padded = numel + (num_experts + 1) * (block_size - 1)
+    max_num_blocks = math.ceil(max_padded / block_size)
+    max_blocks_per_expert = math.ceil(numel / block_size)
+    # Only experts participate in the prefix scan.  The remaining K1 threads
+    # are still useful for counting tokens, but scanning their known zeros
+    # wastes shuffle work, shared memory and inter-warp iterations.
+    scan_threads = math.ceil(num_experts / 32) * 32
+    num_scan_warps = scan_threads // 32
+
+    @tilelang.jit(out_idx=[], compile_flags=["-O3"])
+    def _align(threads: int):
+        @T.prim_func
+        def _align_main(
+            flat: T.Tensor([numel], "int32"),
+            sorted_token_ids: T.Tensor([max_padded], "int32"),
+            expert_ids: T.Tensor([max_num_blocks], "int32"),
+            num_tokens_post_pad: T.Tensor([1], "int32"),
+            cumsum: T.Tensor([num_experts + 1], "int32"),
+        ):
+            with T.Kernel(1, threads=threads) as (_,):
+                tx = T.get_thread_binding()
+
+                s_counts = T.alloc_shared([num_experts], "int32")
+                s_vals = T.alloc_shared([scan_threads], "int32")
+                s_warp_sum = T.alloc_shared([num_scan_warps], "int32")
+                s_warp_excl = T.alloc_shared([num_scan_warps], "int32")
+                # s_total is a running accumulator used only by tx==0 to build
+                # s_warp_excl during the inter-warp scan; its final value (grand
+                # total) is derived independently at line 135 and not re-read.
+                s_total = T.alloc_shared([1], "int32")
+                s_cumsum = T.alloc_shared([num_experts + 1], "int32")
+
+                # Step 1: zero s_counts
+                for i in T.serial(T.ceildiv(num_experts, threads)):
+                    idx = i * threads + tx
+                    if idx < num_experts:
+                        s_counts[idx] = T.int32(0)
+                T.sync_threads()
+
+                # Step 1: count tokens per expert
+                for i in T.serial(T.ceildiv(numel, threads)):
+                    idx = i * threads + tx
+                    if idx < numel:
+                        T.atomic_add(s_counts[flat[idx]], 1)
+                T.sync_threads()
+
+                # Step 2: warp-scan prefix-sum on padded counts
+                lane = tx % 32
+                warp_id = tx // 32
+
+                if tx < scan_threads:
+                    s_vals[tx] = (
+                        T.ceildiv(s_counts[tx], block_size) * block_size
+                        if tx < num_experts
+                        else T.int32(0)
+                    )
+                T.sync_threads()
+
+                # Intra-warp inclusive scan via shuffle_up
+                # 5 rounds = log2(warp_size=32): each round doubles the scan distance
+                for d in T.serial(5):
+                    if tx < scan_threads:
+                        stride = 1 << d
+                        up_val = T.tvm_warp_shuffle_up(
+                            T.uint32(0xFFFFFFFF), s_vals[tx], stride, 32, 32
+                        )
+                        if lane >= stride:
+                            s_vals[tx] = s_vals[tx] + up_val
+
+                # Last lane of each warp records warp sum
+                if tx < scan_threads and lane == 31:
+                    s_warp_sum[warp_id] = s_vals[tx]
+                T.sync_threads()
+
+                # Inter-warp exclusive scan (for->if pattern to write shared)
+                for w in T.serial(num_scan_warps):
+                    if tx == 0:
+                        if w == 0:
+                            s_total[0] = T.int32(0)
+                        s_warp_excl[w] = s_total[0]
+                        s_total[0] = s_total[0] + s_warp_sum[w]
+                T.sync_threads()
+
+                # Convert inclusive scan -> exclusive cumsum entry
+                if tx < num_experts:
+                    own_padded = T.ceildiv(s_counts[tx], block_size) * block_size
+                    excl = s_vals[tx] - own_padded + s_warp_excl[warp_id]
+                    s_cumsum[tx] = excl
+                    cumsum[tx] = excl
+                if tx == num_experts - 1:
+                    total = s_vals[tx] + s_warp_excl[warp_id]
+                    s_cumsum[num_experts] = total
+                    cumsum[num_experts] = total
+                    num_tokens_post_pad[0] = total
+
+                # Small inputs stay in one kernel to avoid an extra launch.
+                # Large inputs move these two output-only phases to the
+                # multi-block finalize kernel below.  In the common uniform
+                # case an expert owns only a few blocks, so making every
+                # expert thread execute max_blocks_per_expert iterations is
+                # overwhelmingly predicate/control overhead.
+                if not parallel_finalize:
+                    T.sync_threads()
+                    # Step 3: fill expert_ids linearly — no binary search.
+                    if tx < num_experts:
+                        e_start = s_cumsum[tx] // block_size
+                        e_end = s_cumsum[tx + 1] // block_size
+                        for b in T.serial(max_blocks_per_expert):
+                            blk = e_start + b
+                            if blk < e_end:
+                                expert_ids[blk] = tx
+
+                    # Step 4: fill sentinel
+                    for i in T.serial(T.ceildiv(max_padded, threads)):
+                        idx = i * threads + tx
+                        if idx < max_padded:
+                            sorted_token_ids[idx] = numel
+
+        return _align_main
+
+    return _align
+
+
+@functools.lru_cache(maxsize=32)
+def _make_maca_finalize_kernel(numel: int, num_experts: int, block_size: int):
+    """Fill sentinel and expert_ids with many blocks after K1 builds cumsum.
+
+    Block ``bid`` owns expert ``bid``.  All blocks also initialize
+    sorted_token_ids through a grid-stride loop, so every wave performs useful
+    sentinel stores instead of leaving the tail expert blocks nearly idle.
+    """
+    max_padded = numel + (num_experts + 1) * (block_size - 1)
+    max_num_blocks = math.ceil(max_padded / block_size)
+    max_blocks_per_expert = math.ceil(numel / block_size)
+    finalize_blocks = num_experts
+    total_finalize_threads = finalize_blocks * _MACA_FINALIZE_THREADS
+    sentinel_fill_iters = math.ceil(max_padded / total_finalize_threads)
+    expert_fill_iters = math.ceil(max_blocks_per_expert / _MACA_FINALIZE_THREADS)
+
+    @tilelang.jit(out_idx=[], compile_flags=["-O3"])
+    def _finalize():
+        @T.prim_func
+        def _finalize_main(
+            sorted_token_ids: T.Tensor([max_padded], "int32"),
+            expert_ids: T.Tensor([max_num_blocks], "int32"),
+            cumsum: T.Tensor([num_experts + 1], "int32"),
+        ):
+            with T.Kernel(finalize_blocks, threads=_MACA_FINALIZE_THREADS) as (bid,):
+                tx = T.get_thread_binding()
+
+                # Grid-stride sentinel initialization.  With 64 threads per
+                # expert block, each wave writes a few contiguous chunks and
+                # all expert blocks participate in the initialization.
+                gid = bid * _MACA_FINALIZE_THREADS + tx
+                for i in T.serial(sentinel_fill_iters):
+                    idx = gid + i * total_finalize_threads
+                    if idx < max_padded:
+                        sorted_token_ids[idx] = numel
+
+                # One block per expert.  Threads cooperatively fill only that
+                # expert's actual padded block range; no binary search and no
+                # 512-iteration loop per expert thread.
+                if bid < num_experts:
+                    e_start = cumsum[bid] // block_size
+                    e_end = cumsum[bid + 1] // block_size
+                    for i in T.serial(expert_fill_iters):
+                        blk = e_start + i * _MACA_FINALIZE_THREADS + tx
+                        if blk < e_end:
+                            expert_ids[blk] = bid
+
+        return _finalize_main
+
+    return _finalize
 
 
 @functools.lru_cache(maxsize=32)
@@ -412,6 +597,88 @@ class MoePermuteAlignKernel(Kernel):
             threads = self.config["threads"]
             align_fn = self._align_fn(threads)
             align_fn(flat, sorted_token_ids, expert_ids, num_tokens_post_pad, cumsum)
+            scatter_fn = self._scatter_fn()
+            scatter_fn(flat, sorted_token_ids, cumsum)
+
+        return sorted_token_ids, expert_ids, num_tokens_post_pad
+
+
+class MoePermuteAlignMACAKernel(Kernel):
+    """MACA-optimized MoE token permutation and alignment kernel."""
+
+    supported_archs: list[int] = [80, 86, 89, 90]
+
+    def __init__(
+        self,
+        numel: int,
+        num_experts: int,
+        block_size: int,
+        config: Optional[dict] = None,
+        tune: bool = False,
+    ):
+        super().__init__()
+        self.numel = numel
+        self.num_experts = num_experts
+        self.block_size = block_size
+
+        self._small_batch_fn = (
+            _make_small_batch_kernel(numel, num_experts, block_size)
+            if numel < _SMALL_NUMEL_THRESHOLD and num_experts <= _SMALL_EXPERTS_THRESHOLD
+            else None
+        )
+        if self._small_batch_fn is None:
+            parallel_finalize = numel >= _MACA_PARALLEL_FINALIZE_NUMEL_THRESHOLD
+            self._align_fn = _make_maca_align_kernel(
+                numel,
+                num_experts,
+                block_size,
+                parallel_finalize,
+            )
+            self._finalize_fn = (
+                _make_maca_finalize_kernel(numel, num_experts, block_size)
+                if parallel_finalize
+                else None
+            )
+            self._scatter_fn = _make_scatter_kernel(numel, num_experts, block_size)
+        else:
+            self._align_fn = None
+            self._finalize_fn = None
+            self._scatter_fn = None
+
+        self.init_config(config, tune)
+
+    @property
+    def default_config(self) -> dict:
+        return {"threads": _THREADS}
+
+    def forward(self, topk_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the MACA-optimized alignment kernel."""
+        assert topk_ids.dtype == torch.int32, "topk_ids must be int32"
+        assert topk_ids.is_cuda, "topk_ids must be on CUDA"
+        assert topk_ids.numel() == self.numel, (
+            f"Expected numel={self.numel}, got {topk_ids.numel()}"
+        )
+
+        flat = topk_ids.flatten().contiguous()
+        max_padded = self.numel + (self.num_experts + 1) * (self.block_size - 1)
+        max_num_blocks = math.ceil(max_padded / self.block_size)
+        dev = flat.device
+
+        sorted_token_ids = torch.empty(max_padded, dtype=torch.int32, device=dev)
+        expert_ids = torch.empty(max_num_blocks, dtype=torch.int32, device=dev)
+        num_tokens_post_pad = torch.empty(1, dtype=torch.int32, device=dev)
+
+        if self._small_batch_fn is not None:
+            fn = self._small_batch_fn()
+            fn(flat, sorted_token_ids, expert_ids, num_tokens_post_pad)
+        else:
+            cumsum = torch.empty(self.num_experts + 1, dtype=torch.int32, device=dev)
+            threads = self.config["threads"]
+            align_fn = self._align_fn(threads)
+            align_fn(flat, sorted_token_ids, expert_ids, num_tokens_post_pad, cumsum)
+            if self._finalize_fn is not None:
+                finalize_fn = self._finalize_fn()
+                finalize_fn(sorted_token_ids, expert_ids, cumsum)
             scatter_fn = self._scatter_fn()
             scatter_fn(flat, sorted_token_ids, cumsum)
 

@@ -5,7 +5,8 @@ from typing import ClassVar, Dict, Optional, Tuple
 import torch
 
 from tileops.kernels.kernel_base import Kernel
-from tileops.kernels.moe import MoePermuteAlignKernel
+from tileops.kernels.moe import MoePermuteAlignKernel, MoePermuteAlignMACAKernel
+from tileops.utils import is_maca
 
 from ..compile_boundary import get_instance
 from ..op_base import Op
@@ -61,7 +62,11 @@ class MoePermuteAlignFwdOp(Op):
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
-        return {"permute_align_kernel": MoePermuteAlignKernel}
+        return {
+            "permute_align_kernel": (
+                MoePermuteAlignMACAKernel if is_maca() else MoePermuteAlignKernel
+            )
+        }
 
     def _padded_extents(self, numel: int) -> Tuple[int, int]:
         """``(max_padded, num_blocks)`` — the two padded extents the manifest states.
