@@ -23,6 +23,7 @@ from benchmarks.benchmark_base import (
 )
 from tileops.manifest import load_workloads
 from tileops.ops import GroupedGemmFwdOp
+from tileops.utils import is_maca
 from workloads.grouped_gemm import (
     GroupedGemmWorkload,
 )
@@ -45,7 +46,8 @@ def _torch_grouped_mm(test: GroupedGemmWorkload, inputs: tuple):
     Reads B as ``[groups, K, N]`` and takes cumulative group ends, both built here
     rather than inside the timed callable.
     """
-    if not hasattr(torch, "_grouped_mm"):
+    # MetaX torch exposes the symbol, but grouped mm is not implemented.
+    if is_maca() or not hasattr(torch, "_grouped_mm"):
         return None
     if test.transpose_a and test.transpose_b:
         return None

@@ -32,7 +32,6 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "benchmarks/ops/bench_gated_deltanet.py::test_gated_deltanet_vs_fla_fwd[gdn-bthd-b2-s32k-h4-d64-bfloat16]",
             "benchmarks/ops/bench_gated_deltanet.py::test_gated_deltanet_vs_fla_fwd[gdn-bthd-b1-s4k-h16-d128-float16]",
             "benchmarks/ops/bench_gated_deltanet.py::test_gated_deltanet_vs_fla_fwd[gdn-bthd-b1-s4k-h16-d128-bfloat16]",
-            "benchmarks/ops/bench_grouped_gemm.py::test_grouped_gemm_bench[nt-batch16-m4096-n4096-k4096-bfloat16]",
         ),
     ),
     (
