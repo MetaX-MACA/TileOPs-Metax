@@ -15,6 +15,7 @@ from tileops.ops.mamba.ssd_chunk_scan import SSDChunkScanFwdOp
 from tileops.ops.mamba.ssd_chunk_state import SSDChunkStateFwdOp
 from tileops.ops.mamba.ssd_decode import SSDDecodeFwdOp
 from tileops.ops.mamba.ssd_state_passing import SSDStatePassingFwdOp
+from tileops.utils import is_maca
 from workloads.mamba import (
     CBProducerFwdWorkload,
     DaCumsumFwdWorkload,
@@ -210,8 +211,10 @@ def test_da_cumsum_fwd_bench(
         )
 
     functors["torch-ref"] = baseline
-    functors[TORCH_COMPILE_TAG] = compiled_reference(baseline)
-
+    # MACA's current torch hits Inductor SplitScan on cumsum(broadcast) when
+    # chunk_len >= 129 (pytorch#180221 / pytorch#180369). Keep the tag on CUDA.
+    if not is_maca():
+        functors[TORCH_COMPILE_TAG] = compiled_reference(baseline)
     bm.compare(functors, *inputs)
 
 

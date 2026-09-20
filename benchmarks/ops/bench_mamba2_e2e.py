@@ -21,6 +21,7 @@ from benchmarks.benchmark_base import (
 )
 from tileops.manifest import load_workloads
 from tileops.ops.mamba.mamba2_fwd import Mamba2FwdOp
+from tileops.utils import is_maca
 from workloads.mamba2_e2e import Mamba2FwdWorkload
 
 # Optional mamba_ssm Triton baseline
@@ -241,6 +242,8 @@ def test_mamba2_fwd_bench(
 
     reference_args = (x, dt, A, B, C)
     functors["torch-ref"] = (_torch_wrapper, reference_args)
-    functors[TORCH_COMPILE_TAG] = (compiled_reference(_torch_wrapper), reference_args)
-
+    # MACA's current torch hits Inductor SplitScan on the fused da_cumsum
+    # (broadcast A / dt_bias, chunk_len=256; pytorch#180221 / pytorch#180369).
+    if not is_maca():
+        functors[TORCH_COMPILE_TAG] = (compiled_reference(_torch_wrapper), reference_args)
     bm.compare(functors, x, dt, A, B, C, dt_bias, initial_states)
