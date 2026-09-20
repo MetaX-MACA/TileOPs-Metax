@@ -84,14 +84,16 @@ MoeGroupedGemmNopadFwdOp:
     bytes: "(numel * k + num_experts * n * k + numel * n) * elem_bytes"
 
   source:
-    kernel: tileops/kernels/moe/moe_grouped_gemm_nopad.py
+    kernel:
+    - tileops/kernels/moe/moe_grouped_gemm_nopad.py
+    - tileops/kernels/grouped_gemm/grouped_gemm_persistent_maca.py
     op: tileops/ops/moe/routed_expert/moe_grouped_gemm_nopad.py
     test: tests/ops/test_moe_grouped_gemm_nopad.py
     bench: benchmarks/ops/bench_moe_grouped_gemm_nopad.py
     bench_manifest_driven: true
     kernel_map:
       moe_grouped_gemm_kernel: MoeGroupedGemmNopadKernel
-      moe_grouped_gemm_persistent_kernel: GroupedGemmPersistent3WGKernel
+      moe_grouped_gemm_persistent_kernel: GroupedGemmPersistentMACAKernel
 
 MoeGateUpFwdOp:
   ref_api: "none"
@@ -134,6 +136,8 @@ MoeGateUpFwdOp:
     kernel:
     - tileops/kernels/moe/moe_grouped_gemm_persistent_3wg_fused_act.py
     - tileops/kernels/moe/moe_grouped_gemm_separate_act.py
+    - tileops/kernels/moe/moe_grouped_gemm_nopad.py
+    - tileops/kernels/grouped_gemm/grouped_gemm_persistent_maca.py
     op: tileops/ops/moe/routed_expert/gate_up.py
     test: tests/ops/test_moe_gate_up.py
     bench: benchmarks/ops/bench_moe_gate_up.py
@@ -142,7 +146,7 @@ MoeGateUpFwdOp:
       moe_grouped_gemm_fused_act_kernel: MoeGroupedGemmPersistent3WGFusedActKernel
       moe_grouped_gemm_act_kernel: MoeGroupedGemmSeparateActKernel
       moe_grouped_gemm_kernel: MoeGroupedGemmNopadKernel
-      moe_grouped_gemm_persistent_kernel: GroupedGemmPersistent3WGKernel
+      moe_grouped_gemm_persistent_kernel: GroupedGemmPersistentMACAKernel
 
 FusedMoEExpertsNopadPersistent3WGFwdOp:
   ref_api: "none"
@@ -202,19 +206,12 @@ FusedMoEExpertsNopadPersistent3WGFwdOp:
     bytes: "(num_experts * 3 * ffn_size * hidden_size + 2 * num_tokens * hidden_size) * elem_bytes"
 
   source:
-    kernel: tileops/kernels/moe/moe_grouped_gemm_nopad.py
+    kernel: tileops/ops/moe/routed_expert/fused_routed_expert.py
     op: tileops/ops/moe/routed_expert/fused_routed_expert.py
     test: tests/ops/test_fused_moe_experts.py
     bench: benchmarks/ops/bench_fused_moe_experts.py
     bench_manifest_driven: true
-    kernel_map:
-      contiguous: MoePrePermuteContiguousKernel
-      moe_grouped_gemm_kernel: MoeGroupedGemmNopadKernel
-      moe_grouped_gemm_persistent_kernel: GroupedGemmPersistent3WGKernel
-      moe_grouped_gemm_fused_act_kernel: MoeGroupedGemmPersistent3WGFusedActKernel
-      silu_and_mul: SiluAndMulFwdKernel
-      gelu_and_mul: GeluAndMulFwdKernel
-      unpermute_kernel: MoeUnpermuteKernel
+    kernel_map: {}
 
 FusedTopKOp:
   ref_api: "none"
@@ -319,15 +316,7 @@ FusedMoeFwdOp:
     test: tests/ops/test_moe_fused_moe.py
     bench: benchmarks/ops/bench_moe_fused_moe.py
     bench_manifest_driven: true
-    kernel_map:
-      fused_topk_kernel: FusedTopKKernel
-      contiguous: MoePrePermuteContiguousKernel
-      moe_grouped_gemm_kernel: MoeGroupedGemmNopadKernel
-      moe_grouped_gemm_persistent_kernel: GroupedGemmPersistent3WGKernel
-      moe_grouped_gemm_fused_act_kernel: MoeGroupedGemmPersistent3WGFusedActKernel
-      silu_and_mul: SiluAndMulFwdKernel
-      gelu_and_mul: GeluAndMulFwdKernel
-      unpermute_kernel: MoeUnpermuteKernel
+    kernel_map: {}
 
 MoePrePermuteFwdOp:
   ref_api: "none"
