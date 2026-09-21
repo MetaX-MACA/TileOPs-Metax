@@ -640,10 +640,10 @@ def test_small_batch_dispatch() -> None:
     constructs kernel objects without triggering a JIT compile (that happens on
     first forward), so this stays smoke-fast.
     """
-    from tileops.utils import get_sm_version
+    from tileops.utils import get_sm_version, is_maca
 
-    if get_sm_version() not in (SmallBatchGemmKernel.supported_archs or []):
-        pytest.skip("small_batch kernel-mode is SM90-only")
+    if not is_maca() and get_sm_version() not in (SmallBatchGemmKernel.supported_archs or []):
+        pytest.skip("small_batch kernel-mode is only available on SM90 and MACA")
 
     op = GemmFwdOp(trans_a=False, trans_b=True)
     assert op._get_kernel((), 2, 2112, 7168, torch.float16)[0] == "small_batch"

@@ -47,7 +47,7 @@ from .gemm import (
     GemvKernel,
     SmallBatchGemmKernel,
 )
-from .gemm_maca import GemmMACAKernel
+from .gemm_maca import GemmMACAKernel, GemvMACAKernel, SmallBatchGemmMACAKernel
 from .grouped_gemm import GroupedGemmKernel
 from .kernel_base import Kernel
 from .linear_attention import (
@@ -170,6 +170,8 @@ __all__ = [
     "GemmFp8EpilogueKernel",
     "GemmKernel",
     "GemmMACAKernel",
+    "GemvMACAKernel",
+    "SmallBatchGemmMACAKernel",
     "GemvKernel",
     "GroupConv1dKernel",
     "GroupConv2dKernel",

@@ -12,7 +12,11 @@ from tileops.kernels.gemm.dense import (
 )
 from tileops.kernels.gemm.w4a16 import GROUP_SIZE, GemmW4A16Kernel
 from tileops.kernels.gemm.w4a16_decode import GemmW4A16DecodeKernel
-from tileops.kernels.gemm_maca import GemmMACAKernel
+from tileops.kernels.gemm_maca import (
+    GemmMACAKernel,
+    GemvMACAKernel,
+    SmallBatchGemmMACAKernel,
+)
 from tileops.kernels.kernel_base import Kernel
 from tileops.perf.profile import tensor_core_roof
 from tileops.utils import get_sm_version, is_maca
@@ -74,10 +78,12 @@ class GemmFwdOp(Op):
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
         gemm_cls = GemmMACAKernel if (is_maca() or get_sm_version() < 90) else GemmKernel
+        gemv_cls = GemvMACAKernel if is_maca() else GemvKernel
+        small_batch_cls = SmallBatchGemmMACAKernel if is_maca() else SmallBatchGemmKernel
         return {
             "gemm_kernel": gemm_cls,
-            "gemv_kernel": GemvKernel,
-            "small_batch_kernel": SmallBatchGemmKernel,
+            "gemv_kernel": gemv_cls,
+            "small_batch_kernel": small_batch_cls,
         }
 
     def _infer_mnk(self, a: torch.Tensor, b: torch.Tensor) -> Tuple[int, int, int]:
