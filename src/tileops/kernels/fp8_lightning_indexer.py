@@ -198,8 +198,7 @@ def clean_logits_(
     return clean_logits_kernel
 
 
-@torch.library.custom_op("tileops::fp8_lightning_indexer_wrapped_kernel", mutates_args=("Logits",))
-def fp8_lightning_indexer_wrapped_kernel(
+def _fp8_lightning_indexer_run(
     batch: int,
     seq_len: int,
     heads: int,
@@ -234,7 +233,6 @@ def fp8_lightning_indexer_wrapped_kernel(
         clean_logits_(threads=threads)(Logits, CuSeqLenKS, CuSeqLenKE)
 
 
-@fp8_lightning_indexer_wrapped_kernel.register_fake
 def _(
     batch: int,
     seq_len: int,
@@ -361,7 +359,7 @@ class FP8LightningIndexerKernel(Kernel):
             device=IndexQ.device,
             dtype=torch.float32,
         )
-        fp8_lightning_indexer_wrapped_kernel(
+        _fp8_lightning_indexer_run(
             self.batch,
             self.seq_len,
             self.heads,

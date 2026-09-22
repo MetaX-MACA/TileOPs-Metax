@@ -9,6 +9,7 @@ GemmFwdOp:
   ref_api: "torch.matmul"
   family: gemm
   status: implemented
+  torch_compile_fullgraph: true
 
   signature:
     inputs:
@@ -62,14 +63,15 @@ GemmFwdOp:
     bench: benchmarks/ops/bench_gemm.py
     bench_manifest_driven: true
     kernel_map:
-      gemm_kernel: GemmKernel
+      gemm_tma_kernel: GemmTmaKernel
+      gemm_cp_async_kernel: GemmCpAsyncKernel
       gemv_kernel: GemvKernel
-      small_batch_kernel: SmallBatchGemmKernel
 
 GemmFp8FwdOp:
   ref_api: "torch._scaled_mm"
   family: gemm
   status: implemented
+  torch_compile_fullgraph: true
 
   signature:
     inputs:
@@ -77,11 +79,11 @@ GemmFp8FwdOp:
       b: {dtype: "same_as(a)", shape: "[N, K]"}
       scale_a: {dtype: "float32"}
       scale_b: {dtype: "float32"}
-      bias: {dtype: "bfloat16", shape: "[N]", optional: true}
+      bias: {dtype: "same_as(d)", shape: "[N]", optional: true}
     outputs:
-      d: {dtype: "bfloat16 | float16", shape: "[M, N]"}
+      d: {dtype: "bfloat16", caller_stated: true, shape: "[M, N]"}
     params:
-      out_dtype: {type: dtype, default: bfloat16}
+      out_dtype: {type: "bfloat16 | float16", default: bfloat16}
     shape_rules:
     - "a.shape[1] == b.shape[1]"
     - "d.shape == (a.shape[0], b.shape[0])"
@@ -114,13 +116,14 @@ GemmFp8FwdOp:
     bench: benchmarks/ops/bench_gemm.py
     bench_manifest_driven: true
     kernel_map:
-      gemm_fp8_epilogue_kernel: GemmFp8EpilogueKernel
-      gemm_fp8_block_scaled_kernel: GemmFp8BlockScaledKernel
+      gemm_fp8_tensor_scale_kernel: GemmFp8TensorScaleKernel
+      gemm_fp8_block_scale_kernel: GemmFp8BlockScaleKernel
 
 GemmW4A16FwdOp:
   ref_api: "none"
   family: gemm
   status: implemented
+  torch_compile_fullgraph: true
 
   signature:
     inputs:
@@ -160,12 +163,13 @@ GemmW4A16FwdOp:
     bench_manifest_driven: true
     kernel_map:
       gemm_w4a16_kernel: GemmW4A16Kernel
-      gemm_w4a16_decode_kernel: GemmW4A16DecodeKernel
+      gemm_w4a16_gemv_kernel: GemmW4A16GemvKernel
 
 GroupedGemmFwdOp:
   ref_api: "none"
   family: gemm
   status: implemented
+  torch_compile_fullgraph: true
 
   signature:
     inputs:
@@ -204,10 +208,12 @@ GroupedGemmFwdOp:
     func: "tileops.perf.formulas.grouped_gemm_roofline"
 
   source:
-    kernel: tileops/kernels/grouped_gemm/grouped_gemm.py
+    kernel:
+    - tileops/kernels/grouped_gemm/grouped_gemm_persistent.py
+    - tileops/kernels/grouped_gemm/grouped_gemm.py
     kernel_map:
+      grouped_gemm_persistent: GroupedGemmPersistentKernel
       grouped_gemm_kernel: GroupedGemmKernel
-      grouped_gemm_persistent_3wg_kernel: GroupedGemmPersistent3WGKernel
     op: tileops/ops/gemm/grouped_gemm.py
     test: tests/ops/test_grouped_gemm.py
     bench: benchmarks/ops/bench_grouped_gemm.py

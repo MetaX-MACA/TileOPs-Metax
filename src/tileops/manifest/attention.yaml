@@ -8,6 +8,7 @@ MultiHeadAttentionBwdOp:
   ref_api: "torch.nn.functional.scaled_dot_product_attention"
   family: attention
   status: implemented
+  torch_compile_fullgraph: true
 
   signature:
     inputs:
@@ -44,6 +45,17 @@ MultiHeadAttentionBwdOp:
 
   roofline:
     func: "tileops.perf.formulas.mha_bwd_roofline"
+    composition:
+    - stage: gqa_backward
+      source: "tileops.perf.formulas.gqa_bwd_roofline"
+
+  composition:
+    kind: composite
+    stages:
+    # MHA is GQA with one KV head per query head: every kernel this op runs is
+    # built by the GQA backward op it delegates to.
+    - name: gqa_backward
+      op: GroupedQueryAttentionBwdOp
 
   source:
     kernel: tileops/kernels/attention/gqa_bwd.py
@@ -58,7 +70,8 @@ MultiHeadAttentionBwdOp:
 GroupedQueryAttentionDenseFwdOp:
   ref_api: "torch.nn.functional.scaled_dot_product_attention"
   family: attention
-  status: spec-only
+  status: implemented
+  torch_compile_fullgraph: true
 
   signature:
     inputs:
@@ -71,14 +84,14 @@ GroupedQueryAttentionDenseFwdOp:
       rope_cos: {dtype: "same_as(o)", optional: true}
       rope_sin: {dtype: "same_as(o)", optional: true}
     outputs:
-      o: {dtype: "float16 | bfloat16"}
+      o: {dtype: "same_as(q)", caller_stated: true}
     params:
       is_causal: {type: bool, default: true}
       sm_scale: {type: "float | None", default: null}
       softcap: {type: "float | None", default: null}
       window_size_left: {type: int, default: -1}
       window_size_right: {type: int, default: -1}
-      dtype: {type: "torch.dtype | None", default: null}
+      out_dtype: {type: "float16 | bfloat16 | None", default: null}
       pos_encoding_mode: {type: str, default: none}
       rotary_dim: {type: "int | None", default: null}
       rope_layout: {type: str, default: neox}
@@ -113,7 +126,24 @@ GroupedQueryAttentionDenseFwdOp:
       - "o.shape == (B, S_q, H, D)"
       - "H % H_kv == 0"
 
-  workloads: []
+  workloads:
+    # Dense decode: one query token over a contiguous KV cache.
+    - {q_shape: [32, 1, 32, 128], kv_shape: [32, 4096, 8, 128], dtypes: [float16, bfloat16], label: "decode-llama-8b-4k"}
+    - {q_shape: [8, 1, 32, 128], kv_shape: [8, 32768, 8, 128], dtypes: [float16, bfloat16], label: "decode-llama-8b-32k"}
+    - {q_shape: [16, 1, 64, 128], kv_shape: [16, 4096, 8, 128], dtypes: [float16, bfloat16], label: "decode-llama-70b-4k"}
+    - {q_shape: [4, 1, 64, 128], kv_shape: [4, 32768, 8, 128], dtypes: [float16, bfloat16], label: "decode-llama-70b-32k"}
+    - {q_shape: [32, 1, 32, 128], kv_shape: [32, 4096, 8, 128], softcap: 50.0, dtypes: [float16], label: "decode-llama-8b-4k-softcap50"}
+    - {q_shape: [1, 1, 32, 128], kv_shape: [1, 1024, 4, 128], dtypes: [float16], label: "decode-qwen3-30b-a3b-bs1-1k"}
+    - {q_shape: [1, 1, 32, 128], kv_shape: [1, 4096, 4, 128], dtypes: [float16], label: "decode-qwen3-30b-a3b-bs1-4k"}
+    - {q_shape: [1, 1, 32, 128], kv_shape: [1, 8192, 4, 128], dtypes: [float16], label: "decode-qwen3-30b-a3b-bs1-8k"}
+    - {q_shape: [1, 1, 32, 128], kv_shape: [1, 16384, 4, 128], dtypes: [float16], label: "decode-qwen3-30b-a3b-bs1-16k"}
+    - {q_shape: [1, 1, 32, 128], kv_shape: [1, 32768, 4, 128], dtypes: [float16], label: "decode-qwen3-30b-a3b-bs1-32k"}
+    - {q_shape: [1, 1, 32, 128], kv_shape: [1, 65536, 4, 128], dtypes: [float16], label: "decode-qwen3-30b-a3b-bs1-64k"}
+    - {q_shape: [1, 1, 32, 128], kv_shape: [1, 131072, 4, 128], dtypes: [float16], label: "decode-qwen3-30b-a3b-bs1-128k"}
+    - {q_shape: [1, 1, 32, 128], kv_shape: [1, 262144, 4, 128], dtypes: [float16], label: "decode-qwen3-30b-a3b-bs1-256k"}
+    # Chunked prefill; the rows that pass the optional inputs.
+    - {q_shape: [1, 256, 8, 128], kv_shape: [1, 1792, 2, 128], rope_cos_shape: [1792, 32], rope_sin_shape: [1792, 32], pos_encoding_mode: rope, rotary_dim: 64, dtypes: [float16, bfloat16], label: "prefill-rope-neox-q256-kv1792"}
+    - {q_shape: [1, 256, 8, 128], kv_shape: [1, 1792, 2, 128], q_scale_shape: [1, 2], k_scale_shape: [1, 2], v_scale_shape: [1, 2], dtype: float16, dtypes: [float8_e4m3fn], label: "prefill-scaled-q256-kv1792"}
 
   roofline:
     func: "tileops.perf.formulas.gqa_fwd_roofline"
@@ -121,11 +151,17 @@ GroupedQueryAttentionDenseFwdOp:
   source:
     kernel: tileops/kernels/attention/gqa_dense.py
     kernel_map:
-      gqa_dense: GQADenseCausalWsKernel
+      gqa_dense: GQADenseWsKernel
+      gqa_dense_decode: GQADecodeKernel
+      gqa_dense_decode_bs1: GQADecodeBs1Kernel
+      gqa_dense_fp8: GQADenseFP8Kernel
+      gqa_dense_fp8_decode: GQADenseFP8DecodeKernel
+      gqa_dense_decode_long_context: GQADecodeLongContextKernel
       gqa_dense_sliding_window: GQADenseSlidingWindowKernel
     op: tileops/ops/attention/gqa.py
     test: tests/ops/attention/test_gqa.py
     bench: benchmarks/ops/attention/bench_gqa.py
+    bench_manifest_driven: true
 
 GroupedQueryAttentionVarlenFwdOp:
   ref_api: "none"
@@ -145,17 +181,17 @@ GroupedQueryAttentionVarlenFwdOp:
       rope_cos: {dtype: "same_as(o)", optional: true}
       rope_sin: {dtype: "same_as(o)", optional: true}
     outputs:
-      o: {dtype: "float16 | bfloat16"}
+      o: {dtype: "same_as(q)", caller_stated: true}
     params:
       is_causal: {type: bool, default: true}
       window_size_left: {type: int, default: -1}
       window_size_right: {type: int, default: -1}
       sm_scale: {type: "float | None", default: null}
       softcap: {type: "float | None", default: null}
+      out_dtype: {type: "float16 | bfloat16 | None", default: null}
       pos_encoding_mode: {type: str, default: none}
       rotary_dim: {type: "int | None", default: null}
       rope_layout: {type: str, default: neox}
-      dtype: {type: "torch.dtype | None", default: null}
     dtype_combos:
       - {q: float16, k: float16, v: float16, cu_seqlens_q: int32, cu_seqlens_kv: int32, o: float16}
       - {q: bfloat16, k: bfloat16, v: bfloat16, cu_seqlens_q: int32, cu_seqlens_kv: int32, o: bfloat16}
@@ -215,17 +251,17 @@ GroupedQueryAttentionPagedFwdOp:
       rope_cos: {dtype: "same_as(o)", optional: true}
       rope_sin: {dtype: "same_as(o)", optional: true}
     outputs:
-      o: {dtype: "float16 | bfloat16"}
+      o: {dtype: "same_as(q)", caller_stated: true}
     params:
       is_causal: {type: bool, default: true}
       window_size_left: {type: int, default: -1}
       window_size_right: {type: int, default: -1}
       sm_scale: {type: "float | None", default: null}
       softcap: {type: "float | None", default: null}
+      out_dtype: {type: "float16 | bfloat16 | None", default: null}
       pos_encoding_mode: {type: str, default: none}
       rotary_dim: {type: "int | None", default: null}
       rope_layout: {type: str, default: neox}
-      dtype: {type: "torch.dtype | None", default: null}
     dtype_combos:
       - {q: float16, k_pages: float16, v_pages: float16, page_table: int32, cache_seqlens: int32, cu_seqlens_q: int32, o: float16}
       - {q: bfloat16, k_pages: bfloat16, v_pages: bfloat16, page_table: int32, cache_seqlens: int32, cu_seqlens_q: int32, o: bfloat16}
@@ -273,6 +309,7 @@ GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp:
   ref_api: "none"
   family: attention
   status: implemented
+  torch_compile_fullgraph: true
 
   signature:
     inputs:
@@ -344,7 +381,6 @@ GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp:
     kernel: tileops/kernels/attention/gqa_fwd.py
     kernel_map:
       gqa_prefill_paged_with_kv_cache_fwd_kernel: GQAPrefillPagedWithKVCacheFwdKernel
-      gqa_prefill_paged_with_kv_cache_rope_append_kernel: GQAPrefillPagedWithKVCacheRopeAppendKernel
       gqa_prefill_paged_with_kv_cache_rope_fwd_kernel: GQAPrefillPagedWithKVCacheRopeFwdKernel
       gqa_prefill_paged_with_fp8_kv_cache_fwd_kernel: GQAPrefillPagedWithFP8KVCacheFwdKernel
     op: tileops/ops/attention/gqa.py
@@ -356,6 +392,7 @@ GroupedQueryAttentionBwdOp:
   ref_api: "torch.nn.functional.scaled_dot_product_attention"
   family: attention
   status: implemented
+  torch_compile_fullgraph: true
 
   signature:
     inputs:
@@ -412,6 +449,7 @@ MultiHeadAttentionDecodePagedWithKVCacheFwdOp:
   ref_api: "none"
   family: attention
   status: implemented
+  torch_compile_fullgraph: true
 
   signature:
     inputs:
@@ -446,6 +484,7 @@ MultiHeadAttentionDecodePagedWithKVCacheFwdOp:
     kernel: tileops/kernels/attention/mha_decode_paged.py
     kernel_map:
       mha_decode_paged_kernel: MHADecodePagedKernel
+      mha_decode_paged_ws_kernel: MHADecodePagedWsKernel
     op: tileops/ops/attention/mha.py
     test: tests/ops/attention/test_mha_decode_paged.py
     bench: benchmarks/ops/attention/bench_mha_decode_paged.py
@@ -455,6 +494,7 @@ GroupedQueryAttentionDecodePagedWithKVCacheFwdOp:
   ref_api: "none"
   family: attention
   status: implemented
+  torch_compile_fullgraph: true
 
   signature:
     inputs:
@@ -512,6 +552,7 @@ GroupedQueryAttentionPrefillVarlenFwdOp:
   ref_api: "none"
   family: attention
   status: implemented
+  torch_compile_fullgraph: true
 
   signature:
     inputs:
@@ -561,6 +602,7 @@ GroupedQueryAttentionSlidingWindowVarlenFwdOp:
   ref_api: "none"
   family: attention
   status: implemented
+  torch_compile_fullgraph: true
 
   signature:
     inputs:
@@ -613,6 +655,7 @@ MultiHeadLatentAttentionDecodeWithKVCacheFwdOp:
   ref_api: "none"
   family: attention
   status: implemented
+  torch_compile_fullgraph: true
 
   signature:
     inputs:
@@ -657,6 +700,7 @@ DeepSeekSparseAttentionDecodeWithKVCacheFwdOp:
   ref_api: "none"
   family: attention
   status: implemented
+  torch_compile_fullgraph: true
 
   signature:
     inputs:
@@ -701,6 +745,7 @@ NSACmpFwdVarlenOp:
   ref_api: "none"
   family: attention
   status: implemented
+  torch_compile_fullgraph: true
 
   signature:
     inputs:
@@ -751,6 +796,7 @@ NSATopkVarlenOp:
   ref_api: "none"
   family: attention
   status: implemented
+  torch_compile_fullgraph: true
 
   signature:
     inputs:
@@ -805,6 +851,7 @@ NSAFwdVarlenOp:
   ref_api: "none"
   family: attention
   status: implemented
+  torch_compile_fullgraph: true
 
   signature:
     inputs:

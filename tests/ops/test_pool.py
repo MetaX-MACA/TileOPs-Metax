@@ -24,6 +24,10 @@ from tileops.kernels.pool import (
     MaxPool3dKernel,
     MaxPool3dWithIndicesKernel,
 )
+from tileops.kernels.pool.avg_pool1d import _WindowStaging
+from tileops.kernels.pool.common import AvgPoolWindow, pool_output_dim, window_span
+from tileops.kernels.pool.max_pool1d import _plan as _max_pool1d_plan
+from tileops.kernels.pool.max_pool1d import _Shape as _MaxPool1dShape
 from tileops.ops import (
     AdaptiveAvgPool2dFwdOp,
     AdaptiveMaxPool2dFwdOp,
@@ -404,13 +408,47 @@ class AvgPool3dFixture(FixtureBase):
                     marks=pytest.mark.full,
                     id="full-divisor-override-bf16",
                 ),
+                pytest.param(
+                    1,
+                    16,
+                    8,
+                    12,
+                    12,
+                    (2, 2, 1),
+                    (2, 2, 2),
+                    (0, 0, 0),
+                    False,
+                    True,
+                    None,
+                    torch.float16,
+                    False,
+                    marks=pytest.mark.full,
+                    id="full-window-narrower-than-stride-fp16",
+                ),
+                pytest.param(
+                    1,
+                    16,
+                    8,
+                    12,
+                    12,
+                    (2, 2, 2),
+                    (2, 2, 2),
+                    (0, 0, 0),
+                    False,
+                    True,
+                    -3,
+                    torch.float16,
+                    False,
+                    marks=pytest.mark.full,
+                    id="full-negative-divisor-tiled-w-fp16",
+                ),
             ],
         ),
     ]
 
 
 class AvgPoolTest(AvgPoolWorkload, TestBase):
-    """Dim-generic avg-pool reference harness (divisor_override is 2d/3d-only)."""
+    """Dim-generic avg-pool reference test (divisor_override is 2d/3d-only)."""
 
 
 def _avg_pool_expected_kernel(
@@ -560,6 +598,72 @@ def test_avg_pool3d(
         dtype,
         tune,
     )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "l_in, kernel_l, stride_l, pad_l, dtype",
+    [
+        (4096, 3, 2, 1, "float16"),
+        (32000, 5, 4, 2, "float16"),
+        (2048, 4, 2, 1, "bfloat16"),
+        (28000, 12000, 4001, 0, "float16"),
+        (127, 7, 3, 3, "bfloat16"),
+        (30, 4, 4, 2, "bfloat16"),
+        (33, 3, 2, 1, "float16"),
+        (64, 1, 1, 0, "float16"),
+    ],
+)
+def test_avg_pool1d_staged_span_stays_aligned(
+    l_in: int, kernel_l: int, stride_l: int, pad_l: int, dtype: str
+) -> None:
+    """Every group of the staged span lies wholly inside the row or wholly outside it.
+
+    The staging load is vectorized, and it is the group boundaries that decide whether a
+    group is loaded or zeroed, so a boundary landing mid-row would read the wrong
+    elements for the whole group. Three things move a boundary: the block step
+    ``block_ol * stride_l``, the head in front of the leftmost window, and the row end.
+    Only a window too wide to stage at 128 outputs selects a width that can break this,
+    which is why no benchmarked shape reaches it.
+    """
+    window = AvgPoolWindow(
+        rows=1,
+        size=(l_in,),
+        kernel=(kernel_l,),
+        stride=(stride_l,),
+        pad=(pad_l,),
+        ceil_mode=False,
+        count_include_pad=True,
+        divisor_override=None,
+    )
+    staging = _WindowStaging(window, dtype)
+    for block_ol in staging.widths():
+        staged = window_span(
+            block_ol, block_ol * stride_l, l_in, kernel_l, stride_l, pad_l, 1, dtype
+        )
+        assert (block_ol * stride_l) % staged.vector_elems == 0
+        assert l_in % staged.vector_elems == 0
+        assert staged.head % staged.vector_elems == 0
+        assert staged.span % staged.vector_elems == 0
+        assert staged.head >= pad_l
+        assert staged.span >= staged.head + (block_ol - 1) * stride_l + kernel_l
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("l_in, kernel_l", [(15, 16), (31, 32), (100, 128), (1000, 1024)])
+def test_max_pool1d_row_reduce_takes_no_tap_past_the_row(l_in: int, kernel_l: int) -> None:
+    """A window wider than the row does not reach the row-reduce body.
+
+    That body reads taps 0 to ``kernel_size - 1`` of the row with no bounds test, which
+    only holds where the window fits. Ceil mode admits a window wider than the row --
+    PyTorch pads the missing taps with ``-inf`` and still emits one output -- and the
+    taps past the row's end would then read the row after it.
+    """
+    shape = _MaxPool1dShape(8, l_in, kernel_l, kernel_l, 0, 1, "float16")
+    plan = _max_pool1d_plan(shape, True, False)
+    assert plan.out_l == 1
+    assert not plan.always_in_bounds
+    assert plan.body != "rowreduce"
 
 
 @pytest.mark.smoke
@@ -1012,7 +1116,7 @@ _MAX_POOL1D_PARAMS = [
         marks=pytest.mark.full,
         id="full-ceil-k5-s3-p2-bf16",
     ),
-    # Short output: sends max_pool1d down the shared-memory staged read.
+    # Non-overlapping windows over a short output row: the windowed read.
     pytest.param(
         2,
         32,
@@ -1026,7 +1130,23 @@ _MAX_POOL1D_PARAMS = [
         False,
         True,
         marks=pytest.mark.full,
-        id="full-staged-short-output-fp16",
+        id="full-windowed-short-output-fp16",
+    ),
+    # One output a row, at a window width the row-reduce fragment takes.
+    pytest.param(
+        2,
+        8,
+        32,
+        (32,),
+        (32,),
+        (0,),
+        (1,),
+        False,
+        torch.float16,
+        False,
+        True,
+        marks=pytest.mark.full,
+        id="full-rowreduce-one-output-fp16",
     ),
 ]
 
@@ -1318,7 +1438,7 @@ class MaxPool3dFixture(FixtureBase):
 
 
 class MaxPoolTest(MaxPoolWorkload, TestBase):
-    """Dim-generic max-pool reference harness."""
+    """Dim-generic max-pool reference test."""
 
 
 def _run_max_pool_case(
@@ -2063,8 +2183,6 @@ def test_pool_output_dim_with_dilation(
     ceil_mode: bool,
     expected: int | str,
 ) -> None:
-    from tileops.kernels.pool.common import pool_output_dim
-
     if expected == "default_matches_explicit":
         default = pool_output_dim(input_size, kernel_size, stride, padding, ceil_mode)
         explicit = pool_output_dim(
@@ -2610,6 +2728,19 @@ class AdaptiveMaxPool2dFixture(FixtureBase):
                     False,
                     marks=pytest.mark.full,
                     id="full-partial-none-fp16",
+                ),
+                # Shape coverage: an output wider than the input gives bins of 1 and 2,
+                # so the widest bin exceeds ceil(in/out), and the other axis is ragged.
+                pytest.param(
+                    1,
+                    8,
+                    8,
+                    8,
+                    (12, 3),
+                    torch.float16,
+                    False,
+                    marks=pytest.mark.full,
+                    id="full-expanding-bins-fp16",
                 ),
             ],
         ),

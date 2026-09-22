@@ -2,10 +2,24 @@ import pytest
 import torch
 
 from tests.test_base import FixtureBase, TestBase
-from tileops.kernels.gemm import GemmKernel, SmallBatchGemmKernel
-from tileops.kernels.gemm.dense import GemmFp8BlockScaledKernel
-from tileops.kernels.gemm.heuristics import best_config
+from tileops.kernels.gemm import (
+    GemmCpAsyncKernel,
+    GemmTmaKernel,
+    GemvKernel,
+)
+from tileops.kernels.gemm.dense import (
+    GemmFp8BlockScaleKernel,
+    _b_eviction,
+    _bandwidth_autotune_grid,
+)
+from tileops.kernels.gemm.heuristics import (
+    best_config,
+    gemv_config,
+    small_batch_config,
+    small_m_splitk_config,
+)
 from tileops.ops import GemmFp8FwdOp, GemmFwdOp, GemmW4A16FwdOp
+from tileops.utils import get_sm_version, is_maca
 from workloads.gemm import GemmFp8Workload, GemmW4A16Workload, GemmWorkload, quantize_weight_int4
 
 
@@ -396,6 +410,28 @@ class GemmFp8Fixture(FixtureBase):
                     marks=pytest.mark.full,
                     id="full-fp8-e4m3-per-tensor-gemv",
                 ),
+                pytest.param(
+                    128,
+                    256,
+                    6144,
+                    torch.float8_e4m3fn,
+                    "block128",
+                    torch.bfloat16,
+                    False,
+                    marks=pytest.mark.full,
+                    id="full-fp8-e4m3-block128-split-k",
+                ),
+                pytest.param(
+                    128,
+                    256,
+                    6144,
+                    torch.float8_e4m3fn,
+                    "per_tensor",
+                    torch.bfloat16,
+                    True,
+                    marks=pytest.mark.full,
+                    id="full-fp8-e4m3-per-tensor-split-k-bias",
+                ),
             ],
         ),
     ]
@@ -437,6 +473,38 @@ class GemmW4A16Fixture(FixtureBase):
                     torch.float16,
                     marks=pytest.mark.full,
                     id="full-w4a16-m16",
+                ),
+                pytest.param(
+                    1,
+                    35,
+                    384,
+                    torch.float16,
+                    marks=pytest.mark.full,
+                    id="full-w4a16-gemv-short-k-n-tail",
+                ),
+                pytest.param(
+                    1,
+                    65,
+                    1024,
+                    torch.float16,
+                    marks=pytest.mark.full,
+                    id="full-w4a16-gemv-n-tail",
+                ),
+                pytest.param(
+                    1,
+                    96,
+                    8192,
+                    torch.float16,
+                    marks=pytest.mark.full,
+                    id="full-w4a16-gemv-staged-k",
+                ),
+                pytest.param(
+                    17,
+                    65,
+                    256,
+                    torch.float16,
+                    marks=pytest.mark.full,
+                    id="full-w4a16-small-mn-tail",
                 ),
             ],
         ),
@@ -488,6 +556,27 @@ def test_gemm_w4a16(m: int, n: int, k: int, dtype: torch.dtype) -> None:
 
 
 @pytest.mark.smoke
+@pytest.mark.parametrize("k_index", [0, 127, 128, 383])
+def test_gemm_w4a16_gemv_preserves_fp32_scale(k_index: int) -> None:
+    """A basis vector exposes exact nibble, group, and weight-rounding errors."""
+    n, k = 35, 384
+    rows = torch.arange(n)[:, None]
+    quantized = (rows + torch.arange(k)[None, :]) % 16
+    zero = ((3 * rows + torch.arange(k // 128)[None, :]) % 16).to(torch.uint8)
+    scale = 0.03137 + torch.arange(n * (k // 128), dtype=torch.float32).reshape(n, -1) * 0.001147
+    packed = (quantized[:, 0::2] | (quantized[:, 1::2] << 4)).to(torch.uint8)
+    group = k_index // 128
+    centered = quantized[:, k_index].float() - zero[:, group].float()
+    expected = (centered * scale[:, group]).half()[None, :]
+    # These scales distinguish the contract from rounding scales to A16 first.
+    assert not torch.equal(expected[0], (centered * scale[:, group].half().float()).half())
+    activation = torch.zeros((1, k), device="cuda", dtype=torch.float16)
+    activation[0, k_index] = 1
+    actual = GemmW4A16FwdOp()(activation, packed.cuda(), scale.cuda(), zero.cuda())
+    torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
+
+
+@pytest.mark.smoke
 def test_quantize_weight_int4_keeps_one_sided_groups_in_range() -> None:
     weight = torch.tensor(
         [
@@ -510,42 +599,48 @@ def test_gemm_fp8_block128_single_k_block_uses_block_kernel() -> None:
     test = GemmFp8Test(128, 256, 128, torch.float8_e4m3fn, "block128")
     op = GemmFp8FwdOp()
     test.check(op, *test.gen_inputs(), atol=5e-2, rtol=5e-2)
-    assert op.kernel.__class__.__name__ == "GemmFp8BlockScaledKernel"
+    assert op.kernel.__class__.__name__ == "GemmFp8BlockScaleKernel"
 
 
 @pytest.mark.parametrize(
-    ("shape", "expected_tile"),
+    ("shape", "expected"),
     [
         pytest.param(
             (4096, 2112, 7168),
-            (128, 64),
+            (128, 4),
             marks=pytest.mark.smoke,
             id="prefill-gate-up",
         ),
         pytest.param(
-            (4096, 4096, 7168),
-            (64, 128),
+            (128, 7168, 2048),
+            (64, 5),
             marks=pytest.mark.full,
-            id="prefill-attn-proj",
+            id="decode-grid-underfills",
         ),
         pytest.param(
-            (4096, 7168, 2048),
-            (128, 128),
+            (8, 7168, 2048),
+            (128, 6),
             marks=pytest.mark.full,
-            id="prefill-down-default",
+            id="tiny-m-widens-the-tile",
+        ),
+        pytest.param(
+            (4096, 7168, 16384),
+            (128, 3),
+            marks=pytest.mark.full,
+            id="long-k-shallow-ring",
         ),
     ],
 )
 def test_gemm_fp8_block128_default_config(
-    shape: tuple[int, int, int], expected_tile: tuple[int, int]
+    shape: tuple[int, int, int], expected: tuple[int, int]
 ) -> None:
-    kernel = GemmFp8BlockScaledKernel(
+    kernel = GemmFp8BlockScaleKernel(
         *shape,
         dtype=torch.float8_e4m3fn,
         out_dtype=torch.bfloat16,
     )
 
-    assert (kernel.config["block_m"], kernel.config["block_n"]) == expected_tile
+    assert (kernel.config["block_n"], kernel.config["num_stages"]) == expected
 
 
 @pytest.mark.smoke
@@ -630,35 +725,80 @@ def test_gemv_boundary_rhs_col(n: int, k: int, dtype: torch.dtype, tune: bool) -
 
 
 @pytest.mark.smoke
-def test_small_batch_dispatch() -> None:
-    """small_batch dispatches only at m == 2, on the n band swap_ab leaves it.
+def test_lhs_rows_band_dispatch() -> None:
+    """``GemvKernel`` takes its ``lhs_rows`` band only at m == 2, on the n band swap_ab leaves it.
 
-    One case per clause of ``SmallBatchGemmKernel.applies``: m == 1 stays on
-    gemv, m >= 3 and non-NT stay on the generic kernel (whose small-m band
-    picks swap_ab / split-K / simple configs analytically), and so does any n
-    wide enough for the operand-swapped grid. Dispatch only — ``_get_kernel``
-    constructs kernel objects without triggering a JIT compile (that happens on
-    first forward), so this stays smoke-fast.
+    One case per clause of ``GemvKernel.band_for``: m == 1 lands on the same class in
+    its ``lhs_row`` band, m >= 3 and non-NT stay on the generic kernel (whose small-m
+    band picks swap_ab / split-K / simple configs analytically), and so does any n wide
+    enough for the operand-swapped grid. Selection only — no kernel is built, so this
+    stays smoke-fast.
     """
     from tileops.utils import get_sm_version
 
-    if get_sm_version() not in (SmallBatchGemmKernel.supported_archs or []):
-        pytest.skip("small_batch kernel-mode is SM90-only")
+    if get_sm_version() not in (GemvKernel.supported_archs or []):
+        pytest.skip("the bandwidth-bound band is SM90-only")
 
-    op = GemmFwdOp(trans_a=False, trans_b=True)
-    assert op._get_kernel((), 2, 2112, 7168, torch.float16)[0] == "small_batch"
-    assert op._get_kernel((), 2, 7168, 2048, torch.float16)[0] == "gemm"
-    assert op._get_kernel((), 3, 2112, 7168, torch.float16)[0] == "gemm"
-    assert op._get_kernel((), 1, 2112, 7168, torch.float16)[0] == "lhs_row"
-    op_nn = GemmFwdOp(trans_a=False, trans_b=False)
-    assert op_nn._get_kernel((), 2, 2112, 7168, torch.float16)[0] == "gemm"
+    nt = GemmFwdOp(trans_a=False, trans_b=True)
+    fp = torch.float16
+    two_rows = nt._call_spec(2, 2112, 7168, fp)
+    assert nt.select_kernel(two_rows) is GemvKernel
+    assert GemvKernel.band_for(two_rows) == "lhs_rows"
+    assert nt.select_kernel(nt._call_spec(2, 7168, 2048, fp)) is GemmTmaKernel
+    assert nt.select_kernel(nt._call_spec(3, 2112, 7168, fp)) is GemmTmaKernel
+    one_row = nt._call_spec(1, 2112, 7168, fp)
+    assert nt.select_kernel(one_row) is GemvKernel
+    assert GemvKernel.band_for(one_row) == "lhs_row"
+    nn = GemmFwdOp(trans_a=False, trans_b=False)
+    assert nn.select_kernel(nn._call_spec(2, 2112, 7168, fp)) is GemmTmaKernel
+
+
+@pytest.mark.smoke
+def test_gemv_bands_build_their_own_body_and_config() -> None:
+    """Each band states its own body shape and config band; the band is in the identity.
+
+    The three bands share ``_gemm_small_batch_kernel``, so what separates them is what
+    this asserts: how many rows the body contracts, which config rule picks its
+    parameters, and that two bands never share a cache entry.
+    """
+    from tileops.utils import get_sm_count, get_sm_version
+
+    if get_sm_version() not in (GemvKernel.supported_archs or []):
+        pytest.skip("the bandwidth-bound band is SM90-only")
+
+    fp = torch.float16
+    nt = GemmFwdOp(trans_a=False, trans_b=True)
+    nn = GemmFwdOp(trans_a=False, trans_b=False)
+
+    rows_identity, _ = GemvKernel.entry_for(nt._call_spec(2, 2112, 7168, fp))
+    row_identity, _ = GemvKernel.entry_for(nt._call_spec(1, 2112, 7168, fp))
+    col_identity, _ = GemvKernel.entry_for(nn._call_spec(2112, 1, 7168, fp))
+    assert rows_identity[0] == "lhs_rows"
+    assert row_identity[0] == "lhs_row"
+    assert col_identity[0] == "rhs_col"
+    assert len({rows_identity, row_identity, col_identity}) == 3
+
+    rows = GemvKernel("lhs_rows", 2, 2112, 7168, fp)
+    row = GemvKernel("lhs_row", 1, 2112, 7168, fp)
+    col = GemvKernel("rhs_col", 2112, 1, 7168, fp)
+    assert (rows.out_len, row.out_len, col.out_len) == (2112, 2112, 2112)
+    assert rows.default_config == small_batch_config(2112, 7168, get_sm_count())
+    assert row.default_config == gemv_config(7168) == col.default_config
+    assert rows.autotune_configs == _bandwidth_autotune_grid((32, 64, 128), (1, 2, 4), (2, 3, 4, 5))
+    assert row.autotune_configs == _bandwidth_autotune_grid(
+        (32, 64, 128, 256), (1, 2, 4, 8, 16), (1, 2, 3, 4, 5, 6)
+    )
+    assert col.autotune_configs == row.autotune_configs
+
+    with pytest.raises(ValueError, match="serves bands"):
+        GemvKernel("m2", 2, 2112, 7168, fp)
 
 
 @pytest.mark.smoke
 def test_explicit_structure_config_is_taken_verbatim() -> None:
     """A structure-flagged ``config=`` survives instead of being merged away.
 
-    ``GemmKernel`` has one config schema per structure, so the base's
+    ``GemmTmaKernel`` has one config schema per structure, so the base's
     merge-over-``default_config`` would drop the caller's flag and keep their tile
     values — asking for ``coop2s`` on a shape the selector serves with ``coop2``
     yielded ``coop2`` at ``coop2s``' ``block_n``, which no measurement covers.
@@ -668,70 +808,25 @@ def test_explicit_structure_config_is_taken_verbatim() -> None:
     if get_sm_version() != 90:
         pytest.skip("the GEMM structures are SM90-only")
 
-    assert GemmKernel(1536, 2112, 256, torch.bfloat16, trans_b=True).config["block_n"] == 192
+    assert GemmTmaKernel(1536, 2112, 256, torch.bfloat16, trans_b=True).config["block_n"] == 192
 
     requested = {"coop2s": True, "block_n": 64, "block_k": 128, "num_stages": 4}
-    kernel = GemmKernel(1536, 2112, 256, torch.bfloat16, trans_b=True, config=dict(requested))
+    kernel = GemmTmaKernel(1536, 2112, 256, torch.bfloat16, trans_b=True, config=dict(requested))
     assert kernel.config == requested
 
-    merged = GemmKernel(512, 512, 512, torch.float16, config={"block_k": 32}).config
+    merged = GemmTmaKernel(512, 512, 512, torch.float16, config={"block_k": 32}).config
     assert merged["block_k"] == 32
     assert "block_m" in merged and "panel_size" in merged
 
 
 @pytest.mark.smoke
-def test_registered_wrapped_ops_keep_their_contracts() -> None:
-    """The two ``tileops::`` ops stay callable at the ranks they advertise.
+def test_gemm_routes_tma_misaligned_shapes_to_the_pipelined_mainloop() -> None:
+    """An unaligned innermost dimension leaves ``GemmTmaKernel``, which names the dim.
 
-    Nothing in-tree calls either — ``forward`` builds the JIT directly and these
-    exist for ``torch.compile`` — so their bodies rot unwatched. Both were
-    changed here: the GEMM op gained ``panel_size`` / ``split_k`` and a split-K
-    branch, and the GEMV op now delegates to the shared ``[m, k] -> [m, n]``
-    small-batch body while still advertising ``a[k] -> c[n]``. That rank
-    adaptation was in fact missing and silent until this test existed.
-    """
-    from torch.library import opcheck
-
-    from tileops.kernels.gemm.dense import _gemm_wrapped_kernel, _gemv_wrapped_kernel
-    from tileops.utils import get_sm_version
-
-    if get_sm_version() != 90:
-        pytest.skip("both bodies are SM90-only")
-
-    m, n, k = 128, 512, 1024
-    a = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
-    b = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
-    ref = a.float() @ b.float().T
-
-    for split_k in (1, 4):
-        args = (m, n, k, False, True, "bfloat16", 64, 128, 128, 4, 16, split_k, a, b)
-        out = _gemm_wrapped_kernel(*args)
-        assert out.shape == (m, n)
-        torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
-        opcheck(
-            torch.ops.tileops.gemm_wrapped_kernel,
-            args,
-            test_utils=("test_schema", "test_faketensor"),
-        )
-
-    vec_args = (n, k, "bfloat16", 1, 128, 4, a[0].contiguous(), b)
-    out = _gemv_wrapped_kernel(*vec_args)
-    assert out.shape == (n,)
-    torch.testing.assert_close(out.float(), ref[0], atol=2e-2, rtol=2e-2)
-    opcheck(
-        torch.ops.tileops.gemv_wrapped_kernel,
-        vec_args,
-        test_utils=("test_schema", "test_faketensor"),
-    )
-
-
-@pytest.mark.smoke
-def test_gemm_refuses_tma_misaligned_shapes_by_naming_the_dim() -> None:
-    """An unaligned innermost dimension is refused, with the dimension named.
-
-    Every ``GemmKernel`` structure loads through TMA, which addresses the
+    Every ``GemmTmaKernel`` structure loads through TMA, which addresses the
     innermost dimension in 16-byte units; which logical dim that is follows the
     layout, so the same extent is served in one layout and refused in another.
+    ``GemmCpAsyncKernel`` loads through ``cp.async`` and takes what is refused.
     Undeclared, these calls died inside TileLang's descriptor check instead
     ("Check failed: (result.supported) is false"), naming nothing to change.
 
@@ -745,16 +840,21 @@ def test_gemm_refuses_tma_misaligned_shapes_by_naming_the_dim() -> None:
     nt, nn = GemmFwdOp(trans_a=False, trans_b=True), GemmFwdOp(trans_a=False, trans_b=False)
     fp = torch.bfloat16
 
-    with pytest.raises(ValueError, match=r"multiple of 8 elements.*k=1001"):
-        nt._get_kernel((), 256, 512, 1001, fp)
-    with pytest.raises(ValueError, match=r"multiple of 8 elements.*n=511"):
-        nn._get_kernel((), 256, 511, 1024, fp)
-    assert nt._get_kernel((), 256, 511, 1024, fp)[0] == "gemm"
+    misaligned_k = nt._call_spec(256, 512, 1001, fp)
+    assert nt.select_kernel(misaligned_k) is GemmCpAsyncKernel
+    assert "multiple of 8 elements" in GemmTmaKernel.refusal(misaligned_k)
+    assert "k=1001" in GemmTmaKernel.refusal(misaligned_k)
 
-    assert nt._get_kernel((), 1, 512, 1001, fp)[0] == "lhs_row"
+    misaligned_n = nn._call_spec(256, 511, 1024, fp)
+    assert nn.select_kernel(misaligned_n) is GemmCpAsyncKernel
+    assert "n=511" in GemmTmaKernel.refusal(misaligned_n)
+
+    assert nt.select_kernel(nt._call_spec(256, 511, 1024, fp)) is GemmTmaKernel
+    assert nt.select_kernel(nt._call_spec(1, 512, 1001, fp)) is GemvKernel
+    assert nt._call_spec(1, 512, 1001, fp).gemv_mode == "lhs_row"
 
     with pytest.raises(ValueError, match=r"cannot serve 256x512x1001"):
-        GemmKernel(256, 512, 1001, fp, trans_a=False, trans_b=True)
+        GemmTmaKernel(256, 512, 1001, fp, trans_a=False, trans_b=True)
 
 
 @pytest.mark.smoke
@@ -791,8 +891,46 @@ def test_gemm_refuses_non_matrix_operands_before_building_anything() -> None:
 
     with pytest.raises(ValueError, match=r"contracts two matrices.*a\.ndim=3"):
         op(a, a)
-    assert (op.m, op.n, op.k) == (None, None, None)
-    assert not op.built_kernels("gemm_kernel")
+    assert not any(hasattr(op, dim) for dim in ("m", "n", "k"))
+    assert not op.built_kernels("gemm")
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("num_stages, stage_n", [(3, 0), (4, 128)])
+def test_coop2_epilogue_chunking_matches_reference(num_stages: int, stage_n: int) -> None:
+    """Shape coverage: the coop2 epilogue staged in one SMEM chunk and in two.
+
+    ``stage_n`` cuts a ``block_n``-wide output tile into ``block_n / stage_n`` chunks.
+    """
+    m, n, k = 1536, 3072, 256
+    test = GemmTest(m, n, k, torch.bfloat16, False, True)
+    a, b = test.gen_inputs()
+    kernel = GemmTmaKernel(
+        m,
+        n,
+        k,
+        torch.bfloat16,
+        trans_a=False,
+        trans_b=True,
+        config={
+            "coop2": True,
+            "block_n": 256,
+            "block_k": 64,
+            "num_stages": num_stages,
+            "group_size_m": 16,
+            "stage_n": stage_n,
+        },
+    )
+    torch.testing.assert_close(kernel.forward(a, b), torch.matmul(a, b.T), atol=1.6e-2, rtol=1.6e-2)
+
+
+@pytest.mark.smoke
+def test_b_tile_eviction_hint_follows_the_m_tile_count() -> None:
+    """Dispatch branch: the streaming-B hint is on at one or two M-tiles, off above."""
+    assert _b_eviction(64, 64) == "evict_first"
+    assert _b_eviction(128, 64) == "evict_first"
+    assert _b_eviction(129, 64) is None
+    assert _b_eviction(4096, 128) is None
 
 
 @pytest.mark.smoke
@@ -806,7 +944,7 @@ def test_structure_routing_matches_test_ids() -> None:
     passes. This pins the mapping: when it fails, the correctness case named in
     the assertion needs a new shape, not a new expectation.
 
-    Routing only — ``_get_kernel`` builds no JIT, so this stays smoke-fast.
+    Routing only — construction builds no JIT, so this stays smoke-fast.
     """
     from tileops.utils import get_sm_version
 
@@ -826,13 +964,15 @@ def test_structure_routing_matches_test_ids() -> None:
         ("full-fp16-small-m8-splitk", 8, 2112, 7168, torch.float16, True, "splitK4"),
         ("full-fp16-small-m4-basic-ntail", 4, 3000, 2048, torch.float16, True, "basic"),
     ]
-    flags = GemmKernel._STRUCTURE_FLAGS
+    flags = GemmTmaKernel._STRUCTURE_FLAGS
 
     for test_id, m, n, k, dtype, trans_b, want in expected:
         op = GemmFwdOp(trans_a=False, trans_b=trans_b)
-        mode, kernel = op._get_kernel((), m, n, k, dtype)
-        assert mode == "gemm", f"{test_id}: expected the generic kernel, got {mode}"
-        config = kernel.config
+        call = op._call_spec(m, n, k, dtype)
+        cls = op.select_kernel(call)
+        assert cls is GemmTmaKernel, f"{test_id}: expected the generic kernel, got {cls.__name__}"
+        _identity, build = cls.entry_for(call)
+        config = build().config
         got = next((f for f in flags if config.get(f)), None)
         if got is None:
             split_k = config.get("split_k", 1)
@@ -844,21 +984,21 @@ def test_structure_routing_matches_test_ids() -> None:
 
 
 @pytest.mark.smoke
-def test_gemm_kernel_tune_falls_back_to_default() -> None:
-    """``GemmKernel`` defines no ``autotune_configs``: ``tune=True`` must warn
+def test_gemm_tma_kernel_tune_falls_back_to_default() -> None:
+    """``GemmTmaKernel`` defines no ``autotune_configs``: ``tune=True`` must warn
     and fall back to ``default_config``.
 
     The in-tree tuner sweeps only the basic mainloop builder, so a silent
     basic-grid sweep would downgrade shapes whose default is a structure-
     flagged config (coop2 / split-K). Construction only — no JIT compile.
     """
-    from tileops.utils import get_sm_version
-
-    if get_sm_version() not in (GemmKernel.supported_archs or []):
+    if is_maca() or get_sm_version() not in (89, 90):
         pytest.skip("GemmKernel is SM89/SM90-only")
 
     with pytest.warns(UserWarning, match="does not define autotune_configs"):
-        kernel = GemmKernel(4096, 4096, 7168, torch.float16, tune=True, trans_a=False, trans_b=True)
+        kernel = GemmTmaKernel(
+            4096, 4096, 7168, torch.float16, tune=True, trans_a=False, trans_b=True
+        )
     assert kernel.config == kernel.default_config
 
 
@@ -873,3 +1013,78 @@ def test_config_selector_declines_a_board_it_was_not_measured_on() -> None:
     assert best_config(1024, 1024, 1024, False, False, 132, "NVIDIA H200") is not None
     assert best_config(1024, 1024, 1024, False, False, 132, "NVIDIA H20-3e") is None
     assert best_config(1024, 1024, 1024, False, False, 132, "no such board") is None
+
+
+@pytest.mark.smoke
+def test_small_m_splitk_config_selects_a_shape_band() -> None:
+    assert small_m_splitk_config(32, 7168, 18432, 132, "NVIDIA H200") == {
+        "block_m": 32,
+        "block_n": 112,
+        "block_k": 128,
+        "num_stages": 2,
+        "threads": 128,
+        "split_k": 4,
+    }
+    assert small_m_splitk_config(64, 7168, 18432, 132, "NVIDIA H200") is None
+    assert small_m_splitk_config(32, 7168, 2048, 132, "NVIDIA H200") is None
+    assert small_m_splitk_config(32, 7168, 18432, 132, "NVIDIA H100") is None
+    # The band is fitted on the board, not on the exact name CUDA reports for it,
+    # and the name arrives both as CUDA spells it and through a call record.
+    assert small_m_splitk_config(32, 7168, 18432, 132, "NVIDIA H200 NVL") is not None
+    assert small_m_splitk_config(32, 7168, 18432, 132, "nvidia h200") is not None
+
+
+@pytest.mark.smoke
+def test_dense_splitk_interfaces_match_reference() -> None:
+    m, n, k = 32, 112, 512
+    a = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
+    basic_config = {
+        "block_m": m,
+        "block_n": n,
+        "block_k": 128,
+        "num_stages": 2,
+        "threads": 128,
+        "split_k": 4,
+    }
+    actual = GemmCpAsyncKernel(m, n, k, torch.bfloat16, basic_config, trans_b=True)(a, b)
+    torch.testing.assert_close(actual.float(), a.float() @ b.float().T, rtol=2e-2, atol=1e-1)
+
+    gated_b = torch.randn(2 * n, k, dtype=torch.bfloat16, device="cuda")
+    gated_config = {
+        "block_m": 64,
+        "block_n": n,
+        "block_k": 128,
+        "num_stages": 4,
+        "panel_size": 8,
+        "split_k": 4,
+    }
+    actual = GemmTmaKernel(
+        m,
+        2 * n,
+        k,
+        torch.bfloat16,
+        gated_config,
+        trans_b=True,
+        activation="silu_and_mul",
+    )(a, gated_b)
+    gate, up = (a.float() @ gated_b.float().T).chunk(2, dim=1)
+    expected = torch.nn.functional.silu(gate) * up
+    torch.testing.assert_close(actual.float(), expected, rtol=2e-2, atol=1e-1)
+
+
+@pytest.mark.smoke
+def test_gemm_cp_async_kernel_k_tail_padding() -> None:
+    """Non-16-aligned k rides on the backend zero-padding the K tail.
+
+    Verified on real sm80 and sm89 hardware: any k with
+    k * itemsize >= 4 compiles and matches the reference with
+    block_k = 16 (the mma.sync floor); the K tail is zero-padded.
+    """
+    for k in (2, 8, 24):
+        kern = GemmCpAsyncKernel(m=32, n=64, k=k, dtype=torch.bfloat16, trans_b=True)
+        a = torch.randn(32, k, dtype=torch.bfloat16, device="cuda") * 0.05
+        b = torch.randn(64, k, dtype=torch.bfloat16, device="cuda") * 0.05
+        out = kern(a, b)
+        ref = a.float() @ b.float().t()
+        torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)

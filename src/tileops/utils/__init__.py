@@ -5,6 +5,7 @@ from .utils import (
     get_sm_count,
     get_sm_version,
     is_h200,
+    is_h200_name,
     is_hopper,
     is_maca,
     str2dtype,
@@ -19,5 +20,6 @@ __all__ = [
     "is_h200",
     "is_hopper",
     "is_maca",
+    "is_h200_name",
     "str2dtype",
 ]

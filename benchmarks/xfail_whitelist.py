@@ -8,6 +8,7 @@ _AUTOTUNE_FAILURE = "no benchmark configuration compiles and validates successfu
 _NUMERICAL_MISMATCH = "known MACA numerical mismatch"
 _OUT_OF_MEMORY = "known MACA out-of-memory on this workload"
 _MISSING_BASELINE = "required baseline/package unavailable or incompatible on MACA"
+_UNSUPPORTED_RUNTIME = "known MACA unsupported runtime operation"
 
 
 # FIXME(staged-rollout): quarantine the current MetaX benchmark failures by exact node ID.
@@ -41,11 +42,6 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         _COMPILATION_FAILURE,
         (
-            "benchmarks/ops/bench_elementwise_manifest.py::test_logical_and_manifest_bench[cnn-feat-broadcast-bool]",
-            "benchmarks/ops/bench_elementwise_manifest.py::test_logical_or_manifest_bench[cnn-feat-broadcast-bool]",
-            "benchmarks/ops/bench_elementwise_manifest.py::test_bitwise_and_manifest_bench[cnn-feat-broadcast-bool]",
-            "benchmarks/ops/bench_elementwise_manifest.py::test_bitwise_or_manifest_bench[cnn-feat-broadcast-bool]",
-            "benchmarks/ops/bench_elementwise_manifest.py::test_bitwise_xor_manifest_bench[cnn-feat-broadcast-bool]",
             # Legacy nodeids (pre-workload-name ids); keep until collection drops them.
             "benchmarks/ops/bench_deltanet.py::test_deltanet_vs_fla_fwd[2-4096-4-64-64-64-dtype0-False]",
             "benchmarks/ops/bench_deltanet.py::test_deltanet_vs_fla_fwd[2-4096-4-64-64-32-dtype1-False]",
@@ -109,6 +105,20 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "benchmarks/ops/bench_gla_chunkwise.py::test_gla_fwdbwd_bench[2-16384-4-64-64-64-dtype7-False]",
             "benchmarks/ops/bench_gla_chunkwise.py::test_gla_bwd_bench[2-4096-4-64-64-64-dtype4-False]",
             "benchmarks/ops/bench_gla_chunkwise.py::test_gla_fwdbwd_bench[2-4096-4-64-64-64-dtype4-False]",
+            "benchmarks/ops/bench_elementwise_manifest.py::test_logical_and_manifest_bench[cnn-feat-broadcast-bool]",
+            "benchmarks/ops/bench_elementwise_manifest.py::test_logical_or_manifest_bench[cnn-feat-broadcast-bool]",
+            "benchmarks/ops/bench_elementwise_manifest.py::test_bitwise_and_manifest_bench[cnn-feat-broadcast-bool]",
+            "benchmarks/ops/bench_elementwise_manifest.py::test_bitwise_or_manifest_bench[cnn-feat-broadcast-bool]",
+            "benchmarks/ops/bench_elementwise_manifest.py::test_bitwise_xor_manifest_bench[cnn-feat-broadcast-bool]",
+            "benchmarks/ops/bench_fp8_lightning_indexer.py::test_fp8_lightning_indexer_bench[lightning-indexer-s8k-h32-d64-bfloat16]",
+            "benchmarks/ops/bench_gla_chunkwise.py::test_gla_bwd_bench[gla-bwd-b2-s2k-h4-d64-float16]",
+            "benchmarks/ops/bench_gla_chunkwise.py::test_gla_bwd_bench[gla-bwd-b2-s2k-h4-d64-bfloat16]",
+            "benchmarks/ops/bench_gla_chunkwise.py::test_gla_bwd_bench[gla-bwd-b2-s4k-h4-d64-float16]",
+            "benchmarks/ops/bench_gla_chunkwise.py::test_gla_bwd_bench[gla-bwd-b2-s4k-h4-d64-bfloat16]",
+            "benchmarks/ops/bench_gla_chunkwise.py::test_gla_bwd_bench[gla-bwd-b2-s8k-h4-d64-float16]",
+            "benchmarks/ops/bench_gla_chunkwise.py::test_gla_bwd_bench[gla-bwd-b2-s8k-h4-d64-bfloat16]",
+            "benchmarks/ops/bench_gla_chunkwise.py::test_gla_bwd_bench[gla-bwd-b2-s16k-h4-d64-float16]",
+            "benchmarks/ops/bench_gla_chunkwise.py::test_gla_bwd_bench[gla-bwd-b2-s16k-h4-d64-bfloat16]",
             # Current named-id deltanet / gated-deltanet MACA gemm.h compile failures
             "benchmarks/ops/bench_deltanet.py::test_deltanet_vs_fla_fwd[dn-b2-s2k-h4-d64-float16]",
             "benchmarks/ops/bench_deltanet.py::test_deltanet_vs_fla_fwd[dn-b2-s2k-h4-d64-bfloat16]",
@@ -142,18 +152,6 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "benchmarks/ops/bench_gated_deltanet.py::test_gated_deltanet_vs_fla_bwd[gdn-bwd-b2-s8k-h4-d64-bfloat16]",
             "benchmarks/ops/bench_gated_deltanet.py::test_gated_deltanet_vs_fla_bwd[gdn-bwd-b2-s16k-h4-d64-float16]",
             "benchmarks/ops/bench_gated_deltanet.py::test_gated_deltanet_vs_fla_bwd[gdn-bwd-b2-s16k-h4-d64-bfloat16]",
-            "benchmarks/ops/bench_mamba.py::test_da_cumsum_fwd_bench[mamba2-780m-b1-s4k-float16]",
-            "benchmarks/ops/bench_mamba.py::test_da_cumsum_fwd_bench[mamba2-1p3b-b8-s2k-bfloat16]",
-            "benchmarks/ops/bench_mamba.py::test_da_cumsum_fwd_bench[mamba2-780m-b1-s4k-dt-bias-float16]",
-            "benchmarks/ops/bench_mamba.py::test_da_cumsum_fwd_bench[mamba2-1p3b-b8-s2k-dt-bias-bfloat16]",
-            "benchmarks/ops/bench_mamba2_e2e.py::test_mamba2_fwd_bench[mamba2-2p7b-b1-s2k-bfloat16]",
-            "benchmarks/ops/bench_mamba2_e2e.py::test_mamba2_fwd_bench[mamba2-1p3b-b1-s8k-float16]",
-            "benchmarks/ops/bench_mamba2_e2e.py::test_mamba2_fwd_bench[mamba2-2p7b-b1-s2k-dt-bias-bfloat16]",
-            "benchmarks/ops/bench_mamba2_e2e.py::test_mamba2_fwd_bench[mamba2-1p3b-b1-s8k-dt-bias-float16]",
-            "benchmarks/ops/bench_mamba2_e2e.py::test_mamba2_fwd_bench[mamba2-2p7b-b1-s2k-init-states-bfloat16]",
-            "benchmarks/ops/bench_mamba2_e2e.py::test_mamba2_fwd_bench[mamba2-1p3b-b1-s8k-init-states-float16]",
-            "benchmarks/ops/bench_mamba2_e2e.py::test_mamba2_fwd_bench[mamba2-2p7b-b1-s2k-dt-bias-init-states-bfloat16]",
-            "benchmarks/ops/bench_mamba2_e2e.py::test_mamba2_fwd_bench[mamba2-1p3b-b1-s8k-dt-bias-init-states-float16]",
             "benchmarks/ops/bench_deltanet.py::test_deltanet_vs_fla_autograd[dn-autograd-b2-s2k-h4-d64-float16]",
             "benchmarks/ops/bench_deltanet.py::test_deltanet_vs_fla_autograd[dn-autograd-b2-s2k-h4-d64-bfloat16]",
             "benchmarks/ops/bench_deltanet.py::test_deltanet_vs_fla_autograd[dn-autograd-b2-s8k-h4-d64-float16]",
@@ -204,11 +202,41 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
 # Keep exact nodeids above for partial failures where healthy cases must remain
 # visible.
 _MACA_XFAIL_PREFIX_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    # Example:
-    # (
-    #     _COMPILATION_FAILURE,
-    #     ("benchmarks/ops/attention/bench_gqa.py::test_gqa_bwd",),
-    # ),
+    (
+        _COMPILATION_FAILURE,
+        (
+            "benchmarks/ops/attention/bench_gqa.py::test_gqa_dense_decode_bench[",
+            "benchmarks/ops/bench_gemm.py::test_gemm_fp8_bench[",
+        ),
+    ),
+    (
+        _UNSUPPORTED_ARCHITECTURE,
+        (
+            "benchmarks/ops/attention/bench_gqa.py::test_gqa_dense_prefill_bench[",
+            "benchmarks/ops/bench_gated_deltanet.py::test_gated_deltanet_dense_prefill_bench[",
+        ),
+    ),
+    (
+        _OUT_OF_MEMORY,
+        (
+            "benchmarks/ops/bench_moe_fused_moe_shared_expert.py::test_fused_moe_shared_expert_bench[",
+            "benchmarks/ops/bench_moe_staged.py::test_moe_grouped_gemm_bench[deepseek-v3-prefill-gate-up-bfloat16]",
+            "benchmarks/ops/bench_moe_staged.py::test_moe_grouped_gemm_bench[deepseek-v3-decode-gate-up-fused-bfloat16]",
+            "benchmarks/ops/bench_moe_staged.py::test_moe_expert_mlp_bench[deepseek-v3-",
+            "benchmarks/ops/bench_moe_staged.py::test_moe_expert_mlp_bench[qwen3-235b-",
+        ),
+    ),
+    (
+        _UNSUPPORTED_RUNTIME,
+        (
+            "benchmarks/ops/bench_moe_staged.py::test_moe_grouped_gemm_bench[deepseek-v3-decode-gate-up-bfloat16]",
+            "benchmarks/ops/bench_moe_staged.py::test_moe_grouped_gemm_bench[deepseek-v3-decode-down-bfloat16]",
+            "benchmarks/ops/bench_moe_staged.py::test_moe_grouped_gemm_bench[deepseek-v3-prefill-down-bfloat16]",
+            "benchmarks/ops/bench_moe_staged.py::test_moe_grouped_gemm_bench[deepseek-v3-prefill-gate-up-fused-bfloat16]",
+            "benchmarks/ops/bench_moe_staged.py::test_moe_expert_mlp_bench[qwen3-235b-decode-bfloat16]",
+            "benchmarks/ops/bench_moe_staged.py::test_moe_expert_mlp_bench[qwen3-235b-prefill-bfloat16]",
+        ),
+    ),
 )
 
 MACA_XFAILS = {nodeid: reason for reason, nodeids in _MACA_XFAIL_GROUPS for nodeid in nodeids}

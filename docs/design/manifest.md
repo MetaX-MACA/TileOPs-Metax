@@ -43,7 +43,7 @@ flowchart LR
 
 **R4. `dtype` syntax.** `|` separates alternatives. `same_as(ref)` is a dtype-only identity: the tensor's dtype equals `ref`'s at runtime, it adds no axis to R6's product, and it never speaks about shape.
 
-**R5. `promote_int_to_float(ref)`.** An output dtype that resolves to `float32` when `ref`'s runtime dtype is integral and to `same_as(ref)` otherwise, for ops PyTorch promotes (`torch.reciprocal`). `ref` names a `signature.inputs` tensor. Allowed only in `signature.outputs[*].dtype`, where it may appear inside a `|` union.
+**R5. `promote_int_to_float(ref)`.** An output dtype that resolves to `float32` when `ref`'s runtime dtype is integral and to `same_as(ref)` otherwise, for ops PyTorch promotes (`torch.reciprocal`). `ref` names a `signature.inputs` tensor. Allowed only in `signature.outputs[*].dtype`, and never inside a `|` union (R23).
 
 Worked example — `torch.reciprocal` accepts integral inputs and returns `float32`, while floating inputs round-trip:
 
@@ -99,9 +99,11 @@ dtype_combos:
 
 **R20. `static_dims`.** For arbitrary-rank ops (no `shape` declaration), `static_dims` declares values the user commits to at Op construction time. Each entry maps an `__init__` keyword name to a single-axis shape expression `<tensor>.shape[<const_or_param>]`. See [`static_dims`](#static_dims) for full semantics, rules, and examples.
 
-**R21. Workload keys derive from the signature.** In a single-tensor-input op's workloads, the shape key MUST be `{input}_shape` and every other key MUST be a `signature.params` name or the reserved `dtypes` / `label`. Multi-input aggregate keys (`kv_shape`) are family bench conventions, out of scope.
+**R21. Workload keys derive from the signature.** In a single-tensor-input op's workloads, the shape key MUST be `{input}_shape` and every other key MUST be a `signature.params` name or one of the reserved `dtype` / `dtypes` / `label`. `dtype` is the row's element type, which a `roofline.func` formula reads to size its tensors; `dtypes` is the dtype axis a row expands over. Multi-input aggregate keys (`kv_shape`) are family bench conventions, out of scope.
 
 **R22. Mutated inputs.** A tensor input the op may write declares `mutated: true`. An operator lists its tensor arguments in `signature.inputs` order; the inputs its `mutates_args` names, across every operator the op registers, are exactly the ones marked. A mutated input stays an input: output arity does not change and the return does not alias it. If contiguity normalization had to copy one, the op writes the result back after the launch.
+
+**R23. Output dtype origin.** An output's `dtype` resolves to exactly one dtype — a constant, `same_as(ref)` or `promote_int_to_float(ref)` — and never names a set. An output the caller may restate declares `caller_stated: true`, and the value travels in a `signature.params` entry named `out_dtype` whose `type` is the set the caller may ask for; the output's own declaration is then the fallback taken when the caller states none. The two declarations imply each other: the param without a marked output states nothing, and a marked output without the param has no one to state it. An unmarked output keeps its declared dtype whatever the caller asked for, which is how an op that returns an auxiliary tensor beside its result keeps that one its own. An entry declaring the param names an `__init__` parameter of the same name, because the generated fake reads the output dtype off the attribute of that name.
 
 ## `static_dims`
 
@@ -121,9 +123,8 @@ The shape expression is a **forward-time validation rule**, not an init-time der
 
 ```python
 # __init__ — commitment point. No tensor; expression not evaluated.
-def __init__(self, *, N: int, dtype: torch.dtype, dim: int = -1, ...):
+def __init__(self, *, N: int, dim: int = -1, ...):
     self.N = N
-    self.dtype = dtype
     self.dim = dim
     # ...
 
@@ -178,8 +179,9 @@ LinearFwdOp:
 Three blocks in order:
 
 1. `static_dims` — manifest key order
-1. `dtype` — single parameter unless the op has explicit multi-dtype axes
 1. `params` — manifest key order
+
+An input dtype is no block: the tensors carry it. A caller-stated output dtype is a `params` entry like any other, named `out_dtype` (R23).
 
 Parameters are positional-or-keyword in that order. A param the caller must name declares `kw_only: true`, and the validator holds `__init__` to it. `target`, `kernel_map` and `tune` are keyword-only in every op and are not manifest params.
 
@@ -202,7 +204,7 @@ SumFwdOp:
 The generated `__init__` has no shape kwargs:
 
 ```python
-def __init__(self, *, dtype, dim=None, keepdim=False, ...):
+def __init__(self, *, dim=None, keepdim=False, ...):
     # ...
 ```
 
@@ -236,16 +238,18 @@ Validator enforces `cls.__name__ == manifest_key` exactly — no heuristic resol
 
 ## Entry Structure
 
-| Field                     | Required | Description                                                   |
-| ------------------------- | -------- | ------------------------------------------------------------- |
-| `family`                  | yes      | Op family. See [below](#family).                              |
-| `ref_api`                 | yes      | External API reference, or `"none"` if no direct counterpart. |
-| `status`                  | yes      | `spec-only` or `implemented`.                                 |
-| `torch_compile_fullgraph` | no       | Literal `true` only. See [below](#torch_compile_fullgraph).   |
-| `signature`               | yes      | Op interface. See [Signature](#signature).                    |
-| `workloads`               | yes      | Benchmark shapes/dtypes.                                      |
-| `roofline`                | yes      | Performance model.                                            |
-| `source`                  | yes      | Implementation paths.                                         |
+| Field                     | Required | Description                                                            |
+| ------------------------- | -------- | ---------------------------------------------------------------------- |
+| `family`                  | yes      | Op family. See [below](#family).                                       |
+| `ref_api`                 | yes      | External API reference, or `"none"` if no direct counterpart.          |
+| `status`                  | yes      | `spec-only` or `implemented`.                                          |
+| `torch_compile_fullgraph` | no       | Literal `true` only. See [below](#torch_compile_fullgraph).            |
+| `signature`               | yes      | Op interface. See [Signature](#signature).                             |
+| `composition`             | no       | Internal structure of a composite op. See [Composition](#composition). |
+| `resources`               | no       | Execution resources. See [Resources](#resources).                      |
+| `workloads`               | yes      | Benchmark shapes/dtypes.                                               |
+| `roofline`                | yes      | Performance model.                                                     |
+| `source`                  | yes      | Implementation paths.                                                  |
 
 ### `family`
 
@@ -284,14 +288,16 @@ signature:
 
 **Tensor fields:**
 
-| Field         | Required | Description                                                                                                                              |
-| ------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `dtype`       | yes      | `\|` for alternatives, `same_as(ref)` = same dtype as ref, `promote_int_to_float(ref)` = `float32` for integral ref else `same_as(ref)`. |
-| `shape`       | no       | Dimension names (e.g., `"[M, K]"`). Present = fixed rank.                                                                                |
-| `constraints` | no       | Dimension restrictions (requires `shape`).                                                                                               |
-| `layout`      | no       | Memory format when non-default (R19).                                                                                                    |
-| `optional`    | no       | `true` when the op may be called without this input (R18). Inputs only.                                                                  |
-| `mutated`     | no       | `true` when the op may write this input (R22). Inputs only.                                                                              |
+| Field           | Required | Description                                                                                                                              |
+| --------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `dtype`         | yes      | `\|` for alternatives, `same_as(ref)` = same dtype as ref, `promote_int_to_float(ref)` = `float32` for integral ref else `same_as(ref)`. |
+| `caller_stated` | no       | Outputs only. `true` when `out_dtype` states this output's dtype and the declaration is the fallback (R23).                              |
+| `shape`         | no       | Dimension names (e.g., `"[M, K]"`). Present = fixed rank.                                                                                |
+| `constraints`   | no       | Dimension restrictions (requires `shape`).                                                                                               |
+| `layout`        | no       | Memory format when non-default (R19).                                                                                                    |
+| `optional`      | no       | `true` when the op may be called without this input (R18). Inputs only.                                                                  |
+| `mutated`       | no       | `true` when the op may write this input (R22). Inputs only.                                                                              |
+| `nullable`      | no       | `true` when this return position may hold `None`. Outputs only. See [Nullable outputs](#nullable-outputs).                               |
 
 **Param fields:** `type`, plus optional `default` and `kw_only`.
 A param that omits `default` MUST have no `__init__` default either: a
@@ -415,11 +421,125 @@ Shape keys use `<tensor_name>_shape`. Op-specific parameters can be added per en
 
 `workloads` are for benchmark parametrization only, not unit-test coverage.
 
+### Composition
+
+`composition` states that one call to the public op is carried out by several stages. A stage is a
+unit the validator and the cost model address by name; a phase internal to a single kernel is not
+one. The field generates no forward and takes no part in dispatch.
+
+| Field    | Required | Description                         |
+| -------- | -------- | ----------------------------------- |
+| `kind`   | yes      | `composite` — the only value.       |
+| `stages` | yes      | Non-empty list, in execution order. |
+
+Each stage:
+
+| Field      | Required | Description                                                                          |
+| ---------- | -------- | ------------------------------------------------------------------------------------ |
+| `name`     | yes      | Unique within the `composition`. Workspaces and `roofline.composition` cite it.      |
+| `op`       | \*       | Manifest entry name, or a dotted path importing to a class. Exclusive with `kernel`. |
+| `kernel`   | \*       | A key of this entry's `source.kernel_map`. Exclusive with `op`.                      |
+| `variants` | no       | Mutually exclusive performance paths. Top-level stages only.                         |
+| `optional` | no       | The stage runs only in some configurations.                                          |
+
+`op` and `kernel` are the only ways to name what runs, so every stage name resolves.
+
+A variant's `condition` is prose; the executable condition stays in the op. Which variant a call
+takes is a runtime fact, so no workload row declares one. Where a branch replaces several stages, it
+hangs off the stage referencing that op and its `condition` names the stages it replaces.
+
+```yaml
+composition:
+  kind: composite
+  stages:
+  - name: prepare
+    op: PrepareFwdOp
+  - name: compute
+    op: ComputeFwdOp
+    variants:
+    - name: tight
+      stages: [{op: InnerFwdOp}]
+    - name: fused
+      condition: "aligned shapes below the small-batch threshold; replaces prepare"
+      stages: [{kernel: fused_compute}]
+```
+
+### Resources
+
+A workspace is scratch the op needs in order to run. The test against an input is the value: an
+input's value changes the result and the reference API takes it too; a workspace holds nothing
+before the call and nothing to rely on after it, and its shape may change with the backend or the
+variant.
+
+| Field      | Required | Description                                                     |
+| ---------- | -------- | --------------------------------------------------------------- |
+| `name`     | yes      | Unique, and not also an input name.                             |
+| `dtype`    | yes      | Same syntax as an input's dtype, `same_as(ref)` included.       |
+| `owner`    | \*       | A stage name. Required when the entry declares a `composition`. |
+| `kind`     | no       | `scratch` — the only value.                                     |
+| `optional` | no       | The workspace is not passed in every configuration.             |
+| `note`     | no       | Free text.                                                      |
+
+A workspace is still a `forward()` argument. Everything that builds that argument list from the
+manifest — parameter order, shape inference, dtype validation, the empty-input guard — reads
+`signature.inputs` followed by `resources.workspaces`, in declaration order. Workspace shape stays
+with the op (`workspace_shapes()` or a runtime check); there is no `shape` key here.
+
+Two consumers read `signature.inputs` alone: a `dtype_combos` row, which is the value contract a
+caller writes against, and an inline `roofline` expression, which resolves over inputs and params
+only. Neither carries a workspace.
+
+```yaml
+resources:
+  workspaces:
+  - name: workspace1
+    dtype: float16 | bfloat16
+    owner: compute
+    kind: scratch
+```
+
+### Nullable outputs
+
+Output names and count are fixed per entry. A return position that always exists but may hold
+`None` declares `nullable: true`; a return whose *number* of values changes with a parameter is two
+entries instead. `nullable` is valid on outputs only — an input that may be omitted uses `optional`.
+
+```yaml
+outputs:
+  aux_output: {dtype: "same_as(x)", nullable: true}
+  main_output: {dtype: "same_as(x)"}
+```
+
 ### Roofline
 
 Roofline metadata is required on every manifest entry. Its modes,
 variable binding rules, formula syntax, consumers, and codegen behavior
 are defined in [roofline.md](roofline.md).
+
+A composite op declares what its cost is made of under `roofline.composition`, alongside either
+roofline mode; an entry with a `composition` must have one. The parent's cost is still computed by
+its own `flops`/`bytes` or `func`; `composition` records which stages it covers. What the validator
+checks is structural — every stage accounted for, once, against a `source` that resolves — not that
+the parent's number equals the sum of its stages. A parent may drop a stage whose cost is negligible
+at the shapes the op runs at. Each row names a `stage` and
+gives exactly one of `source` (dotted path to the formula that stage's cost comes from, resolved as
+`func` is) or `formula` (prose where no separate function exists). Every stage not marked `optional`
+appears exactly once.
+
+`roofline.func` resolves as `module.attribute`, so it names a module-level function; a class method
+path does not import. A composite's formula belongs in `tileops.perf.formulas` alongside those of
+the ops it composes, and the op's `eval_roofline()` calls that same function.
+
+```yaml
+roofline:
+  func: "tileops.perf.formulas.composite_fwd_bytes"
+  composition:
+  - stage: compute
+    source: "tileops.perf.formulas.inner_fwd_bytes"
+  - stage: epilogue
+    formula: "2 * num_tokens * hidden_size"
+    optional: true
+```
 
 ### Source
 
@@ -434,7 +554,7 @@ are defined in [roofline.md](roofline.md).
 
 #### kernel_map
 
-Op→Kernel dispatch registration table. Declares which Kernels an Op uses so agents know what to implement. Does not describe dispatch strategy (runtime concern). Format: `dispatch_key: KernelClassName`. See [op-slot-rules.md § Slot S14 `default_kernel_map`](op-slot-rules.md#slot-s14).
+Op→Kernel dispatch registration table. Declares which Kernels an Op uses so agents know what to implement, and which slots a caller's `kernel_map=` replaces. Does not describe dispatch strategy (runtime concern). Format: `dispatch_key: KernelClassName`. The validator holds it equal to the op's `default_kernel_map`; a composite op installs none of its own and declares its sub-ops' kernels, which is not checked. See [op-slot-rules.md § Slot S14 `default_kernel_map`](op-slot-rules.md#slot-s14).
 
 ```yaml
 # Single-kernel op

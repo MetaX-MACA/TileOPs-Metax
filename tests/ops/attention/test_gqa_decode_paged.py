@@ -239,7 +239,7 @@ def test_gqa_decode_paged_bs1_fixed_tier_correctness(
 
 @pytest.mark.smoke
 def test_gqa_decode_paged_bs1_dispatch() -> None:
-    """Eligible requests use the Hopper fast path or the generic kernel elsewhere."""
+    """Eligible SM90 requests select the paged TMA/WGMMA kernel."""
     op = GroupedQueryAttentionDecodePagedWithKVCacheFwdOp(1, 32, 4, 8192, 128, 256)
     kernel = op._get_kernel((), torch.float16)
     if is_hopper():
