@@ -10,18 +10,25 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from tileops.kernels.kernel_base import Kernel
+from tileops.kernels.grouped_gemm.heuristics import GemmType
+from tileops.kernels.grouped_gemm.template import GemmTemplate
+from tileops.kernels.kernel_base import Entry, Kernel
+from tileops.utils import get_sm_count, is_h200
+
+from .call_spec import BmmCall
 
 __all__ = [
     "BmmFp8Kernel",
     "BmmFp8MACAKernel",
+    "BmmFp8TransposeKernel",
     "BmmKernel",
+    "BmmPersistentKernel",
 ]
 
 
 @functools.lru_cache(maxsize=64)
 def _bmm_kernel(batch: int, m: int, n: int, k: int, dtype: str = "float16") -> Callable:
-    """Pipelined batched GEMM for Hopper (SM90).
+    """Pipelined batched GEMM for SM90.
 
     Launches a 3D grid ``(ceildiv(n, block_n), ceildiv(m, block_m), batch)``.
     Each block loads its per-batch A/B tiles into SMEM through a ``T.Pipelined``
@@ -689,26 +696,56 @@ def _bmm_fp8_persistent_ws_kernel(
     return _bmm_fp8_persistent_ws_func
 
 
-@torch.library.custom_op("tileops::bmm_wrapped_kernel", mutates_args=())
-def _bmm_wrapped_kernel(
-    batch: int,
-    m: int,
-    n: int,
-    k: int,
-    dtype: str,
-    block_m: int,
-    block_n: int,
-    block_k: int,
-    num_stages: int,
-    threads: int,
-    a: torch.Tensor,
-    b: torch.Tensor,
-) -> torch.Tensor:
-    """Torch custom-op wrapper for ``torch.compile`` compatibility."""
-    return _bmm_kernel(batch, m, n, k, dtype)(block_m, block_n, block_k, num_stages, threads)(a, b)
+@functools.lru_cache(maxsize=32)
+def _bmm_fp8_transpose_kernel(batch: int, rows: int, cols: int, dtype: str) -> Callable:
+    """Swap the last two axes of a contiguous ``[batch, rows, cols]`` tensor.
+
+    Args:
+        batch: Leading axis, untouched.
+        rows: Extent of the source's second axis.
+        cols: Extent of the source's third axis.
+        dtype: TileLang dtype string of both tensors.
+
+    Returns:
+        A ``(block, threads)`` builder returning the compiled ``prim_func``.
+    """
+
+    @tilelang.jit(out_idx=[-1], compile_flags=["-O3"])
+    def _bmm_fp8_transpose_func(block: int = 64, threads: int = 128) -> Callable:
+        exact = rows % block == 0 and cols % block == 0
+
+        @T.prim_func
+        def _bmm_fp8_transpose_main(
+            src: T.Tensor((batch, rows, cols), dtype),  # type: ignore
+            dst: T.Tensor((batch, cols, rows), dtype),  # type: ignore
+        ) -> None:
+            with T.Kernel(
+                T.ceildiv(cols, block), T.ceildiv(rows, block), batch, threads=threads
+            ) as (bx, by, bz):
+                # The store below reads the tile down a column, which conflicts on
+                # shared-memory banks unless the layout is swizzled.
+                tile = T.alloc_shared((block, block), dtype)
+                T.annotate_layout({tile: tilelang.layout.make_swizzled_layout(tile)})
+                r0, c0 = by * block, bx * block
+                if exact:
+                    T.copy(src[bz, r0 : r0 + block, c0 : c0 + block], tile)
+                else:
+                    for i, j in T.Parallel(block, block):
+                        tile[i, j] = T.if_then_else(
+                            (r0 + i < rows) & (c0 + j < cols),
+                            src[bz, r0 + i, c0 + j],
+                            T.cast(0, dtype),
+                        )
+                # ``i`` innermost keeps the store coalesced: ``dst`` is rows-innermost.
+                for j, i in T.Parallel(block, block):
+                    if (c0 + j < cols) and (r0 + i < rows):
+                        dst[bz, c0 + j, r0 + i] = tile[i, j]
+
+        return _bmm_fp8_transpose_main
+
+    return _bmm_fp8_transpose_func
 
 
-@_bmm_wrapped_kernel.register_fake
 def _(
     batch: int,
     m: int,
@@ -736,6 +773,22 @@ class BmmKernel(Kernel):
     """
 
     supported_archs: list[int] = [80, 89, 90]
+    general = True
+
+    @classmethod
+    def entry_for(cls, call: BmmCall) -> Entry:
+        """Build the shape-specialized classic BMM fallback."""
+        index = call.device.index if call.device is not None else None
+        identity = (call.batch, call.m, call.n, call.k, call.dtype, call.tune, index)
+        return identity, lambda: cls(
+            call.batch,
+            call.m,
+            call.n,
+            call.k,
+            call.dtype,
+            tune=call.tune,
+            device_index=index,
+        )
 
     def __init__(
         self,
@@ -746,8 +799,9 @@ class BmmKernel(Kernel):
         dtype: torch.dtype,
         config: Optional[dict] = None,
         tune: bool = False,
+        device_index: Optional[int] = None,
     ) -> None:
-        super().__init__()
+        super().__init__(device_index=device_index)
         if k % 16 != 0:
             raise ValueError(
                 f"BmmKernel requires contraction dim k to be a multiple of 16, got k={k}"
@@ -787,15 +841,105 @@ class BmmKernel(Kernel):
         return [c for c in configs if self.k % c["block_k"] == 0]
 
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        # Call the compiled JIT directly (cf. GemmKernel); the torch custom-op
+        # Call the compiled JIT directly (cf. GemmTmaKernel); the torch custom-op
         # is retained only for torch.compile compatibility.
         if not hasattr(self, "_compiled_kernel"):
             self._compiled_kernel = self.kernel(**self.config)
         return self._compiled_kernel(a, b)
 
 
-class BmmFp8Kernel(Kernel):
+class BmmPersistentKernel(Kernel):
+    """Persistent H200 BMM adapter over :class:`GemmTemplate`.
+
+    The template reads the zero-copy ``[batch, n, k]`` view of public
+    ``b[batch, k, n]`` storage. :class:`BmmKernel` serves calls outside
+    :meth:`applies`; this path takes its configuration from the template selector.
+    """
+
     supported_archs: list[int] = [90]
+
+    # The tile ``get_best_config`` picks for this path on H200. Selection and grid
+    # sizing count the same tiles, or the region claimed is not the grid launched.
+    TILE_M: int = 128
+    TILE_N: int = 256
+
+    # Half a persistent wave of those tiles is enough to beat BmmKernel. Fitted on
+    # the manifest workloads: square-b16-512 reaches 128 tiles and wins,
+    # square-b32-256 reaches 64 and loses. Re-fit against benchmarks/ops/bench_bmm.py
+    # whenever the tile above or the epilogue changes.
+    MIN_WAVE_DENOM: int = 2
+
+    @classmethod
+    def _tiles(cls, batch: int, m: int, n: int) -> int:
+        """Output tiles this call launches at :attr:`TILE_M` x :attr:`TILE_N`."""
+        return batch * -(-m // cls.TILE_M) * -(-n // cls.TILE_N)
+
+    @classmethod
+    def applies(cls, call: BmmCall) -> bool:
+        step = 16 // call.dtype.itemsize
+        tiles = cls._tiles(call.batch, call.m, call.n)
+        return call.h200 and call.n % step == 0 and tiles * cls.MIN_WAVE_DENOM > call.sm_count
+
+    @classmethod
+    def _persistent_grid(cls, batch: int, m: int, n: int, physical_sms: int) -> int:
+        """Choose a full-wave H200 grid for the selector's tile."""
+        tiles = cls._tiles(batch, m, n)
+        power_of_two_grid = 1 << (physical_sms.bit_length() - 1)
+        return power_of_two_grid if tiles % power_of_two_grid == 0 else physical_sms
+
+    @classmethod
+    def entry_for(cls, call: BmmCall) -> Entry:
+        """Build the persistent template specialization for this BMM call."""
+        index = call.device.index if call.device is not None else None
+        identity = (call.batch, call.m, call.n, call.k, call.dtype, index)
+        return identity, lambda: cls(
+            call.batch,
+            call.m,
+            call.n,
+            device_index=index,
+        )
+
+    def __init__(
+        self,
+        batch: int,
+        m: int,
+        n: int,
+        device_index: Optional[int] = None,
+    ) -> None:
+        super().__init__(device_index=device_index)
+        physical_sms = get_sm_count(device_index)
+        persistent_sms = (
+            self._persistent_grid(batch, m, n, physical_sms)
+            if is_h200(device_index)
+            else physical_sms
+        )
+        self.template = GemmTemplate(
+            GemmType.BATCHED,
+            num_groups=batch,
+            static_dims="mnk",
+            sm_count=persistent_sms,
+            device_index=device_index,
+        )
+
+    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        b_nk = b.transpose(-2, -1)
+        out = self.template(a, b_nk)
+        if not self.config:
+            spec = self.template.spec_for(a, b_nk)
+            self.config = {
+                "block_m": spec.block_m,
+                "block_n": spec.block_n,
+                "block_k": spec.block_k,
+                "num_stages": spec.num_stages,
+                "num_math_wgs": spec.num_math_warpgroups,
+                "epilogue_stage_n": spec.epilogue_stage_n,
+                "persistent_sms": spec.num_sms,
+            }
+        return out
+
+
+class BmmFp8Kernel(Kernel):
+    supported_archs: list[int] = [89, 90]
 
     def __init__(
         self,
@@ -810,15 +954,15 @@ class BmmFp8Kernel(Kernel):
         tune: bool = False,
     ) -> None:
         super().__init__()
-        # Every dispatched variant emits WGMMA + TMA (SM90+ only); fail fast
-        # with a clear message on pre-Hopper GPUs instead of a downstream
-        # nvcc / PTX error at JIT time.
         if device is None:
             device = torch.device(torch.cuda.current_device())
         cc = torch.cuda.get_device_capability(device)
-        if cc[0] != 9:
+        if cc[0] < 9 and cc != (8, 9):
+            # Fail fast with a clear message instead of a downstream
+            # nvcc / PTX error at JIT time.
             raise NotImplementedError(
-                f"BmmFp8Kernel requires SM90 (Hopper); got sm{cc[0]}{cc[1]} on the current device"
+                f"BmmFp8Kernel requires FP8 tensor cores (sm89+); "
+                f"got sm{cc[0]}{cc[1]} on the current device"
             )
         if k % 32 != 0:
             raise ValueError(
@@ -832,12 +976,19 @@ class BmmFp8Kernel(Kernel):
         self.dtype = dtype
         self.out_dtype = out_dtype
         # Dispatch policy (in order of preference):
-        #   1) 3-WG WS persistent (best throughput on aligned shapes);
-        #   2) plain persistent (removes wave quantisation);
-        #   3) classic 3D grid (handles arbitrary M/N tails).
+        #   1) 3-WG WS persistent (best throughput on aligned shapes;
+        #      SM90 only — TMA + WGMMA);
+        #   2) plain persistent (removes wave quantisation; SM90 only —
+        #      the plain T.gemm body could run on pre-SM90 archs but is
+        #      unvalidated there);
+        #   3) classic 3D grid (handles arbitrary M/N tails; plain T.gemm,
+        #      runs on any FP8 tensor-core target, sm89+).
         self._sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-        self._use_ws = self._ws_eligible(batch, m, n, k, self._sm_count)
-        self._use_persistent = self._use_ws or self._persistent_eligible(m, n, k, self._use_ws)
+        self._is_sm90 = cc[0] == 9
+        self._use_ws = self._is_sm90 and self._ws_eligible(batch, m, n, k, self._sm_count)
+        self._use_persistent = self._is_sm90 and (
+            self._use_ws or self._persistent_eligible(m, n, k, self._use_ws)
+        )
         if self._use_ws:
             self.kernel = _bmm_fp8_persistent_ws_kernel(
                 batch, m, n, k, self.dtype_str, self.out_dtype_str, self._sm_count
@@ -896,6 +1047,16 @@ class BmmFp8Kernel(Kernel):
                 "threads": 384,
                 "group_size_m": 8,
             }
+        if not self._is_sm90:
+            # Sized for the sm89 100KB per-block SMEM cap; K tails are
+            # zero-padded by the classic copy path.
+            return {
+                "block_m": 128,
+                "block_n": 128,
+                "block_k": 64 if self.k % 64 == 0 else 128,
+                "num_stages": 2,
+                "threads": 128,
+            }
         return {
             "block_m": 128,
             "block_n": 128,
@@ -907,7 +1068,7 @@ class BmmFp8Kernel(Kernel):
     @property
     def autotune_configs(self) -> list[dict]:
         if self._use_ws:
-            SMEM_BUDGET_BYTES = 228 * 1024  # H100/H20 shared-memory cap
+            SMEM_BUDGET_BYTES = 228 * 1024  # SM90 shared-memory cap
             configs = []
             for bm in (128,):
                 half_m = bm // 2
@@ -936,6 +1097,28 @@ class BmmFp8Kernel(Kernel):
                                         "group_size_m": gsm,
                                     }
                                 )
+            return configs
+
+        if not self._is_sm90:
+            # Classic 3D-grid sweep for the sm89 100KB cap.
+            SMEM_BUDGET_BYTES = 100 * 1024
+            configs = []
+            for bm in (64, 128):
+                for bn in (64, 128):
+                    for bk in (64, 128):
+                        for ns in (2, 3):
+                            smem = (bm * bk + bk * bn) * ns + bm * bn * 2
+                            if smem > SMEM_BUDGET_BYTES:
+                                continue
+                            configs.append(
+                                {
+                                    "block_m": bm,
+                                    "block_n": bn,
+                                    "block_k": bk,
+                                    "num_stages": ns,
+                                    "threads": 128,
+                                }
+                            )
             return configs
 
         SMEM_BUDGET_BYTES = 200 * 1024
@@ -1060,3 +1243,75 @@ class BmmFp8MACAKernel(Kernel):
             self._compiled_kernel = self.kernel(**self.config)
 
         return self._compiled_kernel(a, b, scale_a, scale_b)
+
+
+class BmmFp8TransposeKernel(Kernel):
+    """Swap the last two axes of a contiguous FP8 ``[batch, rows, cols]`` tensor.
+
+    Staged through shared memory so both the load and the store stay coalesced,
+    which a strided element-wise copy cannot be at one byte per element.
+
+    Data movement only: the result is bit-identical to
+    ``src.transpose(-2, -1).contiguous()``.
+    """
+
+    # Square staging tile and the lanes that fill it. Fitted on the FP8 BMM
+    # workloads in benchmarks/ops/bench_bmm.py; re-fit against those when the
+    # staging layout changes. Keep the thread count fixed during autotune so a
+    # BMM tune does not spend most of its time on the copy kernel. TILE must
+    # appear among the candidates.
+    TILE: int = 64
+    THREADS: int = 128
+    TILE_CANDIDATES: tuple[int, ...] = (32, 64, 128)
+    THREAD_CANDIDATES: tuple[int, ...] = (128,)
+
+    def __init__(
+        self,
+        batch: int,
+        rows: int,
+        cols: int,
+        dtype: torch.dtype,
+        device: Optional[torch.device] = None,
+        config: Optional[dict] = None,
+        tune: bool = False,
+    ) -> None:
+        """Build the transpose for one shape and dtype.
+
+        Args:
+            batch: Leading axis, untouched.
+            rows: Extent of the source's second axis.
+            cols: Extent of the source's third axis.
+            dtype: Element dtype; ``torch.float8_e4m3fn`` is what the FP8 BMM passes.
+            device: Device the kernel is built for.
+            config: Optional tile override.
+            tune: Whether to autotune the tile.
+        """
+        super().__init__(device_index=(device.index if isinstance(device, torch.device) else None))
+        self.dtype = dtype
+        self.kernel = _bmm_fp8_transpose_kernel(batch, rows, cols, self.dtype_str)
+        self.init_config(config, tune)
+
+    @property
+    def default_config(self) -> dict:
+        return {"block": self.TILE, "threads": self.THREADS}
+
+    @property
+    def autotune_configs(self) -> list[dict]:
+        return [
+            {"block": block, "threads": threads}
+            for block in self.TILE_CANDIDATES
+            for threads in self.THREAD_CANDIDATES
+        ]
+
+    def forward(self, src: torch.Tensor) -> torch.Tensor:
+        """Return ``src`` with its last two axes swapped, contiguous.
+
+        Args:
+            src: Contiguous $[B \\times rows \\times cols]$ tensor.
+
+        Returns:
+            A new contiguous $[B \\times cols \\times rows]$ tensor.
+        """
+        if not hasattr(self, "_compiled_kernel"):
+            self._compiled_kernel = self.kernel(**self.config)
+        return self._compiled_kernel(src)

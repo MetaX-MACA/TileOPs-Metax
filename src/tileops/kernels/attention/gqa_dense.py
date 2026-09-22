@@ -11,12 +11,13 @@ from tilelang.layout import make_swizzled_layout
 
 from tileops.kernels.constants import LOG2E
 
-from ..kernel_base import Kernel
-from .call_spec import WS_ARCH
+from ..kernel_base import Entry, Kernel
+from .call_spec import WS_ARCH, dense_sliding_window_region, dense_ws_region
+from .dense_entry import dense_sliding_window_entry, dense_ws_entry
 from .online_softmax import make_apply_softcap
 
 __all__ = [
-    "GQADenseCausalWsKernel",
+    "GQADenseWsKernel",
     "GQADenseSlidingWindowKernel",
 ]
 
@@ -53,9 +54,11 @@ def _gqa_dense_rope_qk_kernel(
     rotary_dim,
     rope_layout,
     dtype,
+    rope_dtype=None,
     threads=256,
     num_per_thread=4,
 ):
+    rope_dtype = dtype if rope_dtype is None else rope_dtype
     half = rotary_dim // 2
     q_rows = B * Sq * H
     k_rows = B * Skv * Hkv
@@ -72,8 +75,8 @@ def _gqa_dense_rope_qk_kernel(
     def main(
         Q: T.Tensor([q_rows * D], dtype),
         K: T.Tensor([k_rows * D], dtype),
-        RopeCos: T.Tensor([max_position, half], dtype),
-        RopeSin: T.Tensor([max_position, half], dtype),
+        RopeCos: T.Tensor([max_position, half], rope_dtype),
+        RopeSin: T.Tensor([max_position, half], rope_dtype),
         QRot: T.Tensor([q_rows * D], dtype),
         KRot: T.Tensor([k_rows * D], dtype),
     ):
@@ -136,6 +139,7 @@ class DenseQKRoPEPreprocessor:
         rotary_dim: int,
         rope_layout: str,
         dtype: str,
+        rope_dtype: Optional[str] = None,
     ) -> None:
         self.kernel = _gqa_dense_rope_qk_kernel(
             batch,
@@ -148,6 +152,7 @@ class DenseQKRoPEPreprocessor:
             rotary_dim,
             rope_layout,
             dtype,
+            rope_dtype,
         )
 
     def __call__(
@@ -176,6 +181,7 @@ def make_dense_qk_rope_preprocessor(
     rotary_dim: int,
     rope_layout: str,
     dtype: str,
+    rope_dtype: Optional[str] = None,
 ) -> Optional[DenseQKRoPEPreprocessor]:
     """Build the shared Dense Q/K RoPE stage when requested."""
     if not fuse_rope:
@@ -191,6 +197,7 @@ def make_dense_qk_rope_preprocessor(
         rotary_dim,
         rope_layout,
         dtype,
+        rope_dtype,
     )
 
 
@@ -222,11 +229,12 @@ _cf = [
 
 @functools.lru_cache(maxsize=32)
 @tilelang.jit(out_idx=[3], pass_configs=_pc, compile_flags=_cf)
-def _gqa_dense_causal_ws_kernel(
+def _gqa_dense_ws_kernel(
     B,
     H,
     Hkv,
     D,
+    is_causal,
     sm_scale,
     softcap,
     dtype,
@@ -236,7 +244,7 @@ def _gqa_dense_causal_ws_kernel(
     nsV=NSV,
     threads=THREADS,
 ):
-    """Build the causal WS program; its online softmax carries the previous tile's alpha."""
+    """Build the Dense WS program; its online softmax carries the previous tile's alpha."""
     score_scale = (1.0 / D) ** 0.5 if sm_scale is None else sm_scale
     use_softcap = softcap > 0.0
     scale = LOG2E if use_softcap else score_scale * LOG2E
@@ -288,13 +296,16 @@ def _gqa_dense_causal_ws_kernel(
             cv = by // groups
             q0 = bx * block_M
             causal_offset = T.alloc_var("int32", init=seq_len_kv - seq_len_q)
-            eff = T.alloc_var(
-                "int32",
-                init=T.min(
-                    T.ceildiv(seq_len_kv, block_N),
-                    T.ceildiv(q0 + block_M + causal_offset, block_N),
-                ),
-            )
+            if is_causal:
+                eff = T.alloc_var(
+                    "int32",
+                    init=T.min(
+                        T.ceildiv(seq_len_kv, block_N),
+                        T.ceildiv(q0 + block_M + causal_offset, block_N),
+                    ),
+                )
+            else:
+                eff = T.alloc_var("int32", init=T.ceildiv(seq_len_kv, block_N))
             tx = T.get_thread_binding()
 
             if tx >= 256:  # ================= producer =================
@@ -351,11 +362,16 @@ def _gqa_dense_causal_ws_kernel(
                 T.named_barrier_arrive(nxt_bar, NMMA)
                 T.wait_wgmma(0)
                 T.mbarrier_arrive(kfree[0])
-                if q0 + r0 + causal_offset < block_N - 1:
+                if is_causal and q0 + r0 + causal_offset < block_N - 1:
                     mask_limit = q0 + r0 + causal_offset
                     for i, j in T.Parallel(half, block_N):
                         acc_s[i, j] = T.if_then_else(
                             mask_limit + i >= j, acc_s[i, j], -T.infinity(accum)
+                        )
+                elif not is_causal and seq_len_kv < block_N:
+                    for i, j in T.Parallel(half, block_N):
+                        acc_s[i, j] = T.if_then_else(
+                            j < seq_len_kv, acc_s[i, j], -T.infinity(accum)
                         )
                 if use_softcap:
                     apply_softcap(acc_s, half, block_N)
@@ -367,10 +383,16 @@ def _gqa_dense_causal_ws_kernel(
                     logsum[i] = ss[i]
                 T.copy(acc_s, pcast)
 
-                nu = T.alloc_var(
-                    "int32",
-                    init=T.max(1, T.min(eff, T.floordiv(q0 + r0 + causal_offset + 1, block_N))),
-                )
+                if is_causal:
+                    nu = T.alloc_var(
+                        "int32",
+                        init=T.max(
+                            1,
+                            T.min(eff, T.floordiv(q0 + r0 + causal_offset + 1, block_N)),
+                        ),
+                    )
+                else:
+                    nu = T.alloc_var("int32", init=T.max(1, T.floordiv(seq_len_kv, block_N)))
                 for k in T.serial(1, nu):
                     sk = k % nsK
                     svp = (k - 1) % nsV
@@ -425,11 +447,19 @@ def _gqa_dense_causal_ws_kernel(
                     T.named_barrier_arrive(nxt_bar, NMMA)
                     T.wait_wgmma(1)
                     T.mbarrier_arrive(kfree[sk])
-                    mask_limit_tail = q0 + r0 + causal_offset - k * block_N
-                    for i, j in T.Parallel(half, block_N):
-                        acc_s[i, j] = T.if_then_else(
-                            mask_limit_tail + i >= j, acc_s[i, j], -T.infinity(accum)
-                        )
+                    if is_causal:
+                        mask_limit_tail = q0 + r0 + causal_offset - k * block_N
+                        for i, j in T.Parallel(half, block_N):
+                            acc_s[i, j] = T.if_then_else(
+                                mask_limit_tail + i >= j, acc_s[i, j], -T.infinity(accum)
+                            )
+                    else:
+                        for i, j in T.Parallel(half, block_N):
+                            acc_s[i, j] = T.if_then_else(
+                                k * block_N + j < seq_len_kv,
+                                acc_s[i, j],
+                                -T.infinity(accum),
+                            )
                     if use_softcap:
                         apply_softcap(acc_s, half, block_N)
                     T.copy(sm, smp)
@@ -489,11 +519,16 @@ def _gqa_dense_causal_ws_kernel(
                 T.named_barrier_arrive(nxt_bar, NMMA)
                 T.wait_wgmma(0)
                 T.mbarrier_arrive(kfree[0])
-                if q0 + r0 + causal_offset < block_N - 1:
+                if is_causal and q0 + r0 + causal_offset < block_N - 1:
                     mask_limit_wg1 = q0 + r0 + causal_offset
                     for i, j in T.Parallel(half, block_N):
                         acc_s[i, j] = T.if_then_else(
                             mask_limit_wg1 + i >= j, acc_s[i, j], -T.infinity(accum)
+                        )
+                elif not is_causal and seq_len_kv < block_N:
+                    for i, j in T.Parallel(half, block_N):
+                        acc_s[i, j] = T.if_then_else(
+                            j < seq_len_kv, acc_s[i, j], -T.infinity(accum)
                         )
                 if use_softcap:
                     apply_softcap(acc_s, half, block_N)
@@ -505,10 +540,16 @@ def _gqa_dense_causal_ws_kernel(
                     logsum[i] = ss[i]
                 T.copy(acc_s, pcast)
 
-                nu_wg1 = T.alloc_var(
-                    "int32",
-                    init=T.max(1, T.min(eff, T.floordiv(q0 + r0 + causal_offset + 1, block_N))),
-                )
+                if is_causal:
+                    nu_wg1 = T.alloc_var(
+                        "int32",
+                        init=T.max(
+                            1,
+                            T.min(eff, T.floordiv(q0 + r0 + causal_offset + 1, block_N)),
+                        ),
+                    )
+                else:
+                    nu_wg1 = T.alloc_var("int32", init=T.max(1, T.floordiv(seq_len_kv, block_N)))
                 for k in T.serial(1, nu_wg1):
                     sk = k % nsK
                     svp_wg1 = (k - 1) % nsV
@@ -565,11 +606,19 @@ def _gqa_dense_causal_ws_kernel(
                     T.named_barrier_arrive(nxt_bar, NMMA)
                     T.wait_wgmma(1)
                     T.mbarrier_arrive(kfree[sk])
-                    mask_limit_wg1_tail = q0 + r0 + causal_offset - k * block_N
-                    for i, j in T.Parallel(half, block_N):
-                        acc_s[i, j] = T.if_then_else(
-                            mask_limit_wg1_tail + i >= j, acc_s[i, j], -T.infinity(accum)
-                        )
+                    if is_causal:
+                        mask_limit_wg1_tail = q0 + r0 + causal_offset - k * block_N
+                        for i, j in T.Parallel(half, block_N):
+                            acc_s[i, j] = T.if_then_else(
+                                mask_limit_wg1_tail + i >= j, acc_s[i, j], -T.infinity(accum)
+                            )
+                    else:
+                        for i, j in T.Parallel(half, block_N):
+                            acc_s[i, j] = T.if_then_else(
+                                k * block_N + j < seq_len_kv,
+                                acc_s[i, j],
+                                -T.infinity(accum),
+                            )
                     if use_softcap:
                         apply_softcap(acc_s, half, block_N)
                     T.copy(sm, smp)
@@ -602,10 +651,18 @@ def _gqa_dense_causal_ws_kernel(
     return main
 
 
-class GQADenseCausalWsKernel(Kernel):
-    """Causal dense prefill using the FA3 two-consumer pipeline."""
+class GQADenseWsKernel(Kernel):
+    """Dense attention using the FA3 two-consumer pipeline."""
 
     supported_archs: list[int] = [WS_ARCH]
+
+    @classmethod
+    def applies(cls, call) -> bool:
+        return dense_ws_region(call)
+
+    @classmethod
+    def entry_for(cls, call) -> Entry:
+        return dense_ws_entry(cls, call)
 
     def __init__(
         self,
@@ -615,6 +672,7 @@ class GQADenseCausalWsKernel(Kernel):
         seq_len_q: int,
         seq_len_kv: int,
         dim: int,
+        is_causal: bool,
         dtype: torch.dtype,
         sm_scale: Optional[float] = None,
         softcap: float = 0.0,
@@ -629,11 +687,12 @@ class GQADenseCausalWsKernel(Kernel):
     ) -> None:
         super().__init__(device_index=device_index)
         self.dtype = dtype
-        self.kernel = _gqa_dense_causal_ws_kernel(
+        self.kernel = _gqa_dense_ws_kernel(
             batch,
             heads,
             heads_kv,
             dim,
+            is_causal,
             dim**-0.5 if sm_scale is None else sm_scale,
             softcap,
             self.dtype_str,
@@ -738,6 +797,7 @@ def _gqa_sw_fwd_wgmma_pipelined_kernel(
                     )
             elif has_window:
                 for i, j in T.Parallel(block_m, block_n):
+                    out_of_bounds = k_idx * block_n + j >= seq_len
                     left_mask = (window_size_left >= 0) and (
                         k_idx * block_n + j < bx * block_m + i - window_size_left
                     )
@@ -745,7 +805,9 @@ def _gqa_sw_fwd_wgmma_pipelined_kernel(
                         k_idx * block_n + j > bx * block_m + i + window_size_right
                     )
                     acc_s[i, j] = T.if_then_else(
-                        left_mask or right_mask, -T.infinity(accum_dtype), 0
+                        out_of_bounds or left_mask or right_mask,
+                        -T.infinity(accum_dtype),
+                        0,
                     )
             else:
                 T.clear(acc_s)
@@ -859,8 +921,7 @@ def _gqa_sw_fwd_wgmma_pipelined_kernel(
     return _gqa_sw_fwd_wgmma_pipelined_func
 
 
-@torch.library.custom_op("tileops::gqa_sw_fwd_wgmma_pipelined_wrapped_kernel", mutates_args=())
-def _gqa_sw_fwd_wgmma_pipelined_wrapped_kernel(
+def _gqa_sw_fwd_wgmma_pipelined_run(
     batch: int,
     heads: int,
     heads_kv: int,
@@ -895,7 +956,6 @@ def _gqa_sw_fwd_wgmma_pipelined_wrapped_kernel(
     )(block_m, block_n, num_stages, threads)(q, k, v)
 
 
-@_gqa_sw_fwd_wgmma_pipelined_wrapped_kernel.register_fake
 def _(
     batch,
     heads,
@@ -923,6 +983,14 @@ class GQADenseSlidingWindowKernel(Kernel):
     """SM90 Dense sliding-window kernel with a native BSHD ABI."""
 
     supported_archs: list[int] = [90]
+
+    @classmethod
+    def applies(cls, call) -> bool:
+        return dense_sliding_window_region(call)
+
+    @classmethod
+    def entry_for(cls, call) -> Entry:
+        return dense_sliding_window_entry(cls, call)
 
     def __init__(
         self,
@@ -1018,7 +1086,7 @@ class GQADenseSlidingWindowKernel(Kernel):
         self._require_cuda(q=q, k=k, v=v)
         if self.rope is not None:
             q, k = self.rope(q, k, rope_cos, rope_sin)
-        output, _ = _gqa_sw_fwd_wgmma_pipelined_wrapped_kernel(
+        output, _ = _gqa_sw_fwd_wgmma_pipelined_run(
             self.batch,
             self.heads,
             self.heads_kv,

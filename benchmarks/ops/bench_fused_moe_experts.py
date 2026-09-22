@@ -1,7 +1,6 @@
-"""Benchmark for FusedMoEExpertsNopadPersistent3WGFwdOp.
+"""Benchmarks for FusedMoEExpertsFwdOp and IndexedExpertMLPFwdOp.
 
-Measures the permute + grouped-GEMM + unpermute pipeline without routing.
-The nopad (3WG persistent kernel) layout is benchmarked
+Measures the permute + grouped-GEMM + unpermute pipeline without routing and compares it
 against vLLM Triton fused_experts and vLLM CUTLASS fused_experts (when available).
 
 Workloads match the manifest entries (shared workload set):
@@ -13,10 +12,14 @@ Workloads match the manifest entries (shared workload set):
   DeepSeek-V3      4096  7168  2048  256   8   (prefill)
 
 Baselines:
-  - tileops-nopad-3wg: FusedMoEExpertsNopadPersistent3WGFwdOp (default 3WG kernel)
+  - tileops:            FusedMoEExpertsFwdOp
   - vllm-triton:       vLLM Triton fused_experts (default backend)
   - vllm-cutlass:      vLLM CUTLASS fused_experts (when importable)
   - torch-ref:         per-expert GEMM loop with index_add_ (fallback)
+
+``IndexedExpertMLPFwdOp`` is the small-route backend the composite picks below 33 tokens.
+Its own workloads sit in that band, and it is measured against the staged pipeline the
+composite runs everywhere else, which is what the indexed path has to beat to be chosen.
 """
 
 import warnings
@@ -58,7 +61,7 @@ except ImportError:
 
 from benchmarks.benchmark_base import ManifestBenchmark, fields, workload_params
 from tileops.manifest import load_workloads
-from tileops.ops.moe import FusedMoEExpertsNopadPersistent3WGFwdOp
+from tileops.ops.moe import FusedMoEExpertsFwdOp, IndexedExpertMLPFwdOp
 from workloads.moe import MoeExpertsWorkload
 
 # Workload
@@ -67,7 +70,7 @@ from workloads.moe import MoeExpertsWorkload
 @pytest.mark.parametrize(
     "num_tokens, num_experts, top_k, hidden_size, ffn_size, dtype",
     workload_params(
-        load_workloads(FusedMoEExpertsNopadPersistent3WGFwdOp),
+        load_workloads(FusedMoEExpertsFwdOp),
         fields(
             "num_tokens",
             "num_experts",
@@ -78,7 +81,7 @@ from workloads.moe import MoeExpertsWorkload
         ),
     ),
 )
-def test_moe_experts_nopad_bench(
+def test_moe_experts_bench(
     num_tokens: int,
     num_experts: int,
     top_k: int,
@@ -89,22 +92,23 @@ def test_moe_experts_nopad_bench(
     test = MoeExpertsWorkload(num_tokens, num_experts, top_k, hidden_size, ffn_size, dtype)
     hidden, w1, w2, topk_weights, topk_ids = test.gen_inputs()
 
-    output = torch.empty(num_tokens, hidden_size, dtype=dtype, device="cuda")
-    ws1 = torch.empty(0, dtype=dtype, device="cuda")
-    ws2 = torch.empty(0, dtype=dtype, device="cuda")
-
-    # -- TileOPs nopad (3WG persistent) --------------------------------------
-    nopad = FusedMoEExpertsNopadPersistent3WGFwdOp(
+    experts = FusedMoEExpertsFwdOp(
         num_tokens=num_tokens,
         num_experts=num_experts,
         top_k=top_k,
         hidden_size=hidden_size,
         ffn_size=ffn_size,
     )
-    bm = ManifestBenchmark(nopad, test)
+    output = torch.empty(num_tokens, hidden_size, dtype=dtype, device="cuda")
+    ws1_shape, ws2_shape = experts.workspace_shapes(
+        num_tokens, ffn_size, hidden_size, top_k, num_experts
+    )
+    ws1 = torch.empty(ws1_shape, dtype=dtype, device="cuda")
+    ws2 = torch.empty(ws2_shape, dtype=dtype, device="cuda")
+    bm = ManifestBenchmark(experts, test)
 
-    def _nopad_fn(hidden, w1, w2, topk_weights, topk_ids):
-        nopad.forward(
+    def _experts_fn(hidden, w1, w2, topk_weights, topk_ids):
+        experts.forward(
             output,
             hidden,
             w1,
@@ -116,10 +120,10 @@ def test_moe_experts_nopad_bench(
         )
         return output
 
-    _nopad_fn(hidden, w1, w2, topk_weights, topk_ids)  # warmup / JIT compile
+    _experts_fn(hidden, w1, w2, topk_weights, topk_ids)
     torch.cuda.synchronize()
 
-    functors = {"tileops-nopad-3wg": _nopad_fn}
+    functors = {"tileops": _experts_fn}
 
     # -- vLLM Triton baseline -------------------------------------------------
     if _VLLM_TRITON_AVAILABLE:
@@ -174,3 +178,69 @@ def test_moe_experts_nopad_bench(
         functors["torch-ref"] = _torch_fn
 
     bm.compare(functors, hidden, w1, w2, topk_weights, topk_ids)
+
+
+@pytest.mark.parametrize(
+    "num_tokens, num_experts, top_k, hidden_size, ffn_size, dtype",
+    workload_params(
+        load_workloads(IndexedExpertMLPFwdOp),
+        fields(
+            "num_tokens",
+            "num_experts",
+            "top_k",
+            "hidden_size",
+            "ffn_size",
+            dtype_last=True,
+        ),
+    ),
+)
+def test_indexed_expert_mlp_bench(
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    ffn_size: int,
+    dtype: torch.dtype,
+) -> None:
+    test = MoeExpertsWorkload(num_tokens, num_experts, top_k, hidden_size, ffn_size, dtype)
+    hidden, w1, w2, topk_weights, topk_ids = test.gen_inputs()
+
+    indexed = IndexedExpertMLPFwdOp(
+        num_tokens=num_tokens,
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden_size=hidden_size,
+        ffn_size=ffn_size,
+    )
+    output = torch.empty(num_tokens, hidden_size, dtype=dtype, device="cuda")
+    ws1_shape, ws2_shape = indexed.workspace_shapes()
+    ws1 = torch.empty(ws1_shape, dtype=dtype, device="cuda")
+    ws2 = torch.empty(ws2_shape, dtype=dtype, device="cuda")
+
+    def _indexed_fn(hidden, w1, w2, topk_weights, topk_ids):
+        indexed.forward(output, hidden, w1, w2, topk_weights, topk_ids, ws1, ws2)
+        return output
+
+    # The staged pipeline is what the composite runs on every other shape, so it is the
+    # comparator the indexed path has to beat.
+    staged = FusedMoEExpertsFwdOp(
+        num_tokens=num_tokens,
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden_size=hidden_size,
+        ffn_size=ffn_size,
+    )
+    staged_output = torch.empty(num_tokens, hidden_size, dtype=dtype, device="cuda")
+
+    def _staged_fn(hidden, w1, w2, topk_weights, topk_ids):
+        expert_input, physical_ends, inverse = staged._pre_permute(hidden, topk_ids)
+        expert_output = staged._expert_mlp(expert_input, w1, w2, physical_ends)
+        staged._post_permute(expert_output, topk_weights, inverse, out=staged_output)
+        return staged_output
+
+    functors = {"tileops": _indexed_fn, "staged": _staged_fn}
+    for fn in functors.values():
+        fn(hidden, w1, w2, topk_weights, topk_ids)
+    torch.cuda.synchronize()
+
+    ManifestBenchmark(indexed, test).compare(functors, hidden, w1, w2, topk_weights, topk_ids)

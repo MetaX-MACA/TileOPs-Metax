@@ -1,13 +1,13 @@
 """The mixture-of-experts ops, at the public path ``tileops.moe``."""
 
 from .ops.moe import (
-    FusedMoEExpertsNopadPersistent3WGFwdOp,
+    FusedMoEExpertsFwdOp,
     FusedMoeFwdOp,
+    FusedMoeSharedExpertFwdOp,
     FusedTopKOp,
+    IndexedExpertMLPFwdOp,
     MoeExpertMLPFwdOp,
-    MoeGateUpFwdOp,
     MoeGroupedGemmFwdOp,
-    MoeGroupedGemmNopadFwdOp,
     MoePermuteAlignFwdOp,
     MoePostPermuteFwdOp,
     MoePrePermuteFwdOp,
@@ -20,8 +20,8 @@ __all__ = [
     "MoeGroupedGemmFwdOp",
     "MoeExpertMLPFwdOp",
     "MoePostPermuteFwdOp",
-    "FusedMoEExpertsNopadPersistent3WGFwdOp",
+    "FusedMoEExpertsFwdOp",
+    "IndexedExpertMLPFwdOp",
     "FusedMoeFwdOp",
-    "MoeGateUpFwdOp",
-    "MoeGroupedGemmNopadFwdOp",
+    "FusedMoeSharedExpertFwdOp",
 ]

@@ -1,13 +1,4 @@
-"""Weighted inverse-permute kernel used by staged MoE PostPermute.
-
-Scatters expert outputs back to original token order, applies routing weights,
-and reduces K expert contributions per token.
-
-One block per token (T blocks total):
-  - For each of K expert slots: load expert_output[inverse_indices[i*K+k]]
-  - Multiply by topk_weights[i, k] (float32)
-  - Accumulate into float32 thread-local buffer
-  - Cast to output dtype and store to output[i]
+"""Weighted inverse permute for staged MoE PostPermute.
 
 Inputs:
   expert_output    [materialized_rows, H] bf16/fp16 expert output
@@ -15,7 +6,7 @@ Inputs:
   topk_weights     [T, K]                 float32 routing weights
 
 Output:
-  output           [T, H]     bf16/fp16
+  output           [T, H]                 bf16/fp16
 """
 
 import functools
@@ -27,6 +18,7 @@ import torch
 
 from tileops.kernels.buffer_utils import tensors_overlap
 from tileops.kernels.kernel_base import Kernel
+from tileops.utils import get_sm_count
 
 __all__ = ["MoeUnpermuteKernel"]
 
@@ -38,26 +30,10 @@ def _make_unpermute_kernel(
     hidden_size: int,
     materialized_rows: int,
     dtype: str,
+    threads: int,
     scaling: float = 1.0,
 ):
-    """One block per token; threads cooperate over the H dimension.
-
-    Threads are capped at 256 (see below), so each thread handles ceil(H /
-    threads) elements: a clean multiple of VEC=8 (128-bit uint4 load/store)
-    when H // threads is, otherwise partially vectorized (e.g. H=7168 -> 256
-    threads -> 28 elems/thread = 3.5x VEC). Accumulation is in float32, cast to
-    dtype on store.
-    """
-    # Cap threads at 256: 1024 spills the fp32 acc[H] accumulator to local
-    # memory. Below the cap, scale with hidden_size // VEC and keep power-of-2
-    # alignment so small hidden sizes retain 128-bit (VEC=8) vectorized
-    # load/store instead of scalar 16-bit ops (e.g. H=512 -> 64 threads of 8).
-    VEC = 8  # 8 x bf16/fp16 = 128 bits
-    threads = min(256, hidden_size // VEC)
-    if threads > 0:
-        threads = 1 << (threads.bit_length() - 1)
-    threads = max(threads, 1)
-
+    """Build one block per output token with an fp32 reduction."""
     numel = num_tokens * top_k
 
     @tilelang.jit(out_idx=[], compile_flags=["-O3", "-DENABLE_BF16"])
@@ -70,17 +46,13 @@ def _make_unpermute_kernel(
             output: T.Tensor([num_tokens, hidden_size], dtype),
         ):
             with T.Kernel(num_tokens, threads=threads) as (token_idx,):
-                # float32 accumulator for this token's H slice
                 acc = T.alloc_fragment([hidden_size], "float32")
                 src = T.alloc_fragment([hidden_size], dtype)
 
-                # zero accumulator
                 T.fill(acc, 0.0)
 
-                # accumulate K expert contributions. Software-pipeline the
-                # gathers (num_stages=2) so each scattered row load overlaps the
-                # previous slot's accumulate — the K loads are latency-bound.
-                # Serial fallback when top_k < 2 (pipeline depth > trip count).
+                # num_stages=2 overlaps the latency-bound gathers; top_k < 2 leaves
+                # the pipeline deeper than the trip count, so it runs serial.
                 for k in T.Pipelined(top_k, num_stages=2) if top_k >= 2 else T.serial(top_k):
                     flat_idx = token_idx * T.int32(top_k) + k
                     slot = inverse_indices[flat_idx]
@@ -89,7 +61,6 @@ def _make_unpermute_kernel(
                     for j in T.Parallel(hidden_size):
                         acc[j] = acc[j] + T.Cast("float32", src[j]) * weight
 
-                # cast (and scale) then store
                 out_frag = T.alloc_fragment([hidden_size], dtype)
                 if scaling != 1.0:
                     for j in T.Parallel(hidden_size):
@@ -118,11 +89,9 @@ class MoeUnpermuteKernel(Kernel):
         scaling: Scalar multiplied into the reduced output before the cast/store
             (folds ``routed_scaling_factor``). Defaults to 1.0 (no scaling).
         dtype: Data type of expert output and final output (bf16 or fp16).
-        config: Optional config dict. This kernel exposes no tunable knobs.
-        tune: Whether to autotune. The launch geometry is one block per token
-            with a fixed thread count, so ``autotune_configs`` is undefined and
-            ``tune=True`` degrades to the default config with a warning from
-            ``Kernel.init_config``.
+        config: Optional config dict with ``threads``.
+        tune: Whether to autotune.
+        sm_count: Device SM count used to choose the low-token launch width.
 
     Example:
         ```python linenums="1"
@@ -143,6 +112,7 @@ class MoeUnpermuteKernel(Kernel):
         dtype: torch.dtype = torch.bfloat16,
         config: Optional[dict] = None,
         tune: bool = False,
+        sm_count: Optional[int] = None,
     ):
         super().__init__()
         self.num_tokens = num_tokens
@@ -151,16 +121,33 @@ class MoeUnpermuteKernel(Kernel):
         self.materialized_rows = materialized_rows
         self.dtype = dtype
         self.numel = num_tokens * top_k
+        self.sm_count = get_sm_count() if sm_count is None else sm_count
+        if self.sm_count <= 0:
+            raise ValueError("sm_count must be positive")
+        self.init_config(config, tune)
 
         self._unpermute_fn = _make_unpermute_kernel(
-            num_tokens, top_k, hidden_size, materialized_rows, self.dtype_str, scaling
+            num_tokens,
+            top_k,
+            hidden_size,
+            materialized_rows,
+            self.dtype_str,
+            self.config["threads"],
+            scaling,
         )
-
-        self.init_config(config, tune)
 
     @property
     def default_config(self) -> dict:
-        return {}
+        vector = 8
+        vector_threads = min(1024, self.hidden_size // vector)
+        while vector_threads > 0 and self.hidden_size % vector_threads != 0:
+            vector_threads -= 1
+        if self.num_tokens <= self.sm_count:
+            return {"threads": max(vector_threads, 1)}
+        threads = min(256, self.hidden_size // vector)
+        if threads > 0:
+            threads = 1 << (threads.bit_length() - 1)
+        return {"threads": max(threads, 1)}
 
     def forward(
         self,
@@ -196,16 +183,13 @@ class MoeUnpermuteKernel(Kernel):
                 )
             if out.dtype != self.dtype:
                 raise ValueError(f"out dtype must be {self.dtype}, got {out.dtype}")
-            # The kernel writes ``out`` on expert_output's device as a row-major compact
-            # tensor; a cross-device or non-contiguous ``out`` would scatter the
-            # store to the wrong memory. Reject rather than corrupt silently.
+            # A cross-device or non-contiguous ``out`` would scatter the store.
             if out.device != dev:
                 raise ValueError(f"out device must be {dev}, got {out.device}")
             if not out.is_contiguous():
                 raise ValueError("out must be contiguous")
-            # The kernel reads ``expert_output`` while writing
-            # ``out`` concurrently, so an ``out`` overlapping ``expert_output`` in
-            # memory races. Disjoint slices of one workspace buffer are allowed.
+            # Overlap races with the concurrent read; disjoint slices of one
+            # workspace buffer are fine.
             if tensors_overlap(out, expert_output):
                 raise ValueError("out must not overlap expert_output in memory")
             output = out

@@ -7,21 +7,28 @@ from typing import ClassVar, Mapping
 import torch
 
 from tileops.kernels.kernel_base import Kernel
-from tileops.kernels.moe import MoePrePermuteContiguousKernel, MoeUnpermuteKernel
+from tileops.kernels.moe import (
+    MoeGroupedGemmKernel,
+    MoeGroupedGemmMACAAdapter,
+    MoePrePermuteContiguousKernel,
+    MoeUnpermuteKernel,
+)
 from tileops.kernels.moe.call_spec import MGroupedGemmCall, PostPermuteCall, PrePermuteCall
-from tileops.ops.compile_boundary import get_instance
+from tileops.ops._compile_boundary_codegen import OperatorSpec
+from tileops.ops._output_dtype import output_dtype
 from tileops.ops.op_base import Op
+from tileops.perf.formulas import moe_expert_mlp_roofline, moe_grouped_gemm_roofline
+from tileops.perf.profile import tensor_core_roof
 from tileops.utils import get_sm_version, is_h200, is_maca
 
-from ..elementwise import SiluAndMulFwdOp
 from .contracts import (
+    ContiguousLayoutSpec,
     ContiguousMetadata,
     ContiguousPacking,
     MaskedLayoutSpec,
-    MaterializedExpertLayout,
     MGroupedLayoutSpec,
-    NoScaleComputeSpec,
     RoutingEpilogueSpec,
+    layout_value_guard,
 )
 
 __all__ = [
@@ -30,6 +37,10 @@ __all__ = [
     "MoePostPermuteFwdOp",
     "MoePrePermuteFwdOp",
 ]
+
+
+# Gated activations a grouped GEMM may fuse into its epilogue.
+GATED_ACTIVATIONS = ("silu_and_mul", "gelu_and_mul")
 
 
 def _same_device(named_tensors: Mapping[str, torch.Tensor]) -> torch.device:
@@ -63,6 +74,7 @@ class _ContiguousPostPermuteKernel(Kernel):
             call.materialized_rows,
             scaling=call.epilogue.routed_scaling_factor,
             dtype=call.input_dtype,
+            sm_count=call.sm_count,
         )
 
     def forward(
@@ -78,20 +90,14 @@ class _ContiguousPostPermuteKernel(Kernel):
 
 
 class _StagedOpBase(Op):
-    """Common behavior for a staged boundary with no shipped implementation yet."""
+    """Common behavior of the staged boundary ops: no default candidates, dtypes checked per call."""
 
     @property
     def default_kernel_map(self) -> dict[str, Kernel]:
         return {}
 
-    def _infer_output_shapes(self, **shape_kwargs: tuple[int, ...]) -> dict[str, tuple[int, ...]]:
-        raise NotImplementedError("staged output shape depends on materialized layout metadata")
-
     def _validate_dtypes(self, *args: torch.Tensor) -> None:
         raise NotImplementedError("staged dtype validation requires family-specific call data")
-
-    def eval_roofline(self) -> tuple[int, int]:
-        raise NotImplementedError("staged roofline evaluation requires materialized runtime data")
 
 
 class MoePrePermuteFwdOp(_StagedOpBase):
@@ -101,7 +107,7 @@ class MoePrePermuteFwdOp(_StagedOpBase):
     Global placement and communication belong to EPDispatch.
     """
 
-    compile_op_names: ClassVar[tuple[str, ...]] = ("tileops::moe_pre_permute_fwd",)
+    compile_boundary: ClassVar[tuple[OperatorSpec, ...]] = (OperatorSpec(),)
 
     def __init__(
         self,
@@ -114,7 +120,7 @@ class MoePrePermuteFwdOp(_StagedOpBase):
         """Configure a pre-permute boundary for one layout and expert domain."""
         if num_local_experts <= 0:
             raise ValueError("num_local_experts must be positive")
-        self.layout = layout
+        self.layout = _check_layout(layout)
         self.num_local_experts = num_local_experts
         self.target = target
         self.dispatch_kernel(kernel_map)
@@ -129,29 +135,19 @@ class MoePrePermuteFwdOp(_StagedOpBase):
         local_expert_ids_shape: tuple[int, ...],
     ) -> dict[str, tuple[int, ...]]:
         rows = hidden_states_shape[0] * local_expert_ids_shape[1]
-        layout_key = getattr(self.layout, "selection_key", self.layout)
-        if isinstance(self.layout, MaskedLayoutSpec):
-            expert_input = (
-                self.num_local_experts,
-                self.layout.max_m,
-                hidden_states_shape[1],
-            )
+        # The manifest validator's parity probe builds the op without __init__ and
+        # binds a placeholder for ``layout``; getattr resolves it to the tight shapes.
+        layout = self.layout
+        if isinstance(layout, MaskedLayoutSpec):
+            expert_input = (self.num_local_experts, layout.max_m, hidden_states_shape[1])
             metadata_rows = self.num_local_experts
-        elif (
-            getattr(self.layout, "packing", None) is ContiguousPacking.ALIGNED
-            and getattr(self.layout, "metadata_kind", None) is ContiguousMetadata.PER_ROW
-        ):
-            capacity = rows + self.num_local_experts * (self.layout.alignment - 1)
-            expert_input = (capacity, hidden_states_shape[1])
-            metadata_rows = capacity
         else:
-            expert_input = (rows, hidden_states_shape[1])
-            metadata_rows = (
-                rows
-                if getattr(self.layout, "metadata_kind", None) is ContiguousMetadata.PER_ROW
-                or layout_key == "tight_per_row"
-                else self.num_local_experts
-            )
+            per_row = getattr(layout, "metadata_kind", None) is ContiguousMetadata.PER_ROW
+            capacity = rows
+            if per_row and getattr(layout, "packing", None) is ContiguousPacking.ALIGNED:
+                capacity += self.num_local_experts * (layout.alignment - 1)
+            expert_input = (capacity, hidden_states_shape[1])
+            metadata_rows = capacity if per_row else self.num_local_experts
         return {
             "expert_input": expert_input,
             "layout_metadata": (metadata_rows,),
@@ -215,7 +211,7 @@ class MoePrePermuteFwdOp(_StagedOpBase):
         local_expert_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return ``(expert_input, layout_metadata, inverse_indices)``."""
-        return _moe_pre_permute_fwd(hidden_states, local_expert_ids, self._instance_key)
+        return self._wrapped(hidden_states, local_expert_ids, self._instance_key)
 
     def _eager_forward(
         self,
@@ -225,198 +221,396 @@ class MoePrePermuteFwdOp(_StagedOpBase):
         call = self.make_call(hidden_states, local_expert_ids)
         self.dtype = hidden_states.dtype
         self.input_shapes = [tuple(hidden_states.shape), tuple(local_expert_ids.shape)]
-        name = self.select_kernel_key(tuple((self.kernel_map or {}).keys()), call)
-        kernel = self.get_or_build_kernel(
-            name,
-            inputs=(hidden_states, local_expert_ids),
-            key=call,
-            build=lambda: self.kernel_map[name](call),
-        )
+        kernel = self.kernel_for("pre_permute", (hidden_states, local_expert_ids), call)
         return kernel(hidden_states, local_expert_ids)
 
 
+def _check_layout(layout: object) -> MGroupedLayoutSpec:
+    if not isinstance(layout, (ContiguousLayoutSpec, MaskedLayoutSpec)):
+        raise TypeError("layout must be ContiguousLayoutSpec or MaskedLayoutSpec")
+    return layout
+
+
 class MoeGroupedGemmFwdOp(_StagedOpBase):
-    """Independently callable typed M-grouped GEMM boundary."""
+    """M-grouped GEMM over expert-materialized rows: ``out[rows of g] = a[rows of g] @ b[g]^T``.
+
+    ``layout`` fixes how the rows of ``a`` are organised by expert and what the
+    ``layout_metadata`` tensor means; ``E`` is read off ``b``, ``M``/``N``/``K`` off
+    the operands. Accumulation is fp32; the output is written in the operand dtype
+    unless ``out_dtype`` asks for fp32.
+
+    With ``activation`` set, ``b`` stacks the gate and up projections along ``N``
+    (``[E, 2 * ffn, K]``) and ``out`` is ``act(gate) * up`` with ``ffn`` columns: the
+    gated activation is fused into the GEMM's epilogue and the ``[.., 2 * ffn]``
+    intermediate is never written.
+
+    Per layout the operands are (``trans``-free, ``b`` is ``[E, N, K]``):
+
+    | layout                      | ``a``             | ``layout_metadata``          | ``out``           |
+    | --------------------------- | ----------------- | ---------------------------- | ----------------- |
+    | contiguous · physical_psum  | ``[M, K]``        | ``[E]`` segment end rows     | ``[M, N]``        |
+    | contiguous · per_row        | ``[M, K]``        | ``[M]`` expert id per row    | ``[M, N]``        |
+    | masked                      | ``[E, max_m, K]`` | ``[E]`` valid rows per expert| ``[E, max_m, N]`` |
+
+    Rows an aligned layout pads with, and a masked slab's rows past its valid
+    count, hold unspecified values in ``out``. The metadata's value-level
+    invariants (ordering, segment ends, ranges) are not checked here — doing so
+    would synchronise — but ``layout_guard`` returns them as an asynchronous
+    tensor for tests and benchmarks.
+    """
+
+    # A caller-supplied ``out`` makes the operator write rather than return, so the two
+    # forms are two operators and ``forward`` picks per call.
+    compile_boundary: ClassVar[tuple[OperatorSpec, ...]] = (
+        OperatorSpec(),
+        OperatorSpec.writes_out("out"),
+    )
+
+    @staticmethod
+    def _rows_of(layout: MGroupedLayoutSpec, a_shape: tuple[int, ...]) -> int:
+        """Materialized rows of ``a``: ``M`` for contiguous, ``E * max_m`` for masked."""
+        if isinstance(layout, MaskedLayoutSpec):
+            return a_shape[0] * a_shape[1]
+        return a_shape[0]
+
+    @property
+    def default_kernel_map(self) -> dict[str, Kernel]:
+        return {"grouped_gemm": MoeGroupedGemmMACAAdapter if is_maca() else MoeGroupedGemmKernel}
 
     def __init__(
         self,
-        compute: NoScaleComputeSpec | None = None,
+        layout: MGroupedLayoutSpec,
         *,
+        activation: str | None = None,
+        out_dtype: torch.dtype | None = None,
         kernel_map: dict[str, Kernel] | None = None,
         target: object = None,
     ) -> None:
-        """Configure the current BF16/NoScale M-grouped GEMM semantic."""
-        compute = NoScaleComputeSpec() if compute is None else compute
-        if not isinstance(compute, NoScaleComputeSpec):
-            raise TypeError("the current public manifest supports only NoScaleComputeSpec")
-        self.compute = compute
+        """Fix the expert layout, the fused activation and the output dtype policy.
+
+        Args:
+            layout: Manifest ``params.layout``; how ``a``'s rows are grouped by expert.
+            activation: Manifest ``params.activation``; ``None`` for a plain GEMM, or a
+                gated activation (``"silu_and_mul"``, ``"gelu_and_mul"``) fused into the
+                epilogue over a gate||up ``b``, which halves the output width.
+            out_dtype: Manifest ``params.out_dtype``; ``None`` writes the operand dtype,
+                ``torch.float32`` keeps the fp32 accumulator.
+            kernel_map: Optional kernel override dict.
+            target: Which backend serves this instance; detected from the tensors when
+                ``None``.
+        """
+        self.layout = _check_layout(layout)
+        if activation is not None and activation not in GATED_ACTIVATIONS:
+            raise ValueError(f"activation must be None or one of {GATED_ACTIVATIONS}")
+        self.activation = activation
+        if out_dtype is not None and out_dtype is not torch.float32:
+            raise ValueError("out_dtype must be None (operand dtype) or torch.float32")
+        self.out_dtype = out_dtype
         self.target = target
         self.dispatch_kernel(kernel_map)
+
+    def _infer_output_shapes(
+        self,
+        a_shape: tuple[int, ...],
+        b_shape: tuple[int, ...],
+        layout_metadata_shape: tuple[int, ...],
+    ) -> dict[str, tuple[int, ...]]:
+        # The manifest validator's parity probe builds the op without __init__ and
+        # binds a placeholder for ``activation``; anything but None means fused.
+        n = b_shape[1]
+        if getattr(self, "activation", None) is not None:
+            n //= 2
+        return {"output": (*tuple(a_shape)[:-1], n)}
+
+    def eval_roofline(self) -> tuple[int, int]:
+        return moe_grouped_gemm_roofline(self)
+
+    def compute_roof(self) -> str:
+        """FLOPs are matmul contractions; priced on tensor cores."""
+        return tensor_core_roof(self.dtype)
 
     def make_call(
         self,
         a: torch.Tensor,
         b: torch.Tensor,
-        expert_layout: MaterializedExpertLayout,
-        scales: object | None = None,
+        layout_metadata: torch.Tensor,
         out: torch.Tensor | None = None,
     ) -> MGroupedGemmCall:
-        """Validate operands/spec/layout and construct the selection record."""
-        tensors = {"a": a, "b": b}
+        """Validate the operands against the layout and build the selection record."""
+        tensors = {"a": a, "b": b, "layout_metadata": layout_metadata}
         if out is not None:
             tensors["out"] = out
         device = _same_device(tensors)
         if device.type != "cuda":
             raise ValueError("staged grouped GEMM currently requires CUDA tensors")
-        expert_layout.validate_structure(a)
-        if b.ndim != 3 or b.shape[0] != expert_layout.num_experts:
+        if a.dtype not in (torch.bfloat16, torch.float16):
+            raise TypeError("the staged grouped-GEMM contract accepts BF16 or FP16 operands")
+        if b.dtype is not a.dtype:
+            raise TypeError("a and b must share one dtype")
+        if layout_metadata.dtype is not torch.int32:
+            raise TypeError("layout_metadata must have dtype torch.int32")
+        for name, tensor in tensors.items():
+            if not tensor.is_contiguous():
+                raise ValueError(f"{name} must be contiguous")
+        if b.ndim != 3:
             raise ValueError("b must have shape [num_experts, n, k]")
-        if not b.is_contiguous():
-            raise ValueError("b must be contiguous")
-        if a.shape[-1] != b.shape[-1]:
+        num_experts, n, k = b.shape
+        layout = self.layout
+        if isinstance(layout, MaskedLayoutSpec):
+            if a.ndim != 3 or a.shape[0] != num_experts or a.shape[1] != layout.max_m:
+                raise ValueError(
+                    f"masked a must have shape [{num_experts}, {layout.max_m}, k] to match "
+                    f"b and the layout's max_m"
+                )
+        else:
+            if a.ndim != 2:
+                raise ValueError("contiguous a must have shape [rows, k]")
+            if layout.packing is ContiguousPacking.ALIGNED and a.shape[0] % layout.alignment:
+                raise ValueError(
+                    f"aligned rows ({a.shape[0]}) must be a multiple of the layout's "
+                    f"alignment ({layout.alignment})"
+                )
+        if a.shape[-1] != k:
             raise ValueError("a and b must have the same reduction dimension")
-        arch = get_sm_version(device.index)
-        if scales is not None:
-            raise ValueError("NoScaleComputeSpec forbids scales")
-        if (
-            (arch != 90 and not is_maca())
-            or a.dtype is not torch.bfloat16
-            or b.dtype is not torch.bfloat16
-        ):
-            raise ValueError("NoScale currently supports only SM90 BF16 operands")
-        output_shape = (*a.shape[:-1], b.shape[1])
-        if out is not None and not out.is_contiguous():
-            raise ValueError("out must be contiguous")
-        if out is not None and (
-            tuple(out.shape) != output_shape or out.dtype != self.compute.output_dtype
-        ):
-            raise ValueError("out shape and dtype must match the resolved grouped-GEMM output")
+        if self.activation is not None and n % 2:
+            raise ValueError(
+                f"a fused gated activation splits b's N={n} into gate and up halves: N must be even"
+            )
+        rows = MoeGroupedGemmFwdOp._rows_of(layout, tuple(a.shape))
+        expected_meta = layout.metadata_length(rows=rows, num_experts=num_experts)
+        if layout_metadata.ndim != 1 or layout_metadata.shape[0] != expected_meta:
+            raise ValueError(
+                f"layout_metadata must have shape ({expected_meta},) for this layout, "
+                f"got {tuple(layout_metadata.shape)}"
+            )
+        cd_dtype = output_dtype(self, "output", a.dtype)
+        output_shape = self._infer_output_shapes(
+            tuple(a.shape), tuple(b.shape), tuple(layout_metadata.shape)
+        )["output"]
+        if out is not None and (tuple(out.shape) != output_shape or out.dtype != cd_dtype):
+            raise ValueError(
+                f"out must be a {list(output_shape)} tensor of dtype {cd_dtype}, "
+                f"got {list(out.shape)} {out.dtype}"
+            )
+        packing = None if isinstance(layout, MaskedLayoutSpec) else layout.packing.value
+        metadata_kind = None if isinstance(layout, MaskedLayoutSpec) else layout.metadata_kind.value
         return MGroupedGemmCall(
-            arch=arch,
-            layout_key=expert_layout.selection_key,
-            max_m=expert_layout.max_m,
-            device_type=a.device.type,
-            input_dtype=a.dtype,
-            weight_dtype=b.dtype,
-            output_dtype=self.compute.output_dtype,
-            materialized_rows=expert_layout.materialized_rows,
-            num_experts=expert_layout.num_experts,
-            n=b.shape[1],
-            k=b.shape[2],
+            arch=get_sm_version(device.index),
+            h200=is_h200(device.index),
+            kind=layout.kind,
+            packing=packing,
+            metadata_kind=metadata_kind,
+            alignment=getattr(layout, "alignment", 1),
+            max_m=layout.max_m,
+            activation=self.activation,
+            ab_dtype=a.dtype,
+            cd_dtype=cd_dtype,
+            num_groups=num_experts,
+            m=rows,
+            n=n,
+            k=k,
+        )
+
+    def layout_guard(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        layout_metadata: torch.Tensor,
+    ) -> torch.Tensor:
+        """Asynchronous bool: ``layout_metadata``'s values satisfy the layout for ``a``/``b``.
+
+        The metadata's shape is checked here on the host, its values on the device;
+        never a host sync. Consume with ``torch._assert_async`` or ``.item()`` in
+        tests and benchmarks, never in ``forward``.
+
+        Raises:
+            ValueError: ``layout_metadata`` is not the int32 vector the layout expects.
+        """
+        rows = MoeGroupedGemmFwdOp._rows_of(self.layout, tuple(a.shape))
+        expected = self.layout.metadata_length(rows=rows, num_experts=b.shape[0])
+        if layout_metadata.dtype is not torch.int32 or tuple(layout_metadata.shape) != (expected,):
+            raise ValueError(
+                f"layout_metadata must be an int32 vector of length {expected}, "
+                f"got {layout_metadata.dtype} {tuple(layout_metadata.shape)}"
+            )
+        return layout_value_guard(
+            self.layout,
+            layout_metadata,
+            rows=rows,
+            num_experts=b.shape[0],
         )
 
     def forward(
         self,
         a: torch.Tensor,
         b: torch.Tensor,
-        expert_layout: MaterializedExpertLayout,
-        scales: object | None = None,
+        layout_metadata: torch.Tensor,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run one grouped GEMM using the supplied materialized expert layout."""
-        call = self.make_call(a, b, expert_layout, scales, out)
-        name = self.select_kernel_key(tuple((self.kernel_map or {}).keys()), call)
-        kernel = self.get_or_build_kernel(
-            name,
-            inputs=(a, b),
-            key=call,
-            build=lambda: self.kernel_map[name](call),
-        )
-        return kernel(a, b, expert_layout, scales=scales, out=out)
+        """Run one GEMM per expert over the rows the layout assigns it.
+
+        Args:
+            a: Expert-materialized activations, ``[M, K]`` or ``[E, max_m, K]`` per the layout.
+            b: Per-expert weights, ``[E, N, K]``.
+            layout_metadata: ``int32`` metadata whose shape and meaning the layout fixes.
+            out: Optional preallocated output in the resolved output dtype.
+
+        Returns:
+            ``[M, N]`` or ``[E, max_m, N]`` in the operand dtype, or fp32 when asked for.
+        """
+        if out is None:
+            return self._wrapped(a, b, layout_metadata, self._instance_key)
+        self._wrapped_inplace(a, b, layout_metadata, out, self._instance_key)
+        return out
+
+    def _eager_forward(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        layout_metadata: torch.Tensor,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        call = self.make_call(a, b, layout_metadata, out)
+        self.dtype = a.dtype
+        self.input_shapes = [tuple(a.shape), tuple(b.shape), tuple(layout_metadata.shape)]
+        kernel = self.kernel_for("grouped_gemm", (a, b, layout_metadata), call)
+        return kernel(a, b, layout_metadata, out=out)
 
 
 class MoeExpertMLPFwdOp(_StagedOpBase):
-    """Compose two typed grouped GEMMs around a gated activation."""
+    """Two grouped GEMMs on one expert layout, the gated activation fused into the first.
+
+    ``out = (act(expert_input @ w_gate_up[g]^T)) @ w_down[g]^T`` per expert ``g``, where
+    ``act`` is the gated activation: ``w_gate_up`` stacks the gate and up projections
+    along ``N`` and the gate_up GEMM's epilogue applies the activation and halves it,
+    so the ``[.., 2 * ffn]`` intermediate is never written. A composite: it registers
+    no operator of its own, its graph is its two leaves'.
+    """
 
     def __init__(
         self,
+        layout: MGroupedLayoutSpec,
         activation: str = "silu_and_mul",
         *,
-        compute: NoScaleComputeSpec | None = None,
         kernel_map: dict[str, Kernel] | None = None,
         target: object = None,
     ) -> None:
-        """Configure two grouped GEMMs around the selected gated activation."""
-        if activation != "silu_and_mul":
-            raise ValueError("the staged Expert MLP currently supports only silu_and_mul")
+        """Configure two grouped GEMMs on ``layout``, the first fusing the gated activation.
+
+        Args:
+            layout: Manifest ``params.layout``; shared by both GEMMs and the metadata.
+            activation: Manifest ``params.activation``; ``"silu_and_mul"`` or
+                ``"gelu_and_mul"``, fused into the gate_up GEMM's epilogue.
+            kernel_map: Optional overrides, forwarded to both GEMMs.
+            target: Which backend serves the delegates.
+        """
+        if activation not in GATED_ACTIVATIONS:
+            raise ValueError(f"activation must be one of {GATED_ACTIVATIONS}, got {activation!r}")
+        self.layout = _check_layout(layout)
         self.activation = activation
-        self.compute = NoScaleComputeSpec() if compute is None else compute
         self.target = target
         self.dispatch_kernel(kernel_map)
-        overrides = self.forwarded_overrides()
-        grouped_overrides = (
-            {key: value for key, value in overrides.items() if key != "silu_and_mul"}
-            if overrides
-            else None
-        )
+        overrides = self.forwarded_overrides() or None
         self.gate_up = MoeGroupedGemmFwdOp(
-            self.compute, kernel_map=grouped_overrides, target=target
+            layout, activation=activation, kernel_map=overrides, target=target
         )
-        self.activation_op = SiluAndMulFwdOp(kernel_map=overrides)
-        self.activation_op.target = target
-        self.down = MoeGroupedGemmFwdOp(self.compute, kernel_map=grouped_overrides, target=target)
+        self.down = MoeGroupedGemmFwdOp(layout, kernel_map=overrides, target=target)
 
-    def kernel_delegates(self) -> tuple[Op, Op, Op]:
-        return self.gate_up, self.activation_op, self.down
+    def kernel_delegates(self) -> tuple[Op, Op]:
+        return self.gate_up, self.down
 
-    def make_calls(
+    def _infer_output_shapes(
         self,
-        expert_input: torch.Tensor,
-        w_gate_up: torch.Tensor,
-        w_down: torch.Tensor,
-        expert_layout: MaterializedExpertLayout,
-        out: torch.Tensor | None = None,
-    ) -> tuple[MGroupedGemmCall, MGroupedGemmCall]:
-        """Build both GEMM calls while preserving one layout binding."""
-        gate_call = self.gate_up.make_call(expert_input, w_gate_up, expert_layout)
+        expert_input_shape: tuple[int, ...],
+        w_gate_up_shape: tuple[int, ...],
+        w_down_shape: tuple[int, ...],
+        layout_metadata_shape: tuple[int, ...],
+    ) -> dict[str, tuple[int, ...]]:
+        return {"output": (*tuple(expert_input_shape)[:-1], w_down_shape[1])}
+
+    def eval_roofline(self) -> tuple[int, int]:
+        return moe_expert_mlp_roofline(self)
+
+    def compute_roof(self) -> str:
+        """The two GEMMs dominate the FLOPs; priced on tensor cores."""
+        return tensor_core_roof(self.dtype)
+
+    @staticmethod
+    def _check_widths(w_gate_up: torch.Tensor, w_down: torch.Tensor) -> None:
+        if w_gate_up.ndim != 3 or w_down.ndim != 3:
+            raise ValueError("w_gate_up and w_down must have shape [num_experts, n, k]")
         if w_gate_up.shape[1] % 2:
             raise ValueError("w_gate_up output dimension must be even")
-        intermediate_shape = (*expert_input.shape[:-1], w_gate_up.shape[1] // 2)
-        if w_down.shape[-1] != intermediate_shape[-1]:
+        if w_down.shape[-1] != w_gate_up.shape[1] // 2:
             raise ValueError("w_down reduction dimension must match the gated width")
-        intermediate = expert_input.new_empty(intermediate_shape)
-        down_call = self.down.make_call(intermediate, w_down, expert_layout, out=out)
-        return gate_call, down_call
+        if w_down.shape[0] != w_gate_up.shape[0]:
+            raise ValueError("w_gate_up and w_down must hold the same experts")
 
     def forward(
         self,
         expert_input: torch.Tensor,
         w_gate_up: torch.Tensor,
         w_down: torch.Tensor,
-        expert_layout: MaterializedExpertLayout,
+        layout_metadata: torch.Tensor,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run gate/up GEMM, gated activation, and down GEMM on one layout."""
-        self.make_calls(expert_input, w_gate_up, w_down, expert_layout, out)
-        gate_up = self.gate_up(expert_input, w_gate_up, expert_layout)
-        flat_gate_up = gate_up.reshape(-1, gate_up.shape[-1])
-        activated = self.activation_op(flat_gate_up)
-        activated = activated.reshape(*gate_up.shape[:-1], gate_up.shape[-1] // 2)
-        return self.down(activated, w_down, expert_layout, out=out)
+        """Run the gate/up GEMM with its fused activation, then the down GEMM.
+
+        Args:
+            expert_input: ``[M, hidden]`` or ``[E, max_m, hidden]`` per the layout.
+            w_gate_up: ``[E, 2 * ffn, hidden]``, gate and up stacked along the output axis.
+            w_down: ``[E, hidden, ffn]``.
+            layout_metadata: ``int32`` metadata the layout fixes; shared by both GEMMs.
+            out: Optional preallocated ``[.., hidden]`` output in the operand dtype.
+
+        Returns:
+            ``[M, hidden]`` or ``[E, max_m, hidden]`` in the operand dtype.
+        """
+        self._check_widths(w_gate_up, w_down)
+        self.dtype = expert_input.dtype
+        self.input_shapes = [
+            tuple(expert_input.shape),
+            tuple(w_gate_up.shape),
+            tuple(w_down.shape),
+            tuple(layout_metadata.shape),
+        ]
+        activated = self.gate_up(expert_input, w_gate_up, layout_metadata)
+        return self.down(activated, w_down, layout_metadata, out=out)
 
 
 class MoePostPermuteFwdOp(_StagedOpBase):
     """Restore token order and apply the declared local routing epilogue."""
 
-    compile_op_names: ClassVar[tuple[str, ...]] = (
-        "tileops::moe_post_permute_fwd",
-        "tileops::moe_post_permute_fwd_inplace",
+    # A caller-supplied ``out`` makes the operator write rather than return, so the two
+    # forms are two operators and ``forward`` picks per call.
+    compile_boundary: ClassVar[tuple[OperatorSpec, ...]] = (
+        OperatorSpec(),
+        OperatorSpec.writes_out("out"),
     )
 
     def __init__(
         self,
         layout: MGroupedLayoutSpec,
         epilogue: RoutingEpilogueSpec | None = None,
+        out_dtype: torch.dtype | None = None,
         *,
         kernel_map: dict[str, Kernel] | None = None,
         target: object = None,
     ) -> None:
-        """Configure inverse permutation and the exactly-once routing epilogue."""
+        """Configure inverse permutation and the exactly-once routing epilogue.
+
+        Args:
+            out_dtype: Manifest ``params.out_dtype``. The dtype the reduced result is
+                written in; ``None`` keeps the expert output's own.
+        """
         epilogue = RoutingEpilogueSpec() if epilogue is None else epilogue
         if not isinstance(epilogue, RoutingEpilogueSpec):
             raise TypeError("epilogue must be RoutingEpilogueSpec")
-        self.layout = layout
+        if out_dtype is not None and out_dtype not in (torch.bfloat16, torch.float16):
+            raise ValueError("out_dtype must be None, torch.bfloat16, or torch.float16")
+        self.layout = _check_layout(layout)
         self.epilogue = epilogue
+        self.out_dtype = out_dtype
         self.target = target
         self.dispatch_kernel(kernel_map)
 
@@ -484,11 +678,11 @@ class MoePostPermuteFwdOp(_StagedOpBase):
             raise TypeError("inverse_indices must have dtype torch.int32")
         if expert_output.dtype not in (torch.bfloat16, torch.float16):
             raise TypeError("the current staged post-permute contract accepts BF16 or FP16 only")
-        output_dtype = self.epilogue.resolve_output_dtype(expert_output.dtype)
+        declared = output_dtype(self, "output", expert_output.dtype)
         output_shape = (topk_weights.shape[0], expert_output.shape[-1])
         if out is not None and not out.is_contiguous():
             raise ValueError("out must be contiguous")
-        if out is not None and (tuple(out.shape) != output_shape or out.dtype != output_dtype):
+        if out is not None and (tuple(out.shape) != output_shape or out.dtype != declared):
             raise ValueError("out shape and dtype must match the routing epilogue output")
         return PostPermuteCall(
             arch=get_sm_version(device.index),
@@ -498,7 +692,7 @@ class MoePostPermuteFwdOp(_StagedOpBase):
             device_type=expert_output.device.type,
             input_dtype=expert_output.dtype,
             routing_weight_dtype=topk_weights.dtype,
-            output_dtype=output_dtype,
+            output_dtype=declared,
             num_experts=expert_output.shape[0] if isinstance(self.layout, MaskedLayoutSpec) else 0,
             materialized_rows=physical_rows,
             num_tokens=topk_weights.shape[0],
@@ -515,19 +709,15 @@ class MoePostPermuteFwdOp(_StagedOpBase):
     ) -> torch.Tensor:
         """Restore token order, apply routing weights, reduce top-k, and cast."""
         if out is None:
-            return _moe_post_permute_fwd(
-                expert_output, inverse_indices, topk_weights, self._instance_key
-            )
-        _moe_post_permute_fwd_inplace(
-            expert_output, inverse_indices, topk_weights, out, self._instance_key
-        )
+            return self._wrapped(expert_output, topk_weights, inverse_indices, self._instance_key)
+        self._wrapped_inplace(expert_output, topk_weights, inverse_indices, out, self._instance_key)
         return out
 
     def _eager_forward(
         self,
         expert_output: torch.Tensor,
-        inverse_indices: torch.Tensor,
         topk_weights: torch.Tensor,
+        inverse_indices: torch.Tensor,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         call = self.make_call(expert_output, topk_weights, inverse_indices, out)
@@ -537,12 +727,8 @@ class MoePostPermuteFwdOp(_StagedOpBase):
             tuple(topk_weights.shape),
             tuple(inverse_indices.shape),
         ]
-        name = self.select_kernel_key(tuple((self.kernel_map or {}).keys()), call)
-        kernel = self.get_or_build_kernel(
-            name,
-            inputs=(expert_output, topk_weights, inverse_indices),
-            key=call,
-            build=lambda: self.kernel_map[name](call),
+        kernel = self.kernel_for(
+            "post_permute", (expert_output, topk_weights, inverse_indices), call
         )
         return kernel(
             expert_output,
@@ -550,64 +736,3 @@ class MoePostPermuteFwdOp(_StagedOpBase):
             topk_weights,
             out=out,
         )
-
-
-@torch.library.custom_op("tileops::moe_pre_permute_fwd", mutates_args=())
-def _moe_pre_permute_fwd(
-    hidden_states: torch.Tensor,
-    local_expert_ids: torch.Tensor,
-    instance_key: str,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return get_instance(instance_key)._eager_forward(hidden_states, local_expert_ids)
-
-
-@_moe_pre_permute_fwd.register_fake
-def _moe_pre_permute_fwd_fake(
-    hidden_states: torch.Tensor,
-    local_expert_ids: torch.Tensor,
-    instance_key: str,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    op = get_instance(instance_key)
-    shapes = op._infer_output_shapes(tuple(hidden_states.shape), tuple(local_expert_ids.shape))
-    return (
-        hidden_states.new_empty(shapes["expert_input"]),
-        torch.empty(shapes["layout_metadata"], dtype=torch.int32, device=hidden_states.device),
-        torch.empty(shapes["inverse_indices"], dtype=torch.int32, device=hidden_states.device),
-    )
-
-
-@torch.library.custom_op("tileops::moe_post_permute_fwd", mutates_args=())
-def _moe_post_permute_fwd(
-    expert_output: torch.Tensor,
-    inverse_indices: torch.Tensor,
-    topk_weights: torch.Tensor,
-    instance_key: str,
-) -> torch.Tensor:
-    return get_instance(instance_key)._eager_forward(expert_output, inverse_indices, topk_weights)
-
-
-@_moe_post_permute_fwd.register_fake
-def _moe_post_permute_fwd_fake(
-    expert_output: torch.Tensor,
-    inverse_indices: torch.Tensor,
-    topk_weights: torch.Tensor,
-    instance_key: str,
-) -> torch.Tensor:
-    op = get_instance(instance_key)
-    dtype = op.epilogue.resolve_output_dtype(expert_output.dtype)
-    return torch.empty(
-        (topk_weights.shape[0], expert_output.shape[-1]),
-        dtype=dtype,
-        device=expert_output.device,
-    )
-
-
-@torch.library.custom_op("tileops::moe_post_permute_fwd_inplace", mutates_args=("out",))
-def _moe_post_permute_fwd_inplace(
-    expert_output: torch.Tensor,
-    inverse_indices: torch.Tensor,
-    topk_weights: torch.Tensor,
-    out: torch.Tensor,
-    instance_key: str,
-) -> None:
-    get_instance(instance_key)._eager_forward(expert_output, inverse_indices, topk_weights, out=out)

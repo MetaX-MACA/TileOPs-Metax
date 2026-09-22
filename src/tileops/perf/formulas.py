@@ -10,6 +10,7 @@ field.
 
 from __future__ import annotations
 
+from math import prod
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -37,9 +38,8 @@ __all__ = [
     "fp8_lightning_indexer_roofline",
     "fp8_quant_roofline",
     "fused_moe_fwd_bytes",
-    "gated_deltanet_decode_roofline",
+    "fused_moe_shared_expert_fwd_bytes",
     "gated_deltanet_fwd_roofline",
-    "gated_deltanet_prefill_fwd_roofline",
     "ge_fwd_roofline",
     "gemm_fwd_roofline",
     "gemm_w4a16_fwd_roofline",
@@ -67,6 +67,8 @@ __all__ = [
     "mhc_post_roofline",
     "mhc_pre_roofline",
     "minimum_fwd_roofline",
+    "moe_expert_mlp_roofline",
+    "moe_grouped_gemm_roofline",
     "mul_fwd_roofline",
     "ne_fwd_roofline",
     "pow_fwd_roofline",
@@ -120,28 +122,40 @@ def mha_bwd_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
 
 
 def gqa_fwd_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
-    """Roofline for grouped-query attention forward (prefill)."""
+    """Roofline for dense grouped-query attention forward."""
     data = _shape_or_attrs(op, kwargs)
     if "q_shape" in data:
-        batch, seq_len, heads, dim = data["q_shape"]
-        _, _, heads_kv, _ = data["kv_shape"]
+        batch, seq_len_q, heads, dim = data["q_shape"]
+        kv_shape = data.get("k_shape", data.get("kv_shape"))
+        if kv_shape is None:
+            raise KeyError("dense GQA roofline requires k_shape or kv_shape")
+        _, seq_len_kv, heads_kv, _ = kv_shape
     else:
-        batch, seq_len, heads, heads_kv, dim = (
+        batch, seq_len_q, seq_len_kv, heads, heads_kv, dim = (
             data["batch"],
-            data["seq_len"],
+            data.get("seq_len_q", data.get("seq_len")),
+            data.get("seq_len_kv", data.get("seq_len")),
             data["heads"],
             data["heads_kv"],
             data["dim"],
         )
     is_causal = bool(data.get("is_causal", True))
     elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
+    # FP8 input has no FP8 output, so the write is priced on its own dtype.
+    out_bytes = _dtype_itemsize(data.get("out_dtype", data.get("dtype", "float16")))
 
-    flops = 4 * batch * heads * seq_len * seq_len * dim
+    visible_scores = seq_len_q * seq_len_kv
     if is_causal:
-        flops //= 2
-    q_elems = batch * seq_len * heads * dim
-    kv_elems = batch * seq_len * heads_kv * dim
-    return int(flops), int(2 * (q_elems + kv_elems) * elem_bytes)
+        visible_scores = seq_len_q * (seq_len_kv - seq_len_q) + seq_len_q * (seq_len_q + 1) // 2
+    flops = 4 * batch * heads * visible_scores * dim
+    q_elems = batch * seq_len_q * heads * dim
+    kv_elems = batch * seq_len_kv * heads_kv * dim
+    # Per-KV-head scales and RoPE tables the call passed, each read once.
+    optional_bytes = sum(
+        prod(shape) * _dtype_itemsize(dtype) for shape, dtype in data.get("optional_shapes", ())
+    )
+    read_bytes = (q_elems + 2 * kv_elems) * elem_bytes + optional_bytes
+    return int(flops), int(read_bytes + q_elems * out_bytes)
 
 
 def _dtype_itemsize(dtype: Any) -> int:
@@ -181,96 +195,6 @@ def _causal_prefill_visible_scores(seq_len_q: int, seq_len_kv: int) -> int:
     return rows * seq_len_kv - rows * (rows - 1) // 2
 
 
-def gated_deltanet_fwd_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
-    """Roofline for the Gated DeltaNet training forward.
-
-    Same chunkwise matmul work as the prefill helper, over the same conservative
-    model. The byte count differs: this forward also materializes the per-chunk
-    state ``S`` and the ``Aw`` / ``Au`` training artifacts that backward reads.
-    """
-    prefill_flops, prefill_bytes = gated_deltanet_prefill_fwd_roofline(op, **kwargs)
-    data = _shape_or_attrs(op, kwargs)
-    if "q_shape" in data:
-        q_shape, v_shape = data["q_shape"], data["v_shape"]
-        layout = str(data.get("layout", "bthd")).lower()
-        if layout == "bthd":
-            batch, seq_len, heads, dim_k = q_shape
-            dim_v = v_shape[3]
-        else:
-            batch, heads, seq_len, dim_k = q_shape
-            dim_v = v_shape[3]
-        chunk_size = data.get("chunk_size", 64) or 64
-    else:
-        batch, heads, seq_len = data["batch"], data["heads"], data["seq_len"]
-        dim_k, dim_v = data["dim_k"], data["dim_v"]
-        chunk_size = data["chunk_size"] or 64
-    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
-
-    num_chunks = seq_len // chunk_size
-    # S [B, H, NC + 1, DK, DV] plus Aw and Au, each [B, H, S, chunk_size].
-    state_elems = batch * heads * (num_chunks + 1) * dim_k * dim_v
-    wy_elems = 2 * batch * heads * seq_len * chunk_size
-    # The prefill model already counts one [B, H, DK, DV] final state.
-    prefill_state_elems = batch * heads * dim_k * dim_v
-    extra = (state_elems + wy_elems - prefill_state_elems) * elem_bytes
-
-    # Aw comes from a chunk-local block solve the prefill path does not run:
-    # one triangular inverse per chunk, then applying it across DK.
-    blocksolve_flops = (
-        2 * batch * heads * num_chunks * chunk_size * chunk_size * (chunk_size + dim_k)
-    )
-    return int(prefill_flops + blocksolve_flops), int(prefill_bytes + extra)
-
-
-def gated_deltanet_prefill_fwd_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
-    """Approximate roofline for Gated DeltaNet zero-state prefill.
-
-    This models the dominant chunkwise matmul work in the current
-    implementation. It is intentionally conservative; the helper exists so the
-    manifest and benchmark share one explicit cost-model hook.
-    """
-    data = _shape_or_attrs(op, kwargs)
-    if "q_shape" in data:
-        layout = str(data.get("layout", "bthd")).lower()
-        q_shape = data["q_shape"]
-        v_shape = data["v_shape"]
-        if layout == "bthd":
-            batch, seq_len, heads, dim_k = q_shape
-            _, v_seq_len, v_heads, dim_v = v_shape
-        elif layout == "bhtd":
-            batch, heads, seq_len, dim_k = q_shape
-            _, v_heads, v_seq_len, dim_v = v_shape
-        else:
-            raise ValueError(f"Unsupported GDN prefill layout: {layout}")
-        if v_seq_len != seq_len or v_heads != heads:
-            raise ValueError("GDN prefill q_shape and v_shape must share seq_len and heads")
-        chunk_size = data.get("chunk_size", 64) or 64
-    else:
-        batch, heads, seq_len, dim_k, dim_v, chunk_size = (
-            data["batch"],
-            data["heads"],
-            data["seq_len"],
-            data["dim_k"],
-            data["dim_v"],
-            data["chunk_size"] or 64,
-        )
-    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
-
-    num_chunks = seq_len // chunk_size
-    state_flops = 4 * batch * heads * num_chunks * chunk_size * dim_k * dim_v
-    intra_flops = 4 * batch * heads * num_chunks * chunk_size * chunk_size * (dim_k + dim_v)
-    flops = state_flops + intra_flops
-
-    input_elems = (
-        3 * batch * heads * seq_len * dim_k
-        + batch * heads * seq_len * dim_v
-        + 2 * batch * heads * seq_len
-    )
-    output_elems = batch * heads * seq_len * dim_v + batch * heads * dim_k * dim_v
-    nbytes = (input_elems + output_elems) * elem_bytes
-    return int(flops), int(nbytes)
-
-
 def _linear_attention_decode_dims(data: dict[str, Any]) -> tuple[int, int, int, int]:
     if "q_shape" in data:
         batch, heads, dim_k = data["q_shape"]
@@ -293,15 +217,28 @@ def deltanet_decode_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int,
     return int(flops), int(nbytes * elem_bytes)
 
 
-def gated_deltanet_decode_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
-    """Roofline for single-step Gated DeltaNet recurrence decode."""
+def gated_deltanet_fwd_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
+    """Algorithmic lower bound for dense Gated DeltaNet inference."""
     data = _shape_or_attrs(op, kwargs)
-    batch, heads, dim_k, dim_v = _linear_attention_decode_dims(data)
+    batch, seq_len, heads, dim_k = data["q_shape"]
+    _batch, _seq_len, value_heads, dim_v = data["v_shape"]
     elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
 
-    flops = 2 * batch * heads * (3 * dim_k * dim_v + dim_k)
-    nbytes = batch * heads * (2 * dim_k + 2 * dim_v + 2 + 2 * dim_k * dim_v)
-    return int(flops), int(nbytes * elem_bytes)
+    # Per recurrent head and token: two state matvecs and one state
+    # outer-product update (six FLOPs per state element), plus the elementwise
+    # state decay (one multiply per state element).
+    flops = batch * seq_len * value_heads * (7 * dim_k * dim_v)
+
+    qk = 2 * batch * seq_len * heads * dim_k
+    token_values = 2 * batch * seq_len * value_heads * dim_v  # v input and o output
+    gates = 2 * batch * seq_len * value_heads
+    cu_shape = data.get("cu_seqlens_shape")
+    state_batch = cu_shape[0] - 1 if cu_shape is not None else batch
+    state = state_batch * value_heads * dim_v * dim_k
+    seeded = data.get("initial_state") is not None or data.get("initial_state_shape") is not None
+    nbytes = (qk + token_values + gates) * elem_bytes
+    nbytes += state * 4 * (2 if seeded else 1)
+    return int(flops), int(nbytes)
 
 
 def gla_decode_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
@@ -376,24 +313,6 @@ def deltanet_bwd_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, in
     per_token = (3 * dim_k + 3 * dim_v + 1 + 2 * chunk) + (2 * dim_k + dim_v + 1)
     state = batch * heads * (seq_len // chunk + 1) * dim_k * dim_v
     nbytes = batch * heads * seq_len * per_token * elem_bytes + state * 4
-    return int(flops), int(nbytes)
-
-
-def gated_deltanet_bwd_roofline(op: Any | None = None, **kwargs: Any) -> tuple[int, int]:
-    """Roofline for the Gated DeltaNet backward, head-major.
-
-    The gate adds one tensor in and one gradient out over the ungated backward. The
-    per-chunk state the forward saved is read in the input dtype.
-    """
-    data = _shape_or_attrs(op, kwargs)
-    batch, heads, seq_len, dim_k, dim_v = _chunkwise_dims_bhsd(data)
-    chunk = int(data.get("chunk_size", 64))
-    elem_bytes = _dtype_itemsize(data.get("dtype", data.get("dtypes", "float16")))
-
-    flops = 4 * batch * heads * seq_len * dim_k * dim_v
-    tokens = batch * heads * seq_len
-    state = batch * heads * (seq_len // chunk + 1) * dim_k * dim_v
-    nbytes = (tokens * (4 * dim_k + 3 * dim_v + 4) + state) * elem_bytes
     return int(flops), int(nbytes)
 
 
@@ -834,12 +753,26 @@ def _binary_broadcast_roofline(
     return flops, nbytes
 
 
+def _alpha_scaled_flops_per_elem(op: "Op") -> int:
+    """1 for the default ``alpha``, 2 when the scale multiply is real.
+
+    ``torch.add``/``torch.sub`` compute ``input + alpha * other``. At
+    ``alpha == 1`` the kernel emits no multiply and roofline.md §1.3 prices one
+    basic arithmetic op at 1; any other ``alpha`` adds it.
+    """
+    return 1 if op.alpha == 1 else 2
+
+
 def add_fwd_roofline(op: "Op") -> tuple[int, int]:
-    return _binary_broadcast_roofline(op, flops_per_elem=2, bool_output=False)
+    return _binary_broadcast_roofline(
+        op, flops_per_elem=_alpha_scaled_flops_per_elem(op), bool_output=False
+    )
 
 
 def sub_fwd_roofline(op: "Op") -> tuple[int, int]:
-    return _binary_broadcast_roofline(op, flops_per_elem=2, bool_output=False)
+    return _binary_broadcast_roofline(
+        op, flops_per_elem=_alpha_scaled_flops_per_elem(op), bool_output=False
+    )
 
 
 def mul_fwd_roofline(op: "Op") -> tuple[int, int]:
@@ -942,25 +875,74 @@ def fused_topk_roofline(op: "Op") -> tuple[int, int]:
 
 
 def fused_moe_fwd_bytes(op: "Op") -> tuple[int, int]:
-    """Roofline for FusedMoeFwdOp.
+    """Roofline for FusedMoeFwdOp using the last call's active experts.
 
-    Func-mode: byte traffic mixes float32 gating (and the float32 correction
-    bias, when the call passes one) with hidden-states / weights at
-    ``op.dtype``, so a single ``elem_bytes`` cannot express the total.
+    Gating and correction bias are float32; hidden states and weights use
+    ``op.dtype``. Experts with no routed rows contribute no weight traffic.
     """
     num_tokens = int(op.num_tokens)
     num_experts = int(op.num_experts)
+    flops, nbytes = _routed_expert_core(op)
+    gating_bytes = num_tokens * num_experts * 4  # float32 logits
+    bias_bytes = num_experts * 4 if _supplied(op, "correction_bias") else 0
+    return flops, nbytes + gating_bytes + bias_bytes
+
+
+def _routed_expert_core(op: "Op") -> tuple[int, int]:
+    """FLOPs and the weight-plus-token bytes shared by every routed expert MLP.
+
+    An expert no route selects contributes no weight traffic, so the weight term
+    follows the call's ``topk_ids`` rather than ``num_experts``. What each op adds
+    on top is the routing it reads: gating logits where it selects the experts
+    itself, the ids and weights where they arrive ready-made.
+    """
+    topk_ids = getattr(op, "_roofline_topk_ids", None)
+    if topk_ids is None:
+        raise RuntimeError(
+            f"{type(op).__name__}.eval_roofline() requires a prior forward() "
+            "to determine the active experts"
+        )
+    num_tokens = int(op.num_tokens)
     top_k = int(op.top_k)
     hidden_size = int(op.hidden_size)
     ffn_size = int(op.ffn_size)
     elem_bytes = _dtype_itemsize(op.dtype)
+    active_experts = int(topk_ids.unique().numel())
 
     flops = num_tokens * top_k * 6 * ffn_size * hidden_size
-    weight_bytes = num_experts * 3 * ffn_size * hidden_size * elem_bytes
+    weight_bytes = active_experts * 3 * ffn_size * hidden_size * elem_bytes
     token_bytes = 2 * num_tokens * hidden_size * elem_bytes
-    gating_bytes = num_tokens * num_experts * 4  # float32 logits
-    bias_bytes = num_experts * 4 if _supplied(op, "correction_bias") else 0
-    return flops, weight_bytes + token_bytes + gating_bytes + bias_bytes
+    return flops, weight_bytes + token_bytes
+
+
+def routed_expert_mlp_roofline(op: "Op") -> tuple[int, int]:
+    """Roofline for the expert MLP ops, which are handed their routing.
+
+    ``topk_ids`` is int32 and ``topk_weights`` float32, four bytes each per route.
+    """
+    flops, nbytes = _routed_expert_core(op)
+    return flops, nbytes + int(op.num_tokens) * int(op.top_k) * (4 + 4)
+
+
+def fused_moe_shared_expert_fwd_bytes(op: "Op") -> tuple[int, int]:
+    """Roofline for FusedMoeSharedExpertFwdOp: the routed cost plus the shared expert's two GEMMs.
+
+    The shared expert runs on this rank's shard only, so TP shrinks that half
+    and leaves the routed half untouched. With no shared expert configured the
+    result is the routed cost alone.
+    """
+    flops, nbytes = fused_moe_fwd_bytes(op)
+    shard_ffn = getattr(op, "_shared_mlp_shard_ffn", None)
+    if shard_ffn is None:
+        return flops, nbytes
+    elem_bytes = _dtype_itemsize(op.dtype)
+    weights = 3 * int(shard_ffn) * int(op.hidden_size)
+    tokens = int(op.num_tokens)
+    flops += 2 * tokens * weights
+    # Its own read of the hidden states, and the write of ``shared_output``: the op
+    # returns that half separately, so it is an output of its own.
+    nbytes += (weights + 2 * tokens * int(op.hidden_size)) * elem_bytes
+    return flops, nbytes
 
 
 def gemm_fwd_roofline(op: "Op") -> tuple[int, int]:
@@ -1042,6 +1024,50 @@ def grouped_gemm_roofline(op: "Op") -> tuple[int, int]:
         memory_c = batch_count * n * k
         memory_b = k * batch_sum if bool(op.transpose_b) else batch_sum * k
     return int(flops), int((memory_a + memory_b + memory_c) * elem)
+
+
+def _staged_moe_input_shapes(op: "Op") -> tuple:
+    if getattr(op, "input_shapes", None) is None or getattr(op, "dtype", None) is None:
+        raise RuntimeError(f"{type(op).__name__}.eval_roofline requires a prior forward call")
+    return tuple(op.input_shapes)
+
+
+def _staged_moe_rows(a_shape: tuple) -> int:
+    # Contiguous layouts hand over [M, K], masked ones [E, max_m, K].
+    rows = 1
+    for dim in a_shape[:-1]:
+        rows *= int(dim)
+    return rows
+
+
+def moe_grouped_gemm_roofline(op: "Op") -> tuple[int, int]:
+    # Imported here: this module is a leaf the op layer imports, not the other way round.
+    from tileops.ops._output_dtype import output_dtype
+
+    a_shape, b_shape, meta_shape = _staged_moe_input_shapes(op)
+    rows = _staged_moe_rows(a_shape)
+    num_experts, n, k = (int(dim) for dim in b_shape)
+    elem = op.dtype.itemsize
+    # The output width is the op's, not the operands': out_dtype may keep fp32,
+    # and a fused gated activation writes act(gate) * up, half of N.
+    out_elem = output_dtype(op, "output", op.dtype).itemsize
+    n_out = n // 2 if op.activation is not None else n
+    flops = 2 * rows * n * k
+    nbytes = (rows * k + num_experts * n * k) * elem + rows * n_out * out_elem
+    nbytes += int(meta_shape[0]) * 4
+    return int(flops), int(nbytes)
+
+
+def moe_expert_mlp_roofline(op: "Op") -> tuple[int, int]:
+    x_shape, gate_shape, down_shape, meta_shape = _staged_moe_input_shapes(op)
+    rows = _staged_moe_rows(x_shape)
+    num_experts, two_ffn, hidden = (int(dim) for dim in gate_shape)
+    ffn = int(down_shape[2])
+    elem = op.dtype.itemsize
+    flops = rows * (2 * two_ffn * hidden + 6 * ffn + 2 * hidden * ffn)
+    weights = num_experts * two_ffn * hidden + num_experts * hidden * ffn
+    nbytes = (2 * rows * hidden + weights) * elem + int(meta_shape[0]) * 4
+    return int(flops), int(nbytes)
 
 
 def rope_roofline(op: "Op") -> tuple[int, int]:
@@ -1285,7 +1311,7 @@ def bmm_fwd_roofline(op: "Op") -> tuple[int, int]:
 
 
 def bmm_fp8_fwd_roofline(op: "Op") -> tuple[int, int]:
-    """Roofline for batched FP8 GEMM ``BmmFp8KNFwdOp``.
+    """Roofline for batched FP8 GEMM ``BmmFp8FwdOp``.
 
     Layout matches the fp16 ``bmm_fwd_roofline``: ``a``: $[B \\times M \\times K]$,
     ``b``: $[B \\times K \\times N]$. Per-tensor scales only and no fused bias, so bytes are
@@ -1296,7 +1322,7 @@ def bmm_fp8_fwd_roofline(op: "Op") -> tuple[int, int]:
     """
     if getattr(op, "m", None) is None or getattr(op, "dtype", None) is None:
         raise RuntimeError(
-            "BmmFp8KNFwdOp.eval_roofline() is valid only after the first forward(); "
+            "BmmFp8FwdOp.eval_roofline() is valid only after the first forward(); "
             "batch/m/n/k and dtype are inferred from the inputs."
         )
     batch, m, n, k = op.batch, op.m, op.n, op.k

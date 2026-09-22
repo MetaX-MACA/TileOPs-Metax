@@ -17,6 +17,11 @@ __all__ = [
     "ATTENTION_DTYPES",
     "WS_ARCH",
     "AttentionCall",
+    "dense_decode_region",
+    "dense_long_context_decode_region",
+    "dense_fp8_decode_region",
+    "dense_sliding_window_region",
+    "dense_ws_region",
     "decode_bs1_region",
     "dense_prefill_region",
     "fp8_dtype",
@@ -28,7 +33,6 @@ __all__ = [
 ATTENTION_DTYPES = (torch.float16, torch.bfloat16)
 
 _WS_BLOCK_M = 128
-_H200_SMS = 132
 # Architecture the warp-specialized prefill kernels are written for. The
 # classes declare it as their ``supported_archs`` and the region below reads
 # the same name, so the two statements of one fact cannot drift apart.
@@ -71,8 +75,8 @@ class AttentionCall(CallSpec):
     fuse_rope: bool = False
     max_position: Optional[int] = None
     rotary_dim: Optional[int] = None
+    rope_layout: str = "neox"
     accum_dtype: torch.dtype = torch.float32
-    tune: bool = False
 
 
 def uses_sliding_window(call: AttentionCall) -> bool:
@@ -119,7 +123,10 @@ def square_ws_prefill_region(call: AttentionCall) -> bool:
         return False
     groups = call.heads // call.heads_kv
     work_items = call.batch * call.heads_kv * (m_blocks // 2) * groups
-    return work_items >= _H200_SMS
+    # A persistent kernel earns its prologue once the work fills the grid, so the
+    # bar is the device's own SM count rather than the number the board this was
+    # fitted on happens to report.
+    return work_items >= call.sm_count
 
 
 # Tile heights the warp-specialized paged decode kernel can pick from. A tile
@@ -157,8 +164,52 @@ def paged_decode_ws_region(call: AttentionCall) -> bool:
     )
 
 
+def dense_decode_region(call: AttentionCall) -> bool:
+    """The contiguous decode region: one query position, no window, not FP8."""
+    return not call.is_fp8 and call.max_seqlen_q == 1 and not uses_sliding_window(call)
+
+
+def dense_long_context_decode_region(call: AttentionCall) -> bool:
+    """The one decode shape the long-context split serves."""
+    return (
+        dense_decode_region(call)
+        and not call.fuse_rope
+        and call.seqlen_kv >= 1024
+        and call.batch == 1
+        and call.heads == 32
+        and call.heads_kv == 4
+        and call.dim == 128
+        and call.dtype == torch.float16
+        and call.softcap == 0.0
+    )
+
+
+def dense_fp8_decode_region(call: AttentionCall) -> bool:
+    """The FP8 decode region: batch 1, one query position, a long cache."""
+    return (
+        call.is_fp8
+        and call.batch == 1
+        and call.max_seqlen_q == 1
+        and call.seqlen_kv >= 2048
+        and call.heads_kv > 0
+        and call.heads // call.heads_kv <= 16
+        and not uses_sliding_window(call)
+        and not call.fuse_rope
+    )
+
+
+def dense_sliding_window_region(call: AttentionCall) -> bool:
+    """The contiguous windowed region, which FP8 has its own implementation for."""
+    return not call.is_fp8 and uses_sliding_window(call)
+
+
+def dense_ws_region(call: AttentionCall) -> bool:
+    """The contiguous prefill region: more than one query position, no window."""
+    return not call.is_fp8 and call.max_seqlen_q != 1 and not uses_sliding_window(call)
+
+
 def decode_bs1_region(call: AttentionCall) -> bool:
-    """The Hopper batch-1 decode region, shared by contiguous and paged decode.
+    """The SM90 batch-1 decode region, shared by contiguous and paged decode.
 
     Owned by the batch-1 kernels; the general decode kernels behind them exclude
     exactly this region, and the paged batch-1 kernel narrows it further with a

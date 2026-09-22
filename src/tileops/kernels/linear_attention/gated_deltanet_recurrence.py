@@ -17,6 +17,11 @@ Optimization:
   - K-tiling: small shared memory footprint → high occupancy
 """
 
+# FIXME(staged-rollout): decode kernels are retained without a public Op path.
+#
+# Broken invariant: exported kernels have no in-tree Op, test, or benchmark owner.
+# Cleanup: remove this marker when decode dispatch and coverage migrate to that Op.
+
 import functools
 from typing import Optional, Tuple
 
@@ -243,51 +248,6 @@ def _gated_deltanet_decode_tl(
     return _decode_func
 
 
-@torch.library.custom_op("tileops::gated_deltanet_decode_kernel", mutates_args=())
-def _gated_deltanet_decode_wrapped_kernel(
-    batch: int,
-    head: int,
-    dim_k: int,
-    dim_v: int,
-    k_tile: int,
-    dtype: str,
-    num_stages: int,
-    threads: int,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    state: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    kernel_fn = _gated_deltanet_decode_tl(batch, head, dim_k, dim_v, k_tile, dtype)(
-        num_stages, threads
-    )
-    return kernel_fn(q, k, v, g, beta, state)
-
-
-@_gated_deltanet_decode_wrapped_kernel.register_fake
-def _gated_deltanet_decode_wrapped_kernel_fake(
-    batch: int,
-    head: int,
-    dim_k: int,
-    dim_v: int,
-    k_tile: int,
-    dtype: str,
-    num_stages: int,
-    threads: int,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    state: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    o = torch.empty(batch, head, dim_v, dtype=q.dtype, device=q.device)
-    new_state = torch.empty(batch, head, dim_k, dim_v, dtype=q.dtype, device=q.device)
-    return o, new_state
-
-
 class GatedDeltaNetDecodeKernel(Kernel):
     """Gated DeltaNet single-step decode kernel.
 
@@ -324,9 +284,7 @@ class GatedDeltaNetDecodeKernel(Kernel):
         else:
             self.init_config(config, tune=False)
 
-        # Cache the JIT-compiled kernel to avoid re-creation overhead
-        # on every forward call (_gated_deltanet_decode_wrapped_kernel
-        # is kept for torch.compile compatibility).
+        # Cache the JIT-compiled kernel to avoid re-creation overhead on every call.
         self._kernel_fn = _gated_deltanet_decode_tl(
             batch,
             head,
@@ -406,7 +364,7 @@ class GatedDeltaNetDecodeKernel(Kernel):
 
 
 class GatedDeltaNetDecodeRawCudaFlaStyleKernel(Kernel):
-    """Hopper bfloat16 decode kernel for the DK=DV=128 Gated DeltaNet case.
+    """SM90 bfloat16 decode kernel for the DK=DV=128 Gated DeltaNet case.
 
     This path maps one warp to one (batch, head, V tile).  Two lanes cooperate
     on one output value when v_tile=16: each lane owns half of the K dimension,
@@ -414,7 +372,7 @@ class GatedDeltaNetDecodeRawCudaFlaStyleKernel(Kernel):
     stays live in fp32 registers.  The implementation is intentionally narrow:
     it is used only for bfloat16 DK=DV=128 decode on sm90 devices.
 
-    Unlike the sibling decode kernels, this Hopper-specialized path enables
+    Unlike the sibling decode kernels, this SM90-specialized path enables
     --use_fast_math as an explicit speed/precision trade-off for the narrow
     single-step decode workload.
     """

@@ -7,7 +7,7 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from tileops.kernels.kernel_base import Kernel
+from tileops.kernels.kernel_base import Entry, Kernel
 
 from ._common import CONV_SWIZZLE_PANEL, _launch, conv_autotune_configs
 from .call_spec import Conv1dCall, conv1d_dense_region, conv1d_group_region, conv1d_pointwise_region
@@ -17,11 +17,6 @@ __all__ = [
     "Conv1dPointwiseKernel",
     "GroupConv1dKernel",
 ]
-
-
-def _group_conv1d_block_m_choices(c_out_g: int) -> list[int]:
-    del c_out_g
-    return [16, 32, 64, 128]
 
 
 @functools.lru_cache(maxsize=64)
@@ -475,6 +470,13 @@ class Conv1dPointwiseKernel(Kernel):
     def applies(cls, call: Conv1dCall) -> bool:
         return conv1d_pointwise_region(call)
 
+    @classmethod
+    def entry_for(cls, call: Conv1dCall) -> Entry:
+        index = call.device.index if call.device is not None else None
+        args = dict(n=call.n, c_in=call.c_in, l_in=call.l_in, c_out=call.c_out, dtype=call.dtype)
+        identity = (*args.values(), call.has_bias, call.tune, index)
+        return identity, lambda: cls(**args, has_bias=call.has_bias, tune=call.tune)
+
     def __init__(
         self,
         n: int,
@@ -537,6 +539,23 @@ class Conv1dKernel(Kernel):
     @classmethod
     def applies(cls, call: Conv1dCall) -> bool:
         return conv1d_dense_region(call)
+
+    @classmethod
+    def entry_for(cls, call: Conv1dCall) -> Entry:
+        index = call.device.index if call.device is not None else None
+        args = dict(
+            n=call.n,
+            c_in=call.c_in,
+            l_in=call.l_in,
+            c_out=call.c_out,
+            dtype=call.dtype,
+            kernel_l=call.kernel_l,
+            stride_l=call.stride_l,
+            pad_l=(call.pad_left, call.pad_right),
+            dilation_l=call.dilation_l,
+        )
+        identity = (*args.values(), call.has_bias, call.tune, index)
+        return identity, lambda: cls(**args, has_bias=call.has_bias, tune=call.tune)
 
     def __init__(
         self,
@@ -634,9 +653,34 @@ class Conv1dKernel(Kernel):
 class GroupConv1dKernel(Kernel):
     supported_archs: list[int] = [80, 86, 89, 90]
 
+    @staticmethod
+    def _group_conv1d_block_m_choices(c_out_g: int) -> list[int]:
+        del c_out_g
+        return [16, 32, 64, 128]
+
     @classmethod
     def applies(cls, call: Conv1dCall) -> bool:
         return conv1d_group_region(call)
+
+    @classmethod
+    def entry_for(cls, call: Conv1dCall) -> Entry:
+        index = call.device.index if call.device is not None else None
+        args = dict(
+            n=call.n,
+            c_in=call.c_in,
+            l_in=call.l_in,
+            c_out=call.c_out,
+            dtype=call.dtype,
+            kernel_l=call.kernel_l,
+            stride_l=call.stride_l,
+            pad_l=(call.pad_left, call.pad_right),
+            dilation_l=call.dilation_l,
+            groups=call.groups,
+            c_in_g=call.c_in_g,
+            c_out_g=call.c_out // call.groups,
+        )
+        identity = (*args.values(), call.has_bias, call.tune, index)
+        return identity, lambda: cls(**args, has_bias=call.has_bias, tune=call.tune)
 
     def __init__(
         self,
@@ -731,7 +775,7 @@ class GroupConv1dKernel(Kernel):
     def _block_m_choices(self) -> list[int]:
         if self.use_direct:
             return [1]
-        return _group_conv1d_block_m_choices(self.c_out_g)
+        return GroupConv1dKernel._group_conv1d_block_m_choices(self.c_out_g)
 
     @property
     def default_config(self) -> dict:

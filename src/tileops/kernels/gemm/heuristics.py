@@ -41,11 +41,15 @@ import math
 from dataclasses import dataclass
 from typing import Optional
 
+from tileops.utils import is_h200_name
+
 __all__ = [
     "SWAP_AB_MPAD",
     "best_config",
+    "fp8_ws_config",
     "gemv_config",
     "small_batch_config",
+    "small_m_splitk_config",
     "swap_ab_grid_underfills",
 ]
 
@@ -54,10 +58,13 @@ _MAX_ACCUM_REGS = 200
 
 TINY_M_BLOCK_N = 128
 
+# Shortest K slice the FP8 split-K path pays for.
+_FP8_MIN_SLICE_K_TILES = 12
+
 _SWAP_AB_BLOCK_NN = 64
 SWAP_AB_MPAD = 8
 
-_NS_CAP = {"basic": 4, "splitk": 4, "coop2": 6, "coop2_splitk": 4}
+_NS_CAP = {"basic": 4, "splitk": 4, "coop2": 4, "coop2_splitk": 4}
 
 
 @dataclass(frozen=True)
@@ -94,7 +101,9 @@ _CALIBRATIONS = {
         tensor_core_tflops=(
             ("basic", 420.0),
             ("coop2", 525.0),
+            ("coop2s", 600.0),
             ("coop2_splitk", 525.0),
+            ("simple", 500.0),
             ("splitk", 420.0),
         ),
     ),
@@ -116,8 +125,20 @@ class _Cand:
     split_k: int = 1
     stage_n: int = 0
     panel_size: int = 16
+    cluster_m: int = 1
 
     def to_config(self) -> dict:
+        if self.structure == "simple":
+            return {
+                "simple": True,
+                "block_m": self.block_m,
+                "block_n": self.block_n,
+                "block_k": self.block_k,
+                "num_stages": self.num_stages,
+                "threads": 128,
+                "panel_size": self.panel_size,
+                "cluster_m": self.cluster_m,
+            }
         if self.structure == "coop2":
             return {
                 "coop2": True,
@@ -126,6 +147,13 @@ class _Cand:
                 "num_stages": self.num_stages,
                 "group_size_m": 16,
                 "stage_n": self.stage_n,
+            }
+        if self.structure == "coop2s":
+            return {
+                "coop2s": True,
+                "block_n": self.block_n,
+                "block_k": self.block_k,
+                "num_stages": self.num_stages,
             }
         if self.structure == "coop2_splitk":
             return {
@@ -161,8 +189,8 @@ def _ns_basic(bm: int, bn: int, bk: int) -> int:
 
 
 def _coop2_ns_sn(bn: int, bk: int):
-    """Deepest ring the SMEM budget allows; shrink the epilogue staging
-    chunk (stage_n) when that buys another pipeline stage."""
+    """Deepest ring under ``_NS_CAP`` the SMEM budget allows; shrink the epilogue
+    staging chunk (stage_n) when that buys another pipeline stage."""
     ring = (128 + bn) * bk * 2
     best = None
     for sn in (bn, bn // 2, bn // 4):
@@ -204,7 +232,37 @@ def _enumerate(m: int, n: int, k: int, trans_a: bool, trans_b: bool, sm_count: i
                     if k_iters % sk == 0 and k_iters // sk >= 4:
                         out.append(_Cand("splitk", bm, bn, bk, ns, split_k=sk, panel_size=ps))
 
+    nn_tiles = (m // 128) * (n // 64)
+    if (
+        not trans_a
+        and not trans_b
+        and m % 128 == 0
+        and n % 64 == 0
+        and k % 64 == 0
+        and nn_tiles <= 2 * sm_count
+        and 6 <= k // 64 <= 32
+    ):
+        out.append(_Cand("coop2s", 128, 64, 64, 6))
+
     if nt:
+        if m <= 128 and m % 64 == 0 and k % 128 == 0:
+            cluster_m = m // 64
+            for bn in (64, 128, 192, 256):
+                if n % bn:
+                    continue
+                ns = _ns_basic(64, bn, 128)
+                if ns >= 3:
+                    out.append(
+                        _Cand(
+                            "simple",
+                            64,
+                            bn,
+                            128,
+                            ns,
+                            panel_size=0 if cluster_m > 1 else 8,
+                            cluster_m=cluster_m,
+                        )
+                    )
         for bn in (64, 128, 192, 256):
             for bk in (32, 64, 128):
                 d = _coop2_ns_sn(bn, bk)
@@ -259,8 +317,7 @@ def swap_ab_grid_underfills(n: int, sm_count: int) -> bool:
     The measured n boundary where the operand-swapped grid loses its width
     advantage, written once for its two consumers: ``_swap_ab_stages`` returns
     None below it (the tiny-m band falls to split-K or the plain tile), and
-    ``SmallBatchGemmKernel.applies`` claims exactly this underfilled band at
-    ``m == 2`` — that handoff has no gap and no overlap. Retune the two
+    ``GemvKernel.band_for`` claims exactly this underfilled band at ``m == 2`` — that handoff has no gap and no overlap. Retune the two
     together.
     """
     return -(-n // _SWAP_AB_BLOCK_NN) * 8 < sm_count * 3
@@ -354,7 +411,7 @@ def _best_config_cached(
 def best_config(
     m: int, n: int, k: int, trans_a: bool, trans_b: bool, sm_count: int, device_name: str
 ) -> Optional[dict]:
-    """Return the analytically selected ``GemmKernel`` config for a shape.
+    """Return the analytically selected ``GemmTmaKernel`` config for a shape.
 
     Args:
         m: Logical GEMM rows of the output.
@@ -369,7 +426,7 @@ def best_config(
     Returns:
         ``None`` when no profile carries this board's ranking constants, so the
         caller takes its own default rather than a ranking measured elsewhere.
-        Otherwise a config dict in ``GemmKernel`` schema — either the single-consumer
+        Otherwise a config dict in ``GemmTmaKernel`` schema — either the single-consumer
         form (``block_m/block_n/block_k/num_stages/panel_size/split_k``,
         optionally ``simple``) or a structure-flagged form (``coop2`` /
         ``coop2_splitk``). A fresh dict per call: the selection itself is
@@ -384,7 +441,7 @@ def best_config(
 
 
 def gemv_config(k: int) -> dict:
-    """SM90 ``GemvKernel`` config band (single-row / single-column GEMV).
+    """SM90 ``GemvKernel`` config rule for its one-row bands (single-row / single-column GEMV).
 
     GEMV is HBM-bandwidth bound; the lever is memory-level parallelism per
     output row via ``reduce_threads > 32`` (cross-warp SMEM tree reduction,
@@ -409,7 +466,7 @@ def gemv_config(k: int) -> dict:
 
 
 def small_batch_config(n: int, k: int, sm_count: int) -> dict:
-    """``SmallBatchGemmKernel`` (m == 2 NT band) config rule.
+    """``GemvKernel`` config rule for its ``lhs_rows`` band (m == 2 NT).
 
     Modal best across the dispatched band: one output column per block, a
     64-lane reduction over K, 4-deep cp.async ring. One exception: when the
@@ -423,3 +480,91 @@ def small_batch_config(n: int, k: int, sm_count: int) -> dict:
     if n >= 28 * sm_count and k_iters >= 12:
         cfg["num_stages"] = 2
     return cfg
+
+
+def small_m_splitk_config(
+    m: int, n: int, k: int, sm_count: int, device_name: str
+) -> Optional[dict]:
+    """Select the H200 split-K basic GEMM band for a 32-row NT call."""
+    block_k = 128
+    k_tiles = k // block_k
+    if not is_h200_name(device_name) or m != 32 or k % block_k or n % 8 or k_tiles < 48:
+        return None
+    block_ns = [block_n for block_n in range(8, 129, 8) if n % block_n == 0]
+    target_n_tiles = max(1, sm_count // 2)
+    block_n = min(block_ns, key=lambda value: abs(n // value - target_n_tiles))
+    n_tiles = n // block_n
+    split_ks = [
+        split_k for split_k in (2, 4) if k_tiles % split_k == 0 and k_tiles // split_k >= 12
+    ]
+    if not split_ks:
+        return None
+    split_k = min(split_ks, key=lambda value: abs(n_tiles * value - 2 * sm_count))
+    return {
+        "block_m": m,
+        "block_n": block_n,
+        "block_k": block_k,
+        "num_stages": 2,
+        "threads": 128,
+        "split_k": split_k,
+    }
+
+
+def _fp8_ws_stages(m: int, block_n: int, block_scaled: bool) -> int:
+    """Deepest ring the SMEM budget allows for one warp-specialized FP8 tile.
+
+    A stage holds two 64-row ``A`` halves, one ``block_n`` ``B`` tile, and the
+    block128 scale vectors when staged. The epilogue's two staging tiles are
+    live alongside the ring, and exist only for ``m`` over one consumer's half.
+    """
+    per_stage = (2 * 64 + block_n) * 128 + (block_scaled * (128 + block_n) * 4)
+    epilogue = 2 * 64 * block_n * 2 if m > 64 else 0
+    return (_SMEM_BUDGET - epilogue) // per_stage
+
+
+def fp8_ws_config(m: int, n: int, k: int, sm_count: int, block_scaled: bool) -> dict:
+    """Tile, ring depth and K split for the warp-specialized FP8 GEMM.
+
+    ``block_m`` is fixed at 128 by the two-consumer split, so the tile freedom
+    is ``block_n``, over ``{64, 128}``. 256 spills: its accumulator and scaled
+    partial together want 256 registers per thread.
+
+    - ``block_n``: 128, except where that grid does not fill one wave, which
+      leaves SMs idle for the whole launch. The narrow tile doubles the grid,
+      and the re-read of ``A`` it costs stays in L2. At ``m <= 8`` the ``A``
+      tile is mostly padding and the ``B`` re-read decides instead, so the wide
+      tile wins even under a short grid.
+    - ring depth: the deepest the budget allows, except in block128, where a
+      K-step ends in a promotion the next WGMMA cannot start under. There the
+      ring covers nothing beyond the fill, and 4 stages is enough — 3 over a
+      long K axis, 5 over a short one or a weight stream.
+    - split-K: only where the sliced grid still fits one wave and every slice
+      keeps enough K-tiles to amortize the fill and the fp32 workspace.
+    """
+    block_n = 128 if m <= 8 or -(-m // 128) * -(-n // 128) >= sm_count else 64
+    k_iters = -(-k // 128)
+    deepest = _fp8_ws_stages(m, block_n, block_scaled)
+    if not block_scaled or m <= 8:
+        num_stages = deepest
+    elif block_n == 64 or k_iters <= 12:
+        num_stages = min(5, deepest)
+    elif k_iters >= 128:
+        num_stages = 3
+    else:
+        num_stages = 4
+    tiles = -(-m // 128) * -(-n // block_n)
+    split_k = 1
+    for candidate in (4, 2):
+        if (
+            tiles * candidate <= sm_count
+            and k_iters % candidate == 0
+            and k_iters // candidate >= _FP8_MIN_SLICE_K_TILES
+        ):
+            split_k = candidate
+            break
+    return {
+        "block_n": block_n,
+        "num_stages": num_stages,
+        "group_size_m": 8,
+        "split_k": split_k,
+    }

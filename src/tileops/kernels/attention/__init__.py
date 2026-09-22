@@ -1,4 +1,4 @@
-from .deepseek_dsa_decode import SparseMlaKernel, SparseMlaMACAKernel
+from .deepseek_dsa_decode import SparseMlaBasicKernel, SparseMlaKernel, SparseMlaMACAKernel
 from .deepseek_mla_decode import MLADecodeMacaKernel, MLADecodeWsKernel
 from .deepseek_nsa_cmp_fwd import NSACmpFwdVarlenKernel
 from .deepseek_nsa_fwd import NSAFwdVarlenKernel
@@ -11,13 +11,14 @@ from .gqa_bwd_maca import (
     FlashAttnBwdPostprocessMACAKernel,
     GQABwdMACAKernel,
 )
-from .gqa_decode import GQADecodeKernel
+from .gqa_decode import GQADecodeKernel, GQADecodeLongContextKernel
 from .gqa_decode_bs1 import GQADecodeBs1Kernel
 from .gqa_decode_bs1_paged import GQADecodePagedBs1Kernel
+from .gqa_decode_fp8 import GQADenseFP8DecodeKernel
 from .gqa_decode_paged import GQADecodePagedKernel
 from .gqa_dense import (
-    GQADenseCausalWsKernel,
     GQADenseSlidingWindowKernel,
+    GQADenseWsKernel,
 )
 from .gqa_fwd import (
     GQAFwdWgmmaPipelinedKernel,
@@ -27,7 +28,7 @@ from .gqa_fwd import (
     GQAPrefillPagedWithKVCacheRopeAppendKernel,
     GQAPrefillPagedWithKVCacheRopeFwdKernel,
 )
-from .gqa_fwd_fp8 import GQAFwdFP8Fa3ContractPtxAccBN224WsTmaVKernel
+from .gqa_fwd_fp8 import GQADenseFP8Kernel
 from .gqa_fwd_ws import GQAFwdWsPersistentCausalKernel, GQAFwdWsPersistentKernel
 from .gqa_prefill_varlen_fwd import GQAPrefillVarlenFwdKernel
 from .gqa_sliding_window_varlen_fwd import (
@@ -44,11 +45,13 @@ __all__ = [
     "GQABwdWgmmaPipelinedKernel",
     "GQADecodeBs1Kernel",
     "GQADecodeKernel",
+    "GQADecodeLongContextKernel",
     "GQADecodePagedBs1Kernel",
     "GQADecodePagedKernel",
-    "GQADenseCausalWsKernel",
+    "GQADenseFP8DecodeKernel",
+    "GQADenseWsKernel",
     "GQADenseSlidingWindowKernel",
-    "GQAFwdFP8Fa3ContractPtxAccBN224WsTmaVKernel",
+    "GQADenseFP8Kernel",
     "GQAFwdWgmmaPipelinedKernel",
     "GQAFwdWsPersistentCausalKernel",
     "GQAFwdWsPersistentKernel",
@@ -67,6 +70,7 @@ __all__ = [
     "NSACmpFwdVarlenKernel",
     "NSAFwdVarlenKernel",
     "NSATopkVarlenKernel",
+    "SparseMlaBasicKernel",
     "SparseMlaKernel",
     "SparseMlaMACAKernel",
 ]

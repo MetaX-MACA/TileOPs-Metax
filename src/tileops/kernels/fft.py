@@ -87,7 +87,7 @@ def _fft_c2c_kernel(n: int, batch_size: int = 1, dtype: str = "complex64") -> Ca
         # remaining stages (stride >= smem_per_block) use the LUT
         lut_stage_start = smem_stages
         lut_stage_count = log2n - smem_stages
-        # float32 for complex64 (FP32 throughput far exceeds FP64 on Hopper);
+        # float32 for complex64 (FP32 throughput far exceeds FP64 on SM90);
         # float64 for complex128 — identical behaviour, no regression.
         accum_dtype = real_dtype
 
@@ -624,8 +624,7 @@ def _fft_c2c_kernel(n: int, batch_size: int = 1, dtype: str = "complex64") -> Ca
     return _fft_lut_func
 
 
-@torch.library.custom_op("tileops::fft_c2c_wrapped_kernel", mutates_args=())
-def _fft_c2c_wrapped_kernel(
+def _fft_c2c_run(
     n: int,
     batch_size: int,
     dtype: str,
@@ -642,7 +641,6 @@ def _fft_c2c_wrapped_kernel(
     return y_pair
 
 
-@_fft_c2c_wrapped_kernel.register_fake
 def _(
     n: int,
     batch_size: int,
@@ -746,7 +744,7 @@ class FFTC2CKernel(Kernel):
         Returns:
             Interleaved FFT output with shape (batch_size, n, 2).
         """
-        return _fft_c2c_wrapped_kernel(
+        return _fft_c2c_run(
             self.n,
             self.batch_size,
             self.dtype_str,
