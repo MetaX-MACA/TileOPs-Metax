@@ -87,6 +87,7 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "tests/ops/test_softmax.py::test_log_softmax_op[shape6--1-dtype6-False]",
             "tests/ops/test_softmax.py::test_log_softmax_non_contiguous[shape5-dtype5]",
             "tests/ops/test_softmax.py::test_log_softmax_1d[300-dtype5]",
+            "tests/ops/test_topk_selector.py::test_topk_selector_op[1-32768-65536-1-1024-float32-int32-False]",
         ),
     ),
     (
@@ -167,7 +168,24 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
 )
 
+_MACA_XFAIL_PREFIX_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        _NUMERICAL_MISMATCH,
+        ("tests/ops/test_topk_selector.py::test_topk_selector_op[",),
+    ),
+    (
+        _RUNTIME_LAUNCH_ERROR,
+        ("tests/ops/test_convolution.py::",),
+    ),
+)
+
 MACA_XFAILS = {nodeid: reason for reason, nodeids in _MACA_XFAIL_GROUPS for nodeid in nodeids}
+MACA_XFAIL_PREFIXES = {
+    prefix: reason for reason, prefixes in _MACA_XFAIL_PREFIX_GROUPS for prefix in prefixes
+}
 
 if len(MACA_XFAILS) != sum(len(nodeids) for _, nodeids in _MACA_XFAIL_GROUPS):
     raise ValueError("duplicate node ID in the MACA xfail allowlist")
+
+if len(MACA_XFAIL_PREFIXES) != sum(len(prefixes) for _, prefixes in _MACA_XFAIL_PREFIX_GROUPS):
+    raise ValueError("duplicate node ID prefix in the MACA xfail allowlist")

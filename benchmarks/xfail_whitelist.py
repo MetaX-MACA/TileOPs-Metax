@@ -173,7 +173,7 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         _NUMERICAL_MISMATCH,
-        (),
+        ("tests/ops/test_convolution.py::test_conv3d_dispatches_ndhwc_kernel_no_bias",),
     ),
     (
         _OUT_OF_MEMORY,

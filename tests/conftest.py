@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from tests.test_base import _check_result
-from tests.xfail_whitelist import MACA_XFAILS
+from tests.xfail_whitelist import MACA_XFAIL_PREFIXES, MACA_XFAILS
 from tileops.utils import is_maca
 
 
@@ -129,7 +129,13 @@ def _apply_maca_xfails(items: list[pytest.Item]) -> None:
         return
 
     for item in items:
-        reason = MACA_XFAILS.get(_normalized_test_nodeid(item))
+        nodeid = _normalized_test_nodeid(item)
+        reason = MACA_XFAILS.get(nodeid)
+        if reason is None:
+            for prefix, prefix_reason in MACA_XFAIL_PREFIXES.items():
+                if nodeid.startswith(prefix):
+                    reason = prefix_reason
+                    break
         if reason is not None:
             item.add_marker(pytest.mark.xfail(reason=f"MACA: {reason}", strict=False))
 

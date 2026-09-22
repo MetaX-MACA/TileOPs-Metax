@@ -12,9 +12,10 @@ import tilelang
 import tilelang.language as T
 import torch
 
+from tileops.kernels.gemm.dense import swap_ab_grid_underfills
 from tileops.kernels.kernel_base import Kernel
 
-__all__ = ["GemmMACAKernel"]
+__all__ = ["GemmMACAKernel", "GemvMACAKernel", "SmallBatchGemmMACAKernel"]
 
 _DEFAULT_CONFIG = {
     "block_m": 64,
@@ -189,7 +190,19 @@ class GemmMACAKernel(Kernel):
 
     @property
     def default_config(self) -> dict:
-        return dict(_DEFAULT_CONFIG)
+        config = dict(_DEFAULT_CONFIG)
+
+        if self.m <= 32:
+            config["block_n"] = 32
+            config["num_stages"] = 2
+        elif self.m <= 64:
+            config["block_n"] = 64
+        elif self.m <= 128:
+            config["block_n"] = 32
+            if not self.trans_a and self.trans_b and self.k > self.n:
+                config["block_k"] = 128
+
+        return config
 
     @property
     def autotune_configs(self) -> list[dict]:
@@ -205,4 +218,189 @@ class GemmMACAKernel(Kernel):
             cfg["block_k"],
             cfg["num_stages"],
             cfg["threads"],
+        )(a, b)
+
+
+@functools.lru_cache(maxsize=32)
+def _small_batch_gemm_kernel_maca(
+    m: int,
+    n: int,
+    k: int,
+    dtype: str = "float16",
+) -> Callable:
+    """Bandwidth-oriented MACA kernel for one- and two-row NT GEMMs.
+
+    A 64-thread reduction group computes one output column. Reduction is
+    performed explicitly in shared memory because the SM90 thread-allreduce
+    path is not valid on MACA.
+    """
+    accum_dtype = "float32"
+    vector_width = 8
+
+    @tilelang.jit(
+        out_idx=[-1],
+        pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
+        compile_flags=["-O3", "-DENABLE_BF16"],
+    )
+    def _small_batch_func(
+        block_n: int = 4,
+        reduce_threads: int = 64,
+        num_stages: int = 2,
+    ) -> Callable:
+        block_k = reduce_threads * vector_width
+        is_aligned = n % block_n == 0 and k % block_k == 0
+
+        @T.prim_func
+        def _small_batch_main(
+            a: T.Tensor((m, k), dtype),  # type: ignore
+            b: T.Tensor((n, k), dtype),  # type: ignore
+            c: T.Tensor((m, n), dtype),  # type: ignore
+        ) -> None:
+            with T.Kernel(
+                T.ceildiv(n, block_n),
+                threads=(reduce_threads, block_n),
+            ) as bn:
+                tk = T.get_thread_binding(0)
+                tn = T.get_thread_binding(1)
+
+                b_shared = T.alloc_shared((block_n, block_k), dtype)
+                reduce_shared = T.alloc_shared((block_n, reduce_threads), accum_dtype)
+                a_local = T.alloc_local((m, vector_width), dtype)
+                c_accum = T.alloc_local((m,), accum_dtype)
+                c_reduced = T.alloc_local((1,), accum_dtype)
+
+                T.clear(c_accum)
+
+                for bk in T.Pipelined(T.ceildiv(k, block_k), num_stages=num_stages):
+                    if is_aligned:
+                        T.copy(
+                            b[bn * block_n, bk * block_k],
+                            b_shared,
+                            disable_tma=True,
+                        )
+                    else:
+                        for ni, ki in T.Parallel(block_n, block_k):
+                            b_shared[ni, ki] = T.if_then_else(
+                                (bn * block_n + ni < n) & (bk * block_k + ki < k),
+                                b[bn * block_n + ni, bk * block_k + ki],
+                                T.cast(0, dtype),
+                            )
+
+                    for mi in T.serial(m):
+                        for ki in T.vectorized(vector_width):
+                            offset = bk * block_k + tk * vector_width + ki
+                            a_local[mi, ki] = T.if_then_else(
+                                offset < k,
+                                a[mi, offset],
+                                T.cast(0, dtype),
+                            )
+
+                    for mi in T.serial(m):
+                        for ki in T.serial(vector_width):
+                            c_accum[mi] += a_local[mi, ki].astype(accum_dtype) * b_shared[
+                                tn, tk * vector_width + ki
+                            ].astype(accum_dtype)
+
+                for mi in T.serial(m):
+                    reduce_shared[tn, tk] = c_accum[mi]
+                    T.sync_threads()
+
+                    if tk == 0:
+                        c_reduced[0] = T.cast(0, accum_dtype)
+                        for rk in T.serial(reduce_threads):
+                            c_reduced[0] += reduce_shared[tn, rk]
+
+                        if bn * block_n + tn < n:
+                            c[mi, bn * block_n + tn] = c_reduced[0]
+
+                    T.sync_threads()
+
+        return _small_batch_main
+
+    return _small_batch_func
+
+
+class GemvMACAKernel(Kernel):
+    """MACA specialization for one-row NT GEMMs."""
+
+    supported_archs: list[int] = [80, 86, 89, 90]
+
+    @classmethod
+    def applies(cls, call) -> bool:
+        return call.gemv_mode is not None
+
+    def __init__(
+        self,
+        n: int,
+        k: int,
+        dtype: torch.dtype,
+        config: Optional[dict] = None,
+        tune: bool = False,
+    ) -> None:
+        super().__init__()
+        self.n = n
+        self.k = k
+        self.dtype = dtype
+        self.kernel = _small_batch_gemm_kernel_maca(1, n, k, self.dtype_str)
+        self.init_config(config, tune)
+
+    @property
+    def default_config(self) -> dict:
+        return {"block_n": 4, "reduce_threads": 64, "num_stages": 2}
+
+    @property
+    def autotune_configs(self) -> list[dict]:
+        return [self.default_config]
+
+    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        cfg = self.config
+        return self.kernel(
+            cfg["block_n"],
+            cfg["reduce_threads"],
+            cfg["num_stages"],
+        )(a.reshape(1, -1).contiguous(), b).reshape(self.n)
+
+
+class SmallBatchGemmMACAKernel(Kernel):
+    """MACA specialization for two-row NT GEMMs."""
+
+    supported_archs: list[int] = [80, 86, 89, 90]
+
+    @classmethod
+    def applies(cls, call) -> bool:
+        if call.trans_a or not call.trans_b or call.m != 2:
+            return False
+        return swap_ab_grid_underfills(call.n, call.sm_count)
+
+    def __init__(
+        self,
+        m: int,
+        n: int,
+        k: int,
+        dtype: torch.dtype,
+        config: Optional[dict] = None,
+        tune: bool = False,
+    ) -> None:
+        super().__init__()
+        self.m = m
+        self.n = n
+        self.k = k
+        self.dtype = dtype
+        self.kernel = _small_batch_gemm_kernel_maca(m, n, k, self.dtype_str)
+        self.init_config(config, tune)
+
+    @property
+    def default_config(self) -> dict:
+        return {"block_n": 4, "reduce_threads": 64, "num_stages": 2}
+
+    @property
+    def autotune_configs(self) -> list[dict]:
+        return [self.default_config]
+
+    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        cfg = self.config
+        return self.kernel(
+            cfg["block_n"],
+            cfg["reduce_threads"],
+            cfg["num_stages"],
         )(a, b)

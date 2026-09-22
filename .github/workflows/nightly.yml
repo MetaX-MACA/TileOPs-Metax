@@ -311,6 +311,7 @@ jobs:
         continue-on-error: true
 
       - name: Build the perf history window
+        id: perf_history_source
         if: ${{ always() }}
         uses: actions/github-script@v7
         with:
