@@ -56,15 +56,15 @@ GemmFwdOp:
     func: "tileops.perf.formulas.gemm_fwd_roofline"
 
   source:
-    kernel: tileops/kernels/gemm/dense.py
+    kernel: tileops/kernels/gemm_maca.py
     op: tileops/ops/gemm/gemm.py
     test: tests/ops/test_gemm.py
     bench: benchmarks/ops/bench_gemm.py
     bench_manifest_driven: true
     kernel_map:
-      gemm_kernel: GemmKernel
-      gemv_kernel: GemvKernel
-      small_batch_kernel: SmallBatchGemmKernel
+      gemm_kernel: GemmMACAKernel
+      gemv_kernel: GemvMACAKernel
+      small_batch_kernel: SmallBatchGemmMACAKernel
 
 GemmFp8FwdOp:
   ref_api: "torch._scaled_mm"
