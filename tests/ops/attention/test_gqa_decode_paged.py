@@ -7,9 +7,12 @@ import torch
 import torch.nn.functional as F
 
 from tests.test_base import FixtureBase, TestBase
-from tileops.kernels.attention.gqa_decode_paged import GQADecodePagedKernel
+from tileops.kernels.attention.gqa_decode_paged import (
+    GQADecodePagedKernel,
+    GQADecodePagedMACAKernel,
+)
 from tileops.ops import GroupedQueryAttentionDecodePagedWithKVCacheFwdOp
-from tileops.utils import is_hopper
+from tileops.utils import is_hopper, is_maca
 from workloads.attention.gqa import (
     GroupedQueryAttentionDecodePagedWorkload,
 )
@@ -225,7 +228,8 @@ def test_gqa_decode_paged_bs1_fixed_tier_correctness(
             "ctx" if real_seqlen_kv_value >= 1024 else "no_split"
         )
     else:
-        assert isinstance(kernel, GQADecodePagedKernel)
+        expected_type = GQADecodePagedMACAKernel if is_maca() else GQADecodePagedKernel
+        assert isinstance(kernel, expected_type)
     test.check(
         op,
         q,
@@ -250,7 +254,8 @@ def test_gqa_decode_paged_bs1_dispatch() -> None:
         assert kernel._ctx_splits_for(2048) == 16
         assert kernel._ctx_splits_for(3072) == 8
     else:
-        assert isinstance(kernel, GQADecodePagedKernel)
+        expected_type = GQADecodePagedMACAKernel if is_maca() else GQADecodePagedKernel
+        assert isinstance(kernel, expected_type)
 
 
 @pytest.mark.smoke
@@ -277,4 +282,5 @@ def test_gqa_decode_paged_bs1_dispatch_fallbacks(
     op = GroupedQueryAttentionDecodePagedWithKVCacheFwdOp(
         batch, 32, 4, seqlen_kv, dim, page_size, softcap=softcap
     )
-    assert op._get_kernel((), dtype).__class__.__name__ == "GQADecodePagedKernel"
+    expected_name = "GQADecodePagedMACAKernel" if is_maca() else "GQADecodePagedKernel"
+    assert op._get_kernel((), dtype).__class__.__name__ == expected_name

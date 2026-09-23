@@ -11,6 +11,7 @@ from tileops.kernels.attention import (
     GQABwdWgmmaPipelinedKernel,
     GQADecodePagedBs1Kernel,
     GQADecodePagedKernel,
+    GQADecodePagedMACAKernel,
     GQADenseCausalWsKernel,
     GQADenseSlidingWindowKernel,
     GQAPrefillPagedWithFP8KVCacheFwdKernel,
@@ -2011,7 +2012,9 @@ class GroupedQueryAttentionDecodePagedWithKVCacheFwdOp(Op):
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
         return {
-            "gqa_decode_paged_kernel": GQADecodePagedKernel,
+            "gqa_decode_paged_kernel": (
+                GQADecodePagedMACAKernel if is_maca() else GQADecodePagedKernel
+            ),
             "gqa_decode_paged_bs1_kernel": GQADecodePagedBs1Kernel,
         }
 
