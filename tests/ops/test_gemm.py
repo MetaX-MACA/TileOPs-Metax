@@ -631,14 +631,10 @@ def test_gemv_boundary_rhs_col(n: int, k: int, dtype: torch.dtype, tune: bool) -
 
 @pytest.mark.smoke
 def test_small_batch_dispatch() -> None:
-    """small_batch dispatches only at m == 2, on the n band swap_ab leaves it.
+    """MACA dispatches every two-row NT GEMM to its small-batch kernel.
 
-    One case per clause of ``SmallBatchGemmKernel.applies``: m == 1 stays on
-    gemv, m >= 3 and non-NT stay on the generic kernel (whose small-m band
-    picks swap_ab / split-K / simple configs analytically), and so does any n
-    wide enough for the operand-swapped grid. Dispatch only — ``_get_kernel``
-    constructs kernel objects without triggering a JIT compile (that happens on
-    first forward), so this stays smoke-fast.
+    Other supported devices retain the existing swapped-grid underfill policy.
+    Non-NT GEMMs and GEMMs with m != 2 keep their existing dispatch behavior.
     """
     from tileops.utils import get_sm_version, is_maca
 
@@ -646,8 +642,11 @@ def test_small_batch_dispatch() -> None:
         pytest.skip("small_batch kernel-mode is only available on SM90 and MACA")
 
     op = GemmFwdOp(trans_a=False, trans_b=True)
+    # MACA specializes every two-row NT GEMM. Other supported devices
+    # retain the swapped-grid underfill policy of SmallBatchGemmKernel.
     assert op._get_kernel((), 2, 2112, 7168, torch.float16)[0] == "small_batch"
-    assert op._get_kernel((), 2, 7168, 2048, torch.float16)[0] == "gemm"
+    wide_n_key = "small_batch" if is_maca() else "gemm"
+    assert op._get_kernel((), 2, 7168, 2048, torch.float16)[0] == wide_n_key
     assert op._get_kernel((), 3, 2112, 7168, torch.float16)[0] == "gemm"
     assert op._get_kernel((), 1, 2112, 7168, torch.float16)[0] == "lhs_row"
     op_nn = GemmFwdOp(trans_a=False, trans_b=False)
