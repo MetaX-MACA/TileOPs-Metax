@@ -12,7 +12,6 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from tileops.kernels.gemm.dense import swap_ab_grid_underfills
 from tileops.kernels.kernel_base import Kernel
 
 __all__ = ["GemmMACAKernel", "GemvMACAKernel", "SmallBatchGemmMACAKernel"]
@@ -345,9 +344,7 @@ class SmallBatchGemmMACAKernel(Kernel):
 
     @classmethod
     def applies(cls, call) -> bool:
-        if call.trans_a or not call.trans_b or call.m != 2:
-            return False
-        return swap_ab_grid_underfills(call.n, call.sm_count)
+        return not call.trans_a and call.trans_b and call.m == 2
 
     def __init__(
         self,
