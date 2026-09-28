@@ -18,6 +18,7 @@ from tileops.kernels.attention import (
     GQAPrefillPagedWithKVCacheFwdKernel,
     GQAPrefillPagedWithKVCacheRopeFwdKernel,
     GQAPrefillVarlenFwdKernel,
+    GQAPrefillVarlenFwdMACAKernel,
     GQASlidingWindowVarlenFwdWgmmaPipelinedKernel,
 )
 from tileops.kernels.kernel_base import Kernel
@@ -1212,7 +1213,11 @@ class GroupedQueryAttentionPrefillVarlenFwdOp(Op):
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
-        return {"gqa_prefill_varlen_fwd_kernel": GQAPrefillVarlenFwdKernel}
+        return {
+            "gqa_prefill_varlen_fwd_kernel": (
+                GQAPrefillVarlenFwdMACAKernel if is_maca() else GQAPrefillVarlenFwdKernel
+            )
+        }
 
     @staticmethod
     def _lengths_from_cu_seqlens(cu_seqlens: torch.Tensor) -> list[int]:
