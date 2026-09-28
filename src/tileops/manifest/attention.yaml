@@ -549,9 +549,9 @@ GroupedQueryAttentionPrefillVarlenFwdOp:
     func: "tileops.perf.formulas.gqa_prefill_varlen_fwd_roofline"
 
   source:
-    kernel: tileops/kernels/attention/gqa_fwd.py
+    kernel: tileops/kernels/attention/gqa_prefill_varlen_fwd.py
     kernel_map:
-      gqa_prefill_varlen_fwd_kernel: GQAPrefillVarlenFwdKernel
+      gqa_prefill_varlen_fwd_kernel: GQAPrefillVarlenFwdMACAKernel
     op: tileops/ops/attention/gqa.py
     test: tests/ops/attention/test_gqa.py
     bench: benchmarks/ops/attention/bench_gqa.py
