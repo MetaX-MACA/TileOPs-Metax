@@ -405,10 +405,10 @@ class GQASlidingWindowVarlenFwdWgmmaPipelinedKernel(_GQASlidingWindowVarlenFwdKe
     def default_config(self) -> dict:
         if is_maca():
             return {
-                "block_m": 64,
+                "block_m": 128,
                 "block_n": 64 if self.dim <= 64 else 32,
                 "num_stages": 1,
-                "threads": 128,
+                "threads": 256,
             }
         return {
             "block_m": 128,
