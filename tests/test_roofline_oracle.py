@@ -73,6 +73,7 @@ class TestBytesOracle:
         op.input_shape = a_shape
         op.other_shape = b_shape  # out_shape derives via _infer_output_shapes
         op.dtype = torch.bfloat16
+        op.alpha = 1  # add/sub price the scale multiply from it
         oracle = _nbytes(
             (a_shape, torch.bfloat16),
             (b_shape, torch.bfloat16),
@@ -170,39 +171,156 @@ class TestBytesOracle:
         )
         assert op.eval_roofline()[1] == oracle
 
-    def test_fused_moe_counts_the_bias_the_call_passed(self):
+    def test_fused_moe_counts_active_experts_and_bias(self):
         from tileops.ops.moe.fused_moe import FusedMoeFwdOp
 
-        tokens, experts, top_k, hidden, ffn = 4096, 64, 8, 4096, 1408
+        tokens, experts, top_k, hidden, ffn = 2, 8, 2, 64, 32
         for has_bias in (True, False):
             op = FusedMoeFwdOp.__new__(FusedMoeFwdOp)
             op.num_tokens, op.num_experts, op.top_k = tokens, experts, top_k
             op.hidden_size, op.ffn_size = hidden, ffn
             op.dtype = torch.bfloat16
             op.correction_bias_shape = (experts,) if has_bias else None
+            # Only experts 0, 3 and 7 receive rows.
+            op._roofline_topk_ids = torch.tensor([[0, 3], [3, 7]], dtype=torch.int32)
             oracle = _nbytes(
                 ((tokens, hidden), torch.bfloat16),  # hidden states in
-                ((experts, 2 * ffn, hidden), torch.bfloat16),  # w_gate_up
-                ((experts, hidden, ffn), torch.bfloat16),  # w_down
+                ((3, 2 * ffn, hidden), torch.bfloat16),  # active w_gate_up
+                ((3, hidden, ffn), torch.bfloat16),  # active w_down
                 ((tokens, experts), torch.float32),  # gating logits
                 ((tokens, hidden), torch.bfloat16),  # output
                 *((((experts,), torch.float32),) if has_bias else ()),
             )
             assert op.eval_roofline()[1] == oracle, f"has_bias={has_bias}"
 
+        del op._roofline_topk_ids
+        with pytest.raises(RuntimeError, match="requires a prior forward"):
+            op.eval_roofline()
 
-# Classification registry: every implemented op appears in exactly one of
-# AUDITED (has a bytes-oracle case above), EXEMPT (traffic depends on tensor
-# content; audited by the NCU script instead, roofline.md §4.5), or PENDING.
+    def test_routed_expert_mlp_counts_active_experts_and_the_routing(self):
+        from tileops.moe import IndexedExpertMLPFwdOp
+
+        tokens, experts, top_k, hidden, ffn = 2, 8, 2, 64, 32
+        op = IndexedExpertMLPFwdOp.__new__(IndexedExpertMLPFwdOp)
+        op.num_tokens, op.num_experts, op.top_k = tokens, experts, top_k
+        op.hidden_size, op.ffn_size = hidden, ffn
+        op.dtype = torch.bfloat16
+        # Only experts 0, 3 and 7 receive rows.
+        op._roofline_topk_ids = torch.tensor([[0, 3], [3, 7]], dtype=torch.int32)
+        oracle = _nbytes(
+            ((tokens, hidden), torch.bfloat16),  # hidden states in
+            ((3, 2 * ffn, hidden), torch.bfloat16),  # active w_gate_up
+            ((3, hidden, ffn), torch.bfloat16),  # active w_down
+            ((tokens, top_k), torch.int32),  # topk_ids
+            ((tokens, top_k), torch.float32),  # topk_weights
+            ((tokens, hidden), torch.bfloat16),  # output
+        )
+        assert op.eval_roofline()[1] == oracle
+
+        del op._roofline_topk_ids
+        with pytest.raises(RuntimeError, match="requires a prior forward"):
+            op.eval_roofline()
+
+    def test_fused_moe_experts_counts_active_experts_and_the_routing(self):
+        from tileops.moe import FusedMoEExpertsFwdOp
+
+        tokens, experts, top_k, hidden, ffn = 2, 8, 2, 64, 32
+        op = FusedMoEExpertsFwdOp.__new__(FusedMoEExpertsFwdOp)
+        op.num_tokens, op.num_experts, op.top_k = tokens, experts, top_k
+        op.hidden_size, op.ffn_size = hidden, ffn
+        op.dtype = torch.bfloat16
+        # Only experts 0, 3 and 7 receive rows.
+        op._roofline_topk_ids = torch.tensor([[0, 3], [3, 7]], dtype=torch.int32)
+        oracle = _nbytes(
+            ((tokens, hidden), torch.bfloat16),  # hidden states in
+            ((3, 2 * ffn, hidden), torch.bfloat16),  # active w_gate_up
+            ((3, hidden, ffn), torch.bfloat16),  # active w_down
+            ((tokens, top_k), torch.int32),  # topk_ids
+            ((tokens, top_k), torch.float32),  # topk_weights
+            ((tokens, hidden), torch.bfloat16),  # output
+        )
+        assert op.eval_roofline()[1] == oracle
+
+    def test_shared_expert_adds_its_shard_to_the_routed_cost(self):
+        from tileops.moe import FusedMoeSharedExpertFwdOp
+
+        tokens, experts, top_k, hidden, ffn = 2, 8, 2, 64, 32
+        shard_ffn = 16
+        op = FusedMoeSharedExpertFwdOp.__new__(FusedMoeSharedExpertFwdOp)
+        op.num_tokens, op.num_experts, op.top_k = tokens, experts, top_k
+        op.hidden_size, op.ffn_size = hidden, ffn
+        op.dtype = torch.bfloat16
+        op.correction_bias_shape = None
+        op._roofline_topk_ids = torch.tensor([[0, 3], [3, 7]], dtype=torch.int32)
+        routed = _nbytes(
+            ((tokens, hidden), torch.bfloat16),  # hidden states in
+            ((3, 2 * ffn, hidden), torch.bfloat16),  # active w_gate_up
+            ((3, hidden, ffn), torch.bfloat16),  # active w_down
+            ((tokens, experts), torch.float32),  # gating logits
+            ((tokens, hidden), torch.bfloat16),  # output
+        )
+        op._shared_mlp_shard_ffn = None
+        assert op.eval_roofline()[1] == routed
+
+        op._shared_mlp_shard_ffn = shard_ffn
+        shared = _nbytes(
+            ((3 * shard_ffn, hidden), torch.bfloat16),  # this rank's shared weights
+            ((tokens, hidden), torch.bfloat16),  # its own read of the hidden states
+            ((tokens, hidden), torch.bfloat16),  # shared_output, returned separately
+        )
+        assert op.eval_roofline()[1] == routed + shared
+
+    def test_gqa_dense_counts_qkv_output_and_the_optional_inputs(self):
+        from tileops.ops.attention.gqa import GroupedQueryAttentionDenseFwdOp
+
+        batch, seq_len_q, seq_len_kv, heads, heads_kv, dim = 1, 256, 1792, 8, 2, 128
+        q_shape = (batch, seq_len_q, heads, dim)
+        kv_shape = (batch, seq_len_kv, heads_kv, dim)
+        scales = (((batch, heads_kv), torch.float32),) * 3
+        tables = (((seq_len_kv, dim // 4), torch.float16),) * 2
+        # (q/k/v dtype, output dtype, the optional tensors the call passed)
+        calls = {
+            "16-bit": (torch.float16, torch.float16, ()),
+            "fused RoPE": (torch.float16, torch.float16, tables),
+            "FP8": (torch.float8_e4m3fn, torch.float16, scales),
+        }
+        for label, (dtype, out_dtype, optional) in calls.items():
+            op = GroupedQueryAttentionDenseFwdOp.__new__(GroupedQueryAttentionDenseFwdOp)
+            op._roofline_kwargs = {
+                "q_shape": q_shape,
+                "k_shape": kv_shape,
+                "is_causal": True,
+                "dtype": dtype,
+                "out_dtype": out_dtype,
+                "optional_shapes": optional,
+            }
+            oracle = _nbytes(
+                (q_shape, dtype),
+                (kv_shape, dtype),
+                (kv_shape, dtype),
+                (q_shape, out_dtype),
+                *optional,
+            )
+            assert op.eval_roofline()[1] == oracle, label
+
+
+# Classification registry: every implemented op appears in AUDITED (has a
+# bytes-oracle case above) or PENDING. There is no exemption: an op whose
+# traffic depends on tensor content is recounted the same way, with the case
+# constructing the selecting tensor itself, exactly as it constructs shapes.
 # Adding an op to the manifest forces a choice here.
 AUDITED = frozenset(
     {
         "AddFwdOp",
         "ArgmaxFwdOp",
         "Conv2dFwdOp",
+        "FusedMoEExpertsFwdOp",
         "FusedMoeFwdOp",
+        "FusedMoeSharedExpertFwdOp",
         "GemmFp8FwdOp",
         "GemmW4A16FwdOp",
+        "GroupedQueryAttentionDenseFwdOp",
+        "IndexedExpertMLPFwdOp",
         "MoePostPermuteFwdOp",
         "MoePrePermuteFwdOp",
         "RMSNormFwdOp",
@@ -210,12 +328,9 @@ AUDITED = frozenset(
     }
 )
 
-# op name -> why the shape-level oracle cannot count its traffic
-EXEMPT: dict[str, str] = {}
-
 # FIXME(staged-rollout): most implemented ops lack a bytes-oracle case.
 #
-# Broken invariant: every implemented op is AUDITED or EXEMPT.
+# Broken invariant: every implemented op is AUDITED.
 # Why: the oracle landed with the SOL metric; cases are added family by
 #   family, highest formula complexity first.
 # Cleanup: PENDING is empty; delete it and this marker.
@@ -242,8 +357,7 @@ PENDING = frozenset(
         "BitwiseNotFwdOp",
         "BitwiseOrFwdOp",
         "BitwiseXorFwdOp",
-        "BmmFp8KNFwdOp",
-        "BmmFp8NKFwdOp",
+        "BmmFp8FwdOp",
         "BmmFwdOp",
         "CBProducerFwdOp",
         "CeilFwdOp",
@@ -278,18 +392,10 @@ PENDING = frozenset(
         "FloorFwdOp",
         "FusedAddLayerNormFwdOp",
         "FusedAddRMSNormFwdOp",
-        "FusedMoEExpertsNopadPersistent3WGFwdOp",
         "FusedTopKOp",
         "GLABwdOp",
         "GLADecodeFwdOp",
         "GLAFwdOp",
-        "GatedDeltaNetAutogradOp",
-        "GatedDeltaNetBHTDFwdOp",
-        "GatedDeltaNetBTHDFwdOp",
-        "GatedDeltaNetBwdOp",
-        "GatedDeltaNetDecodeFwdOp",
-        "GatedDeltaNetPrefillBHTDFwdOp",
-        "GatedDeltaNetPrefillBTHDFwdOp",
         "GeFwdOp",
         "GeluAndMulFwdOp",
         "GeluFwdOp",
@@ -342,8 +448,8 @@ PENDING = frozenset(
         "MeanPoolingFwdOp",
         "MinimumFwdOp",
         "MishFwdOp",
-        "MoeGateUpFwdOp",
-        "MoeGroupedGemmNopadFwdOp",
+        "MoeExpertMLPFwdOp",
+        "MoeGroupedGemmFwdOp",
         "MoePermuteAlignFwdOp",
         "MulFwdOp",
         "MultiHeadAttentionBwdOp",
@@ -400,12 +506,12 @@ def test_every_implemented_op_is_classified():
     from tileops.manifest import load_manifest
 
     implemented = {name for name, e in load_manifest().items() if e.get("status") == "implemented"}
-    classified = AUDITED | set(EXEMPT) | PENDING
+    classified = AUDITED | PENDING
     assert implemented - classified == set(), (
         f"unclassified implemented ops: {sorted(implemented - classified)}; "
-        "add an oracle case (AUDITED), an EXEMPT reason, or a PENDING entry"
+        "add an oracle case (AUDITED) or a PENDING entry"
     )
     assert classified - implemented == set(), (
         f"stale registry entries: {sorted(classified - implemented)}"
     )
-    assert not (AUDITED & PENDING) and not (AUDITED & set(EXEMPT))
+    assert not (AUDITED & PENDING)

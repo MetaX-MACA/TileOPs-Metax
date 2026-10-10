@@ -360,8 +360,7 @@ def _mha_decode_split_kernel(batch, heads, seqlen_q, seqlen_kv, dim, is_causal, 
 # Custom ops (torch.compile compatible wrappers)
 
 
-@torch.library.custom_op("tileops::mha_decode_no_split_op", mutates_args=())
-def _mha_decode_no_split_op(
+def _mha_decode_no_split_run(
     batch: int,
     heads: int,
     seqlen_q: int,
@@ -383,7 +382,6 @@ def _mha_decode_no_split_op(
     )(Q, K, V, real_seqlen_kv)
 
 
-@_mha_decode_no_split_op.register_fake
 def _(
     batch: int,
     heads: int,
@@ -404,8 +402,7 @@ def _(
     return torch.empty_like(Q)
 
 
-@torch.library.custom_op("tileops::mha_decode_split_op", mutates_args=())
-def _mha_decode_split_op(
+def _mha_decode_split_run(
     batch: int,
     heads: int,
     seqlen_q: int,
@@ -431,7 +428,6 @@ def _mha_decode_split_op(
     )(Q, K, V, real_seqlen_kv, glse, Output_partial, split_length)
 
 
-@_mha_decode_split_op.register_fake
 def _(
     batch: int,
     heads: int,
@@ -580,7 +576,7 @@ class MHADecodeKernel(Kernel):
             # (float16/bfloat16) whose MMA layouts differ in replicate count.
             # Cap to the default thread count which is always safe for the no-split variant.
             no_split_threads = min(threads, self.default_config["threads"])
-            return _mha_decode_no_split_op(
+            return _mha_decode_no_split_run(
                 self.batch,
                 self.heads,
                 self.seqlen_q,
@@ -612,7 +608,7 @@ class MHADecodeKernel(Kernel):
             device=Q.device,
         )
 
-        return _mha_decode_split_op(
+        return _mha_decode_split_run(
             self.batch,
             self.heads,
             self.seqlen_q,

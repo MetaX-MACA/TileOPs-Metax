@@ -143,6 +143,29 @@ class GemmMACAKernel(Kernel):
     # Mirror GemmKernel: general fallback behind specialised roles (e.g. Gemv).
     general = True
 
+    @classmethod
+    def entry_for(cls, call):
+        """Construct the MACA kernel from the dispatch call record."""
+        identity = (
+            call.m,
+            call.n,
+            call.k,
+            call.dtype,
+            call.tune,
+            call.trans_a,
+            call.trans_b,
+            call.device.index if call.device is not None else None,
+        )
+        return identity, lambda: cls(
+            call.m,
+            call.n,
+            call.k,
+            call.dtype,
+            tune=call.tune,
+            trans_a=call.trans_a,
+            trans_b=call.trans_b,
+        )
+
     def __init__(
         self,
         m: int,

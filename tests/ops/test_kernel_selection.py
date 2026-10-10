@@ -8,7 +8,6 @@ from tileops.ops import (
     GroupedQueryAttentionDecodePagedWithKVCacheFwdOp,
     GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp,
 )
-from tileops.ops.attention.selection import PAGED_DECODE_KEYS, PAGED_PREFILL_KEYS
 from tileops.utils import get_sm_version
 
 pytestmark = pytest.mark.skipif(
@@ -21,13 +20,13 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize(
     ("ctor", "dtype", "expected"),
     [
-        pytest.param({}, torch.float16, "gqa_decode_paged_bs1_kernel", id="bs1-fp16"),
-        pytest.param({}, torch.bfloat16, "gqa_decode_paged_kernel", id="bf16-falls-back"),
-        pytest.param({"batch": 2}, torch.float16, "gqa_decode_paged_kernel", id="batched"),
+        pytest.param({}, torch.float16, "GQADecodePagedBs1Kernel", id="bs1-fp16"),
+        pytest.param({}, torch.bfloat16, "GQADecodePagedKernel", id="bf16-falls-back"),
+        pytest.param({"batch": 2}, torch.float16, "GQADecodePagedKernel", id="batched"),
         pytest.param(
             {"page_size": 192, "seqlen_kv": 8064},
             torch.float16,
-            "gqa_decode_paged_kernel",
+            "GQADecodePagedKernel",
             id="page-tile",
         ),
     ],
@@ -44,7 +43,7 @@ def test_paged_decode_dispatch_is_unchanged(ctor: dict, dtype: torch.dtype, expe
     }
     kwargs.update(ctor)
     op = GroupedQueryAttentionDecodePagedWithKVCacheFwdOp(**kwargs)
-    candidate = op.select_kernel_key(PAGED_DECODE_KEYS, op.attention_call(dtype))
+    candidate = op.select_kernel(op.attention_call(dtype)).__name__
     if expected == "gqa_decode_paged_bs1_kernel" and get_sm_version() not in (
         GQADecodePagedBs1Kernel.supported_archs or []
     ):
@@ -56,10 +55,10 @@ def test_paged_decode_dispatch_is_unchanged(ctor: dict, dtype: torch.dtype, expe
 @pytest.mark.parametrize(
     ("ctor", "expected"),
     [
-        pytest.param({}, "gqa_prefill_paged_with_kv_cache_fwd_kernel", id="plain-cache"),
+        pytest.param({}, "GQAPrefillPagedWithKVCacheFwdKernel", id="plain-cache"),
         pytest.param(
             {"fuse_rope": True, "max_position": 4096},
-            "gqa_prefill_paged_with_kv_cache_rope_fwd_kernel",
+            "GQAPrefillPagedWithKVCacheRopeFwdKernel",
             id="fused-rope",
         ),
     ],
@@ -73,10 +72,11 @@ def test_paged_prefill_dispatch_is_unchanged(ctor: dict, expected: str) -> None:
         "max_pages_per_req": 8,
         "page_size": 256,
         "dim": 128,
+        "max_seqlen_q": 512,
     }
     kwargs.update(ctor)
     op = GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp(**kwargs)
-    candidate = op.select_kernel_key(PAGED_PREFILL_KEYS, op.attention_call(torch.float16))
+    candidate = op.select_kernel(op.attention_call(torch.float16)).__name__
     assert candidate == expected
 
 
@@ -92,7 +92,8 @@ def test_paged_prefill_fp8_cache_dispatch_is_unchanged() -> None:
         max_pages_per_req=8,
         page_size=256,
         dim=128,
+        max_seqlen_q=512,
         cache_dtype=torch.float8_e4m3fn,
     )
-    candidate = op.select_kernel_key(PAGED_PREFILL_KEYS, op.attention_call(torch.float16))
-    assert candidate == "gqa_prefill_paged_with_fp8_kv_cache_fwd_kernel"
+    candidate = op.select_kernel(op.attention_call(torch.float16)).__name__
+    assert candidate == "GQAPrefillPagedWithFP8KVCacheFwdKernel"

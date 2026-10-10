@@ -7,7 +7,7 @@ straight from the gating scores (Qwen3 / DeepSeek-V3 style).
 The shared core (`FusedMoe`) wires `FusedTopKOp` (routing),
 `FusedMoEPrepareAndFinalize` (quantization / EP dispatch), and an
 `FusedMoEExpertsModular` implementation (permute + GEMM + unpermute). Shared
-expert handling belongs to `SharedFusedMoE`.
+expert handling belongs to `FusedMoeSharedExpertFwdOp`.
 """
 
 from typing import Dict, Optional
@@ -21,7 +21,7 @@ from tileops.ops.moe.abc import (
 )
 from tileops.ops.moe.fused_topk import FusedTopKOp
 from tileops.ops.moe.prepare_finalize.no_dp_ep import MoEPrepareAndFinalizeNoDPEP
-from tileops.ops.moe.routed_expert import FusedMoEExpertsNopadPersistent3WGFwdOp
+from tileops.ops.moe.routed_expert import FusedMoEExpertsFwdOp
 from tileops.ops.op_base import Op
 from tileops.perf.profile import tensor_core_roof
 
@@ -32,7 +32,7 @@ class FusedMoe(Op):
     """Shared composite implementation for routed MoE FFN ops.
 
     The concrete manifest identity (`FusedMoeFwdOp`) subclasses this; the
-    routing-and-expert pipeline below is shared with `SharedFusedMoE`.
+    routing-and-expert pipeline below is shared with `FusedMoeSharedExpertFwdOp`.
 
     """
 
@@ -126,7 +126,7 @@ class FusedMoe(Op):
             self._experts: FusedMoEExpertsModular = experts
         else:
             self.activation = activation
-            self._experts = FusedMoEExpertsNopadPersistent3WGFwdOp(
+            self._experts = FusedMoEExpertsFwdOp(
                 num_tokens=num_tokens,
                 num_experts=num_experts,
                 top_k=top_k,
@@ -177,6 +177,8 @@ class FusedMoe(Op):
             topk_ids,
             self.num_experts,
         )
+        # Post-prepare ids name the local experts whose weights are read.
+        self._roofline_topk_ids = r.topk_ids
 
         T_prime = r.hidden_q.shape[0]
         ws1_shape, ws2_shape = self._experts.workspace_shapes(

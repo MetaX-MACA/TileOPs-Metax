@@ -3,7 +3,7 @@ from typing import Dict, Optional, Tuple
 import torch
 
 from tileops.kernels.fp8_quant import FP8QuantKernel
-from tileops.kernels.kernel_base import Kernel
+from tileops.kernels.kernel_base import Entry, Kernel
 
 from .op_base import Op
 
@@ -11,6 +11,17 @@ __all__ = ["FP8QuantFwdOp"]
 
 
 class FP8QuantFwdOp(Op):
+    """Quantize each row of an index tensor to ``float8_e4m3fn`` against its own maximum.
+
+    ``scale_tensor`` is the row's absolute maximum, floored at ``1e-4``, over 448, to
+    within one float32 ulp. ``output_tensor`` is the row scaled by the reciprocal of that
+    scale, so for a finite row every element is within one ``float8_e4m3fn`` code of
+    ``clamp(input / scale, -448, 448)`` rather than equal to it.
+
+    Neither output propagates a non-finite input: a row holding an infinity or a NaN is
+    quantized against the maximum of its finite values.
+    """
+
     def __init__(self, kernel_map: Optional[Dict[str, Kernel]] = None, tune: bool = False):
         """Build the op. Shapes and dtype are taken from the first call.
 
@@ -41,14 +52,17 @@ class FP8QuantFwdOp(Op):
         in_dtype: torch.dtype,
         device_index: int | None,
     ) -> Kernel:
-        key = (batch, seq_len_kv, kv_group, index_dim, in_dtype, device_index, self.tune)
-        return self.get_or_build_kernel(
+        return self.kernel_for(
             "fp8_quant_kernel",
             inputs,
-            key=key,
-            build=lambda: self.kernel_map["fp8_quant_kernel"](
-                batch, seq_len_kv, kv_group, index_dim, in_dtype, tune=self.tune
-            ),
+            (batch, seq_len_kv, kv_group, index_dim, in_dtype, device_index, self.tune),
+        )
+
+    def entry_for(self, role: str, call: tuple) -> Entry:
+        """One implementation, built per shape, dtype and device."""
+        batch, seq_len_kv, kv_group, index_dim, in_dtype, _device_index, tune = call
+        return call, lambda: self.kernel_map["fp8_quant_kernel"](
+            batch, seq_len_kv, kv_group, index_dim, in_dtype, tune=tune
         )
 
     def _infer_output_shapes(

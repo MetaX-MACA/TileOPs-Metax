@@ -1,10 +1,10 @@
-"""Warp-specialized batch=1 paged GQA decode kernel (Hopper), context-split.
+"""Warp-specialized batch=1 paged GQA decode kernel (SM90), context-split.
 
 ``GQADecodePagedBs1Kernel`` dispatches on the runtime ``real_seqlen_kv``: lengths >= 1024
 run a context-only warp-specialized split (one TMA producer warp feeding a four-warp
 wgmma consumer warpgroup, exp2-domain online softmax, fp32 partial reduce via a combine
 kernel); shorter lengths fall back to the generic paged non-split decode kernel.
-Logical KV tiles are translated through the page table before TMA. Hopper-only, low-level
+Logical KV tiles are translated through the page table before TMA. SM90-only, low-level
 ``tma_copy`` / ``mbarrier`` / ``wgmma_gemm``.
 """
 
@@ -15,11 +15,13 @@ import tilelang
 import tilelang.language as T
 import torch
 
+from tileops.kernels.attention.call_spec import AttentionCall
 from tileops.kernels.attention.gqa_decode_paged import (
-    _gqa_decode_paged_no_split_op,
+    _gqa_decode_paged_no_split_run,
     gqa_decode_paged_block_n,
+    paged_decode_entry,
 )
-from tileops.kernels.kernel_base import Kernel
+from tileops.kernels.kernel_base import Entry, Kernel
 
 from .call_spec import decode_bs1_region
 from .gqa_decode_bs1_common import (
@@ -118,8 +120,7 @@ def _gqa_decode_paged_bs1_ctx_kernel(
     return _func
 
 
-@torch.library.custom_op("tileops::gqa_decode_paged_bs1_ctx_op", mutates_args=())
-def _gqa_decode_paged_bs1_ctx_op(
+def _gqa_decode_paged_bs1_ctx_run(
     batch: int,
     heads: int,
     groups: int,
@@ -148,7 +149,6 @@ def _gqa_decode_paged_bs1_ctx_op(
     )
 
 
-@_gqa_decode_paged_bs1_ctx_op.register_fake
 def _(
     batch: int,
     heads: int,
@@ -175,7 +175,7 @@ def _(
 
 
 class GQADecodePagedBs1Kernel(GQADecodeBs1KernelMixin, Kernel):
-    """Hopper warp-specialized batch=1 paged GQA decode kernel.
+    """SM90 warp-specialized batch=1 paged GQA decode kernel.
 
     ``forward`` dispatches on the runtime ``real_seqlen_kv``: >= 1024 runs the context-only
     split, shorter lengths run the generic non-split paged GQA decode kernel.
@@ -200,6 +200,10 @@ class GQADecodePagedBs1Kernel(GQADecodeBs1KernelMixin, Kernel):
             return block_n
         return None
 
+    @classmethod
+    def entry_for(cls, call: AttentionCall) -> Entry:
+        return paged_decode_entry(cls, call)
+
     def __init__(
         self,
         batch,
@@ -213,8 +217,9 @@ class GQADecodePagedBs1Kernel(GQADecodeBs1KernelMixin, Kernel):
         softcap: float = 0.0,
         config: Optional[dict] = None,
         tune=False,
+        device_index: Optional[int] = None,
     ):
-        super().__init__()
+        super().__init__(device_index=device_index)
         self.batch = batch
         self.heads = heads
         self.groups = groups
@@ -252,7 +257,7 @@ class GQADecodePagedBs1Kernel(GQADecodeBs1KernelMixin, Kernel):
         c = self.config
         real_max = int(real_seqlen_kv.max().item())
         if real_max < self._MIN_CTX:
-            return _gqa_decode_paged_no_split_op(
+            return _gqa_decode_paged_no_split_run(
                 self.batch,
                 self.heads,
                 self.groups,
@@ -275,7 +280,7 @@ class GQADecodePagedBs1Kernel(GQADecodeBs1KernelMixin, Kernel):
 
         ctx_splits = self._ctx_splits_for(real_max)
         glse, Output_partial = self._allocate_partials(Q, ctx_splits)
-        return _gqa_decode_paged_bs1_ctx_op(
+        return _gqa_decode_paged_bs1_ctx_run(
             self.batch,
             self.heads,
             self.groups,

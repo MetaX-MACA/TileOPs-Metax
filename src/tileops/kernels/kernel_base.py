@@ -1,47 +1,17 @@
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Dict, Optional, Union
+from typing import Any, Callable, Dict, Hashable, Optional, Union
 
 import torch
-from tilelang.autotuner import autotune
 
-__all__ = ["Kernel"]
+__all__ = ["Entry", "Kernel"]
+
+# What ``Op.kernel_for`` stores for one specialization: the identity two
+# builds share to be the same entry, and the thunk that produces it.
+Entry = tuple[Hashable, Callable[[], object]]
 
 # Sentinel for ``tune_jit_kernel(supply_prog=...)``: inherit the whole-kernel
 # supplier. Distinct from ``None``, which means "no supplier".
 _INHERIT_SUPPLY_PROG = object()
-
-
-def _int_tensor_input_names(jit_kernel: Any, seeds: Dict[str, Any]) -> list[str]:
-    """Integer tensor parameters *jit_kernel* takes as inputs, outputs excluded.
-
-    Raises:
-        ValueError: When the parameters cannot be read, which the caller treats
-            as unproven rather than safe.
-    """
-    get_tir = getattr(jit_kernel, "get_tir", None)
-    if not callable(get_tir):
-        raise ValueError(
-            f"{jit_kernel!r} does not expose get_tir, so its parameters cannot be read"
-        )
-    try:
-        prim_func = get_tir(**seeds)
-    except Exception as exc:
-        raise ValueError(f"the parameters of {jit_kernel!r} cannot be read: {exc}") from exc
-
-    out_idx = getattr(jit_kernel, "out_idx", None) or []
-    if isinstance(out_idx, int):
-        out_idx = [out_idx]
-    count = len(prim_func.params)
-    outputs = {i + count if i < 0 else i for i in out_idx}
-
-    names = []
-    for i, param in enumerate(prim_func.params):
-        if i in outputs:
-            continue
-        buffer = prim_func.buffer_map.get(param)
-        if buffer is not None and "int" in str(buffer.dtype):
-            names.append(str(param.name))
-    return names
 
 
 class Kernel(ABC):
@@ -55,6 +25,39 @@ class Kernel(ABC):
         "npt_arg": "num_per_thread",
         "num_per_thread_arg": "num_per_thread",
     }
+
+    @staticmethod
+    def _int_tensor_input_names(jit_kernel: Any, seeds: Dict[str, Any]) -> list[str]:
+        """Integer tensor parameters *jit_kernel* takes as inputs, outputs excluded.
+
+        Raises:
+            ValueError: When the parameters cannot be read, which the caller treats
+                as unproven rather than safe.
+        """
+        get_tir = getattr(jit_kernel, "get_tir", None)
+        if not callable(get_tir):
+            raise ValueError(
+                f"{jit_kernel!r} does not expose get_tir, so its parameters cannot be read"
+            )
+        try:
+            prim_func = get_tir(**seeds)
+        except Exception as exc:
+            raise ValueError(f"the parameters of {jit_kernel!r} cannot be read: {exc}") from exc
+
+        out_idx = getattr(jit_kernel, "out_idx", None) or []
+        if isinstance(out_idx, int):
+            out_idx = [out_idx]
+        count = len(prim_func.params)
+        outputs = {i + count if i < 0 else i for i in out_idx}
+
+        names = []
+        for i, param in enumerate(prim_func.params):
+            if i in outputs:
+                continue
+            buffer = prim_func.buffer_map.get(param)
+            if buffer is not None and "int" in str(buffer.dtype):
+                names.append(str(param.name))
+        return names
 
     def __init__(self, *args, device_index: "int | None" = None, **kwargs) -> None:
         self.device_index = device_index
@@ -80,9 +83,12 @@ class Kernel(ABC):
         """Whether this implementation serves the call *call* describes.
 
         States a region positively — what this class serves, never what a
-        sibling serves. Architecture is not part of it: ``supported_archs``
-        already answers that, and a specialised implementation the device
-        cannot run simply does not apply, leaving the call to the general one.
+        sibling serves.
+
+        ``supported_archs`` says where this class can run, and one the device
+        cannot run does not apply. A class that runs where a sibling supersedes it
+        states that exclusion here instead, since ``supported_archs`` also gates
+        direct construction.
 
         Answered by the class that would run, so a ``kernel_map`` override is
         asked about its own region rather than the region of the class it
@@ -110,6 +116,25 @@ class Kernel(ABC):
         if not cls.applies(call):
             return "does not serve this call"
         return None
+
+    @classmethod
+    def entry_for(cls, call: Any) -> Entry:
+        """How to build this class for *call*, and what makes two builds one entry.
+
+        The identity is the construction arguments, so two calls that would compile
+        the same kernel share an entry and none reuses one compiled for different
+        arguments. The thunk runs only on a cache miss.
+
+        The default is the identity mapping: this class is constructed from the call
+        record itself. A class with a narrower constructor overrides it and states
+        which of the call's facts it is built from.
+
+        The device index is in the identity wherever this class could build a
+        different object on another device, whether it takes one as an argument or
+        reads it while compiling. A class that only validates the architecture it
+        was handed does not put it there.
+        """
+        return call, lambda: cls(call)
 
     def _check_arch(self) -> None:
         """Reject construction on a device this kernel is not built for.
@@ -287,7 +312,7 @@ class Kernel(ABC):
         """
         if self.autotune_accepts_random_int_inputs:
             return
-        names = _int_tensor_input_names(jit_kernel, seeds)
+        names = Kernel._int_tensor_input_names(jit_kernel, seeds)
         if not names:
             return
         raise ValueError(
@@ -362,6 +387,8 @@ class Kernel(ABC):
             autotune_kwargs["supply_prog"] = supply_prog
         else:
             self._refuse_random_int_inputs(jit_kernel, seeds)
+        from tilelang.autotuner import autotune
+
         autotuned_kernel_fn = autotune(**autotune_kwargs)(jit_kernel)
 
         return self._call_autotuned_kernel(autotuned_kernel_fn, jit_kernel, seed_config)

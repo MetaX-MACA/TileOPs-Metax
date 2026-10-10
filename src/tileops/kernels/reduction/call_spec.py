@@ -24,11 +24,11 @@ class LogicalReduceCall(CallSpec):
     op_kind: str = ""
     dtype: torch.dtype = torch.float16
     keepdim: bool = False
+    m: int = 0
     edge_axes: bool = False
     kept: int = 0
     trail_needs_tiling: bool = False
     reduced_count: int = 0
-    tune: bool = False
 
 
 def logical_reduce_region(call: LogicalReduceCall) -> bool:
@@ -48,7 +48,7 @@ def logical_edge_fused_region(call: LogicalReduceCall) -> bool:
 
     if not logical_reduce_region(call):
         return False
-    if not call.h200 or call.tune:
+    if not call.h200:
         return False
     if not call.edge_axes or call.trail_needs_tiling:
         return False

@@ -1,17 +1,13 @@
-"""FusedMoEExperts implementation: nopad + 3WG persistent variant.
-
-Registers no operator of its own: a composite is not the unit of replacement,
-so its graph is its leaves' operators.
-"""
+"""FusedMoEExperts implementation with indexed and tight backends."""
 
 from __future__ import annotations
 
 from typing import Dict, Optional
 
-import torch
 from torch import Tensor
 
 from tileops.kernels.kernel_base import Kernel
+from tileops.perf.formulas import routed_expert_mlp_roofline
 from tileops.perf.profile import tensor_core_roof
 
 from ...op_base import Op
@@ -22,31 +18,23 @@ from ..abc import (
     _validate_fused_moe_experts_dtypes,
 )
 from ..contracts import ContiguousLayoutSpec, RoutingEpilogueSpec
-from ..staged import MoePostPermuteFwdOp, MoePrePermuteFwdOp
-from .gate_up import MoeGateUpFwdOp
-from .moe_grouped_gemm_nopad import MoeGroupedGemmNopadFwdOp
+from ..staged import MoeExpertMLPFwdOp, MoePostPermuteFwdOp, MoePrePermuteFwdOp
+from .indexed_routed_expert import IndexedExpertMLPFwdOp
 
-__all__ = ["FusedMoEExpertsNopadPersistent3WGFwdOp"]
+__all__ = ["FusedMoEExpertsFwdOp"]
 
 
-class FusedMoEExpertsNopadPersistent3WGFwdOp(FusedMoEExpertsModular):
-    """Expert GEMM using tight (T*K rows, no-pad) layout with 3WG persistent kernel.
-
-    The local pipeline uses staged PrePermute/PostPermute boundaries around the
-    existing GateUp and down-GEMM stages.
+class FusedMoEExpertsFwdOp(FusedMoEExpertsModular):
+    """Expert MLP with indexed small-route and tight grouped backends.
 
     forward() output shape is (T, H): reduction is done internally by the
     PostPermute/Unpermute stage, so make_weighted_reduce() returns
     WeightedReduceNoOp.
-
-    Example:
-        ```python linenums="1"
-        experts = FusedMoEExpertsNopadPersistent3WGFwdOp(
-            num_tokens=512, num_experts=128, top_k=8,
-            hidden_size=7168, ffn_size=2048,
-        )
-        ```
     """
+
+    # The tight path is what an instance runs until __init__ selects otherwise,
+    # so contract checks that read the op without constructing it see it too.
+    _indexed_mlp: IndexedExpertMLPFwdOp | None = None
 
     def __init__(
         self,
@@ -82,24 +70,8 @@ class FusedMoEExpertsNopadPersistent3WGFwdOp(FusedMoEExpertsModular):
         self.hidden_size = hidden_size
         self.ffn_size = ffn_size
         self.activation = activation
-        self._routed_scaling_factor = routed_scaling_factor
-        numel = num_tokens * top_k
-        self._gate_up = MoeGateUpFwdOp(
-            numel=numel,
-            num_experts=num_experts,
-            ffn=ffn_size,
-            k=hidden_size,
-            activation=activation,
-            kernel_map=kernel_map,
-        )
-        self._gemm_down = MoeGroupedGemmNopadFwdOp(
-            numel=numel,
-            num_experts=num_experts,
-            n=hidden_size,
-            k=ffn_size,
-            kernel_map=kernel_map,
-        )
         layout = ContiguousLayoutSpec.tight_physical_psum()
+        self._expert_mlp = MoeExpertMLPFwdOp(layout, activation, kernel_map=kernel_map)
         self._pre_permute = MoePrePermuteFwdOp(
             layout=layout,
             num_local_experts=num_experts,
@@ -112,27 +84,34 @@ class FusedMoEExpertsNopadPersistent3WGFwdOp(FusedMoEExpertsModular):
             ),
             kernel_map=kernel_map,
         )
-
-    def kernel_delegates(self) -> tuple[Op, ...]:
-        return (
-            self._pre_permute,
-            self._gate_up,
-            self._gemm_down,
-            self._post_permute,
+        indexed = (
+            activation == "silu_and_mul"
+            and hidden_size % 128 == 0
+            and ffn_size % 256 == 0
+            and (
+                num_tokens <= 32 or (num_tokens == 64 and hidden_size == 7168 and ffn_size == 2048)
+            )
+        )
+        self._indexed_mlp = (
+            IndexedExpertMLPFwdOp(
+                num_tokens,
+                num_experts,
+                top_k,
+                hidden_size,
+                ffn_size,
+                routed_scaling_factor,
+                kernel_map,
+            )
+            if indexed
+            else None
         )
 
+    def kernel_delegates(self) -> tuple[Op, ...]:
+        tight = (self._pre_permute, self._expert_mlp, self._post_permute)
+        return tight if self._indexed_mlp is None else (*tight, self._indexed_mlp)
+
     def eval_roofline(self) -> tuple[int, int]:
-        """Manifest ``roofline``: three F x H weight planes per local expert."""
-        if self.dtype is None:
-            raise ValueError(
-                f"{type(self).__name__}.eval_roofline() requires a prior forward() to bind dtype"
-            )
-        flops = self.num_tokens * self.top_k * 6 * self.ffn_size * self.hidden_size
-        nbytes = (
-            self.num_experts * 3 * self.ffn_size * self.hidden_size
-            + 2 * self.num_tokens * self.hidden_size
-        ) * self.dtype.itemsize
-        return int(flops), int(nbytes)
+        return routed_expert_mlp_roofline(self)
 
     def _validate_dtypes(
         self,
@@ -159,20 +138,20 @@ class FusedMoEExpertsNopadPersistent3WGFwdOp(FusedMoEExpertsModular):
             workspace1,
             workspace2,
         )
-        self._reject_non_empty_workspaces(workspace1, workspace2)
 
-    def _reject_non_empty_workspaces(
-        self,
-        workspace1: Tensor,
-        workspace2: Tensor,
-    ) -> None:
-        """workspace_shapes() returns ((0,), (0,)); anything else is a mismatch."""
-        if workspace1.numel() != 0 or workspace2.numel() != 0:
+    def _validate_workspaces(self, workspace1: Tensor, workspace2: Tensor) -> None:
+        """Hold the two scratch buffers to the sizes the chosen backend implies."""
+        expected1, expected2 = self.workspace_shapes(
+            self.num_tokens,
+            self.ffn_size,
+            self.hidden_size,
+            self.top_k,
+            self.num_experts,
+        )
+        if tuple(workspace1.shape) != expected1 or tuple(workspace2.shape) != expected2:
             raise ValueError(
-                "workspace1 and workspace2 must be empty (numel == 0) for "
-                f"{type(self).__name__}; got "
-                f"workspace1.numel()={workspace1.numel()}, "
-                f"workspace2.numel()={workspace2.numel()}."
+                f"workspace1 and workspace2 must have shapes {expected1} and {expected2}; "
+                f"got {tuple(workspace1.shape)} and {tuple(workspace2.shape)}"
             )
 
     def workspace_shapes(
@@ -183,6 +162,8 @@ class FusedMoEExpertsNopadPersistent3WGFwdOp(FusedMoEExpertsModular):
         topk: int,
         num_experts: int,
     ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        if getattr(self, "_indexed_mlp", None) is not None:
+            return self._indexed_mlp.workspace_shapes()
         return ((0,), (0,))
 
     def output_shape(self, T_prime: int, H: int) -> tuple[int, int]:
@@ -193,7 +174,6 @@ class FusedMoEExpertsNopadPersistent3WGFwdOp(FusedMoEExpertsModular):
 
     @property
     def default_kernel_map(self) -> dict:
-        # All sub-kernels are owned by the inner Ops (permute / GEMM / activation / unpermute).
         return {}
 
     def _infer_output_shapes(
@@ -232,13 +212,25 @@ class FusedMoEExpertsNopadPersistent3WGFwdOp(FusedMoEExpertsModular):
             workspace1,
             workspace2,
         )
+        self._validate_workspaces(workspace1, workspace2)
+        if self._indexed_mlp is not None:
+            self._indexed_mlp(
+                output,
+                hidden_states,
+                w_gate_up,
+                w_down,
+                topk_weights,
+                topk_ids,
+                workspace1,
+                workspace2,
+            )
+            self._roofline_topk_ids = topk_ids
+            return
         expert_input, physical_ends, inverse_indices = self._pre_permute(hidden_states, topk_ids)
-        # Temporary bridge until GroupedGemm consumes staged layout metadata.
-        true_offsets = torch.cat((physical_ends.new_zeros(1), physical_ends[:-1]))
-        true_sizes = physical_ends - true_offsets
-        act = self._gate_up(expert_input, w_gate_up, true_sizes, true_offsets)
-        expert_output = self._gemm_down(act, w_down, true_sizes, true_offsets)
+        expert_output = self._expert_mlp(expert_input, w_gate_up, w_down, physical_ends)
         self._post_permute(expert_output, topk_weights, inverse_indices, out=output)
+        # Set once the call has run, so a rejected one leaves no routing for the roofline.
+        self._roofline_topk_ids = topk_ids
 
     def compute_roof(self) -> str:
         """FLOPs are matmul contractions; priced on tensor cores."""

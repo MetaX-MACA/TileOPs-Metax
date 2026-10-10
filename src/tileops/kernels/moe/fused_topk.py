@@ -1,59 +1,27 @@
-"""MoE fused top-k routing kernel (fused scoring + top-k selection).
+"""MoE fused top-k routing kernel: scoring and top-k selection in one pass.
 
-Single TileLang kernel fusing scoring and top-k into one pass (no global memory
-roundtrip for intermediate scores).
+One warp owns one token, and lane l holds experts {l, l+32, l+64, ...} in
+registers, so every reduction is an intra-warp ``shfl_xor`` and the kernel
+issues no ``__syncthreads()``. Intermediate scores never reach global memory.
+Expert slots past E are held at -inf so they lose every argmax.
 
-Algorithm (TOKENS_PER_BLOCK tokens per block, 1 warp per token):
-  Each warp of 32 lanes independently handles one token.
-  Thread lane l holds experts {l, l+32, l+64, ...} in local registers.
+``renormalize=True`` divides the K selected weights by their own sum inside the
+kernel, so the caller needs no second pass over ``topk_weights``. Under softmax
+it also makes the row-sum reduction unnecessary, because
+``(exp_i/rowsum) / sum_j(exp_j/rowsum)`` equals ``exp_i / sum_j exp_j``.
 
-  1. Load: each lane reads ceil(E/32) experts from global memory into registers.
-     Padding elements (idx >= E) are initialized to -inf.
-  2. Scoring:
-       softmax → warp-level 2-pass (max shfl-reduce, exp+sum shfl-reduce); no syncs
-       sigmoid → element-wise sigmoid in-register; no syncs
-  3. K-pass argmax: for each of K iterations:
-       - Lane-local argmax over ceil(E/32) register elements
-       - Warp-level (val, idx) all-reduce via shfl_xor (no barrier)
-       - Lane 0 writes topk_weights[token_id, k] and topk_ids[token_id, k]
-       - All lanes independently mask their selected expert to -inf in registers
-  4. renormalize=True: the K winning scores stay in registers and are divided by
-     their own sum before the weight writeback, so the caller needs no second
-     pass over topk_weights. For softmax this also drops the row-sum warp
-     reduction — renormalizing by the selected sum cancels the row sum,
-     (exp_i/rowsum) / Σ(exp_j/rowsum) == exp_i / Σ exp_j — so it is never needed.
+``with_correction_bias=True`` adds a per-expert bias to the sigmoid scores for
+selection only; ``topk_weights`` still carries the original unbiased sigmoid
+score. Used by Kimi K2 and DeepSeek-V3-variant models.
 
-correction_bias variant (with_correction_bias=True):
-  Adds a per-expert bias to sigmoid scores before top-k selection, while
-  writing the original (unbiased) sigmoid score to topk_weights.
-  Used by Kimi K2 / DeepSeekV3-variant models.
+Ties in the argmax go to the lower expert index.
 
-  Extra register array my_biased[ELEMS_PER_THREAD] = sigmoid(logit) + bias.
-  K-pass argmax compares my_biased; output uses my_scores (unbiased sigmoid).
-  Warp all-reduce tracks both l_best_val (biased, for tie-breaking) and
-  l_best_orig (unbiased, for output) via paired shfl_xor.
-
-Barrier analysis:
-  All reduces are intra-warp (shfl_xor, no __syncthreads).
-  ZERO __syncthreads() calls for all paths.
-  vs old 1-block-per-token: 22 syncs (softmax), 18 syncs (sigmoid)
-  vs vLLM (CUB BlockReduce, 2 kernels): ~29 syncs
-
-Grid/occupancy (T=4096, E=256, TOKENS_PER_BLOCK=16):
-  Grid = ceil(T / TOKENS_PER_BLOCK) = 256 blocks
-  Threads per block = TOKENS_PER_BLOCK * 32 = 512
-  Max blocks/SM = 2048 / 512 = 4  →  4 * 132 = 528 concurrent blocks
-  256 < 528 → all blocks run in 1 wave
-
-TOKENS_PER_BLOCK is the tunable parameter (default 16; try 4 or 8 for small T).
-
-Supported scoring functions:
-  "softmax" — row-wise softmax (Qwen3, Qwen2, Qwen3.5)
-  "sigmoid" — element-wise sigmoid (DeepSeek-V3, GLM-4, Kimi K2)
+Scoring functions: ``softmax`` (Qwen3, Qwen2, Qwen3.5) and ``sigmoid``
+(DeepSeek-V3, GLM-4, Kimi K2).
 
 Outputs:
-  topk_weights  [T, K]  float32 — routing weights (optionally renormalized)
-  topk_ids      [T, K]  int32   — expert indices
+    topk_weights: [T, K] float32 routing weights, renormalized when asked.
+    topk_ids: [T, K] int32 expert indices.
 """
 
 import functools
@@ -78,6 +46,7 @@ def _fused_topk_kernel(
     num_experts,
     top_k,
     scoring_func,
+    input_dtype,
     with_correction_bias=False,
     renormalize=False,
 ):
@@ -99,23 +68,22 @@ def _fused_topk_kernel(
         JIT factory _func(TOKENS_PER_BLOCK) → callable.
     """
 
-    @tilelang.jit(out_idx=[])
+    @tilelang.jit(
+        out_idx=[],
+        pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
+    )
     def _func(TOKENS_PER_BLOCK):
         WARP_SIZE = WARP_LANES
-        # Each lane handles ceil(E / 32) experts stored in local registers.
         ELEMS_PER_THREAD = -(-num_experts // WARP_SIZE)  # ceildiv(E, 32)
         LOG_WARP = int(math.log2(WARP_SIZE))  # = 5 for WARP_SIZE=32
         HALF_WARP = WARP_SIZE // 2  # = 16
         num_blocks = -(-num_tokens // TOKENS_PER_BLOCK)  # ceildiv(T, TPB)
 
         if with_correction_bias:
-            # ── Variant: sigmoid + per-expert correction bias ─────────────────
-            # Kernel signature adds correction_bias [E] float32.
-            # K-pass argmax selects based on (sigmoid + bias); output writes
-            # the original (unbiased) sigmoid score.
+
             @T.prim_func
             def main(
-                gating_output: T.Tensor([num_tokens, num_experts], "float32"),
+                gating_output: T.Tensor([num_tokens, num_experts], input_dtype),
                 correction_bias: T.Tensor([num_experts], "float32"),
                 topk_weights: T.Tensor([num_tokens, top_k], "float32"),
                 topk_ids: T.Tensor([num_tokens, top_k], "int32"),
@@ -126,13 +94,11 @@ def _fused_topk_kernel(
                     lane_id = tx % WARP_SIZE
                     token_id = block_id * TOKENS_PER_BLOCK + warp_id
 
-                    # my_scores[j]:  original sigmoid(logit)  — for output weight
-                    # my_biased[j]:  sigmoid(logit) + bias    — for argmax selection
+                    # my_biased only decides selection; my_scores is what gets written.
                     my_scores = T.alloc_local([ELEMS_PER_THREAD], "float32")
                     my_biased = T.alloc_local([ELEMS_PER_THREAD], "float32")
 
                     if token_id < num_tokens:
-                        # ── Step 1: Load raw logits ───────────────────────────
                         for j in T.serial(ELEMS_PER_THREAD):
                             expert_idx = j * WARP_SIZE + lane_id
                             if expert_idx < num_experts:
@@ -140,7 +106,6 @@ def _fused_topk_kernel(
                             else:
                                 my_scores[j] = -T.infinity("float32")
 
-                        # ── Step 2: Sigmoid + bias (element-wise, no syncs) ───
                         for j in T.serial(ELEMS_PER_THREAD):
                             expert_idx = j * WARP_SIZE + lane_id
                             if expert_idx < num_experts:
@@ -152,27 +117,16 @@ def _fused_topk_kernel(
                                 my_scores[j] = -T.infinity("float32")
                                 my_biased[j] = -T.infinity("float32")
 
-                        # ── Step 3: K-pass argmax (zero syncs) ────────────────
-                        #
-                        # Compare using my_biased (biased) for expert selection.
-                        # Write my_scores (original sigmoid) to topk_weights.
-                        # Track l_best_orig alongside l_best_val through the
-                        # warp shfl_xor all-reduce so lane 0 has the correct
-                        # unbiased weight to write.
                         l_best_val = T.alloc_var(T.float32)  # biased (for selection)
                         l_best_orig = T.alloc_var(T.float32)  # original sigmoid (for output)
                         l_best_idx = T.alloc_var(T.int32)
 
                         if renormalize:
-                            # The winning unbiased scores stay in registers, so the
-                            # normalization divisor is known without reading
-                            # topk_weights back from global memory.
                             sel_vals = T.alloc_local([top_k], "float32")
                             sel_sum = T.alloc_var(T.float32)
                             sel_sum = T.float32(0)
 
                         for k in T.serial(top_k):
-                            # Lane-local argmax on biased scores
                             l_best_val = -T.infinity("float32")
                             l_best_orig = T.float32(0)
                             l_best_idx = T.int32(-1)
@@ -182,16 +136,12 @@ def _fused_topk_kernel(
                                     l_best_orig = my_scores[j]
                                     l_best_idx = j * T.int32(WARP_SIZE) + lane_id
 
-                            # Warp (biased_val, orig_val, idx) all-reduce via shfl_xor.
-                            # Winner decided by biased_val with tie-breaking on lower idx.
-                            # l_best_orig is carried along so all lanes end up with the
-                            # original sigmoid score of the winning expert.
                             for i in T.serial(LOG_WARP):
                                 mask = T.int32(HALF_WARP) >> i
                                 other_val = T.shfl_xor(l_best_val, mask)
                                 other_orig = T.shfl_xor(l_best_orig, mask)
                                 other_idx = T.shfl_xor(l_best_idx, mask)
-                                # Update orig first (uses old l_best_val / l_best_idx)
+                                # Must precede l_best_val/l_best_idx: it reads the old pair.
                                 l_best_orig = T.if_then_else(
                                     other_val > l_best_val,
                                     other_orig,
@@ -216,7 +166,6 @@ def _fused_topk_kernel(
                                 )
                                 l_best_val = T.max(l_best_val, other_val)
 
-                            # Lane 0 writes original (unbiased) sigmoid score
                             if renormalize:
                                 sel_vals[k] = l_best_orig
                                 sel_sum = sel_sum + l_best_orig
@@ -227,13 +176,11 @@ def _fused_topk_kernel(
                                     topk_weights[token_id, k] = l_best_orig
                                     topk_ids[token_id, k] = l_best_idx
 
-                            # Mask both arrays so this expert is not selected again
                             for j in T.serial(ELEMS_PER_THREAD):
                                 if j * T.int32(WARP_SIZE) + lane_id == l_best_idx:
                                     my_scores[j] = -T.infinity("float32")
                                     my_biased[j] = -T.infinity("float32")
 
-                        # ── Step 4: fused renormalization ─────────────────────
                         if renormalize:
                             inv_sel_sum = T.alloc_var(T.float32)
                             inv_sel_sum = T.float32(1) / sel_sum
@@ -242,10 +189,10 @@ def _fused_topk_kernel(
                                     topk_weights[token_id, k] = sel_vals[k] * inv_sel_sum
 
         else:
-            # ── Standard variant (no correction bias) ─────────────────────────
+
             @T.prim_func
             def main(
-                gating_output: T.Tensor([num_tokens, num_experts], "float32"),
+                gating_output: T.Tensor([num_tokens, num_experts], input_dtype),
                 topk_weights: T.Tensor([num_tokens, top_k], "float32"),
                 topk_ids: T.Tensor([num_tokens, top_k], "int32"),
             ):
@@ -253,15 +200,9 @@ def _fused_topk_kernel(
                     tx = T.get_thread_binding()
                     warp_id = tx // WARP_SIZE
                     lane_id = tx % WARP_SIZE
-                    # Each warp handles one token.
                     token_id = block_id * TOKENS_PER_BLOCK + warp_id
-
-                    # ── Local register array ──────────────────────────────────
                     my_scores = T.alloc_local([ELEMS_PER_THREAD], "float32")
-
-                    # ── Guard: skip warps whose token_id is out of range ──────
                     if token_id < num_tokens:
-                        # ── Step 1: Load experts into registers ───────────────
                         for j in T.serial(ELEMS_PER_THREAD):
                             expert_idx = j * WARP_SIZE + lane_id
                             if expert_idx < num_experts:
@@ -269,7 +210,6 @@ def _fused_topk_kernel(
                             else:
                                 my_scores[j] = -T.infinity("float32")
 
-                        # ── Step 2: Scoring (zero __syncthreads, warp shfl only)
                         if not renormalize:
                             inv_row_sum = T.alloc_var(T.float32)
                             inv_row_sum = T.float32(1)  # default (sigmoid / no renorm)
@@ -277,7 +217,6 @@ def _fused_topk_kernel(
                         if scoring_func == "softmax":
                             l_max = T.alloc_var(T.float32)
 
-                            # Warp max all-reduce (shfl_xor, no barrier)
                             l_max = -T.infinity("float32")
                             for j in T.serial(ELEMS_PER_THREAD):
                                 l_max = T.max(l_max, my_scores[j])
@@ -285,14 +224,12 @@ def _fused_topk_kernel(
                                 l_max = T.max(l_max, T.shfl_xor(l_max, T.int32(HALF_WARP) >> i))
 
                             if renormalize:
-                                # The row sum cancels against the selected-sum
-                                # divisor, so skip its warp reduction entirely.
+                                # The row sum cancels against the selected-sum divisor.
                                 for j in T.serial(ELEMS_PER_THREAD):
                                     my_scores[j] = T.exp(my_scores[j] - l_max)
                             else:
                                 l_sum = T.alloc_var(T.float32)
 
-                                # Exp in-place + warp sum all-reduce (shfl_xor, no barrier)
                                 l_sum = T.float32(0)
                                 for j in T.serial(ELEMS_PER_THREAD):
                                     val = T.exp(my_scores[j] - l_max)
@@ -310,20 +247,15 @@ def _fused_topk_kernel(
                                     my_scores[j] = T.float32(1) / (T.float32(1) + T.exp(-val))
                                 # Padding already -inf; sigmoid(-inf)≈0, keep -inf for argmax.
 
-                        # ── Step 3: K-pass argmax (zero __syncthreads, warp shfl)
                         l_best_val = T.alloc_var(T.float32)
                         l_best_idx = T.alloc_var(T.int32)
 
                         if renormalize:
-                            # The winning scores stay in registers, so the
-                            # normalization divisor is known without reading
-                            # topk_weights back from global memory.
                             sel_vals = T.alloc_local([top_k], "float32")
                             sel_sum = T.alloc_var(T.float32)
                             sel_sum = T.float32(0)
 
                         for k in T.serial(top_k):
-                            # Lane-local argmax
                             l_best_val = -T.infinity("float32")
                             l_best_idx = T.int32(-1)
                             for j in T.serial(ELEMS_PER_THREAD):
@@ -331,7 +263,6 @@ def _fused_topk_kernel(
                                     l_best_val = my_scores[j]
                                     l_best_idx = j * T.int32(WARP_SIZE) + lane_id
 
-                            # Warp (val, idx) all-reduce via shfl_xor (no barrier).
                             for i in T.serial(LOG_WARP):
                                 mask = T.int32(HALF_WARP) >> i
                                 other_val = T.shfl_xor(l_best_val, mask)
@@ -349,7 +280,6 @@ def _fused_topk_kernel(
                                 )
                                 l_best_val = T.max(l_best_val, other_val)
 
-                            # Lane 0 writes output
                             if renormalize:
                                 sel_vals[k] = l_best_val
                                 sel_sum = sel_sum + l_best_val
@@ -360,12 +290,10 @@ def _fused_topk_kernel(
                                     topk_weights[token_id, k] = l_best_val * inv_row_sum
                                     topk_ids[token_id, k] = l_best_idx
 
-                            # All lanes mask their own register entry — NO sync needed.
                             for j in T.serial(ELEMS_PER_THREAD):
                                 if j * T.int32(WARP_SIZE) + lane_id == l_best_idx:
                                     my_scores[j] = -T.infinity("float32")
 
-                        # ── Step 4: fused renormalization ─────────────────────
                         if renormalize:
                             inv_sel_sum = T.alloc_var(T.float32)
                             inv_sel_sum = T.float32(1) / sel_sum
@@ -398,17 +326,13 @@ class FusedTopKKernel(Kernel):
         with_correction_bias: If True, accept a per-expert correction_bias tensor in
             forward(). Adds bias to sigmoid scores for expert selection while writing
             unbiased sigmoid scores to topk_weights. Requires scoring_func="sigmoid".
+        dtype: Input logits dtype; routing arithmetic remains float32.
         config: Optional kernel config dict (key: "TOKENS_PER_BLOCK").
         tune: Whether to autotune. ``TOKENS_PER_BLOCK`` is pinned to the
             one-warp-per-token mapping the algorithm relies on, so
             ``autotune_configs`` is undefined and ``tune=True`` degrades to the
             default config with a warning from ``Kernel.init_config``.
 
-    Note:
-        ``dtype`` does not apply. Routing arithmetic is fixed at float32 and
-        the outputs are float32 weights plus int32 expert ids; ``forward()``
-        up-casts ``gating_output`` of any float dtype before the launch, so no
-        element type is selected at construction.
     """
 
     supported_archs: list[int] = [80, 86, 89, 90]
@@ -421,10 +345,12 @@ class FusedTopKKernel(Kernel):
         scoring_func: str = "softmax",
         renormalize: bool = False,
         with_correction_bias: bool = False,
+        dtype: torch.dtype = torch.float32,
         config: Optional[dict] = None,
         tune: bool = False,
+        device_index: Optional[int] = None,
     ):
-        super().__init__()
+        super().__init__(device_index=device_index)
         if scoring_func not in _SCORING_FUNCS:
             raise ValueError(
                 f"Unsupported scoring_func '{scoring_func}'. Expected one of {_SCORING_FUNCS}."
@@ -443,16 +369,22 @@ class FusedTopKKernel(Kernel):
         self.scoring_func = scoring_func
         self.renormalize = renormalize
         self.with_correction_bias = with_correction_bias
+        self.dtype = dtype
 
         self._kernel_fn = _fused_topk_kernel(
-            num_tokens, num_experts, top_k, scoring_func, with_correction_bias, renormalize
+            num_tokens,
+            num_experts,
+            top_k,
+            scoring_func,
+            self.dtype_str,
+            with_correction_bias,
+            renormalize,
         )
         self.init_config(config, tune)
 
     @property
     def default_config(self) -> dict:
-        # TOKENS_PER_BLOCK = 16 gives 512 threads/block (16 warps/block).
-        return {"TOKENS_PER_BLOCK": 16}
+        return {"TOKENS_PER_BLOCK": min(16, max(1, math.ceil(self.num_tokens / 16)))}
 
     def forward(
         self,
@@ -489,17 +421,14 @@ class FusedTopKKernel(Kernel):
                 "correction_bias must be None when with_correction_bias=False"
             )
 
-        logits_f32 = gating_output.to(torch.float32)
-
-        dev = logits_f32.device
+        dev = gating_output.device
         topk_weights = torch.empty(self.num_tokens, self.top_k, dtype=torch.float32, device=dev)
         topk_ids = torch.empty(self.num_tokens, self.top_k, dtype=torch.int32, device=dev)
 
         fn = self._kernel_fn(self.config["TOKENS_PER_BLOCK"])
         if self.with_correction_bias:
-            bias_f32 = correction_bias.to(torch.float32)
-            fn(logits_f32, bias_f32, topk_weights, topk_ids)
+            fn(gating_output, correction_bias, topk_weights, topk_ids)
         else:
-            fn(logits_f32, topk_weights, topk_ids)
+            fn(gating_output, topk_weights, topk_ids)
 
         return topk_weights, topk_ids

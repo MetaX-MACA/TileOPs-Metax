@@ -1,12 +1,13 @@
-from typing import Dict, Optional
+from typing import ClassVar, Dict, Optional
 
 import torch
 
-from tileops.kernels.attention import SparseMlaKernel, SparseMlaMACAKernel
-from tileops.kernels.kernel_base import Kernel
+from tileops.kernels.attention import SparseMlaBasicKernel, SparseMlaKernel, SparseMlaMACAKernel
+from tileops.kernels.kernel_base import Entry, Kernel
 from tileops.perf.profile import tensor_core_roof
-from tileops.utils import is_hopper, is_maca
+from tileops.utils import get_sm_version, is_hopper, is_maca
 
+from .._compile_boundary_codegen import OperatorSpec
 from ..op_base import Op
 
 __all__ = ["DeepSeekSparseAttentionDecodeWithKVCacheFwdOp"]
@@ -22,6 +23,8 @@ class DeepSeekSparseAttentionDecodeWithKVCacheFwdOp(Op):
     The layout of the operation is BSHD.
 
     """
+
+    compile_boundary: ClassVar[tuple[OperatorSpec, ...]] = (OperatorSpec(),)
 
     def __init__(
         self,
@@ -89,27 +92,26 @@ class DeepSeekSparseAttentionDecodeWithKVCacheFwdOp(Op):
         self.dispatch_kernel(kernel_map)
 
     def _get_kernel(self, inputs: "tuple[torch.Tensor | None, ...]", dtype: torch.dtype) -> Kernel:
-        return self.get_or_build_kernel(
-            "sparse_mla_kernel",
-            inputs,
-            key=dtype,
-            build=lambda: self.kernel_map["sparse_mla_kernel"](
-                self.batch,
-                self.seq_len,
-                self.seq_len_kv,
-                self.heads,
-                self.dim,
-                self.dim_tail,
-                dtype,
-                self.topk,
-                self.stride_kv,
-                self.q_start_index_s,
-                self.heads_kv,
-                self.sm_scale,
-                self.is_causal,
-                self._cp0,
-                tune=self.tune,
-            ),
+        return self.kernel_for("sparse_mla_kernel", inputs, dtype)
+
+    def entry_for(self, role: str, call: torch.dtype) -> Entry:
+        """One implementation, built per dtype; every extent is the op's."""
+        return call, lambda: self.kernel_map["sparse_mla_kernel"](
+            self.batch,
+            self.seq_len,
+            self.seq_len_kv,
+            self.heads,
+            self.dim,
+            self.dim_tail,
+            call,
+            self.topk,
+            self.stride_kv,
+            self.q_start_index_s,
+            self.heads_kv,
+            self.sm_scale,
+            self.is_causal,
+            self._cp0,
+            tune=self.tune,
         )
 
     @property
@@ -119,12 +121,14 @@ class DeepSeekSparseAttentionDecodeWithKVCacheFwdOp(Op):
 
         Returns:
             Dict[str, Kernel]: A dictionary mapping kernel names to kernel functions.
-            The default map includes the "sparse_mla_kernel".
+            The default map includes the "sparse_mla_kernel": the WGMMA
+            warp-specialized SparseMlaKernel on SM90, and the
+            architecture-agnostic SparseMlaBasicKernel (plain T.gemm) elsewhere.
         """
         if is_maca():
             kernel_cls = SparseMlaMACAKernel
         elif is_hopper():
-            kernel_cls = SparseMlaKernel
+            kernel_cls = SparseMlaKernel if get_sm_version() == 90 else SparseMlaBasicKernel
 
         else:
             raise RuntimeError(
@@ -157,6 +161,15 @@ class DeepSeekSparseAttentionDecodeWithKVCacheFwdOp(Op):
         Returns:
             torch.Tensor: The result of applying the sparse attention
                             operation on the input tensors.
+        """
+        return self._wrapped(q, kv, indices, self._instance_key)
+
+    def _eager_forward(
+        self, q: torch.Tensor, kv: torch.Tensor, indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Validate, resolve the kernel and launch, inside the operator.
+
+        Never traced: kernel construction enters a TileLang builder.
         """
         self._validate_dtypes(q, kv, indices)
         self.dtype = q.dtype

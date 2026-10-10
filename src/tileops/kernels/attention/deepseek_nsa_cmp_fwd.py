@@ -34,15 +34,6 @@ def _nsa_cmp_fwd_varlen_kernel(
     bk = dim_k
     bv = dim_v
 
-    q_shape = [c_seq_len, heads, dim_k]
-    k_cmp_shape = [chunk_num, head_kv, dim_k]
-    v_cmp_shape = [chunk_num, head_kv, dim_v]
-    lse_shape = [c_seq_len, heads]
-    offsets_shape = [seq_num + 1]
-    token_indices_shape = [c_seq_len, 2]
-    chunk_offsets_shape = [seq_num + 1]
-    o_shape = [c_seq_len, heads, dim_v]
-
     @tilelang.jit(
         out_idx=[-2, -1],
         pass_configs={
@@ -54,14 +45,14 @@ def _nsa_cmp_fwd_varlen_kernel(
     def _nsa_cmp_fwd_varlen_func(threads: int):
         @T.prim_func
         def _parallel_nsa_cmp_fwd_varlen_main(
-            q: T.Tensor(q_shape, dtype),
-            k_cmp: T.Tensor(k_cmp_shape, dtype),
-            v_cmp: T.Tensor(v_cmp_shape, dtype),
-            offsets: T.Tensor(offsets_shape, T.int32),
-            chunk_offsets: T.Tensor(chunk_offsets_shape, T.int32),
-            token_indices: T.Tensor(token_indices_shape, T.int32),
-            output: T.Tensor(o_shape, dtype),
-            temp_lse: T.Tensor(lse_shape, dtype),
+            q: T.Tensor((c_seq_len, heads, dim_k), dtype),
+            k_cmp: T.Tensor((chunk_num, head_kv, dim_k), dtype),
+            v_cmp: T.Tensor((chunk_num, head_kv, dim_v), dtype),
+            offsets: T.Tensor((seq_num + 1,), T.int32),
+            chunk_offsets: T.Tensor((seq_num + 1,), T.int32),
+            token_indices: T.Tensor((c_seq_len, 2), T.int32),
+            output: T.Tensor((c_seq_len, heads, dim_v), dtype),
+            temp_lse: T.Tensor((c_seq_len, heads), dtype),
         ):
             with T.Kernel(c_seq_len, head_kv, threads=threads) as (bx, by):
                 q_shared = T.alloc_shared([group, bk], dtype)
@@ -161,8 +152,7 @@ def _nsa_cmp_fwd_varlen_kernel(
     return _nsa_cmp_fwd_varlen_func
 
 
-@torch.library.custom_op("tileops::nsa_cmp_fwd_varlen_wrapped_kernel", mutates_args=())
-def _nsa_cmp_fwd_varlen_wrapped_kernel(
+def _nsa_cmp_fwd_varlen_run(
     seq_num: int,
     c_seq_len: int,
     heads: int,
@@ -188,7 +178,6 @@ def _nsa_cmp_fwd_varlen_wrapped_kernel(
     )(threads)(q, k_cmp, v_cmp, offsets, chunk_offsets, token_indices)
 
 
-@_nsa_cmp_fwd_varlen_wrapped_kernel.register_fake
 def _(
     seq_num: int,
     c_seq_len: int,
@@ -268,7 +257,7 @@ class NSACmpFwdVarlenKernel(Kernel):
         chunk_offsets: torch.Tensor,
         token_indices: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return _nsa_cmp_fwd_varlen_wrapped_kernel(
+        return _nsa_cmp_fwd_varlen_run(
             self.seq_num,
             self.c_seq_len,
             self.heads,

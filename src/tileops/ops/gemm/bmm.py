@@ -5,18 +5,26 @@ batch item is an independent GEMM, no broadcasting.
 """
 
 import warnings
-from typing import ClassVar, Dict, Hashable, Optional, Set, Tuple
+from typing import ClassVar, Dict, Optional, Set, Tuple
 
 import torch
 
-from tileops.kernels.gemm.bmm import BmmFp8Kernel, BmmFp8MACAKernel, BmmKernel
-from tileops.kernels.kernel_base import Kernel
+from tileops.kernels.gemm.bmm import (
+    BmmFp8Kernel,
+    BmmFp8MACAKernel,
+    BmmFp8TransposeKernel,
+    BmmKernel,
+    BmmPersistentKernel,
+)
+from tileops.kernels.gemm.call_spec import BmmCall
+from tileops.kernels.kernel_base import Entry, Kernel
 from tileops.perf.profile import tensor_core_roof
 from tileops.utils import is_maca
 
+from .._compile_boundary_codegen import OperatorSpec
 from ..op_base import Op
 
-__all__ = ["BmmFp8KNFwdOp", "BmmFp8NKFwdOp", "BmmFwdOp"]
+__all__ = ["BmmFp8FwdOp", "BmmFwdOp"]
 
 
 class BmmFwdOp(Op):
@@ -28,6 +36,8 @@ class BmmFwdOp(Op):
     use for each ``(batch, m, n, k, dtype)`` combination and cached.
 
     """
+
+    compile_boundary: ClassVar[tuple[OperatorSpec, ...]] = (OperatorSpec(),)
 
     def __init__(
         self,
@@ -47,15 +57,13 @@ class BmmFwdOp(Op):
         self._active_sig: Optional[tuple] = None
         self._active_kernel: Optional[Kernel] = None
         # Roofline / dtype bindings, populated on the first forward().
-        self.batch: Optional[int] = None
-        self.m: Optional[int] = None
-        self.n: Optional[int] = None
-        self.k: Optional[int] = None
-        self.dtype: Optional[torch.dtype] = None
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
-        return {"bmm_kernel": BmmKernel}
+        return {
+            "bmm_persistent_kernel": BmmPersistentKernel,
+            "bmm_kernel": BmmKernel,
+        }
 
     def _infer_bmnk(
         self,
@@ -92,32 +100,33 @@ class BmmFwdOp(Op):
             )
         return batch_a, m, n, k_a
 
-    def _cache_key(self, *input_shapes: Tuple[int, ...]) -> Hashable:
-        """Project onto the dims the kernel actually specializes on."""
-        if len(input_shapes) == 2:
-            a_shape, b_shape = input_shapes
-            if len(a_shape) == 3 and len(b_shape) == 3:
-                batch, m, k = a_shape
-                _, _, n = b_shape
-                return (batch, m, n, k, None if self.dtype is None else str(self.dtype))
-        return (self.batch, self.m, self.n, self.k, None if self.dtype is None else str(self.dtype))
-
-    def _get_kernel(
+    def _call_spec(
         self,
-        inputs: "tuple[torch.Tensor | None, ...]",
         batch: int,
         m: int,
         n: int,
         k: int,
         dtype: torch.dtype,
-    ) -> Kernel:
-        """Return the cached BmmKernel for the given dims, building lazily."""
-        return self.get_or_build_kernel(
-            "bmm_kernel",
-            inputs,
-            key=(batch, m, n, k, dtype),
-            build=lambda: self.kernel_map["bmm_kernel"](batch, m, n, k, dtype, tune=self.tune),
+        device: torch.device,
+    ) -> BmmCall:
+        """State the inferred BMM call for implementation selection."""
+        return BmmCall(
+            batch=batch,
+            m=m,
+            n=n,
+            k=k,
+            dtype=dtype,
+            device=device,
+            tune=self.tune,
         )
+
+    def _get_kernel(
+        self,
+        inputs: "tuple[torch.Tensor | None, ...]",
+        call: BmmCall,
+    ) -> Kernel:
+        """Return what serves *call*, building and caching on a miss."""
+        return self.kernel_for("bmm", inputs, call)
 
     def _infer_output_shapes(
         self,
@@ -148,9 +157,14 @@ class BmmFwdOp(Op):
             flops, nbytes = op.eval_roofline()    # valid after the forward
             ```
         """
-        # Fast path: same input signature as the last call → reuse the already
-        # built/JIT'd kernel directly.
-        sig = (a.shape, b.shape, a.dtype, b.dtype)
+        return self._wrapped(a, b, self._instance_key)
+
+    def _eager_forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Validate, resolve the kernel and launch, inside the operator.
+
+        Never traced: kernel construction enters a TileLang builder.
+        """
+        sig = (a.shape, b.shape, a.dtype, b.dtype, a.device)
         if sig != self._active_sig:
             self._validate_dtypes(a, b)
             batch, m, n, k = self._infer_bmnk(a, b)
@@ -159,7 +173,8 @@ class BmmFwdOp(Op):
             self.dtype = a.dtype
             self.a_shape = tuple(a.shape)
             self.b_shape = tuple(b.shape)
-            kernel = self._get_kernel((a, b), batch, m, n, k, a.dtype)
+            call = self._call_spec(batch, m, n, k, a.dtype, a.device)
+            kernel = self._get_kernel((a, b), call)
             # Expose the active kernel so autotune()/introspection can find it.
             self.kernel = kernel
             self._active_kernel = kernel
@@ -172,21 +187,25 @@ class BmmFwdOp(Op):
         return tensor_core_roof(self.dtype)
 
 
-class BmmFp8KNFwdOp(Op):
-    """Batched FP8 GEMM over ``b`` in $[B \\times K \\times N]$: ``d[i] = (a[i] @ b[i]) * scale_a * scale_b``.
+class BmmFp8FwdOp(Op):
+    """Batched FP8 GEMM: ``d[i] = (a[i] @ b[i]) * scale_a * scale_b``.
 
-    This is torch.bmm's memory order. The fp8-TN WGMMA kernel wants K innermost,
-    so this op transposes ``b`` before the call; ``BmmFp8NKFwdOp`` takes $[B \\times N \\times K]$
-    and hands it over as it stands.
+    ``trans_b`` states which axis order ``b`` arrives in: ``False`` is torch.bmm's
+    $[B \\times K \\times N]$, ``True`` is $[B \\times N \\times K]$.
 
+    FP8 WGMMA reads ``b`` K-innermost and has no transposed operand mode, so a
+    ``b`` that does not already lie that way is transposed into a new buffer,
+    costing one extra read and write of it. Which calls pay is decided by ``b``'s
+    strides, not by ``trans_b``: passing ``b`` K-innermost avoids the copy under
+    either value of the flag, and is the faster call.
     """
 
-    # Whether ``b`` arrives with K innermost, which is what the kernel wants.
-    B_IS_NK: ClassVar[bool] = False
+    compile_boundary: ClassVar[tuple[OperatorSpec, ...]] = (OperatorSpec(),)
 
     def __init__(
         self,
-        out_dtype: torch.dtype | str = "bfloat16",
+        out_dtype: torch.dtype = torch.bfloat16,
+        trans_b: bool = False,
         kernel_map: Optional[Dict[str, Kernel]] = None,
         tune: bool = False,
     ) -> None:
@@ -194,33 +213,30 @@ class BmmFp8KNFwdOp(Op):
 
         Args:
             out_dtype: Output tensor dtype (``torch.float16`` or ``torch.bfloat16``).
+            trans_b: Whether ``b``'s axes are $[B \\times N \\times K]$ rather than
+                $[B \\times K \\times N]$. Which of the two is faster is decided by
+                ``b``'s strides, not by this flag.
             kernel_map: Optional kernel override dict.
             tune: Whether to autotune (applied when a kernel is first built).
         """
-        if isinstance(out_dtype, str):
-            out_dtype = getattr(torch, out_dtype)
         if out_dtype not in (torch.float16, torch.bfloat16):
             raise ValueError(
-                f"BmmFp8KNFwdOp outputs torch.float16 or torch.bfloat16, got {out_dtype}"
+                f"BmmFp8FwdOp outputs torch.float16 or torch.bfloat16, got {out_dtype}"
             )
         self.out_dtype = out_dtype
+        self.trans_b = trans_b
         self.tune = tune
         self.dispatch_kernel(kernel_map)
         self._active_sig: Optional[tuple] = None
         self._active: Optional[Kernel] = None
-        # Shape-signatures whose "slow path" warning has already been emitted, so a
-        # single BmmFp8KNFwdOp warns once per shape rather than on every forward.
-        self._kn_warned: Set[Tuple[int, int, int, int]] = set()
-        self.batch: Optional[int] = None
-        self.m: Optional[int] = None
-        self.n: Optional[int] = None
-        self.k: Optional[int] = None
-        self.dtype: Optional[torch.dtype] = None
+        # ``b`` shapes already warned about, so one op warns once per shape.
+        self._kn_warned: Set[Tuple[int, int, int]] = set()
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
         return {
             "bmm_fp8_kernel": BmmFp8MACAKernel if is_maca() else BmmFp8Kernel,
+            "bmm_fp8_transpose_kernel": BmmFp8TransposeKernel,
         }
 
     def _validate_dtypes(
@@ -231,21 +247,21 @@ class BmmFp8KNFwdOp(Op):
         scale_b: torch.Tensor,
     ) -> None:
         if a.dtype != torch.float8_e4m3fn:
-            raise ValueError(f"BmmFp8KNFwdOp only supports torch.float8_e4m3fn, got {a.dtype}")
+            raise ValueError(f"BmmFp8FwdOp only supports torch.float8_e4m3fn, got {a.dtype}")
         if b.dtype != a.dtype:
-            raise ValueError(f"BmmFp8KNFwdOp expects b dtype {a.dtype}, got {b.dtype}")
+            raise ValueError(f"BmmFp8FwdOp expects b dtype {a.dtype}, got {b.dtype}")
         if scale_a.dtype != torch.float32 or scale_b.dtype != torch.float32:
-            raise ValueError("BmmFp8KNFwdOp expects scale_a and scale_b to be torch.float32")
+            raise ValueError("BmmFp8FwdOp expects scale_a and scale_b to be torch.float32")
 
     def _infer_bmnk(
         self,
         a: torch.Tensor,
         b: torch.Tensor,
-    ) -> Tuple[int, int, int, int, bool]:
-        """Derive logical ``(batch, m, n, k, b_is_nk)`` from ``a`` and ``b``."""
+    ) -> Tuple[int, int, int, int]:
+        """Derive logical ``(batch, m, n, k)`` from ``a`` and ``b``."""
         if a.dim() != 3 or b.dim() != 3:
             raise ValueError(
-                f"BmmFp8KNFwdOp expects strict 3D inputs a=[B,M,K] and "
+                f"BmmFp8FwdOp expects strict 3D inputs a=[B,M,K] and "
                 f"b=[B,K,N] or [B,N,K] (got a.shape={tuple(a.shape)}, "
                 f"b.shape={tuple(b.shape)})"
             )
@@ -253,29 +269,29 @@ class BmmFp8KNFwdOp(Op):
         batch_b, b1, b2 = b.shape
         if batch_a != batch_b:
             raise ValueError(
-                f"BmmFp8KNFwdOp batch dim mismatch: a.shape[0]={batch_a} vs b.shape[0]={batch_b}"
+                f"BmmFp8FwdOp batch dim mismatch: a.shape[0]={batch_a} vs b.shape[0]={batch_b}"
             )
-        if self.B_IS_NK:
+        if self.trans_b:
             if b2 != k:
                 raise ValueError(
                     f"{type(self).__name__} takes b as [B,N,K], but "
                     f"b={tuple(b.shape)} needs b.shape[2]==K={k}"
                 )
-            n, b_is_nk = b1, True
+            n = b1
         else:  # 'kn'
             if b1 != k:
                 raise ValueError(
-                    f"BmmFp8KNFwdOp contraction dim mismatch: a contributes K={k}, "
+                    f"BmmFp8FwdOp contraction dim mismatch: a contributes K={k}, "
                     f"but b.shape={tuple(b.shape)} is not a valid [B,K,N] "
                     f"(needs b.shape[1]==K={k})."
                 )
-            n, b_is_nk = b2, False
+            n = b2
         if k % 32 != 0:
             raise ValueError(
-                f"BmmFp8KNFwdOp requires contraction dim K to be a multiple of "
+                f"BmmFp8FwdOp requires contraction dim K to be a multiple of "
                 f"32 (FP8 WGMMA K-step), got K={k}"
             )
-        return batch_a, m, n, k, b_is_nk
+        return batch_a, m, n, k
 
     def _validate_shapes(
         self,
@@ -283,26 +299,24 @@ class BmmFp8KNFwdOp(Op):
         b: torch.Tensor,
         scale_a: torch.Tensor,
         scale_b: torch.Tensor,
-    ) -> Tuple[int, int, int, int, bool]:
+    ) -> Tuple[int, int, int, int]:
         if not a.is_cuda:
-            raise ValueError(
-                f"BmmFp8KNFwdOp expects all inputs to be on CUDA, got device {a.device}"
-            )
+            raise ValueError(f"BmmFp8FwdOp expects all inputs to be on CUDA, got device {a.device}")
         if b.device != a.device or scale_a.device != a.device or scale_b.device != a.device:
             raise ValueError(
-                f"BmmFp8KNFwdOp expects all inputs to be on the same CUDA device, got "
+                f"BmmFp8FwdOp expects all inputs to be on the same CUDA device, got "
                 f"a: {a.device}, b: {b.device}, scale_a: {scale_a.device}, "
                 f"scale_b: {scale_b.device}"
             )
-        batch, m, n, k, b_is_nk = self._infer_bmnk(a, b)
+        batch, m, n, k = self._infer_bmnk(a, b)
         if scale_a.dim() != 0 or scale_b.dim() != 0:
             raise ValueError(
-                "BmmFp8KNFwdOp supports scale shapes ()/() only (per-tensor, "
+                "BmmFp8FwdOp supports scale shapes ()/() only (per-tensor, "
                 "global fp32 scalar shared across the batch, matching "
                 "flashinfer.bmm_fp8's A_scale/B_scale), got "
                 f"{tuple(scale_a.shape)}/{tuple(scale_b.shape)}"
             )
-        return batch, m, n, k, b_is_nk
+        return batch, m, n, k
 
     def _get_kernel(
         self,
@@ -314,13 +328,33 @@ class BmmFp8KNFwdOp(Op):
         dtype: torch.dtype,
         device: torch.device,
     ) -> Kernel:
-        return self.get_or_build_kernel(
-            "bmm_fp8_kernel",
-            inputs,
-            key=(batch, m, n, k, dtype, self.out_dtype, device),
-            build=lambda: self.kernel_map["bmm_fp8_kernel"](
-                batch, m, n, k, dtype, self.out_dtype, device=device, tune=self.tune
-            ),
+        return self.kernel_for(
+            "bmm_fp8_kernel", inputs, (batch, m, n, k, dtype, self.out_dtype, device)
+        )
+
+    def _get_transpose_kernel(
+        self,
+        inputs: "tuple[torch.Tensor | None, ...]",
+        batch: int,
+        rows: int,
+        cols: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Kernel:
+        return self.kernel_for(
+            "bmm_fp8_transpose_kernel", inputs, (batch, rows, cols, dtype, device)
+        )
+
+    def entry_for(self, role: str, call: tuple) -> Entry:
+        """One implementation per role, built per shape, dtype and device."""
+        if role == "bmm_fp8_transpose_kernel":
+            batch, rows, cols, dtype, device = call
+            return call, lambda: self.kernel_map["bmm_fp8_transpose_kernel"](
+                batch, rows, cols, dtype, device=device, tune=self.tune
+            )
+        batch, m, n, k, dtype, out_dtype, device = call
+        return call, lambda: self.kernel_map["bmm_fp8_kernel"](
+            batch, m, n, k, dtype, out_dtype, device=device, tune=self.tune
         )
 
     def _infer_output_shapes(
@@ -330,8 +364,7 @@ class BmmFp8KNFwdOp(Op):
         scale_a_shape: tuple[int, ...],
         scale_b_shape: tuple[int, ...],
     ) -> dict[str, tuple[int, ...]]:
-        """Manifest ``shape_rules``: which axis of *b* carries ``N`` follows ``B_IS_NK``."""
-        return {"d": (a_shape[0], a_shape[1], b_shape[1 if self.B_IS_NK else 2])}
+        return {"d": (a_shape[0], a_shape[1], b_shape[1 if self.trans_b else 2])}
 
     def forward(
         self,
@@ -344,7 +377,8 @@ class BmmFp8KNFwdOp(Op):
 
         Args:
             a: Left operand, $[B \\times M \\times K]$, ``torch.float8_e4m3fn``.
-            b: Right operand, $[B \\times K \\times N]$, same dtype as ``a``.
+            b: Right operand, same dtype as ``a``: $[B \\times K \\times N]$, or
+                $[B \\times N \\times K]$ when ``trans_b``.
             scale_a: Per-tensor scale for ``a``, a 0-dim ``torch.float32`` tensor.
             scale_b: Per-tensor scale for ``b``, a 0-dim ``torch.float32`` tensor.
 
@@ -358,12 +392,26 @@ class BmmFp8KNFwdOp(Op):
 
         Example:
             ```python linenums="1"
-            op = BmmFp8KNFwdOp(out_dtype=torch.bfloat16)
+            op = BmmFp8FwdOp(out_dtype=torch.bfloat16)      # b as [B, K, N]
             d = op(a, b_kn, scale_a, scale_b)
             flops, nbytes = op.eval_roofline()    # valid after the forward
             ```
         """
+        return self._wrapped(a, b, scale_a, scale_b, self._instance_key)
+
+    def _eager_forward(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        scale_a: torch.Tensor,
+        scale_b: torch.Tensor,
+    ) -> torch.Tensor:
+        """Validate, resolve the kernel and launch, inside the operator.
+
+        Never traced: kernel construction enters a TileLang builder.
+        """
         sig = (
+            a.device,
             a.shape,
             b.shape,
             b.stride(),
@@ -377,7 +425,7 @@ class BmmFp8KNFwdOp(Op):
         )
         if sig != self._active_sig:
             self._validate_dtypes(a, b, scale_a, scale_b)
-            batch, m, n, k, b_is_nk = self._validate_shapes(a, b, scale_a, scale_b)
+            batch, m, n, k = self._validate_shapes(a, b, scale_a, scale_b)
             self.batch, self.m, self.n, self.k = batch, m, n, k
             self.dtype = a.dtype
             self.a_shape = tuple(a.shape)
@@ -389,50 +437,48 @@ class BmmFp8KNFwdOp(Op):
             )
             self._active = kernel
             self._active_sig = sig
-        if self.B_IS_NK:
-            b = b.contiguous()
-        else:
-            # Slow path: [B,K,N] layout requires an extra DtoD transpose
-            # before the fp8-TN WGMMA kernel can consume it. Emit a one-shot
-            # warning per (B,M,N,K) shape so users know how to opt into the
-            # zero-copy fast path (pass b as [B,N,K]).
-            shape_key = (self.batch, self.m, self.n, self.k)
-            if shape_key not in self._kn_warned:
-                self._kn_warned.add(shape_key)
-                warnings.warn(
-                    f"BmmFp8KNFwdOp: b has layout [B,K,N] (shape={self.b_shape}); "
-                    f"triggering an extra transpose(-2,-1).contiguous() DtoD "
-                    f"copy before the fp8-TN WGMMA kernel. For best "
-                    f"performance pass b as [B,N,K] (K-innermost) for the "
-                    f"zero-copy fast path.",
-                    stacklevel=2,
-                )
-            b = b.transpose(-2, -1).contiguous()
+        b = self._as_k_innermost(b, a.dtype, a.device)
         scale_a = scale_a.reshape(1)
         scale_b = scale_b.reshape(1)
         return self._active(a, b, scale_a, scale_b)
 
+    def _as_k_innermost(
+        self, b: torch.Tensor, dtype: torch.dtype, device: torch.device
+    ) -> torch.Tensor:
+        """Return ``b`` as a contiguous $[B \\times N \\times K]$ tensor.
+
+        ``trans_b`` says which axis carries K; ``b``'s strides say whether any
+        movement is owed.
+
+        Args:
+            b: The right operand as the caller passed it.
+            dtype: Element dtype, part of the transpose kernel's identity.
+            device: Device the transpose would be built for.
+
+        Returns:
+            ``b`` itself when it already lies K-innermost, else a transposed copy.
+        """
+        b_nk = b if self.trans_b else b.transpose(-2, -1)
+        if b_nk.is_contiguous():
+            return b_nk
+        batch, n, k = b_nk.shape
+        if b_nk.stride() == (n * k, 1, n):
+            # A contiguous [B, K, N] seen the other way round, which is the only
+            # stride pattern the transpose kernel reads.
+            shape_key = (batch, n, k)
+            if shape_key not in self._kn_warned:
+                self._kn_warned.add(shape_key)
+                warnings.warn(
+                    f"BmmFp8FwdOp: b (shape={tuple(b.shape)}) does not lie "
+                    f"K-innermost, so it is transposed into a new buffer before "
+                    f"the FP8 WGMMA kernel, which reads only that order. Passing "
+                    f"b K-innermost skips the copy and is the faster call.",
+                    stacklevel=2,
+                )
+            kernel = self._get_transpose_kernel((b,), batch, k, n, dtype, device)
+            return kernel(b_nk.transpose(-2, -1))
+        return b_nk.contiguous()
+
     def compute_roof(self) -> str:
         """FLOPs are matmul contractions; priced on tensor cores."""
         return tensor_core_roof(self.dtype)
-
-
-class BmmFp8NKFwdOp(BmmFp8KNFwdOp):
-    """Batched FP8 GEMM over ``b`` in $[B \\times N \\times K]$.
-
-    K is innermost, which is the order the fp8-TN WGMMA kernel reads, so ``b``
-    reaches it without a transpose. Same kernel and same arithmetic as
-    ``BmmFp8KNFwdOp``; only the memory order ``b`` arrives in differs, and memory
-    order is part of the signature, so it is its own entry.
-
-    ``b`` is $[B \\times N \\times K]$; every other argument, the return value and the
-    errors are ``BmmFp8KNFwdOp.forward``'s.
-
-    Example:
-        ```python linenums="1"
-        op = BmmFp8NKFwdOp(out_dtype=torch.bfloat16)
-        d = op(a, b_nk, scale_a, scale_b)
-        ```
-    """
-
-    B_IS_NK: ClassVar[bool] = True
