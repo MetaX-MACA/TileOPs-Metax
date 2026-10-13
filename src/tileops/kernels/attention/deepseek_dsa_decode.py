@@ -532,6 +532,8 @@ def _sparse_mla_kernel_maca(
                 s_shared = T.alloc_shared([h_per_block, i_block], dtype)
                 indices_shared = T.alloc_shared([i_block], indices_dtype)
                 is_kv_valid = T.alloc_shared([i_block], "bool", scope="shared")
+                kv_valid_flags = T.alloc_fragment([i_block], "int32")
+                tile_has_valid = T.alloc_shared([1], "int32")
 
                 acc_s = T.alloc_fragment([h_per_block, i_block], accum_dtype)
                 acc_o_l = T.alloc_fragment([h_per_block, d // 2], accum_dtype)
@@ -571,78 +573,90 @@ def _sparse_mla_kernel_maca(
                     for bi_i in T.Parallel(i_block):
                         kv_index = indices[b_i, s_i, g_i, kk * i_block + bi_i]
                         indices_shared[bi_i] = kv_index
-                        is_kv_valid[bi_i] = (
+                        kv_is_valid = (
                             (kv_index >= 0) & (kv_index < seq_len_kv) & (kv_index <= max_kv_i)
                         )
+                        is_kv_valid[bi_i] = kv_is_valid
+                        kv_valid_flags[bi_i] = T.cast(kv_is_valid, "int32")
 
-                    for bi_i, d_i in T.Parallel(i_block, d // 2):
-                        kv_shared_l[bi_i, d_i] = T.if_then_else(
-                            is_kv_valid[bi_i],
-                            kv[b_i, indices_shared[bi_i], g_i, d_i],
-                            T.cast(0, dtype),
+                    # Publish one predicate shared by every thread in the block.
+                    T.reduce_max(kv_valid_flags, tile_has_valid, dim=0, clear=True)
+                    T.sync_threads()
+
+                    if tile_has_valid[0] != 0:
+                        for bi_i, d_i in T.Parallel(i_block, d // 2):
+                            kv_shared_l[bi_i, d_i] = T.if_then_else(
+                                is_kv_valid[bi_i],
+                                kv[b_i, indices_shared[bi_i], g_i, d_i],
+                                T.cast(0, dtype),
+                            )
+                            kv_shared_r[bi_i, d_i] = T.if_then_else(
+                                is_kv_valid[bi_i],
+                                kv[b_i, indices_shared[bi_i], g_i, d // 2 + d_i],
+                                T.cast(0, dtype),
+                            )
+
+                        for bi_i, d_i in T.Parallel(i_block, d_tail):
+                            kv_tail_shared[bi_i, d_i] = T.if_then_else(
+                                is_kv_valid[bi_i],
+                                kv[b_i, indices_shared[bi_i], g_i, d + d_i],
+                                T.cast(0, dtype),
+                            )
+
+                        for h_i, bi_i in T.Parallel(h_per_block, i_block):
+                            acc_s[h_i, bi_i] = T.if_then_else(
+                                is_kv_valid[bi_i], T.cast(0, accum_dtype), -T.infinity(accum_dtype)
+                            )
+
+                        T.gemm(
+                            q_local_l,
+                            kv_shared_l,
+                            acc_s,
+                            transpose_B=True,
+                            policy=T.GemmWarpPolicy.FullRow,
                         )
-                        kv_shared_r[bi_i, d_i] = T.if_then_else(
-                            is_kv_valid[bi_i],
-                            kv[b_i, indices_shared[bi_i], g_i, d // 2 + d_i],
-                            T.cast(0, dtype),
+                        T.gemm(
+                            q_local_r,
+                            kv_shared_r,
+                            acc_s,
+                            transpose_B=True,
+                            policy=T.GemmWarpPolicy.FullRow,
+                        )
+                        T.gemm(
+                            q_tail_local,
+                            kv_tail_shared,
+                            acc_s,
+                            transpose_B=True,
+                            policy=T.GemmWarpPolicy.FullRow,
                         )
 
-                    for bi_i, d_i in T.Parallel(i_block, d_tail):
-                        kv_tail_shared[bi_i, d_i] = T.if_then_else(
-                            is_kv_valid[bi_i],
-                            kv[b_i, indices_shared[bi_i], g_i, d + d_i],
-                            T.cast(0, dtype),
-                        )
+                        T.copy(m_i, m_i_prev)
+                        T.reduce_max(acc_s, m_i, dim=1, clear=False)
 
-                    for h_i, bi_i in T.Parallel(h_per_block, i_block):
-                        acc_s[h_i, bi_i] = T.if_then_else(
-                            is_kv_valid[bi_i], T.cast(0, accum_dtype), -T.infinity(accum_dtype)
-                        )
+                        for h_i in T.Parallel(h_per_block):
+                            alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
 
-                    T.gemm(
-                        q_local_l,
-                        kv_shared_l,
-                        acc_s,
-                        transpose_B=True,
-                        policy=T.GemmWarpPolicy.FullRow,
-                    )
-                    T.gemm(
-                        q_local_r,
-                        kv_shared_r,
-                        acc_s,
-                        transpose_B=True,
-                        policy=T.GemmWarpPolicy.FullRow,
-                    )
-                    T.gemm(
-                        q_tail_local,
-                        kv_tail_shared,
-                        acc_s,
-                        transpose_B=True,
-                        policy=T.GemmWarpPolicy.FullRow,
-                    )
+                        for h_i, bi_i in T.Parallel(h_per_block, i_block):
+                            acc_s[h_i, bi_i] = T.exp2(
+                                acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale
+                            )
 
-                    T.copy(m_i, m_i_prev)
-                    T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                        T.reduce_sum(acc_s, sumexp_i, dim=1)
 
-                    for h_i in T.Parallel(h_per_block):
-                        alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
+                        for h_i in T.Parallel(h_per_block):
+                            sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
 
-                    for h_i, bi_i in T.Parallel(h_per_block, i_block):
-                        acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
+                        for h_i, d_i in T.Parallel(h_per_block, d // 2):
+                            acc_o_l[h_i, d_i] = acc_o_l[h_i, d_i] * alpha[h_i]
+                            acc_o_r[h_i, d_i] = acc_o_r[h_i, d_i] * alpha[h_i]
 
-                    T.reduce_sum(acc_s, sumexp_i, dim=1)
+                        T.copy(acc_s, s_shared)
 
-                    for h_i in T.Parallel(h_per_block):
-                        sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
+                        T.gemm(s_shared, kv_shared_l, acc_o_l, policy=T.GemmWarpPolicy.FullRow)
+                        T.gemm(s_shared, kv_shared_r, acc_o_r, policy=T.GemmWarpPolicy.FullRow)
 
-                    for h_i, d_i in T.Parallel(h_per_block, d // 2):
-                        acc_o_l[h_i, d_i] = acc_o_l[h_i, d_i] * alpha[h_i]
-                        acc_o_r[h_i, d_i] = acc_o_r[h_i, d_i] * alpha[h_i]
-
-                    T.copy(acc_s, s_shared)
-
-                    T.gemm(s_shared, kv_shared_l, acc_o_l, policy=T.GemmWarpPolicy.FullRow)
-                    T.gemm(s_shared, kv_shared_r, acc_o_r, policy=T.GemmWarpPolicy.FullRow)
+                    # Protect the shared predicate and tile buffers before reuse.
+                    T.sync_threads()
 
                 for h_i, d_i in T.Parallel(h_per_block, d // 2):
                     if h0 + h_i < ori_heads:
@@ -1028,11 +1042,11 @@ class SparseMlaMACAKernel(Kernel):
 
     @property
     def default_config(self) -> dict:
-        return {"block_i": 32, "threads": 256}
+        return {"block_i": 32, "threads": 512}
 
     @property
     def autotune_configs(self) -> list[dict]:
-        return [{"block_i": 32, "threads": 256}]
+        return [{"block_i": 32, "threads": 512}]
 
     def forward(self, q: torch.Tensor, kv: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
         return _sparse_mla_maca_wrapped_kernel(
