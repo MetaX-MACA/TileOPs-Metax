@@ -9,6 +9,7 @@ from .bmm import (
     BmmFp8MACAKernel,
     BmmFp8TransposeKernel,
     BmmKernel,
+    BmmMACAKernel,
     BmmPersistentKernel,
 )
 from .call_spec import BmmCall, GemmCall
@@ -28,6 +29,7 @@ __all__ = [
     "BmmFp8MACAKernel",
     "BmmFp8TransposeKernel",
     "BmmKernel",
+    "BmmMACAKernel",
     "BmmPersistentKernel",
     "GemmCpAsyncKernel",
     "GemmCall",
