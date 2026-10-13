@@ -26,4 +26,8 @@ PAGED_PREFILL_KEYS = (
 PAGED_DECODE_KEYS = ("gqa_decode_paged_bs1_kernel", "gqa_decode_paged_kernel")
 
 # Implementations of paged MHA decode.
-MHA_PAGED_DECODE_KEYS = ("mha_decode_paged_ws_kernel", "mha_decode_paged_kernel")
+MHA_PAGED_DECODE_KEYS = (
+    "mha_decode_paged_ws_kernel",
+    "mha_decode_paged_maca_kernel",
+    "mha_decode_paged_kernel",
+)

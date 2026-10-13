@@ -9,10 +9,11 @@ import tilelang.language as T
 import torch
 
 from tileops.kernels.kernel_base import Kernel
+from tileops.utils import is_maca
 
 from .online_softmax import make_log2e_scale, make_online_softmax, make_rescale
 
-__all__ = ["MHADecodePagedKernel"]
+__all__ = ["MHADecodePagedKernel", "MHADecodePagedMACAKernel"]
 
 # JIT kernel: no-split variant (paged)
 
@@ -440,6 +441,152 @@ def _mha_decode_split_kernel(batch, heads, seqlen_q, seqlen_kv, dim, page_size, 
 # Use distinct op names so paged and non-paged (mha_decode.py) do not overwrite
 # each other in torch.library; otherwise the first-registered impl "changes" the
 # registry and later parametrized tests can hit the wrong implementation.
+@functools.lru_cache(maxsize=32)
+def _mha_decode_paged_maca_simt_kernel(batch, heads, seqlen_kv, dim, page_size, dtype):
+    scale = make_log2e_scale(dim)
+
+    @tilelang.jit(
+        out_idx=[-1],
+        pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
+        compile_flags=["-O3", "-DENABLE_BF16"],
+    )
+    def _func(block_N, num_split, threads):
+        tiles_per_split = T.ceildiv(T.ceildiv(seqlen_kv, block_N), num_split)
+
+        @T.macro
+        def split(
+            Q: T.Tensor([batch, 1, heads, dim], dtype),
+            K: T.Tensor([seqlen_kv, heads, dim], dtype),
+            V: T.Tensor([seqlen_kv, heads, dim], dtype),
+            real_seqlen_kv: T.Tensor([batch], "int32"),
+            block_table: T.Tensor([batch, seqlen_kv // page_size], "int32"),
+            partial_lse: T.Tensor([batch, heads, num_split], "float"),
+            partial_o: T.Tensor([batch, heads, num_split, dim], "float"),
+            Output: T.Tensor([batch, 1, heads, dim], dtype),
+        ):
+            with T.Kernel(num_split, heads, batch, threads=threads) as (sid, hid, bid):
+                q_shared = T.alloc_shared([dim], dtype)
+                k_shared = T.alloc_shared([block_N, dim], dtype)
+                v_shared = T.alloc_shared([block_N, dim], dtype)
+                # Reuse the same fragment for the QK products and weighted V.
+                products = T.alloc_fragment([block_N, dim], "float")
+                scores = T.alloc_fragment([block_N], "float")
+                probs = T.alloc_fragment([block_N], "float")
+                o_tile = T.alloc_fragment([dim], "float")
+                o_acc = T.alloc_fragment([dim], "float")
+                tile_max = T.alloc_fragment([1], "float")
+                tile_sum = T.alloc_fragment([1], "float")
+                running_max = T.alloc_local([1], "float")
+                running_sum = T.alloc_local([1], "float")
+
+                T.copy(Q[bid, 0, hid, :], q_shared)
+                T.clear(o_acc)
+                running_max[0] = -1.0e30
+                running_sum[0] = 0.0
+                valid_tiles = T.ceildiv(real_seqlen_kv[bid], block_N)
+
+                for t in T.serial(tiles_per_split):
+                    logical_tile = sid * tiles_per_split + t
+                    if logical_tile < valid_tiles:
+                        page_idx = logical_tile // (page_size // block_N)
+                        tile_in_page = logical_tile % (page_size // block_N)
+                        physical_tile = (
+                            block_table[bid, page_idx] * (page_size // block_N) + tile_in_page
+                        )
+                        T.copy(
+                            K[physical_tile * block_N : (physical_tile + 1) * block_N, hid, :],
+                            k_shared,
+                        )
+                        for n, d in T.Parallel(block_N, dim):
+                            products[n, d] = T.cast(k_shared[n, d], "float") * T.cast(
+                                q_shared[d], "float"
+                            )
+                        T.reduce_sum(products, scores, dim=1)
+                        for n in T.Parallel(block_N):
+                            scores[n] = T.if_then_else(
+                                logical_tile * block_N + n < real_seqlen_kv[bid],
+                                scores[n] * scale,
+                                -1.0e30,
+                            )
+                        T.reduce_max(scores, tile_max, dim=0)
+                        new_max = T.max(running_max[0], tile_max[0])
+                        alpha = T.exp2(running_max[0] - new_max)
+                        for n in T.Parallel(block_N):
+                            probs[n] = T.exp2(scores[n] - new_max)
+                        T.reduce_sum(probs, tile_sum, dim=0)
+                        running_sum[0] = running_sum[0] * alpha + tile_sum[0]
+                        T.copy(
+                            V[physical_tile * block_N : (physical_tile + 1) * block_N, hid, :],
+                            v_shared,
+                        )
+                        for n, d in T.Parallel(block_N, dim):
+                            products[n, d] = probs[n] * T.cast(v_shared[n, d], "float")
+                        T.reduce_sum(products, o_tile, dim=0)
+                        for d in T.Parallel(dim):
+                            o_acc[d] = o_acc[d] * alpha + o_tile[d]
+                        running_max[0] = new_max
+
+                inv_sum = T.if_then_else(running_sum[0] > 0.0, 1.0 / running_sum[0], 0.0)
+                if num_split == 1:
+                    # Write the output directly and skip the combine launch.
+                    for d in T.Parallel(dim):
+                        Output[bid, 0, hid, d] = o_acc[d] * inv_sum
+                else:
+                    partial_lse[bid, hid, sid] = T.if_then_else(
+                        running_sum[0] > 0.0,
+                        T.log2(T.max(running_sum[0], 1.0e-30)) + running_max[0],
+                        -1.0e30,
+                    )
+                    for d in T.Parallel(dim):
+                        partial_o[bid, hid, sid, d] = o_acc[d] * inv_sum
+
+        @T.macro
+        def combine(
+            partial_lse: T.Tensor([batch, heads, num_split], "float"),
+            partial_o: T.Tensor([batch, heads, num_split, dim], "float"),
+            Output: T.Tensor([batch, 1, heads, dim], dtype),
+        ):
+            with T.Kernel(heads, batch, threads=threads) as (hid, bid):
+                lse = T.alloc_fragment([num_split], "float")
+                max_lse = T.alloc_fragment([1], "float")
+                lse_sum = T.alloc_local([1], "float")
+                o_acc = T.alloc_fragment([dim], "float")
+                for k in T.Parallel(num_split):
+                    lse[k] = partial_lse[bid, hid, k]
+                T.fill(max_lse, -1.0e30)
+                T.reduce_max(lse, max_lse, dim=0, clear=False)
+                lse_sum[0] = 0.0
+                for k in T.serial(num_split):
+                    lse_sum[0] += T.exp2(partial_lse[bid, hid, k] - max_lse[0])
+                logsum = T.log2(lse_sum[0]) + max_lse[0]
+                T.clear(o_acc)
+                for k in T.serial(num_split):
+                    weight = T.exp2(partial_lse[bid, hid, k] - logsum)
+                    for d in T.Parallel(dim):
+                        o_acc[d] += partial_o[bid, hid, k, d] * weight
+                for d in T.Parallel(dim):
+                    Output[bid, 0, hid, d] = o_acc[d]
+
+        @T.prim_func
+        def mha_decode_paged_maca_simt(
+            Q: T.Tensor([batch, 1, heads, dim], dtype),
+            K: T.Tensor([seqlen_kv, heads, dim], dtype),
+            V: T.Tensor([seqlen_kv, heads, dim], dtype),
+            real_seqlen_kv: T.Tensor([batch], "int32"),
+            block_table: T.Tensor([batch, seqlen_kv // page_size], "int32"),
+            partial_lse: T.Tensor([batch, heads, num_split], "float"),
+            partial_o: T.Tensor([batch, heads, num_split, dim], "float"),
+            Output: T.Tensor([batch, 1, heads, dim], dtype),
+        ):
+            split(Q, K, V, real_seqlen_kv, block_table, partial_lse, partial_o, Output)
+            if num_split > 1:
+                combine(partial_lse, partial_o, Output)
+
+        return mha_decode_paged_maca_simt
+
+    return _func
+
+
 @torch.library.custom_op("tileops::mha_decode_paged_no_split_op", mutates_args=())
 def _mha_decode_paged_no_split_op(
     batch: int,
@@ -542,6 +689,50 @@ def _(
     glse: torch.Tensor,
     Output_partial: torch.Tensor,
     acc_split_length: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty_like(Q)
+
+
+@torch.library.custom_op("tileops::mha_decode_paged_maca_simt_op", mutates_args=())
+def _mha_decode_paged_maca_simt_op(
+    batch: int,
+    heads: int,
+    seqlen_kv: int,
+    dim: int,
+    page_size: int,
+    dtype: str,
+    block_N: int,
+    num_split: int,
+    threads: int,
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    real_seqlen_kv: torch.Tensor,
+    block_table: torch.Tensor,
+) -> torch.Tensor:
+    partial_lse = torch.empty((batch, heads, num_split), device=Q.device, dtype=torch.float32)
+    partial_o = torch.empty((batch, heads, num_split, dim), device=Q.device, dtype=torch.float32)
+    return _mha_decode_paged_maca_simt_kernel(batch, heads, seqlen_kv, dim, page_size, dtype)(
+        block_N, num_split, threads
+    )(Q, K, V, real_seqlen_kv, block_table, partial_lse, partial_o)
+
+
+@_mha_decode_paged_maca_simt_op.register_fake
+def _(
+    batch: int,
+    heads: int,
+    seqlen_kv: int,
+    dim: int,
+    page_size: int,
+    dtype: str,
+    block_N: int,
+    num_split: int,
+    threads: int,
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    real_seqlen_kv: torch.Tensor,
+    block_table: torch.Tensor,
 ) -> torch.Tensor:
     return torch.empty_like(Q)
 
@@ -761,4 +952,93 @@ class MHADecodePagedKernel(Kernel):
             glse,
             Output_partial,
             acc_split_length,
+        )
+
+
+class MHADecodePagedMACAKernel(Kernel):
+    """Single-query SIMT paged MHA decode on MACA."""
+
+    supported_archs: list[int] = [80]
+    general: bool = False
+
+    @classmethod
+    def applies(cls, call) -> bool:
+        return (
+            is_maca()
+            and call.arch == 80
+            and call.max_seqlen_q == 1
+            and not call.is_causal
+            and call.heads == call.heads_kv
+            and call.dim in (64, 128)
+            and call.page_size % 64 == 0
+            and call.dtype in (torch.float16, torch.bfloat16)
+        )
+
+    def __init__(
+        self,
+        batch: int,
+        heads: int,
+        seqlen_q: int,
+        seqlen_kv: int,
+        dim: int,
+        page_size: int,
+        is_causal: bool = False,
+        dtype: torch.dtype = torch.float16,
+        config: Optional[dict] = None,
+        tune: bool = False,
+    ) -> None:
+        super().__init__()
+        if seqlen_q != 1 or is_causal:
+            raise ValueError("MACA paged MHA decode requires one non-causal query token")
+        self.batch = batch
+        self.heads = heads
+        self.seqlen_q = seqlen_q
+        self.seqlen_kv = seqlen_kv
+        self.dim = dim
+        self.page_size = page_size
+        self.is_causal = is_causal
+        self.dtype = dtype
+        # The generic MMA autotuner does not tune this SIMT kernel.  Build its
+        # fallback only for a call outside this specialization.
+        self._fallback = None
+        self._fallback_config = config
+        self._fallback_tune = tune
+        self.config = {"block_N": 64, "threads": 128}
+
+    def forward(self, Q, K, V, real_seqlen_kv, block_table):
+        batch, seqlen_q, heads, dim = Q.shape
+        page_size = self.page_size
+        if seqlen_q != 1 or page_size % 64 or dim not in (64, 128):
+            if self._fallback is None:
+                self._fallback = MHADecodePagedKernel(
+                    self.batch,
+                    self.heads,
+                    self.seqlen_q,
+                    self.seqlen_kv,
+                    self.dim,
+                    self.page_size,
+                    self.is_causal,
+                    self.dtype,
+                    config=self._fallback_config,
+                    tune=self._fallback_tune,
+                )
+            return self._fallback.forward(Q, K, V, real_seqlen_kv, block_table)
+
+        # Short KV uses one GPU launch.  Long KV exposes more independent CTAs.
+        num_split = 4 if K.shape[0] <= 512 else 8
+        return _mha_decode_paged_maca_simt_op(
+            batch,
+            heads,
+            K.shape[0],
+            dim,
+            page_size,
+            str(Q.dtype).split(".")[-1],
+            self.config["block_N"],
+            num_split,
+            self.config["threads"],
+            Q,
+            K,
+            V,
+            real_seqlen_kv,
+            block_table,
         )
