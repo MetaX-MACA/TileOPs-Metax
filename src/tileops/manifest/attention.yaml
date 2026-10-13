@@ -485,6 +485,7 @@ MultiHeadAttentionDecodePagedWithKVCacheFwdOp:
     kernel: tileops/kernels/attention/mha_decode_paged.py
     kernel_map:
       mha_decode_paged_kernel: MHADecodePagedKernel
+      mha_decode_paged_maca_kernel: MHADecodePagedMACAKernel
       mha_decode_paged_ws_kernel: MHADecodePagedWsKernel
     op: tileops/ops/attention/mha.py
     test: tests/ops/attention/test_mha_decode_paged.py

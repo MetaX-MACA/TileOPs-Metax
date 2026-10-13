@@ -6,6 +6,7 @@ from tileops.kernels.attention import (
     FlashAttnBwdPreprocessKernel,
     GQABwdWgmmaPipelinedKernel,
     MHADecodePagedKernel,
+    MHADecodePagedMACAKernel,
     MHADecodePagedWsKernel,
 )
 from tileops.kernels.kernel_base import Kernel
@@ -203,6 +204,7 @@ class MultiHeadAttentionDecodePagedWithKVCacheFwdOp(Op):
         return {
             "mha_decode_paged_kernel": MHADecodePagedKernel,
             "mha_decode_paged_ws_kernel": MHADecodePagedWsKernel,
+            "mha_decode_paged_maca_kernel": MHADecodePagedMACAKernel,
         }
 
     def _attention_call(
