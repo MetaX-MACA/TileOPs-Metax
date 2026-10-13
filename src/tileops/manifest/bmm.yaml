@@ -41,7 +41,7 @@ BmmFwdOp:
     bench: benchmarks/ops/bench_bmm.py
     bench_manifest_driven: true
     kernel_map:
-      bmm_kernel: BmmKernel
+      bmm_kernel: BmmMACAKernel
 
 # BmmFp8KNFwdOp: strict 3D-3D batched FP8 GEMM with per-tensor scaling.
 # A single fp32 scalar per operand is shared across the whole batch,

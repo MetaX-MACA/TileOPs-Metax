@@ -9,7 +9,7 @@ from typing import ClassVar, Dict, Hashable, Optional, Set, Tuple
 
 import torch
 
-from tileops.kernels.gemm.bmm import BmmFp8Kernel, BmmFp8MACAKernel, BmmKernel
+from tileops.kernels.gemm.bmm import BmmFp8Kernel, BmmFp8MACAKernel, BmmKernel, BmmMACAKernel
 from tileops.kernels.kernel_base import Kernel
 from tileops.perf.profile import tensor_core_roof
 from tileops.utils import is_maca
@@ -55,7 +55,7 @@ class BmmFwdOp(Op):
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
-        return {"bmm_kernel": BmmKernel}
+        return {"bmm_kernel": BmmMACAKernel if is_maca() else BmmKernel}
 
     def _infer_bmnk(
         self,
