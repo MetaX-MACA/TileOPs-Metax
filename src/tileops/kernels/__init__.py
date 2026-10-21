@@ -54,6 +54,7 @@ if TYPE_CHECKING:  # type checkers and IDEs do not run __getattr__
         BmmFp8MACAKernel,
         BmmFp8TransposeKernel,
         BmmKernel,
+        BmmMACAKernel,
         BmmPersistentKernel,
         GemmCpAsyncKernel,
         GemmFp8BlockScaleKernel,
@@ -61,7 +62,11 @@ if TYPE_CHECKING:  # type checkers and IDEs do not run __getattr__
         GemmTmaKernel,
         GemvKernel,
     )
-    from .gemm_maca import GemmMACAKernel
+    from .gemm_maca import (
+        GemmMACAKernel,
+        GemvMACAKernel,
+        SmallBatchGemmMACAKernel,
+    )
     from .grouped_gemm import (
         GroupedGemmKernel,
         GroupedGemmPersistentKernel,
@@ -146,6 +151,7 @@ _LAZY = {
     "BmmFp8MACAKernel": ".gemm.bmm",
     "BmmFp8TransposeKernel": ".gemm",
     "BmmKernel": ".gemm",
+    "BmmMACAKernel": ".gemm.bmm",
     "BmmPersistentKernel": ".gemm",
     "Conv1dKernel": ".convolution",
     "Conv1dPointwiseKernel": ".convolution",
@@ -197,6 +203,8 @@ _LAZY = {
     "GemmTmaKernel": ".gemm",
     "GemvKernel": ".gemm",
     "GemmMACAKernel": ".gemm_maca",
+    "GemvMACAKernel": ".gemm_maca",
+    "SmallBatchGemmMACAKernel": ".gemm_maca",
     "GroupConv1dKernel": ".convolution",
     "GroupConv2dKernel": ".convolution",
     "GroupConv3dKernel": ".convolution",

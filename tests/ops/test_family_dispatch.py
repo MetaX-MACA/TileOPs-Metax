@@ -52,8 +52,12 @@ def test_gemm_dispatch(m: int, n: int, trans_a: bool, trans_b: bool, expected: s
         arch=_SM90, m=m, n=n, k=64, dtype=torch.float16, trans_a=trans_a, trans_b=trans_b
     )
 
-    if is_maca() and expected == "GemmTmaKernel":
-        expected = "GemmMACAKernel"
+    if is_maca():
+        expected = {
+            "GemmTmaKernel": "GemmMACAKernel",
+            "GemvKernel": "GemvMACAKernel",
+        }.get(expected, expected)
+
     assert op.select_kernel(call).__name__ == expected
 
 

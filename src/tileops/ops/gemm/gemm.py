@@ -12,7 +12,11 @@ from tileops.kernels.gemm.dense import (
 )
 from tileops.kernels.gemm.w4a16 import GROUP_SIZE, GemmW4A16Kernel
 from tileops.kernels.gemm.w4a16_gemv import GemmW4A16GemvKernel
-from tileops.kernels.gemm_maca import GemmMACAKernel
+from tileops.kernels.gemm_maca import (
+    GemmMACAKernel,
+    GemvMACAKernel,
+    SmallBatchGemmMACAKernel,
+)
 from tileops.kernels.kernel_base import Kernel
 from tileops.perf.profile import tensor_core_roof
 from tileops.utils import get_sm_version, is_maca
@@ -24,7 +28,12 @@ __all__ = ["GemmFp8FwdOp", "GemmFwdOp", "GemmW4A16FwdOp"]
 
 # Compatibility list used by dispatch tests and downstream callers that inspect
 # the GEMM family candidates explicitly.
-_GEMM_KEYS = ("gemv_kernel", "gemm_tma_kernel", "gemm_cp_async_kernel")
+_GEMM_KEYS = (
+    "gemv_kernel",
+    "gemm_tma_kernel",
+    "gemm_cp_async_kernel",
+    "small_batch_kernel",
+)
 
 
 class GemmFwdOp(Op):
@@ -70,14 +79,20 @@ class GemmFwdOp(Op):
     def default_kernel_map(self) -> Dict[str, Kernel]:
         use_maca = is_maca()
         gemm_cls = GemmMACAKernel if (use_maca or get_sm_version() < 90) else GemmTmaKernel
+        gemv_cls = GemvMACAKernel if use_maca else GemvKernel
+
         kernels = {
             "gemm_tma_kernel": gemm_cls,
-            "gemv_kernel": GemvKernel,
+            "gemv_kernel": gemv_cls,
         }
-        # MACA has its own GEMM implementation; keeping the CUDA cp.async
-        # candidate installed makes dispatch ambiguous for GEMV-shaped calls.
-        if not use_maca:
+
+        # MACA uses its dedicated two-row NT GEMM kernel.
+        # Keep the CUDA cp.async candidate only on non-MACA devices.
+        if use_maca:
+            kernels["small_batch_kernel"] = SmallBatchGemmMACAKernel
+        else:
             kernels["gemm_cp_async_kernel"] = GemmCpAsyncKernel
+
         return kernels
 
     def _infer_mnk(self, a: torch.Tensor, b: torch.Tensor) -> Tuple[int, int, int]:

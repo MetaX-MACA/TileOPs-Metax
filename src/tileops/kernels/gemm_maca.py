@@ -199,7 +199,11 @@ class GemmMACAKernel(Kernel):
         elif self.m <= 128:
             config["block_n"] = 32
             if not self.trans_a and self.trans_b and self.k > self.n:
+                config["block_m"] = 32
                 config["block_k"] = 128
+                config["threads"] = 128
+        else:
+            config["block_m"] = 128
 
         return config
 
@@ -320,13 +324,41 @@ def _small_batch_gemm_kernel_maca(
 
 
 class GemvMACAKernel(Kernel):
-    """MACA specialization for one-row NT GEMMs."""
+    """MACA specialization for one-row NT and one-column NN GEMMs."""
 
     supported_archs: list[int] = [80, 86, 89, 90]
 
     @classmethod
     def applies(cls, call) -> bool:
         return call.gemv_mode is not None
+
+    @classmethod
+    def entry_for(cls, call):
+        mode = call.gemv_mode
+        if mode is None:
+            raise ValueError("GemvMACAKernel requires a GEMV-shaped call")
+
+        # For rhs_col, the output length is the original matrix's M.
+        out_len = call.n if mode == "lhs_row" else call.m
+        device_index = call.device.index if call.device is not None else None
+        identity = (
+            mode,
+            call.m,
+            call.n,
+            call.k,
+            call.dtype,
+            call.tune,
+            call.trans_a,
+            call.trans_b,
+            device_index,
+        )
+        return identity, lambda: cls(
+            n=out_len,
+            k=call.k,
+            dtype=call.dtype,
+            tune=call.tune,
+            mode=mode,
+        )
 
     def __init__(
         self,
@@ -335,8 +367,14 @@ class GemvMACAKernel(Kernel):
         dtype: torch.dtype,
         config: Optional[dict] = None,
         tune: bool = False,
+        *,
+        mode: str = "lhs_row",
     ) -> None:
         super().__init__()
+        if mode not in ("lhs_row", "rhs_col"):
+            raise ValueError(f"Unsupported GEMV mode: {mode}")
+
+        self.mode = mode
         self.n = n
         self.k = k
         self.dtype = dtype
@@ -352,12 +390,20 @@ class GemvMACAKernel(Kernel):
         return [self.default_config]
 
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        # The kernel takes a vector followed by a row-major matrix.
+        if self.mode == "rhs_col":
+            a, b = b, a
+
         cfg = self.config
-        return self.kernel(
+        out = self.kernel(
             cfg["block_n"],
             cfg["reduce_threads"],
             cfg["num_stages"],
-        )(a.reshape(1, -1).contiguous(), b).reshape(self.n)
+        )(a.reshape(1, -1).contiguous(), b)
+
+        if self.mode == "rhs_col":
+            return out.reshape(self.n, 1)
+        return out.reshape(1, self.n)
 
 
 class SmallBatchGemmMACAKernel(Kernel):
@@ -368,6 +414,27 @@ class SmallBatchGemmMACAKernel(Kernel):
     @classmethod
     def applies(cls, call) -> bool:
         return not call.trans_a and call.trans_b and call.m == 2
+
+    @classmethod
+    def entry_for(cls, call):
+        device_index = call.device.index if call.device is not None else None
+        identity = (
+            call.m,
+            call.n,
+            call.k,
+            call.dtype,
+            call.tune,
+            call.trans_a,
+            call.trans_b,
+            device_index,
+        )
+        return identity, lambda: cls(
+            m=call.m,
+            n=call.n,
+            k=call.k,
+            dtype=call.dtype,
+            tune=call.tune,
+        )
 
     def __init__(
         self,

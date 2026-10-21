@@ -756,6 +756,41 @@ def test_lhs_rows_band_dispatch() -> None:
 
 
 @pytest.mark.smoke
+def test_small_batch_dispatch() -> None:
+    """MACA dispatches every two-row NT GEMM to its small-batch kernel."""
+    from tileops.kernels.gemm_maca import (
+        GemmMACAKernel,
+        GemvMACAKernel,
+        SmallBatchGemmMACAKernel,
+    )
+    from tileops.utils import is_maca
+
+    if not is_maca():
+        pytest.skip("MACA-specific small-batch dispatch test")
+
+    fp = torch.float16
+    nt = GemmFwdOp(trans_a=False, trans_b=True)
+
+    # Cover narrow-N, normal and wide-N shapes on both C500 and C600-U.
+    for n, k in (
+        (64, 7168),
+        (2112, 7168),
+        (7168, 2048),
+    ):
+        call = nt._call_spec(2, n, k, fp)
+        assert nt.select_kernel(call) is SmallBatchGemmMACAKernel
+
+    # Other shapes retain their existing MACA dispatch behavior.
+    assert nt.select_kernel(nt._call_spec(3, 2112, 7168, fp)) is GemmMACAKernel
+    assert nt.select_kernel(nt._call_spec(1, 2112, 7168, fp)) is GemvMACAKernel
+
+    nn = GemmFwdOp(trans_a=False, trans_b=False)
+    assert nn.select_kernel(nn._call_spec(2, 2112, 7168, fp)) is GemmMACAKernel
+    # Preserve the original one-column NN GEMV dispatch.
+    assert nn.select_kernel(nn._call_spec(2112, 1, 7168, fp)) is GemvMACAKernel
+
+
+@pytest.mark.smoke
 def test_gemv_bands_build_their_own_body_and_config() -> None:
     """Each band states its own body shape and config band; the band is in the identity.
 
