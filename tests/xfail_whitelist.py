@@ -112,10 +112,7 @@ _MACA_XFAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         _CI_EXPECTATION_MISMATCH,
-        (
-            "tests/ops/test_family_dispatch.py::test_gemm_k_too_narrow_to_vectorize_is_refused_during_selection",
-            "tests/ops/test_family_dispatch.py::test_gemm_uses_basic_mainloop_off_sm90",
-        ),
+        (),
     ),
     (
         _MANIFEST_VALIDATION,

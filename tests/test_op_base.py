@@ -533,7 +533,6 @@ def test_no_abstract_op_class_is_instantiated_anywhere():
 _RENAMED_KEYS = [
     "gemm_kernel",
     "gemm_basic_kernel",
-    "small_batch_kernel",
     "gemm_fp8_epilogue_kernel",
     "gemm_fp8_block_scaled_kernel",
     "gemm_w4a16_decode_kernel",

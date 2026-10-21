@@ -13,7 +13,7 @@ import torch
 
 from tileops.kernels.gemm import GemmCpAsyncKernel, GemmTmaKernel
 from tileops.kernels.gemm.call_spec import GemmCall
-from tileops.kernels.gemm_maca import GemmMACAKernel
+from tileops.kernels.gemm_maca import GemmMACAKernel, GemvMACAKernel
 from tileops.kernels.linear_attention.deltanet_call import DeltaNetDecodeCall
 from tileops.kernels.linear_attention.deltanet_recurrence import DeltaNetDecodeRawCudaFlaStyleKernel
 from tileops.ops.gemm.gemm import GemmFwdOp
@@ -148,8 +148,11 @@ def test_gemm_k_too_narrow_to_vectorize_is_refused_during_selection() -> None:
     op = GemmFwdOp()
     call = GemmCall(arch=_SM90, sm_count=132, m=64, n=64, k=1, dtype=torch.float16, trans_b=True)
 
-    with pytest.raises(ValueError, match="k must span at least one"):
-        op.select_kernel(call)
+    if is_maca():
+        assert op.select_kernel(call) is GemmMACAKernel
+    else:
+        with pytest.raises(ValueError, match="k must span at least one"):
+            op.select_kernel(call)
 
     with pytest.raises(ValueError, match="cannot serve k=1"):
         GemmCpAsyncKernel(64, 64, 1, torch.float16, trans_b=True)
@@ -160,7 +163,11 @@ def test_gemm_uses_basic_mainloop_off_sm90() -> None:
     op = GemmFwdOp()
     call = GemmCall(arch=_SM80, m=1, n=8, k=64, dtype=torch.float16, trans_b=True)
 
-    assert op.select_kernel(call) is GemmCpAsyncKernel
+    if is_maca():
+        assert op.select_kernel(call) is GemvMACAKernel
+        return
+    else:
+        assert op.select_kernel(call) is GemmCpAsyncKernel
 
 
 # --- DeltaNet decode: fp32 has its own kernel; the raw-CUDA one serves 16-bit
