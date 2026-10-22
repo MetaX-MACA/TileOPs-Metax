@@ -36,7 +36,7 @@ from .gqa_sliding_window_varlen_fwd import (
     GQASlidingWindowVarlenFwdWgmmaPipelinedKernel,
 )
 from .mha_decode import MHADecodeKernel
-from .mha_decode_paged import MHADecodePagedKernel
+from .mha_decode_paged import MHADecodePagedKernel, MHADecodePagedMACAKernel
 from .mha_decode_paged_ws import MHADecodePagedWsKernel
 
 __all__ = [
@@ -67,6 +67,7 @@ __all__ = [
     "GQASlidingWindowVarlenFwdWgmmaPipelinedKernel",
     "MHADecodeKernel",
     "MHADecodePagedKernel",
+    "MHADecodePagedMACAKernel",
     "MHADecodePagedWsKernel",
     "MLADecodeMacaKernel",
     "MLADecodeWsKernel",
