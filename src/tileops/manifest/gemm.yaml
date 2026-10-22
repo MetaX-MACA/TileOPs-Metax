@@ -64,6 +64,7 @@ GemmFwdOp:
     bench_manifest_driven: true
     kernel_map:
       gemm_tma_kernel: GemmMACAKernel
+      gemm_cp_async_kernel: GemmCpAsyncKernel
       gemv_kernel: GemvMACAKernel
       small_batch_kernel: SmallBatchGemmMACAKernel
 

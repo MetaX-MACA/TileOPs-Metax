@@ -199,7 +199,11 @@ class GemmMACAKernel(Kernel):
         elif self.m <= 128:
             config["block_n"] = 32
             if not self.trans_a and self.trans_b and self.k > self.n:
+                config["block_m"] = 32
                 config["block_k"] = 128
+                config["threads"] = 128
+        else:
+            config["block_m"] = 128
 
         return config
 
