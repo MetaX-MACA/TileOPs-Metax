@@ -24,6 +24,7 @@ from tileops.kernels.attention import (
     GQAPrefillPagedWithKVCacheFwdKernel,
     GQAPrefillPagedWithKVCacheRopeFwdKernel,
     GQAPrefillVarlenFwdKernel,
+    GQAPrefillVarlenFwdMACAKernel,
     GQASlidingWindowVarlenFwdWgmmaPipelinedKernel,
 )
 from tileops.kernels.kernel_base import Entry, Kernel
@@ -1220,9 +1221,17 @@ class GroupedQueryAttentionPrefillVarlenFwdOp(Op):
     ) -> Dict[str, tuple[int, ...]]:
         return {"o": tuple(q_shape)}
 
-    def _get_kernel(self, inputs: "tuple[torch.Tensor | None, ...]", dtype: torch.dtype) -> Kernel:
+    def _get_kernel(
+        self,
+        inputs: "tuple[torch.Tensor | None, ...]",
+        dtype: torch.dtype,
+    ) -> Kernel:
         _validate_attention_dtype(dtype)
-        return self.kernel_for("gqa_prefill_varlen_fwd_kernel", inputs, dtype)
+
+        kernel_key = (
+            "gqa_prefill_varlen_fwd_maca_kernel" if is_maca() else "gqa_prefill_varlen_fwd_kernel"
+        )
+        return self.kernel_for(kernel_key, inputs, dtype)
 
     def entry_for(self, role: str, call: torch.dtype) -> Entry:
         """One implementation, built per dtype; every extent is the op's."""
@@ -1243,7 +1252,10 @@ class GroupedQueryAttentionPrefillVarlenFwdOp(Op):
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
-        return {"gqa_prefill_varlen_fwd_kernel": GQAPrefillVarlenFwdKernel}
+        return {
+            "gqa_prefill_varlen_fwd_kernel": GQAPrefillVarlenFwdKernel,
+            "gqa_prefill_varlen_fwd_maca_kernel": GQAPrefillVarlenFwdMACAKernel,
+        }
 
     @staticmethod
     def _lengths_from_cu_seqlens(cu_seqlens: torch.Tensor) -> list[int]:
