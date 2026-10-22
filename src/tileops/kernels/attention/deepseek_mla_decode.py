@@ -975,7 +975,21 @@ class MLADecodeMacaKernel(Kernel):
 
     @property
     def autotune_configs(self) -> list[dict]:
-        return [self.default_config]
+        default = self.default_config
+        configs = [default]
+        element_size = torch.finfo(self.dtype).bits // 8
+
+        for block_N in (64, 128):
+            shared_bytes = element_size * (
+                default["block_H"] * (2 * self.dim + self.pe_dim)
+                + block_N * (self.dim + self.pe_dim + default["block_H"])
+            )
+            if shared_bytes <= 64 * 1024 and self.seqlen_kv % block_N == 0:
+                configs.append({**default, "block_N": block_N})
+                if block_N == 128:
+                    configs.append({**default, "block_N": block_N, "threads": 256})
+
+        return configs
 
     def forward(self, q: torch.Tensor, q_pe: torch.Tensor, k: torch.Tensor, k_pe: torch.Tensor):
         return _mla_decode_maca_wrapped_kernel(
