@@ -43,6 +43,7 @@ BmmFwdOp:
     bench_manifest_driven: true
     kernel_map:
       bmm_persistent_kernel: BmmPersistentKernel
+      bmm_maca_kernel: BmmMACAKernel
       bmm_kernel: BmmKernel
 
 # Strict 3D-3D batched FP8 GEMM with per-tensor scaling. A single fp32 scalar

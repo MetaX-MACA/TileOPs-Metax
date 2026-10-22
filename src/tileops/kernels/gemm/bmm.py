@@ -22,6 +22,7 @@ __all__ = [
     "BmmFp8MACAKernel",
     "BmmFp8TransposeKernel",
     "BmmKernel",
+    "BmmMACAKernel",
     "BmmPersistentKernel",
 ]
 
@@ -117,6 +118,68 @@ def _bmm_kernel(batch: int, m: int, n: int, k: int, dtype: str = "float16") -> C
                 for i, j in T.Parallel(block_m, block_n):
                     if m_start + i < m and n_start + j < n:
                         c[bz, m_start + i, n_start + j] = c_smem[i, j]
+
+        return _bmm_main
+
+    return _bmm_func
+
+
+@functools.lru_cache(maxsize=64)
+def _bmm_kernel_maca(batch: int, m: int, n: int, k: int, dtype: str) -> Callable:
+    """Batched MACA GEMM with direct fragment-to-global output stores."""
+
+    @tilelang.jit(
+        out_idx=[-1],
+        pass_configs={"tl.disable_warp_specialized": True},
+        compile_flags=["-O3", "-DENABLE_BF16"],
+    )
+    def _bmm_func(
+        block_m: int = 64,
+        block_n: int = 128,
+        block_k: int = 64,
+        num_stages: int = 1,
+        threads: int = 256,
+    ) -> Callable:
+        @T.prim_func
+        def _bmm_main(
+            a: T.Tensor((batch, m, k), dtype),
+            b: T.Tensor((batch, k, n), dtype),
+            c: T.Tensor((batch, m, n), dtype),
+        ) -> None:
+            with T.Kernel(T.ceildiv(n, block_n), T.ceildiv(m, block_m), batch, threads=threads) as (
+                bx,
+                by,
+                bz,
+            ):
+                a_smem = T.alloc_shared((block_m, block_k), dtype)
+                b_smem = T.alloc_shared((block_k, block_n), dtype)
+                c_local = T.alloc_fragment((block_m, block_n), "float32")
+                T.annotate_layout(
+                    {
+                        a_smem: tilelang.layout.make_swizzled_layout(a_smem),
+                        b_smem: tilelang.layout.make_swizzled_layout(b_smem),
+                    }
+                )
+                T.use_swizzle(10, enable=True)
+                m_start = by * block_m
+                n_start = bx * block_n
+                T.clear(c_local)
+
+                for ki in T.Pipelined(T.ceildiv(k, block_k), num_stages=num_stages):
+                    k_start = ki * block_k
+                    T.copy(
+                        a[bz, m_start : m_start + block_m, k_start : k_start + block_k],
+                        a_smem,
+                    )
+                    T.copy(
+                        b[bz, k_start : k_start + block_k, n_start : n_start + block_n],
+                        b_smem,
+                    )
+                    T.gemm(a_smem, b_smem, c_local, policy=T.GemmWarpPolicy.FullRow)
+
+                for i, j in T.Parallel(block_m, block_n):
+                    if m_start + i < m and n_start + j < n:
+                        c[bz, m_start + i, n_start + j] = T.cast(c_local[i, j], dtype)
 
         return _bmm_main
 
@@ -773,6 +836,7 @@ class BmmKernel(Kernel):
     """
 
     supported_archs: list[int] = [80, 89, 90]
+    _kernel_factory = staticmethod(_bmm_kernel)
     general = True
 
     @classmethod
@@ -811,7 +875,7 @@ class BmmKernel(Kernel):
         self.n = n
         self.k = k
         self.dtype = dtype
-        self.kernel = _bmm_kernel(batch, m, n, k, self.dtype_str)
+        self.kernel = self._kernel_factory(batch, m, n, k, self.dtype_str)
         self.init_config(config, tune)
 
     @property
@@ -846,6 +910,52 @@ class BmmKernel(Kernel):
         if not hasattr(self, "_compiled_kernel"):
             self._compiled_kernel = self.kernel(**self.config)
         return self._compiled_kernel(a, b)
+
+
+class BmmMACAKernel(BmmKernel):
+    """MACA BMM with a direct-store epilogue and device-sized tuning grid."""
+
+    general = False
+    _kernel_factory = staticmethod(_bmm_kernel_maca)
+
+    @property
+    def default_config(self) -> dict:
+        config = super().default_config
+        config.update(block_n=128, num_stages=1, threads=256)
+        return config
+
+    @property
+    def autotune_configs(self) -> list[dict]:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        smem_limit = max(
+            props.shared_memory_per_block,
+            getattr(props, "shared_memory_per_block_optin", 0),
+        )
+        configs = []
+        for bm in (64, 128):
+            for bn in (64, 128, 256):
+                for bk in (16, 32, 64, 128):
+                    if self.k % bk != 0 or (bk == 16 and self.k % 32 == 0):
+                        continue
+                    for ns in (1, 2, 3, 4):
+                        # fp16/bf16 A/B tiles; the output uses no shared buffer.
+                        # This is an estimate: the compiler checks actual usage.
+                        if (bm + bn) * bk * ns * 2 > smem_limit:
+                            continue
+                        for threads in (128, 256):
+                            # Limit the fp32 accumulator footprint per thread.
+                            if bm * bn > threads * 128:
+                                continue
+                            configs.append(
+                                {
+                                    "block_m": bm,
+                                    "block_n": bn,
+                                    "block_k": bk,
+                                    "num_stages": ns,
+                                    "threads": threads,
+                                }
+                            )
+        return configs
 
 
 class BmmPersistentKernel(Kernel):
