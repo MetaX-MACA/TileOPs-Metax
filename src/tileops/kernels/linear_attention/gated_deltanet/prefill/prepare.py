@@ -10,6 +10,7 @@ import tilelang.language as T
 import torch
 
 from tileops.kernels.constants import LOG2E
+from tileops.utils import is_maca
 
 from .common import _gemm_v1, prepare_chunk_offsets
 
@@ -71,11 +72,13 @@ def _prefill_blocksolve_A_bthd_tl(
     block_k = 64
     accum_dtype = "float32"
     solve_dtype = dtype
+    maca_backend = is_maca()
 
     @tilelang.jit(
         out_idx=[],
         pass_configs={
             tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+            tilelang.PassConfigKey.TL_ENABLE_ASYNC_COPY: not maca_backend,
         },
         compile_flags=["-O3", "-DENABLE_BF16"],
     )
@@ -184,7 +187,8 @@ def _prefill_blocksolve_A_bthd_tl(
                         ],
                         k3,
                     )
-                    T.ptx_wait_group(0)
+                    if not maca_backend:
+                        T.ptx_wait_group(0)
                     T.sync_threads()
 
                     T.gemm(k0, k0, G00, transpose_B=True)
@@ -460,7 +464,7 @@ def _prefill_blocksolve_A_bthd_tl(
 
         return prefill_blocksolve_A_bthd_tl
 
-    return _func(32)
+    return _func(64 if maca_backend else 32)
 
 
 def _prefill_blocksolve_A_bthd(
