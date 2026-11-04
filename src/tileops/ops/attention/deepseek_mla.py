@@ -51,7 +51,10 @@ class MultiHeadLatentAttentionDecodeWithKVCacheFwdOp(Op):
 
     def entry_for(self, role: str, call: torch.dtype) -> Entry:
         """One implementation, built per dtype; every extent is the op's."""
-        return call, lambda: self.kernel_map["mla_decode_kernel"](
+        kernel_key = "mla_decode_kernel"
+        if is_maca() and kernel_key not in self._overridden_keys:
+            kernel_key = "mla_decode_maca_kernel"
+        return call, lambda: self.kernel_map[kernel_key](
             self.batch,
             self.heads,
             self.heads_kv,
@@ -64,7 +67,10 @@ class MultiHeadLatentAttentionDecodeWithKVCacheFwdOp(Op):
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
-        return {"mla_decode_kernel": MLADecodeMacaKernel if is_maca() else MLADecodeWsKernel}
+        return {
+            "mla_decode_kernel": MLADecodeWsKernel,
+            "mla_decode_maca_kernel": MLADecodeMacaKernel,
+        }
 
     def _infer_output_shapes(
         self,

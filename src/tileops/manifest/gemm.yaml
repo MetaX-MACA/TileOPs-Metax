@@ -63,9 +63,11 @@ GemmFwdOp:
     bench: benchmarks/ops/bench_gemm.py
     bench_manifest_driven: true
     kernel_map:
-      gemm_tma_kernel: GemmMACAKernel
+      gemm_tma_kernel: GemmTmaKernel
+      gemm_maca_kernel: GemmMACAKernel
       gemm_cp_async_kernel: GemmCpAsyncKernel
-      gemv_kernel: GemvMACAKernel
+      gemv_kernel: GemvKernel
+      gemv_maca_kernel: GemvMACAKernel
       small_batch_kernel: SmallBatchGemmMACAKernel
 
 GemmFp8FwdOp:

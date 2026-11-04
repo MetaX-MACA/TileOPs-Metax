@@ -19,7 +19,7 @@ from tileops.kernels.gemm_maca import (
 )
 from tileops.kernels.kernel_base import Kernel
 from tileops.perf.profile import tensor_core_roof
-from tileops.utils import get_sm_version, is_maca
+from tileops.utils import is_maca
 
 from .._compile_boundary_codegen import OperatorSpec
 from ..op_base import Op
@@ -30,7 +30,9 @@ __all__ = ["GemmFp8FwdOp", "GemmFwdOp", "GemmW4A16FwdOp"]
 # the GEMM family candidates explicitly.
 _GEMM_KEYS = (
     "gemv_kernel",
+    "gemv_maca_kernel",
     "gemm_tma_kernel",
+    "gemm_maca_kernel",
     "gemm_cp_async_kernel",
     "small_batch_kernel",
 )
@@ -77,23 +79,30 @@ class GemmFwdOp(Op):
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
-        use_maca = is_maca()
-        gemm_cls = GemmMACAKernel if (use_maca or get_sm_version() < 90) else GemmTmaKernel
-        gemv_cls = GemvMACAKernel if use_maca else GemvKernel
-
-        kernels = {
-            "gemm_tma_kernel": gemm_cls,
-            "gemv_kernel": gemv_cls,
+        return {
+            "gemm_tma_kernel": GemmTmaKernel,
+            "gemm_maca_kernel": GemmMACAKernel,
+            "gemm_cp_async_kernel": GemmCpAsyncKernel,
+            "gemv_kernel": GemvKernel,
+            "gemv_maca_kernel": GemvMACAKernel,
+            "small_batch_kernel": SmallBatchGemmMACAKernel,
         }
 
-        # MACA uses its dedicated two-row NT GEMM kernel.
-        # Keep the CUDA cp.async candidate only on non-MACA devices.
-        if use_maca:
-            kernels["small_batch_kernel"] = SmallBatchGemmMACAKernel
+    def select_kernel_key(self, keys: tuple[str, ...], call: GemmCall) -> str:
+        if is_maca():
+            excluded = {"gemm_cp_async_kernel"}
+            # Preserve explicit overrides of the original MACA dispatch keys.
+            for original, maca in (
+                ("gemm_tma_kernel", "gemm_maca_kernel"),
+                ("gemv_kernel", "gemv_maca_kernel"),
+            ):
+                excluded.add(maca if original in self._overridden_keys else original)
         else:
-            kernels["gemm_cp_async_kernel"] = GemmCpAsyncKernel
+            excluded = {"gemm_maca_kernel", "gemv_maca_kernel", "small_batch_kernel"}
+            if call.arch < 90 and "gemm_tma_kernel" not in self._overridden_keys:
+                excluded.add("gemm_tma_kernel")
 
-        return kernels
+        return super().select_kernel_key(tuple(key for key in keys if key not in excluded), call)
 
     def _infer_mnk(self, a: torch.Tensor, b: torch.Tensor) -> Tuple[int, int, int]:
         """Derive logical ``(m, n, k)`` from input shapes per the trans flags."""

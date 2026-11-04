@@ -4,6 +4,7 @@ import torch
 
 from tileops.kernels.attention import (
     FlashAttnBwdPreprocessKernel,
+    GQABwdMACAKernel,
     GQABwdWgmmaPipelinedKernel,
     MHADecodePagedKernel,
     MHADecodePagedMACAKernel,
@@ -81,6 +82,7 @@ class MultiHeadAttentionBwdOp(Op):
         return {
             "gqa_bwd_preprocess_kernel": FlashAttnBwdPreprocessKernel,
             "gqa_bwd_kernel": GQABwdWgmmaPipelinedKernel,
+            "gqa_bwd_maca_kernel": GQABwdMACAKernel,
         }
 
     def kernel_delegates(self) -> tuple[GroupedQueryAttentionBwdOp, ...]:

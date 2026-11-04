@@ -275,7 +275,18 @@ class MoeGroupedGemmFwdOp(_StagedOpBase):
 
     @property
     def default_kernel_map(self) -> dict[str, Kernel]:
-        return {"grouped_gemm": MoeGroupedGemmMACAAdapter if is_maca() else MoeGroupedGemmKernel}
+        return {
+            "grouped_gemm": MoeGroupedGemmKernel,
+            "grouped_gemm_maca": MoeGroupedGemmMACAAdapter,
+        }
+
+    def select_kernel_key(self, keys: tuple[str, ...], call: object) -> str:
+        generic = "grouped_gemm"
+        maca = "grouped_gemm_maca"
+        if generic in keys and maca in keys:
+            inactive = generic if is_maca() and generic not in self._overridden_keys else maca
+            keys = tuple(key for key in keys if key != inactive)
+        return super().select_kernel_key(keys, call)
 
     def __init__(
         self,

@@ -88,9 +88,9 @@ class GLAFwdOp(Op):
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
-        fwd_cls = GLAFwdMACAKernel if is_maca() else GLAFwdKernel
         return {
-            "GLAFwdKernel": fwd_cls,
+            "GLAFwdKernel": GLAFwdKernel,
+            "GLAFwdMACAKernel": GLAFwdMACAKernel,
         }
 
     def _get_kernel(
@@ -121,7 +121,10 @@ class GLAFwdOp(Op):
     def entry_for(self, role: str, call: tuple) -> Entry:
         """One implementation, built per shape, chunk length, scale, dtype and device."""
         batch, seq_len, heads, dim_k, dim_v, chunk_size, scale, dtype, _device, tune = call
-        return call, lambda: self.kernel_map["GLAFwdKernel"](
+        kernel_key = "GLAFwdKernel"
+        if is_maca() and kernel_key not in self._overridden_keys:
+            kernel_key = "GLAFwdMACAKernel"
+        return call, lambda: self.kernel_map[kernel_key](
             batch,
             seq_len,
             heads,
@@ -249,9 +252,9 @@ class GLABwdOp(Op):
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
-        bwd_cls = GLABwdMACAKernel if is_maca() else GLABwdKernel
         return {
-            "GLABwdKernel": bwd_cls,
+            "GLABwdKernel": GLABwdKernel,
+            "GLABwdMACAKernel": GLABwdMACAKernel,
         }
 
     def _get_kernel(
@@ -282,7 +285,10 @@ class GLABwdOp(Op):
     def entry_for(self, role: str, call: tuple) -> Entry:
         """One implementation, built per shape, chunk length, scale, dtype and device."""
         batch, seq_len, heads, dim_k, dim_v, chunk_size, scale, dtype, _device, tune = call
-        return call, lambda: self.kernel_map["GLABwdKernel"](
+        kernel_key = "GLABwdKernel"
+        if is_maca() and kernel_key not in self._overridden_keys:
+            kernel_key = "GLABwdMACAKernel"
+        return call, lambda: self.kernel_map[kernel_key](
             batch,
             seq_len,
             heads,

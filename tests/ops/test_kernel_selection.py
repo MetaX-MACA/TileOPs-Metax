@@ -44,12 +44,12 @@ def test_paged_decode_dispatch_is_unchanged(ctor: dict, dtype: torch.dtype, expe
     kwargs.update(ctor)
     op = GroupedQueryAttentionDecodePagedWithKVCacheFwdOp(**kwargs)
     candidate = op.select_kernel(op.attention_call(dtype)).__name__
-    if is_maca() and expected == "GQADecodePagedKernel":
-        expected = "GQADecodePagedMACAKernel"
-    if expected == "gqa_decode_paged_bs1_kernel" and get_sm_version() not in (
+    if expected == "GQADecodePagedBs1Kernel" and get_sm_version() not in (
         GQADecodePagedBs1Kernel.supported_archs or []
     ):
-        expected = "gqa_decode_paged_kernel"
+        expected = "GQADecodePagedKernel"
+    if is_maca() and expected == "GQADecodePagedKernel":
+        expected = "GQADecodePagedMACAKernel"
     assert candidate == expected
 
 

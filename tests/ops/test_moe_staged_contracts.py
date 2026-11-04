@@ -627,7 +627,7 @@ def test_grouped_gemm_call_no_candidate_serves_reports_no_implementation() -> No
     """A call outside every shipped candidate's region says so, rather than crashing."""
     device = torch.device("cuda")
     op = MoeGroupedGemmFwdOp(ContiguousLayoutSpec.tight_per_row())  # not claimed yet
-    assert set(op.kernel_map) == {"grouped_gemm"}
+    assert set(op.kernel_map) == {"grouped_gemm", "grouped_gemm_maca"}
     with pytest.raises(ValueError, match="no implementation serves this call"):
         op(
             torch.empty(2, 8, dtype=torch.bfloat16, device=device),

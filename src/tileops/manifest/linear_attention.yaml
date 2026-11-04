@@ -208,6 +208,7 @@ DeltaNetAutogradOp:
     kernel_map:
       DeltaNetFwdKernel: DeltaNetFwdKernel
       DeltaNetBwdKernel: DeltaNetBwdKernel
+      DeltaNetBwdMACAKernel: DeltaNetBwdMACAKernel
     op: tileops/ops/linear_attention/deltanet.py
     test: tests/ops/test_deltanet_autograd.py
     bench: benchmarks/ops/bench_deltanet.py
@@ -291,6 +292,7 @@ DeltaNetBwdOp:
     kernel: tileops/kernels/linear_attention/deltanet/deltanet_bwd.py
     kernel_map:
       DeltaNetBwdKernel: DeltaNetBwdKernel
+      DeltaNetBwdMACAKernel: DeltaNetBwdMACAKernel
     op: tileops/ops/linear_attention/deltanet.py
     test: tests/ops/test_deltanet_chunkwise_bwd.py
     bench: benchmarks/ops/bench_deltanet.py
@@ -329,6 +331,7 @@ GLAFwdOp:
     kernel: tileops/kernels/linear_attention/gla/gla_fwd.py
     kernel_map:
       GLAFwdKernel: GLAFwdKernel
+      GLAFwdMACAKernel: GLAFwdMACAKernel
     op: tileops/ops/linear_attention/gla.py
     test: tests/ops/test_gla_chunkwise_fwd.py
     bench: benchmarks/ops/bench_gla_chunkwise.py
@@ -371,6 +374,7 @@ GLABwdOp:
     kernel: tileops/kernels/linear_attention/gla/gla_bwd.py
     kernel_map:
       GLABwdKernel: GLABwdKernel
+      GLABwdMACAKernel: GLABwdMACAKernel
     op: tileops/ops/linear_attention/gla.py
     test: tests/ops/test_gla_chunkwise_bwd.py
     bench: benchmarks/ops/bench_gla_chunkwise.py

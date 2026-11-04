@@ -237,7 +237,8 @@ class BmmFp8FwdOp(Op):
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
         return {
-            "bmm_fp8_kernel": BmmFp8MACAKernel if is_maca() else BmmFp8Kernel,
+            "bmm_fp8_kernel": BmmFp8Kernel,
+            "bmm_fp8_maca_kernel": BmmFp8MACAKernel,
             "bmm_fp8_transpose_kernel": BmmFp8TransposeKernel,
         }
 
@@ -355,7 +356,10 @@ class BmmFp8FwdOp(Op):
                 batch, rows, cols, dtype, device=device, tune=self.tune
             )
         batch, m, n, k, dtype, out_dtype, device = call
-        return call, lambda: self.kernel_map["bmm_fp8_kernel"](
+        kernel_key = "bmm_fp8_kernel"
+        if is_maca() and kernel_key not in self._overridden_keys:
+            kernel_key = "bmm_fp8_maca_kernel"
+        return call, lambda: self.kernel_map[kernel_key](
             batch, m, n, k, dtype, out_dtype, device=device, tune=self.tune
         )
 

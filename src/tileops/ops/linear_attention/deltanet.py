@@ -227,9 +227,9 @@ class DeltaNetBwdOp(Op):
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
-        bwd_cls = DeltaNetBwdMACAKernel if is_maca() else DeltaNetBwdKernel
         return {
-            "DeltaNetBwdKernel": bwd_cls,
+            "DeltaNetBwdKernel": DeltaNetBwdKernel,
+            "DeltaNetBwdMACAKernel": DeltaNetBwdMACAKernel,
         }
 
     def _get_kernel(
@@ -249,7 +249,10 @@ class DeltaNetBwdOp(Op):
     def entry_for(self, role: str, call: tuple) -> Entry:
         """One implementation, built per shape, chunk length, dtype and device."""
         batch, heads, seq_len, chunk_size, dim_k, dim_v, dtype, _device, tune = call
-        return call, lambda: self.kernel_map["DeltaNetBwdKernel"](
+        kernel_key = "DeltaNetBwdKernel"
+        if is_maca() and kernel_key not in self._overridden_keys:
+            kernel_key = "DeltaNetBwdMACAKernel"
+        return call, lambda: self.kernel_map[kernel_key](
             batch,
             heads,
             seq_len,
@@ -434,10 +437,10 @@ class DeltaNetAutogradOp(Op):
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
-        bwd_cls = DeltaNetBwdMACAKernel if is_maca() else DeltaNetBwdKernel
         return {
             "DeltaNetFwdKernel": DeltaNetFwdKernel,
-            "DeltaNetBwdKernel": bwd_cls,
+            "DeltaNetBwdKernel": DeltaNetBwdKernel,
+            "DeltaNetBwdMACAKernel": DeltaNetBwdMACAKernel,
         }
 
     def _infer_output_shapes(
@@ -498,12 +501,16 @@ class DeltaNetAutogradOp(Op):
         """Forward and backward are built together, so they are one entry."""
         batch, heads, seq_len, chunk_size, dim_k, dim_v, dtype, _device, tune = call
 
+        bwd_key = "DeltaNetBwdKernel"
+        if is_maca() and bwd_key not in self._overridden_keys:
+            bwd_key = "DeltaNetBwdMACAKernel"
+
         def build() -> tuple:
             args = (batch, heads, seq_len, chunk_size, dim_k, dim_v)
             kwargs = {"dtype": Kernel.dtype_to_str(dtype), "tune": tune}
             return (
                 self.kernel_map["DeltaNetFwdKernel"](*args, **kwargs),
-                self.kernel_map["DeltaNetBwdKernel"](*args, **kwargs),
+                self.kernel_map[bwd_key](*args, **kwargs),
             )
 
         return call, build

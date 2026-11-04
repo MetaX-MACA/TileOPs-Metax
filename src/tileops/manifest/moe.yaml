@@ -50,6 +50,7 @@ MoePermuteAlignFwdOp:
     bench_manifest_driven: true
     kernel_map:
       permute_align_kernel: MoePermuteAlignKernel
+      permute_align_maca_kernel: MoePermuteAlignMACAKernel
 
 FusedMoEExpertsFwdOp:
   ref_api: "none"
@@ -119,6 +120,7 @@ FusedMoEExpertsFwdOp:
       contiguous: MoePrePermuteContiguousKernel
       grouped_gemm: MoeGroupedGemmKernel
       unpermute_kernel: MoeUnpermuteKernel
+      grouped_gemm_maca: MoeGroupedGemmMACAAdapter
 
   composition:
     kind: composite
@@ -343,6 +345,7 @@ FusedMoeFwdOp:
       fused_topk_kernel: FusedTopKKernel
       contiguous: MoePrePermuteContiguousKernel
       grouped_gemm: MoeGroupedGemmKernel
+      grouped_gemm_maca: MoeGroupedGemmMACAAdapter
       unpermute_kernel: MoeUnpermuteKernel
 
   composition:
@@ -434,6 +437,7 @@ MoeGroupedGemmFwdOp:
     bench_manifest_driven: true
     kernel_map:
       grouped_gemm: MoeGroupedGemmKernel
+      grouped_gemm_maca: MoeGroupedGemmMACAAdapter
 
 MoeExpertMLPFwdOp:
   ref_api: "none"
@@ -488,6 +492,7 @@ MoeExpertMLPFwdOp:
     bench_manifest_driven: true
     kernel_map:
       grouped_gemm: MoeGroupedGemmKernel
+      grouped_gemm_maca: MoeGroupedGemmMACAAdapter
 
 MoePostPermuteFwdOp:
   ref_api: "none"
@@ -623,3 +628,4 @@ FusedMoeSharedExpertFwdOp:
     bench_manifest_driven: true
     kernel_map:
       shared_expert_mlp: SharedExpertMLPKernel
+      shared_expert_mlp_maca: SharedExpertMLPMACAKernel
