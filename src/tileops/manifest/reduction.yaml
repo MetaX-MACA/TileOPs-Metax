@@ -583,6 +583,7 @@ ArgmaxFwdOp:
     kernel: tileops/kernels/reduction/argreduce.py
     kernel_map:
       argreduce: ArgreduceKernel
+      argreduce_maca: ArgreduceMACAKernel
     op: tileops/ops/reduction/argreduce.py
     test: tests/ops/test_argreduce.py
     bench: benchmarks/ops/bench_argreduce.py
@@ -625,6 +626,7 @@ ArgminFwdOp:
     kernel: tileops/kernels/reduction/argreduce.py
     kernel_map:
       argreduce: ArgreduceKernel
+      argreduce_maca: ArgreduceMACAKernel
     op: tileops/ops/reduction/argreduce.py
     test: tests/ops/test_argreduce.py
     bench: benchmarks/ops/bench_argreduce.py

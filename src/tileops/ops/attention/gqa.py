@@ -1228,15 +1228,15 @@ class GroupedQueryAttentionPrefillVarlenFwdOp(Op):
     ) -> Kernel:
         _validate_attention_dtype(dtype)
 
-        kernel_key = (
-            "gqa_prefill_varlen_fwd_maca_kernel" if is_maca() else "gqa_prefill_varlen_fwd_kernel"
-        )
+        kernel_key = "gqa_prefill_varlen_fwd_kernel"
+        if is_maca() and kernel_key not in self._overridden_keys:
+            kernel_key = "gqa_prefill_varlen_fwd_maca_kernel"
         return self.kernel_for(kernel_key, inputs, dtype)
 
     def entry_for(self, role: str, call: torch.dtype) -> Entry:
         """One implementation, built per dtype; every extent is the op's."""
         identity = (self.batch, self.heads, self.heads_kv, self.dim, self.sm_scale, call)
-        return identity, lambda: self.kernel_map["gqa_prefill_varlen_fwd_kernel"](
+        return identity, lambda: self.kernel_map[role](
             batch=self.batch,
             heads=self.heads,
             heads_kv=self.heads_kv,
@@ -1924,7 +1924,10 @@ class GroupedQueryAttentionBwdOp(Op):
         """Both passes run on every call, so they are built together as one entry."""
 
         def build() -> tuple[Kernel, Kernel, Kernel | None]:
-            backward = self.kernel_map["gqa_bwd_kernel"]
+            kernel_key = "gqa_bwd_kernel"
+            if is_maca() and kernel_key not in self._overridden_keys:
+                kernel_key = "gqa_bwd_maca_kernel"
+            backward = self.kernel_map[kernel_key]
             return (
                 self.kernel_map["gqa_bwd_preprocess_kernel"](
                     self.batch,
@@ -1957,7 +1960,8 @@ class GroupedQueryAttentionBwdOp(Op):
     def default_kernel_map(self) -> Dict[str, Kernel]:
         return {
             "gqa_bwd_preprocess_kernel": FlashAttnBwdPreprocessKernel,
-            "gqa_bwd_kernel": GQABwdMACAKernel if is_maca() else GQABwdWgmmaPipelinedKernel,
+            "gqa_bwd_kernel": GQABwdWgmmaPipelinedKernel,
+            "gqa_bwd_maca_kernel": GQABwdMACAKernel,
         }
 
     def _infer_output_shapes(
@@ -2076,12 +2080,19 @@ class GroupedQueryAttentionDecodePagedWithKVCacheFwdOp(Op):
             "gqa_decode_paged", inputs, self.attention_call(dtype, device_of(inputs))
         )
 
+    def select_kernel_key(self, keys: tuple[str, ...], call: object) -> str:
+        generic = "gqa_decode_paged_kernel"
+        maca = "gqa_decode_paged_maca_kernel"
+        if generic in keys and maca in keys:
+            inactive = generic if is_maca() and generic not in self._overridden_keys else maca
+            keys = tuple(key for key in keys if key != inactive)
+        return super().select_kernel_key(keys, call)
+
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
         return {
-            "gqa_decode_paged_kernel": (
-                GQADecodePagedMACAKernel if is_maca() else GQADecodePagedKernel
-            ),
+            "gqa_decode_paged_kernel": GQADecodePagedKernel,
+            "gqa_decode_paged_maca_kernel": GQADecodePagedMACAKernel,
             "gqa_decode_paged_bs1_kernel": GQADecodePagedBs1Kernel,
         }
 

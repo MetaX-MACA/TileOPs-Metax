@@ -61,14 +61,16 @@ class MoePermuteAlignFwdOp(Op):
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
         return {
-            "permute_align_kernel": (
-                MoePermuteAlignMACAKernel if is_maca() else MoePermuteAlignKernel
-            )
+            "permute_align_kernel": MoePermuteAlignKernel,
+            "permute_align_maca_kernel": MoePermuteAlignMACAKernel,
         }
 
     def entry_for(self, role: str, call: object) -> Entry:
         """One implementation, built from the extents the caller committed to."""
-        return call, lambda: self.kernel_map[role](
+        kernel_key = role
+        if is_maca() and kernel_key not in self._overridden_keys:
+            kernel_key = "permute_align_maca_kernel"
+        return call, lambda: self.kernel_map[kernel_key](
             self.numel, self.num_experts, self.block_size, tune=self.tune
         )
 

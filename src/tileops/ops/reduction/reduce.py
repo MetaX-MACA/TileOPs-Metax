@@ -398,6 +398,9 @@ class _ReduceOpBase(Op):
         """
         return (tuple(x.shape), axes, self.keepdim, x.dtype, x.device.index, m, n)
 
+    def _runtime_kernel_key(self) -> str:
+        return self._kernel_key
+
     def entry_for(self, role: str, call: object) -> Entry:
         """One implementation, built from the whole shape and the axes it reduces.
 
@@ -406,7 +409,7 @@ class _ReduceOpBase(Op):
         against that device's shared memory.
         """
         shape, axes, keepdim, dtype, device_index, m, n = call
-        cls = self.kernel_map[self._kernel_key]
+        cls = self.kernel_map[self._runtime_kernel_key()]
         return call, lambda: cls(
             m,
             n,

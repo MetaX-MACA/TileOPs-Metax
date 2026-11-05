@@ -2,10 +2,10 @@ from typing import ClassVar, Dict, Optional
 
 import torch
 
-from tileops.kernels.attention import SparseMlaBasicKernel, SparseMlaKernel, SparseMlaMACAKernel
+from tileops.kernels.attention import SparseMlaKernel, SparseMlaMACAKernel
 from tileops.kernels.kernel_base import Entry, Kernel
 from tileops.perf.profile import tensor_core_roof
-from tileops.utils import get_sm_version, is_hopper, is_maca
+from tileops.utils import is_hopper, is_maca
 
 from .._compile_boundary_codegen import OperatorSpec
 from ..op_base import Op
@@ -96,7 +96,16 @@ class DeepSeekSparseAttentionDecodeWithKVCacheFwdOp(Op):
 
     def entry_for(self, role: str, call: torch.dtype) -> Entry:
         """One implementation, built per dtype; every extent is the op's."""
-        return call, lambda: self.kernel_map["sparse_mla_kernel"](
+        kernel_key = "sparse_mla_kernel"
+        if is_maca():
+            if kernel_key not in self._overridden_keys:
+                kernel_key = "sparse_mla_maca_kernel"
+        elif not is_hopper():
+            raise RuntimeError(
+                "DeepSeekSparseAttentionDecodeWithKVCacheFwdOp "
+                "currently supports MACA and Hopper SM90."
+            )
+        return call, lambda: self.kernel_map[kernel_key](
             self.batch,
             self.seq_len,
             self.seq_len_kv,
@@ -116,27 +125,10 @@ class DeepSeekSparseAttentionDecodeWithKVCacheFwdOp(Op):
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:
-        """
-        Provides the default kernel map for the operation.
-
-        Returns:
-            Dict[str, Kernel]: A dictionary mapping kernel names to kernel functions.
-            The default map includes the "sparse_mla_kernel": the WGMMA
-            warp-specialized SparseMlaKernel on SM90, and the
-            architecture-agnostic SparseMlaBasicKernel (plain T.gemm) elsewhere.
-        """
-        if is_maca():
-            kernel_cls = SparseMlaMACAKernel
-        elif is_hopper():
-            kernel_cls = SparseMlaKernel if get_sm_version() == 90 else SparseMlaBasicKernel
-
-        else:
-            raise RuntimeError(
-                "DeepSeekSparseAttentionDecodeWithKVCacheFwdOp "
-                "currently supports MACA and Hopper SM90."
-            )
-
-        return {"sparse_mla_kernel": kernel_cls}
+        return {
+            "sparse_mla_kernel": SparseMlaKernel,
+            "sparse_mla_maca_kernel": SparseMlaMACAKernel,
+        }
 
     def _infer_output_shapes(
         self,

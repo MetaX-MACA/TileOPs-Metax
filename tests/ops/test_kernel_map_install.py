@@ -92,8 +92,7 @@ def test_auto_discovered_incompatible_kernel_is_refused_at_first_call() -> None:
     class AutoDiscoveredIncompatibleOp(GemmFwdOp):
         @property
         def default_kernel_map(self) -> dict[str, Kernel]:
-            defaults = super().default_kernel_map
-            return {**defaults, "gemm_tma_kernel": IncompatibleGemm}
+            return dict.fromkeys(super().default_kernel_map, IncompatibleGemm)
 
     op = AutoDiscoveredIncompatibleOp()
 

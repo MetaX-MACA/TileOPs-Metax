@@ -220,7 +220,10 @@ class FusedMoeSharedExpertFwdOp(FusedMoe):
 
     def entry_for(self, role: str, call: torch.dtype) -> Entry:
         """One implementation, built per dtype; every extent is the op's."""
-        return call, lambda: self.kernel_map["shared_expert_mlp"](
+        kernel_key = "shared_expert_mlp"
+        if is_maca() and kernel_key not in self._overridden_keys:
+            kernel_key = "shared_expert_mlp_maca"
+        return call, lambda: self.kernel_map[kernel_key](
             num_tokens=self.num_tokens,
             hidden_size=self.hidden_size,
             ffn_size=self._shared_mlp_shard_ffn,
@@ -232,7 +235,8 @@ class FusedMoeSharedExpertFwdOp(FusedMoe):
         # The routed half's kernels belong to the sub-ops it builds; this one is the
         # op's own, so it is declared here and a replacement reaches it.
         return {
-            "shared_expert_mlp": (SharedExpertMLPMACAKernel if is_maca() else SharedExpertMLPKernel)
+            "shared_expert_mlp": SharedExpertMLPKernel,
+            "shared_expert_mlp_maca": SharedExpertMLPMACAKernel,
         }
 
     def forward(

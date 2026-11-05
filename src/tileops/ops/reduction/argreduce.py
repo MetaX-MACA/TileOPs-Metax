@@ -25,6 +25,25 @@ class _ArgreduceOpBase(_ReduceOpBase):
     This op's part is the stride, which the shape and the reduced axis decide.
     """
 
+    _maca_kernel_cls: type[Kernel] | None = None
+
+    @property
+    def default_kernel_map(self) -> Dict[str, Kernel]:
+        kernels = super().default_kernel_map
+        if self._maca_kernel_cls is not None:
+            kernels["argreduce_maca"] = self._maca_kernel_cls
+        return kernels
+
+    def _runtime_kernel_key(self) -> str:
+        kernel_key = self._kernel_key
+        if (
+            self._maca_kernel_cls is not None
+            and is_maca()
+            and kernel_key not in self._overridden_keys
+        ):
+            return "argreduce_maca"
+        return kernel_key
+
     def _build_kernel_kwargs(self, shape, axes, device_index) -> dict:
         """Elements between two neighbours along the reduced axis, on top of the shared set.
 
@@ -45,7 +64,8 @@ class ArgmaxFwdOp(_ArgreduceOpBase):
 
     _op_kind = "argmax"
     _kernel_key = "argreduce"
-    _kernel_cls = ArgreduceMACAKernel if is_maca() else ArgreduceKernel
+    _kernel_cls = ArgreduceKernel
+    _maca_kernel_cls = ArgreduceMACAKernel
 
     def __init__(
         self,
@@ -101,7 +121,8 @@ class ArgminFwdOp(_ArgreduceOpBase):
 
     _op_kind = "argmin"
     _kernel_key = "argreduce"
-    _kernel_cls = ArgreduceMACAKernel if is_maca() else ArgreduceKernel
+    _kernel_cls = ArgreduceKernel
+    _maca_kernel_cls = ArgreduceMACAKernel
 
     def __init__(
         self,
