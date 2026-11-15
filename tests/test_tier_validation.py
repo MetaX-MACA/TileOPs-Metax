@@ -33,7 +33,16 @@ def _make_item(
     """Build a lightweight mock pytest.Item for tier validation tests."""
     markers = markers or []
     item = MagicMock(
-        spec=["nodeid", "path", "name", "originalname", "get_closest_marker", "callspec"]
+        spec=[
+            "nodeid",
+            "path",
+            "name",
+            "originalname",
+            "get_closest_marker",
+            "iter_markers",
+            "callspec",
+            "user_properties",
+        ]
     )
     item.nodeid = f"{path}::{name}"
     item.path = Path(path)
@@ -41,6 +50,9 @@ def _make_item(
     item.originalname = originalname
 
     marker_set = set(markers)
+
+    item.iter_markers = lambda name=None: iter(())
+    item.user_properties = []
 
     def _get_closest_marker(marker_name: str):
         if marker_name in marker_set:
@@ -129,7 +141,7 @@ class TestSmokeOrdering:
 
 @pytest.mark.full
 class TestSmokeConstraints:
-    """Every smoke case must have tune=False and must not be xfail."""
+    """Smoke cases must use tune=False; known backend failures may xfail."""
 
     def test_smoke_tune_true_raises(self):
         """The tune=False constraint applies to ALL smoke cases, not just first."""
@@ -148,75 +160,10 @@ class TestSmokeConstraints:
             with pytest.raises(pytest.UsageError, match="tune=False"):
                 pytest_collection_modifyitems(items)
 
-    def test_smoke_xfail_raises(self):
-        """The no-xfail constraint applies to ALL smoke cases, with or
-        without a tune param."""
-        item_sets = [
-            [
-                _make_item(name="test_op[0]", markers=["smoke", "xfail"], tune=False),
-                _make_item(name="test_op[1]", markers=["full"], tune=False),
-            ],
-            [
-                _make_item(name="test_op[0]", markers=["smoke"], tune=False),
-                _make_item(name="test_op[1]", markers=["smoke", "xfail"], tune=False),
-                _make_item(name="test_op[2]", markers=["full"], tune=False),
-            ],
-            [
-                _make_item(name="test_op[0]", markers=["smoke", "xfail"], tune=None),
-                _make_item(name="test_op[1]", markers=["smoke", "xfail"], tune=None),
-            ],
-        ]
-        for items in item_sets:
-            with pytest.raises(pytest.UsageError, match="xfail"):
-                pytest_collection_modifyitems(items)
-
-    def test_smoke_xfail_reports_only_xfail_error(self):
-        """A smoke+xfail case must raise the xfail rejection without a
-        spurious ordering error, both when it leaves the group with no
-        valid smoke case and when a valid smoke case sits at the front."""
-        # No valid smoke case remains: xfail + missing-smoke errors only.
+    def test_smoke_xfail_is_allowed(self):
         items = [
             _make_item(name="test_op[0]", markers=["smoke", "xfail"], tune=False),
             _make_item(name="test_op[1]", markers=["full"], tune=False),
-        ]
-        with pytest.raises(pytest.UsageError, match="xfail") as exc_info:
-            pytest_collection_modifyitems(items)
-        assert "must not be xfail" in str(exc_info.value)
-        assert "at least one smoke case" in str(exc_info.value)
-        assert "must appear as the first" not in str(exc_info.value)
-
-        # Valid smoke correctly at front: only the xfail rejection fires.
-        items = [
-            _make_item(name="test_op[0]", markers=["smoke", "xfail"], tune=False),
-            _make_item(name="test_op[1]", markers=["smoke"], tune=False),
-            _make_item(name="test_op[2]", markers=["full"], tune=False),
-        ]
-        with pytest.raises(pytest.UsageError, match="xfail") as exc_info:
-            pytest_collection_modifyitems(items)
-        assert "must not be xfail" in str(exc_info.value)
-        assert "must appear as the first" not in str(exc_info.value)
-
-
-@pytest.mark.full
-class TestNonRuntimeOpsFileExemption:
-    """Explicitly exempted non-runtime ops files may be full-only."""
-
-    def test_exempt_ops_file_may_have_zero_smoke(self):
-        items = [
-            _make_item(
-                name="test_compile[0]",
-                originalname="test_compile",
-                path="tests/ops/test_elementwise_compile.py",
-                markers=["full"],
-                tune=False,
-            ),
-            _make_item(
-                name="test_compile[1]",
-                originalname="test_compile",
-                path="tests/ops/test_elementwise_compile.py",
-                markers=["full"],
-                tune=True,
-            ),
         ]
         pytest_collection_modifyitems(items)
 

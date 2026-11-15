@@ -1,27 +1,38 @@
-"""The mixture-of-experts ops, at the public path ``tileops.moe``."""
+"""The mixture-of-experts ops, at the public path ``tileops.moe``, with the layout and
+epilogue specs their constructors take."""
 
-from .ops.moe import (
+from tileops._ops.moe import (
+    ContiguousLayoutSpec,
     FusedMoEExpertsFwdOp,
-    FusedMoeFwdOp,
-    FusedMoeSharedExpertFwdOp,
-    FusedTopKOp,
+    FusedMoEFwdOp,
+    FusedMoESharedExpertFwdOp,
+    FusedTopKFwdOp,
     IndexedExpertMLPFwdOp,
-    MoeExpertMLPFwdOp,
-    MoeGroupedGemmFwdOp,
-    MoePermuteAlignFwdOp,
-    MoePostPermuteFwdOp,
-    MoePrePermuteFwdOp,
+    MaskedLayoutSpec,
+    MoEExpertMLPFwdOp,
+    MoEGroupedGEMMFP8FwdOp,
+    MoEGroupedGEMMFwdOp,
+    MoEPermuteAlignFwdOp,
+    MoEPostPermuteFwdOp,
+    MoEPrePermuteFwdOp,
+    RoutingEpilogueSpec,
+    SharedExpertMLPFwdOp,
 )
 
 __all__ = [
-    "FusedTopKOp",
-    "MoePrePermuteFwdOp",
-    "MoePermuteAlignFwdOp",
-    "MoeGroupedGemmFwdOp",
-    "MoeExpertMLPFwdOp",
-    "MoePostPermuteFwdOp",
+    "ContiguousLayoutSpec",
     "FusedMoEExpertsFwdOp",
+    "FusedMoEFwdOp",
+    "FusedMoESharedExpertFwdOp",
+    "FusedTopKFwdOp",
     "IndexedExpertMLPFwdOp",
-    "FusedMoeFwdOp",
-    "FusedMoeSharedExpertFwdOp",
+    "MaskedLayoutSpec",
+    "MoEExpertMLPFwdOp",
+    "MoEGroupedGEMMFP8FwdOp",
+    "MoEGroupedGEMMFwdOp",
+    "MoEPermuteAlignFwdOp",
+    "MoEPostPermuteFwdOp",
+    "MoEPrePermuteFwdOp",
+    "RoutingEpilogueSpec",
+    "SharedExpertMLPFwdOp",
 ]

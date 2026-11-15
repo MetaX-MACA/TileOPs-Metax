@@ -9,6 +9,9 @@ One function per family, so a family's extents and dtype stay local to its cases
 two tests are the contract and are written once.
 """
 
+from collections.abc import Callable
+from typing import NamedTuple
+
 import pytest
 import torch
 
@@ -18,57 +21,115 @@ from tests.compile_contract import (
     assert_same_result,
     register_compile_contract,
 )
-from tileops.ops.attention.deepseek_dsa import DeepSeekSparseAttentionDecodeWithKVCacheFwdOp
-from tileops.ops.attention.deepseek_mla import MultiHeadLatentAttentionDecodeWithKVCacheFwdOp
-from tileops.ops.attention.deepseek_nsa import NSACmpFwdVarlenOp, NSAFwdVarlenOp, NSATopkVarlenOp
-from tileops.ops.attention.gqa import (
-    GroupedQueryAttentionBwdOp,
-    GroupedQueryAttentionDecodePagedWithKVCacheFwdOp,
-    GroupedQueryAttentionDenseFwdOp,
-    GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp,
-    GroupedQueryAttentionPrefillVarlenFwdOp,
-    GroupedQueryAttentionSlidingWindowVarlenFwdOp,
+from tileops._ops.attention.dsa import DSADenseFwdOp, DSAPagedFwdOp
+from tileops._ops.attention.fp8_lightning_indexer import FP8LightningIndexerFwdOp
+from tileops._ops.attention.gqa.bwd import GQADenseBwdOp
+from tileops._ops.attention.gqa.dense import GQADenseFwdOp, GQADenseWithLSEFwdOp
+from tileops._ops.attention.gqa.paged import GQAPagedFwdOp
+from tileops._ops.attention.gqa.varlen import GQAVarlenFwdOp
+from tileops._ops.attention.mha import (
+    MHAPagedFwdOp,
 )
-from tileops.ops.attention.mha import (
-    MultiHeadAttentionBwdOp,
-    MultiHeadAttentionDecodePagedWithKVCacheFwdOp,
+from tileops._ops.attention.mla import (
+    MLADenseBwdOp,
+    MLADenseDecodeFwdOp,
+    MLAVarlenBwdOp,
+    MLAVarlenFwdOp,
 )
-from tileops.ops.fp8_lightning_indexer import FP8LightningIndexerFwdOp
-from tileops.ops.gemm.bmm import BmmFp8FwdOp, BmmFwdOp
-from tileops.ops.gemm.gemm import GemmFp8FwdOp, GemmFwdOp, GemmW4A16FwdOp
-from tileops.ops.gemm.grouped_gemm import GroupedGemmFwdOp
-from tileops.ops.linear_attention.deltanet import DeltaNetBwdOp, DeltaNetFwdOp
-from tileops.ops.linear_attention.deltanet_recurrence import DeltaNetDecodeFwdOp
-from tileops.ops.linear_attention.gla import GLABwdOp, GLAFwdOp
-from tileops.ops.linear_attention.gla_recurrence import GLADecodeFwdOp
-from tileops.ops.mamba.cb_producer import CBProducerFwdOp
-from tileops.ops.mamba.da_cumsum import DaCumsumFwdOp
-from tileops.ops.mamba.ssd_chunk_scan import SSDChunkScanFwdOp
-from tileops.ops.mamba.ssd_chunk_state import SSDChunkStateFwdOp
-from tileops.ops.mamba.ssd_decode import SSDDecodeFwdOp
-from tileops.ops.mamba.ssd_state_passing import SSDStatePassingFwdOp
-from tileops.ops.sequence_modeling.engram import EngramGateConvBwdOp, EngramGateConvFwdOp
-from tileops.ops.sequence_modeling.engram_decode import EngramDecodeFwdOp
-from tileops.ops.sequence_modeling.mhc import MHCPostFwdOp, MHCPreFwdOp
-from tileops.ops.topk_selector import TopkSelectorFwdOp
-from workloads.attention.deepseek import (
-    DsaDecodeWorkload,
-    MlaDecodeWorkload,
-    NsaCmpFwdWorkload,
-    NsaFwdWorkload,
-    NsaTopkWorkload,
+from tileops._ops.attention.nsa import (
+    NSACompressedVarlenFwdOp,
+    NSATopKVarlenFwdOp,
+    NSAVarlenFwdOp,
 )
-from workloads.attention.gqa import (
-    GQAPrefillPagedWithKVCacheFwdWorkload,
+from tileops._ops.attention.topk_select import TopKSelectFwdOp
+from tileops._ops.fft import FFTC2CFwdOp
+from tileops._ops.gemm.bmm import BMMFP8FwdOp, BMMFwdOp
+from tileops._ops.gemm.gemm import (
+    GEMMFP8FwdOp,
+    GEMMFwdOp,
+    GEMMINT8W8A8FwdOp,
+    GEMMW4A8FwdOp,
+    GEMMW4A16FwdOp,
+)
+from tileops._ops.gemm.grouped_gemm import GroupedGEMMFwdOp
+from tileops._ops.linear_attention.deltanet.chunk import DeltaNetChunkBwdOp, DeltaNetChunkFwdOp
+from tileops._ops.linear_attention.deltanet.fwd import DeltaNetFwdOp
+from tileops._ops.linear_attention.deltanet.recurrent import DeltaNetRecurrentFwdOp
+from tileops._ops.linear_attention.gdn import GDNFwdOp
+from tileops._ops.linear_attention.gla.chunk import GLAChunkBwdOp, GLAChunkFwdOp
+from tileops._ops.linear_attention.gla.fwd import GLAFwdOp
+from tileops._ops.linear_attention.gla.recurrent import GLARecurrentFwdOp
+from tileops._ops.linear_attention.kda import KDAFwdOp
+from tileops._ops.mamba.causal_conv1d import CausalConv1dFwdOp, CausalConv1dUpdateFwdOp
+from tileops._ops.mamba.selective_scan import SelectiveScanFwdOp
+from tileops._ops.mamba.ssd_chunk_coupling import SSDChunkCouplingFwdOp
+from tileops._ops.mamba.ssd_chunk_cumsum import SSDChunkCumsumFwdOp
+from tileops._ops.mamba.ssd_chunk_scan import SSDChunkScanFwdOp
+from tileops._ops.mamba.ssd_chunk_state import SSDChunkStateFwdOp
+from tileops._ops.mamba.ssd_recurrent import SSDRecurrentFwdOp
+from tileops._ops.mamba.ssd_state_passing import SSDStatePassingFwdOp
+from tileops._ops.pool.mean_pooling import MeanPoolingFwdOp
+from tileops._ops.quantization import (
+    FP8QuantPerBlockFwdOp,
+    INT4QuantPerGroupFwdOp,
+    INT8DequantPerBlockFwdOp,
+    INT8DequantPerChannelFwdOp,
+    INT8DequantPerTensorFwdOp,
+    INT8QuantPerChannelFwdOp,
+    INT8QuantPerTensorFwdOp,
+    INT8QuantPerTokenGroupFwdOp,
+    SmoothQuantFwdOp,
+)
+from tileops._ops.quantization.fp8_quant import FP8QuantPerTokenGroupFwdOp
+from tileops._ops.rope import (
+    LongRoPEFwdOp,
+    RoPEFwdOp,
+    RoPELlama31FwdOp,
+    RoPENeoxPositionIdsFwdOp,
+    YaRNFwdOp,
+)
+from tileops._ops.sampling.chain_speculative_sampling import ChainSpeculativeSamplingFwdOp
+from tileops._ops.sampling.min_p_mask import MinPMaskFwdOp
+from tileops._ops.sampling.sampling_from_probs import SamplingFromProbsFwdOp
+from tileops._ops.sampling.top_k_mask import TopKMaskFwdOp
+from tileops._ops.sampling.top_k_top_p_mask import TopKTopPMaskFwdOp
+from tileops._ops.sampling.top_p_mask import TopPMaskFwdOp
+from tileops._ops.sequence_modeling.engram import EngramGateConvBwdOp, EngramGateConvFwdOp
+from tileops._ops.sequence_modeling.engram_decode import EngramDecodeFwdOp
+from tileops._ops.sequence_modeling.mhc import MHCPostFwdOp, MHCPreFwdOp
+from tileops._ops.transform import HadamardTransformFwdOp
+from workloads.attention.dsa import DSADecodeWorkload, DSAPagedCall
+from workloads.attention.fp8_lightning_indexer import FP8LightningIndexerWorkload
+from workloads.attention.gqa.bwd import GQABwdWorkload
+from workloads.attention.gqa.dense import GQADenseDecodeWorkload, GQADenseWithLSECall
+from workloads.attention.gqa.paged import GQAPagedFwdWorkload
+from workloads.attention.gqa.varlen import (
     GQAPrefillVarlenFwdWorkload,
-    GroupedQueryAttentionBwdWorkload,
-    GroupedQueryAttentionDecodePagedWorkload,
-    GroupedQueryAttentionDenseDecodeWorkload,
-    GroupedQueryAttentionSlidingWindowVarlenFwdWorkload,
+    GQASlidingWindowVarlenFwdWorkload,
 )
-from workloads.attention.mha import MhaDecodePagedWorkload
-from workloads.attention.paged import make_unit_cache_scales
-from workloads.fp8_lightning_indexer import FP8LightningIndexerWorkload
+from workloads.attention.mha import MHADecodePagedWorkload
+from workloads.attention.mla import (
+    MLADecodeWorkload,
+    MLADenseBwdWorkload,
+    MLAVarlenBwdWorkload,
+    MLAVarlenWorkload,
+)
+from workloads.attention.nsa import NSACompressedFwdWorkload, NSAFwdWorkload, NSATopKWorkload
+from workloads.device import run_device
+from workloads.quantization.int8_dequant import (
+    INT8DequantPerBlockWorkload,
+    INT8DequantPerChannelWorkload,
+    INT8DequantPerTensorWorkload,
+)
+from workloads.quantization.quantize import (
+    FP8QuantPerBlockWorkload,
+    INT4QuantPerGroupWorkload,
+    INT8QuantPerBlockWorkload,
+    INT8QuantPerChannelWorkload,
+    INT8QuantPerTensorWorkload,
+    SmoothQuantWorkload,
+)
+from workloads.workload_base import manifest_call
 
 
 def _attention_cases():
@@ -77,135 +138,126 @@ def _attention_cases():
     _HEADS, _HEADS_KV, _DIM = 8, 2, 128
 
     def gqa_dense():
-        case = GroupedQueryAttentionDenseDecodeWorkload(2, _HEADS, _HEADS_KV, 256, _DIM, _DTYPE)
-        return GroupedQueryAttentionDenseFwdOp(), case.gen_inputs()
+        case = GQADenseDecodeWorkload(2, _HEADS, _HEADS_KV, 256, _DIM, _DTYPE)
+        return GQADenseFwdOp(), case.gen_inputs()
+
+    def gqa_dense_with_lse():
+        row = dict(B=1, S_q=256, S_kv=256, H=_HEADS, H_kv=_HEADS_KV, D=_DIM, is_causal=True)
+        call = manifest_call("GQADenseWithLSEFwdOp", {"T": "float16"}, **row)
+        return GQADenseWithLSEFwdOp(is_causal=True), GQADenseWithLSECall(call).gen_inputs()
 
     def gqa_bwd():
-        case = GroupedQueryAttentionBwdWorkload(1, _HEADS, _HEADS_KV, 256, _DIM, True, _DTYPE)
-        op = GroupedQueryAttentionBwdOp(1, _HEADS, _HEADS_KV, 256, _DIM, is_causal=True)
+        case = GQABwdWorkload(1, _HEADS, _HEADS_KV, 256, _DIM, True, _DTYPE)
+        op = GQADenseBwdOp(is_causal=True)
         return op, case.gen_inputs()
 
-    def gqa_prefill_varlen():
+    def gqa_varlen():
         lens = [128, 128]
         case = GQAPrefillVarlenFwdWorkload(2, _HEADS, _HEADS_KV, lens, lens, _DIM, True, _DTYPE)
-        op = GroupedQueryAttentionPrefillVarlenFwdOp(max_seqlen_q=128, max_seqlen_kv=128)
+        op = GQAVarlenFwdOp()
         return op, case.gen_inputs()
 
     def gqa_sliding_window_varlen():
         lens = [128, 128]
-        case = GroupedQueryAttentionSlidingWindowVarlenFwdWorkload(
+        case = GQASlidingWindowVarlenFwdWorkload(
             2, lens, lens, _HEADS, _HEADS_KV, _DIM, True, 64, -1, _DTYPE
         )
-        op = GroupedQueryAttentionSlidingWindowVarlenFwdOp(
-            batch=2,
-            heads=_HEADS,
-            heads_kv=_HEADS_KV,
-            dim=_DIM,
-            max_seqlen_q=case.max_seqlen_q,
-            is_causal=True,
-            window_size_left=64,
-        )
+        op = GQAVarlenFwdOp(is_causal=True, window_size_left=64)
         return op, case.gen_inputs()
 
-    def gqa_prefill_paged():
-        case = GQAPrefillPagedWithKVCacheFwdWorkload(
-            2, _HEADS, _HEADS_KV, [64, 64], [128, 128], 64, _DIM, True, _DTYPE
-        )
-        op = GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp(
-            batch=2,
-            heads=_HEADS,
-            heads_kv=_HEADS_KV,
-            max_pages_per_req=case.max_pages_per_req,
-            page_size=64,
-            dim=_DIM,
-            max_seqlen_q=case.max_seqlen_q,
-            is_causal=True,
-        )
-        q, k_new, v_new, k_pages, v_pages, cu_q, cache_seqlens, table = case.gen_inputs()
-        k_scale, v_scale = make_unit_cache_scales()
-        return op, (q, k_new, v_new, k_pages, v_pages, k_scale, v_scale, cu_q, cache_seqlens, table)
+    def gqa_paged_decode():
+        case = GQAPagedFwdWorkload(_HEADS, _HEADS_KV, _DIM, [1, 1], [256, 200], 64, 4, 8, _DTYPE)
+        return GQAPagedFwdOp(), case.gen_inputs()
 
-    def gqa_decode_paged():
-        case = GroupedQueryAttentionDecodePagedWorkload(2, _HEADS, _HEADS_KV, 256, _DIM, 64, _DTYPE)
-        op = GroupedQueryAttentionDecodePagedWithKVCacheFwdOp(
-            batch=2, heads=_HEADS, heads_kv=_HEADS_KV, seqlen_kv=256, dim=_DIM, page_size=64
-        )
-        return op, case.gen_inputs()
-
-    def mha_bwd():
-        case = GroupedQueryAttentionBwdWorkload(1, _HEADS, _HEADS, 256, _DIM, True, _DTYPE)
-        op = MultiHeadAttentionBwdOp(1, _HEADS, 256, _DIM, is_causal=True)
+    def gqa_bwd_mha_heads():
+        # One KV head per query head: the call the warp-specialized kernel serves.
+        case = GQABwdWorkload(1, _HEADS, _HEADS, 256, _DIM, True, _DTYPE)
+        op = GQADenseBwdOp(is_causal=True)
         return op, case.gen_inputs()
 
     def mha_decode_paged():
-        case = MhaDecodePagedWorkload(1, _HEADS, 1, 256, _DIM, 128, False, _DTYPE)
-        op = MultiHeadAttentionDecodePagedWithKVCacheFwdOp(
-            batch=1,
-            heads=_HEADS,
-            seqlen_q=1,
-            seqlen_kv=256,
-            dim=_DIM,
-            page_size=128,
-            is_causal=False,
-        )
+        case = MHADecodePagedWorkload(1, _HEADS, 1, 256, _DIM, 128, False, _DTYPE)
+        op = MHAPagedFwdOp(page_size=128, is_causal=False)
         return op, case.gen_inputs()
 
     def mla_decode():
-        case = MlaDecodeWorkload(1, 64, 1, 256, _DIM, 64, _DTYPE)
-        op = MultiHeadLatentAttentionDecodeWithKVCacheFwdOp(1, 64, 1, 256, _DIM, 64)
+        case = MLADecodeWorkload(1, 64, 1, 256, _DIM, 64, _DTYPE)
+        op = MLADenseDecodeFwdOp()
         return op, case.gen_inputs()
+
+    def mla_varlen():
+        case = MLAVarlenWorkload([128, 128], _HEADS, _DIM, 64, _DIM, _DTYPE)
+        return MLAVarlenFwdOp(), case.gen_inputs()
+
+    def mla_dense_bwd():
+        case = MLADenseBwdWorkload(1, 256, 256, _HEADS, 192, _DIM, _DTYPE)
+        return MLADenseBwdOp(), case.gen_inputs()
+
+    def mla_varlen_bwd():
+        case = MLAVarlenBwdWorkload([128, 128], [128, 128], _HEADS, 192, _DIM, _DTYPE)
+        return MLAVarlenBwdOp(), case.gen_inputs()
 
     def nsa_fwd():
-        case = NsaFwdWorkload(1, 16, 512, 64, True, 0.1, 32, 16, 1, _DTYPE, torch.float32)
-        op = NSAFwdVarlenOp(is_causal=True, scale=0.1, block_size=32, accum_dtype=torch.float32)
+        case = NSAFwdWorkload(1, 16, 512, 64, True, 0.1, 32, 16, 1, _DTYPE)
+        op = NSAVarlenFwdOp(is_causal=True, sm_scale=0.1, block_size=32)
         return op, case.gen_inputs()
 
-    def nsa_cmp_fwd():
-        case = NsaCmpFwdWorkload(1, 512, 32, _DIM, _DIM, 16, 0.088, 32, 32, _DTYPE, torch.float32)
-        op = NSACmpFwdVarlenOp(scale=0.088, bc=32, bs=32, accum_dtype=torch.float32)
+    def nsa_compressed_fwd():
+        case = NSACompressedFwdWorkload(1, 512, 32, _DIM, _DIM, 16, 0.088, 32, _DTYPE)
+        op = NSACompressedVarlenFwdOp(sm_scale=0.088, block_size=32)
         return op, case.gen_inputs()
 
     def nsa_topk():
-        case = NsaTopkWorkload(1, 512, 32, _DIM, 16, 1.0, 16, 32, 32, _DTYPE, torch.float32)
-        op = NSATopkVarlenOp(
-            scale=1.0, selected_block_num=16, bc=32, bs=32, accum_dtype=torch.float32
-        )
+        case = NSATopKWorkload(1, 512, 32, _DIM, 16, 1.0, 16, 32, _DTYPE)
+        op = NSATopKVarlenFwdOp(sm_scale=1.0, selected_block_num=16, block_size=32)
         return op, case.gen_inputs()
 
     def dsa_decode():
         batch, heads, seq_len, seq_len_kv, dim, tail, topk = 1, 64, 64, 128, 512, 64, 128
-        case = DsaDecodeWorkload(batch, heads, seq_len, seq_len_kv, dim, tail, topk, 1, 1, seq_len)
-        op = DeepSeekSparseAttentionDecodeWithKVCacheFwdOp(
-            batch, heads, seq_len, seq_len_kv, dim, tail, topk, 1, 1, q_start_index_s=seq_len
-        )
+        case = DSADecodeWorkload(batch, heads, seq_len, seq_len_kv, dim, tail, topk, 1, 1, seq_len)
+        op = DSADenseFwdOp(tail, 1, q_start_index_s=seq_len)
         return op, case.gen_inputs()
+
+    def dsa_paged():
+        call = manifest_call(
+            "DSAPagedFwdOp", S_q=1, H=64, K=128, NP=8, PS=64, W=2, cache_lens="repeat(128, 2)"
+        )
+        return DSAPagedFwdOp(), DSAPagedCall(call).gen_inputs()
 
     def fp8_lightning_indexer():
         case = FP8LightningIndexerWorkload(1, 2048, 8, 64, 4096, 1)
         return FP8LightningIndexerFwdOp(), case.gen_inputs()
 
-    def topk_selector():
-        score = torch.randn(1, 256, 512, 1, dtype=torch.float32, device="cuda")
-        starts = torch.zeros(1, 256, dtype=torch.int32, device="cuda")
-        ends = torch.full((1, 256), 512, dtype=torch.int32, device="cuda")
-        return TopkSelectorFwdOp(topk=64), (score, starts, ends)
+    def topk_select():
+        score = torch.randn(1, 256, 512, 1, dtype=torch.float32, device=run_device())
+        starts = torch.zeros(1, 256, dtype=torch.int32, device=run_device())
+        ends = torch.full((1, 256), 512, dtype=torch.int32, device=run_device())
+        return TopKSelectFwdOp(top_k=64), (score, starts, ends)
 
     return (
         ("gqa-dense", gqa_dense),
+        # Only the SM90 kernel serves it.
+        ("gqa-dense-with-lse", gqa_dense_with_lse, True, (pytest.mark.sm90,)),
         ("gqa-bwd", gqa_bwd),
-        ("gqa-prefill-varlen", gqa_prefill_varlen),
+        ("gqa-varlen", gqa_varlen),
         ("gqa-sliding-window-varlen", gqa_sliding_window_varlen),
-        ("gqa-prefill-paged", gqa_prefill_paged),
-        ("gqa-decode-paged", gqa_decode_paged),
-        ("mha-bwd", mha_bwd),
+        ("gqa-paged-decode", gqa_paged_decode),
+        ("gqa-bwd-mha-heads", gqa_bwd_mha_heads),
         ("mha-decode-paged", mha_decode_paged),
         ("mla-decode", mla_decode),
+        ("mla-varlen", mla_varlen),
+        # dQ lands through float32 atomic adds, whose order differs from run to run.
+        ("mla-dense-bwd", mla_dense_bwd, False),
+        ("mla-varlen-bwd", mla_varlen_bwd, False),
         ("nsa-fwd", nsa_fwd),
-        ("nsa-cmp-fwd", nsa_cmp_fwd),
+        ("nsa-cmp-fwd", nsa_compressed_fwd),
         ("nsa-topk", nsa_topk),
         ("dsa-decode", dsa_decode),
+        ("dsa-paged", dsa_paged),
         ("fp8-lightning-indexer", fp8_lightning_indexer),
-        ("topk-selector", topk_selector),
+        # Picks the same set every time, but the atomic increments that claim the slots
+        # decide which index lands where.
+        ("topk-selector", topk_select, False),
     )
 
 
@@ -215,15 +267,15 @@ def _gemm_cases():
     _M, _N, _K = 128, 256, 256
 
     def _x(*shape, dtype=_DTYPE):
-        return torch.randn(*shape, dtype=dtype, device="cuda")
+        return torch.randn(*shape, dtype=dtype, device=run_device())
 
     def gemm():
-        return GemmFwdOp(), (_x(_M, _K), _x(_N, _K))
+        return GEMMFwdOp(), (_x(_M, _K), _x(_N, _K))
 
     def gemm_fp8():
         fp8 = dict(dtype=torch.float8_e4m3fn)
         f32 = dict(dtype=torch.float32)
-        return GemmFp8FwdOp(), (
+        return GEMMFP8FwdOp(), (
             _x(_M, _K).to(**fp8),
             _x(_N, _K).to(**fp8),
             _x(1, 1, **f32).abs(),
@@ -231,36 +283,59 @@ def _gemm_cases():
             None,
         )
 
+    def gemm_int8_w8a8():
+        i8 = dict(dtype=torch.int8, device=run_device())
+        f32 = dict(dtype=torch.float32)
+        return GEMMINT8W8A8FwdOp(), (
+            torch.randint(-127, 128, (_M, _K), **i8),
+            torch.randint(-127, 128, (_N, _K), **i8),
+            _x(_M, 1, **f32).abs(),
+            _x(1, _N, **f32).abs(),
+            None,
+        )
+
     def gemm_w4a16():
         group = 128
-        return GemmW4A16FwdOp(), (
+        return GEMMW4A16FwdOp(), (
             _x(_M, _K),
-            torch.randint(0, 255, (_N, _K // 2), dtype=torch.uint8, device="cuda"),
-            _x(_N, _K // group, dtype=torch.float32).abs(),
-            torch.randint(0, 15, (_N, _K // group), dtype=torch.uint8, device="cuda"),
+            torch.randint(0, 255, (_N, _K // 2), dtype=torch.uint8, device=run_device()),
+            _x(_N, _K // group).abs(),  # the scale follows the activation dtype
+            torch.randint(0, 15, (_N, _K // group), dtype=torch.uint8, device=run_device()),
+        )
+
+    def gemm_w4a8():
+        group = 128
+        fp8 = dict(dtype=torch.float8_e4m3fn)
+        f32 = dict(dtype=torch.float32)
+        return GEMMW4A8FwdOp(), (
+            _x(_M, _K).to(**fp8),
+            # Any byte pattern is a valid prepacked weight.
+            torch.randint(0, 255, (_N, _K // 2), dtype=torch.uint8, device=run_device()),
+            _x(_N, _K // group).abs().to(**fp8),
+            _x(_N, **f32).abs(),
+            _x(_M, **f32).abs(),
         )
 
     def grouped_gemm():
         groups, rows = 2, 128
-        sizes = torch.full((groups,), rows, dtype=torch.int32, device="cuda")
-        offsets = torch.tensor([0, rows], dtype=torch.int32, device="cuda")
-        return GroupedGemmFwdOp(), (
+        sizes = torch.full((groups,), rows, dtype=torch.int32, device=run_device())
+        offsets = torch.tensor([0, rows], dtype=torch.int32, device=run_device())
+        return GroupedGEMMFwdOp(), (
             _x(groups * rows, _K),
             _x(groups, _N, _K),
             sizes,
-            offsets,
             offsets,
         )
 
     def bmm():
         batch = 2
-        return BmmFwdOp(), (_x(batch, _M, _K), _x(batch, _K, _N))
+        return BMMFwdOp(), (_x(batch, _M, _K), _x(batch, _K, _N))
 
     def bmm_fp8():
         batch = 2
         fp8 = dict(dtype=torch.float8_e4m3fn)
-        scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
-        return BmmFp8FwdOp(out_dtype=torch.float16), (
+        scale = torch.tensor(1.0, dtype=torch.float32, device=run_device())
+        return BMMFP8FwdOp(out_dtype=torch.float16, trans_b=False), (
             _x(batch, _M, _K).to(**fp8),
             _x(batch, _K, _N).to(**fp8),
             scale,
@@ -270,7 +345,9 @@ def _gemm_cases():
     return (
         ("gemm", gemm),
         ("gemm-fp8", gemm_fp8),
+        ("gemm-int8-w8a8", gemm_int8_w8a8),
         ("gemm-w4a16", gemm_w4a16),
+        ("gemm-w4a8", gemm_w4a8),
         ("grouped-gemm", grouped_gemm),
         ("bmm", bmm),
         ("bmm-fp8", bmm_fp8),
@@ -285,16 +362,16 @@ def _mamba_cases():
     _S = _Q * _NC
 
     def _x(*shape, dtype=_DTYPE):
-        return torch.randn(*shape, dtype=dtype, device="cuda")
+        return torch.randn(*shape, dtype=dtype, device=run_device())
 
     f32 = dict(dtype=torch.float32)
 
-    def da_cumsum():
-        op = DaCumsumFwdOp(chunk_len=_Q, out_dtype=_DTYPE, dt_softplus=True)
+    def ssd_chunk_cumsum():
+        op = SSDChunkCumsumFwdOp(chunk_size=_Q, out_dtype=_DTYPE, dt_softplus=True)
         return op, (_x(_B, _S, _H, **f32), -_x(_H, **f32).abs(), None)
 
-    def cb_producer():
-        op = CBProducerFwdOp(_B, _NC, _G, _Q, _N)
+    def ssd_chunk_coupling():
+        op = SSDChunkCouplingFwdOp(_Q)
         return op, (_x(_B, _S, _G, _N), _x(_B, _S, _G, _N))
 
     def ssd_chunk_state():
@@ -324,7 +401,7 @@ def _mamba_cases():
         )
 
     def ssd_decode():
-        return SSDDecodeFwdOp(), (
+        return SSDRecurrentFwdOp(), (
             -_x(_H, _P, _N, **f32).abs(),
             _x(_B, _H, _P, **f32),
             _x(_B, _H, _P),
@@ -333,9 +410,41 @@ def _mamba_cases():
             _x(_B, _H, _P, _N, **f32),
         )
 
+    def causal_conv1d():
+        cu_seqlens = torch.tensor([0, 5, 64], dtype=torch.int32, device=run_device())
+        flags = torch.tensor([True, False], device=run_device())
+        return CausalConv1dFwdOp(), (
+            _x(64, 256),
+            _x(256, 4),
+            _x(2, 256, 3),
+            cu_seqlens,
+            _x(256),
+            flags,
+        )
+
+    def causal_conv1d_update():
+        return CausalConv1dUpdateFwdOp(), (_x(3, 256), _x(256, 4), _x(3, 256, 3), _x(256))
+
+    def selective_scan():
+        return SelectiveScanFwdOp(), (
+            _x(1, 16, 64),
+            0.1 * _x(1, 16, 64),
+            -_x(16, 16, **f32).abs(),
+            _x(1, 1, 16, 64),
+            _x(1, 1, 16, 64),
+            _x(16, **f32),
+            _x(1, 16, 64),
+            _x(16, **f32),
+            None,
+            None,
+        )
+
     return (
-        ("da-cumsum", da_cumsum),
-        ("cb-producer", cb_producer),
+        ("causal-conv1d", causal_conv1d),
+        ("causal-conv1d-update", causal_conv1d_update),
+        ("selective-scan", selective_scan),
+        ("da-cumsum", ssd_chunk_cumsum),
+        ("cb-producer", ssd_chunk_coupling),
         ("ssd-chunk-state", ssd_chunk_state),
         ("ssd-state-passing", ssd_state_passing),
         ("ssd-chunk-scan", ssd_chunk_scan),
@@ -351,12 +460,12 @@ def _linear_attention_cases():
     _SCALE = _D**-0.5
 
     def _x(*shape, dtype=_DTYPE):
-        return torch.randn(*shape, dtype=dtype, device="cuda")
+        return torch.randn(*shape, dtype=dtype, device=run_device())
 
     chunks = _S // _CHUNK + 1
 
-    def gla_fwd():
-        op = GLAFwdOp(chunk_size=_CHUNK, scale=_SCALE)
+    def gla_chunk_fwd():
+        op = GLAChunkFwdOp(chunk_size=_CHUNK, scale=_SCALE)
         # ``g`` is a log-space decay, so it must be non-positive.
         return op, (
             _x(_B, _S, _H, _D),
@@ -366,20 +475,20 @@ def _linear_attention_cases():
             None,
         )
 
-    def gla_bwd():
-        op = GLABwdOp(chunk_size=_CHUNK, scale=_SCALE)
+    def gla_chunk_bwd():
+        op = GLAChunkBwdOp(chunk_size=_CHUNK, scale=_SCALE)
         return op, (
+            _x(_B, _S, _H, _D),
+            _x(_B, _H, _D, _D, dtype=torch.float32),
             _x(_B, _S, _H, _D),
             _x(_B, _S, _H, _D),
             _x(_B, _S, _H, _D),
             -_x(_B, _S, _H, _D).abs(),
             _x(_B, chunks, _H, _D, _D, dtype=torch.float32),
-            _x(_B, _S, _H, _D),
-            _x(_B, _H, _D, _D, dtype=torch.float32),
         )
 
     def gla_decode():
-        op = GLADecodeFwdOp(scale=_SCALE)
+        op = GLARecurrentFwdOp(scale=_SCALE)
         return op, (
             _x(_B, _H, _D),
             _x(_B, _H, _D),
@@ -388,10 +497,10 @@ def _linear_attention_cases():
             _x(_B, _H, _D, _D),
         )
 
-    def deltanet_fwd():
+    def deltanet_chunk_fwd():
         # The delta rule is a recurrence over S steps; unit-variance operands overflow it
-        # into NaN, which compares unequal to itself. Scale as ``DeltaNetFwdWorkload`` does.
-        op = DeltaNetFwdOp(chunk_size=_CHUNK)
+        # into NaN, which compares unequal to itself. Scale as ``DeltaNetChunkwiseWorkload`` does.
+        op = DeltaNetChunkFwdOp(chunk_size=_CHUNK)
         return op, (
             _x(_B, _H, _S, _D) * 0.1,
             _x(_B, _H, _S, _D) * 0.1,
@@ -399,8 +508,8 @@ def _linear_attention_cases():
             _x(_B, _H, _S).sigmoid() * 0.5,
         )
 
-    def deltanet_bwd():
-        op = DeltaNetBwdOp(chunk_size=_CHUNK)
+    def deltanet_chunk_bwd():
+        op = DeltaNetChunkBwdOp(chunk_size=_CHUNK)
         return op, (
             _x(_B, _H, _S, _D),
             _x(_B, _H, _S, _D),
@@ -415,7 +524,7 @@ def _linear_attention_cases():
         )
 
     def deltanet_decode():
-        return DeltaNetDecodeFwdOp(), (
+        return DeltaNetRecurrentFwdOp(), (
             _x(_B, _H, _D),
             _x(_B, _H, _D),
             _x(_B, _H, _D),
@@ -423,13 +532,178 @@ def _linear_attention_cases():
             _x(_B, _H, _D, _D),
         )
 
+    def gla():
+        return GLAFwdOp(scale=_SCALE), (
+            _x(_B, _S, _H, _D) * 0.1,
+            _x(_B, _S, _H, _D) * 0.1,
+            _x(_B, _S, _H, _D) * 0.1,
+            -_x(_B, _S, _H, _D).abs() * 0.1,
+        )
+
+    def deltanet():
+        k = torch.nn.functional.normalize(_x(_B, _S, _H, _D, dtype=torch.float32), dim=-1)
+        return DeltaNetFwdOp(), (
+            _x(_B, _S, _H, _D) * 0.1,
+            k.to(_DTYPE),
+            _x(_B, _S, _H, _D) * 0.1,
+            _x(_B, _S, _H).sigmoid() * 0.5,
+        )
+
+    def gdn():
+        # A 128-wide head, which both the in-tree prefill and decode kernels serve.
+        k = torch.nn.functional.normalize(_x(_B, _S, _H, 128, dtype=torch.float32), dim=-1)
+        return GDNFwdOp(), (
+            _x(_B, _S, _H, 128) * 0.1,
+            k.to(_DTYPE),
+            _x(_B, _S, _H, 128) * 0.1,
+            -_x(_B, _S, _H).abs() * 0.1,
+            _x(_B, _S, _H).sigmoid(),
+        )
+
+    def kda():
+        # A 128-wide square state with a precomputed gate, which the in-tree prefill serves.
+        k = torch.nn.functional.normalize(_x(_B, _S, _H, 128, dtype=torch.float32), dim=-1)
+        return KDAFwdOp(), (
+            _x(_B, _S, _H, 128) * 0.1,
+            k.to(_DTYPE),
+            _x(_B, _S, _H, 128) * 0.1,
+            -_x(_B, _S, _H, 128).abs() * 0.1,
+            _x(_B, _S, _H).sigmoid(),
+        )
+
     return (
-        ("gla-fwd", gla_fwd),
-        ("gla-bwd", gla_bwd),
+        ("gla-chunk-fwd", gla_chunk_fwd),
+        ("gla-chunk-bwd", gla_chunk_bwd),
         ("gla-decode", gla_decode),
-        ("deltanet-fwd", deltanet_fwd),
-        ("deltanet-bwd", deltanet_bwd),
+        ("deltanet-chunk-fwd", deltanet_chunk_fwd),
+        ("deltanet-chunk-bwd", deltanet_chunk_bwd),
         ("deltanet-decode", deltanet_decode),
+        ("gla", gla),
+        ("deltanet", deltanet),
+        ("gdn", gdn),
+        ("kda", kda),
+    )
+
+
+def _other_cases():
+    """The FFT, Hadamard, quantization and mean pooling ops, with the inputs they are built for."""
+
+    def fft_c2c():
+        x = torch.randn(2, 64, dtype=torch.complex64, device=run_device())
+        return FFTC2CFwdOp(), (x,)
+
+    def hadamard_transform():
+        x = torch.randn(2, 128, dtype=torch.bfloat16, device=run_device())
+        return HadamardTransformFwdOp(), (x,)
+
+    def fp8_quant():
+        x = torch.randn(1, 64, 1, 64, dtype=torch.float16, device=run_device())
+        return FP8QuantPerTokenGroupFwdOp(), (x,)
+
+    def fp8_quant_per_block():
+        return FP8QuantPerBlockFwdOp(), FP8QuantPerBlockWorkload(
+            200, 392, torch.bfloat16
+        ).gen_inputs()
+
+    def int8_dequant_per_channel():
+        case = INT8DequantPerChannelWorkload(64, 64, torch.bfloat16)
+        return INT8DequantPerChannelFwdOp(torch.bfloat16), case.gen_inputs()
+
+    def int8_dequant_per_block():
+        case = INT8DequantPerBlockWorkload(64, 64, torch.bfloat16)
+        return INT8DequantPerBlockFwdOp(torch.bfloat16), case.gen_inputs()
+
+    def int8_dequant_per_tensor():
+        case = INT8DequantPerTensorWorkload(64, 64, torch.bfloat16)
+        return INT8DequantPerTensorFwdOp(torch.bfloat16), case.gen_inputs()
+
+    def int8_quant_per_block():
+        return INT8QuantPerTokenGroupFwdOp(), INT8QuantPerBlockWorkload(
+            64, 256, torch.bfloat16
+        ).gen_inputs()
+
+    def int8_quant_per_channel():
+        return INT8QuantPerChannelFwdOp(), INT8QuantPerChannelWorkload(
+            64, 64, torch.bfloat16
+        ).gen_inputs()
+
+    def int8_quant_per_tensor():
+        return INT8QuantPerTensorFwdOp(), INT8QuantPerTensorWorkload(
+            64, 64, torch.bfloat16
+        ).gen_inputs()
+
+    def int4_quant_per_group():
+        return INT4QuantPerGroupFwdOp(), INT4QuantPerGroupWorkload(
+            64, 256, torch.float16
+        ).gen_inputs()
+
+    def smooth_quant():
+        return SmoothQuantFwdOp(), SmoothQuantWorkload(64, 64, torch.bfloat16).gen_inputs()
+
+    def mean_pooling():
+        x = torch.randn(1, 64, 2, 64, dtype=torch.float16, device=run_device())
+        return MeanPoolingFwdOp(32, torch.float32), (x,)
+
+    def top_k_top_p_mask():
+        logits = torch.randn(2, 256, dtype=torch.bfloat16, device=run_device())
+        k = torch.tensor([1, 40], dtype=torch.int32, device=run_device())
+        p = torch.tensor([0.9, 0.7], dtype=torch.float32, device=run_device())
+        return TopKTopPMaskFwdOp(), (logits, k, p)
+
+    return (
+        ("fft-c2c", fft_c2c),
+        ("hadamard-transform", hadamard_transform),
+        ("fp8-quant", fp8_quant),
+        ("fp8-quant-per-block", fp8_quant_per_block),
+        ("int4-quant-per-group", int4_quant_per_group),
+        ("int8-dequant-per-block", int8_dequant_per_block),
+        ("int8-dequant-per-channel", int8_dequant_per_channel),
+        ("int8-dequant-per-tensor", int8_dequant_per_tensor),
+        ("int8-quant-per-block", int8_quant_per_block),
+        ("int8-quant-per-channel", int8_quant_per_channel),
+        ("int8-quant-per-tensor", int8_quant_per_tensor),
+        ("mean-pooling", mean_pooling),
+        ("smooth-quant", smooth_quant),
+        ("top-k-top-p-mask", top_k_top_p_mask),
+    )
+
+
+def _sampling_cases():
+    """The logit filters, the token draw and the chain verification, each with the inputs it is built for."""
+
+    def min_p_mask():
+        logits = torch.randn(4, 256, dtype=torch.bfloat16, device=run_device())
+        min_p = torch.full((4,), 0.1, device=run_device())
+        return MinPMaskFwdOp(), (logits, min_p)
+
+    def top_k_mask():
+        logits = torch.randn(2, 256, dtype=torch.bfloat16, device=run_device())
+        k = torch.tensor([1, 40], dtype=torch.int32, device=run_device())
+        return TopKMaskFwdOp(), (logits, k)
+
+    def top_p_mask():
+        logits = torch.randn(4, 256, dtype=torch.bfloat16, device=run_device())
+        p = torch.full((4,), 0.9, device=run_device())
+        return TopPMaskFwdOp(), (logits, p)
+
+    def sampling_from_probs():
+        probs = torch.rand(4, 256, device=run_device()).softmax(-1)
+        state = torch.tensor([7], dtype=torch.int64, device=run_device())
+        return SamplingFromProbsFwdOp(), (probs, state, state)
+
+    def chain_speculative_sampling():
+        draft = torch.rand(4, 2, 256, device=run_device()).softmax(-1)
+        target = torch.rand(4, 3, 256, device=run_device()).softmax(-1)
+        ids = torch.randint(0, 256, (4, 2), dtype=torch.int32, device=run_device())
+        state = torch.tensor([7], dtype=torch.int64, device=run_device())
+        return ChainSpeculativeSamplingFwdOp(), (draft, ids, target, state, state)
+
+    return (
+        ("min-p-mask", min_p_mask),
+        ("top-k-mask", top_k_mask),
+        ("top-p-mask", top_p_mask),
+        ("sampling-from-probs", sampling_from_probs),
+        ("chain-speculative-sampling", chain_speculative_sampling),
     )
 
 
@@ -442,10 +716,10 @@ def _sequence_modeling_cases():
     _CONV_TAPS = 4
 
     def _x(*shape, dtype=_DTYPE):
-        return torch.randn(*shape, dtype=dtype, device="cuda")
+        return torch.randn(*shape, dtype=dtype, device=run_device())
 
     def engram_gate_conv_fwd():
-        op = EngramGateConvFwdOp(_M, _SEQ_LEN, _D)
+        op = EngramGateConvFwdOp()
         return op, (
             _x(_M, _SEQ_LEN, _D),
             _x(_M, _SEQ_LEN, _D),
@@ -457,7 +731,7 @@ def _sequence_modeling_cases():
 
     def engram_gate_conv_bwd():
         f32 = dict(dtype=torch.float32)
-        op = EngramGateConvBwdOp(_M, _SEQ_LEN, _D)
+        op = EngramGateConvBwdOp()
         return op, (
             _x(_M, _SEQ_LEN, _D),
             _x(_M, _SEQ_LEN, _D),
@@ -475,7 +749,7 @@ def _sequence_modeling_cases():
 
     def engram_decode():
         batch, d_mem, max_conv_len, dilation = 2, 128, 8, 1
-        op = EngramDecodeFwdOp(batch, d_mem, _D, max_conv_len, _CONV_TAPS, dilation)
+        op = EngramDecodeFwdOp(max_conv_len, _CONV_TAPS, dilation)
         return op, (
             _x(batch, d_mem),
             _x(batch, _D),
@@ -514,13 +788,67 @@ def _sequence_modeling_cases():
     )
 
 
+def _rope_cases():
+    """The RoPE ops, one layout each, with the inputs they are built for."""
+    _DTYPE = torch.float16
+    _SEQ_LEN, _HEADS, _D = 64, 4, 64
+
+    def _x(*shape):
+        return torch.randn(*shape, dtype=_DTYPE, device=run_device())
+
+    def one_d(op_cls):
+        return lambda: (op_cls(input_layout="1d"), (_x(_SEQ_LEN, _D),))
+
+    def two_d(op_cls):
+        return lambda: (op_cls(input_layout="2d"), (_x(2, _SEQ_LEN, _HEADS, _D),))
+
+    def longrope():
+        rescale = torch.linspace(1.0, 2.0, _D // 2, device=run_device())
+        return LongRoPEFwdOp(rescale_factors=rescale), (_x(_SEQ_LEN, _D),)
+
+    def position_ids():
+        op = RoPENeoxPositionIdsFwdOp(max_position=128)
+        positions = torch.arange(_SEQ_LEN, device=run_device(), dtype=torch.int32)
+        return op, (_x(_SEQ_LEN, _HEADS, _D), positions)
+
+    return (
+        ("rope-neox", one_d(RoPEFwdOp)),
+        (
+            "rope-interleaved",
+            lambda: (
+                RoPEFwdOp(rope_layout="interleaved", input_layout="2d"),
+                (_x(2, _SEQ_LEN, _HEADS, _D),),
+            ),
+        ),
+        ("rope-llama31", one_d(RoPELlama31FwdOp)),
+        ("rope-yarn", two_d(YaRNFwdOp)),
+        ("rope-longrope", longrope),
+        ("rope-neox-position-ids", position_ids),
+    )
+
+
 _FAMILIES = (
     _attention_cases,
     _gemm_cases,
     _mamba_cases,
     _linear_attention_cases,
+    _sampling_cases,
     _sequence_modeling_cases,
+    _rope_cases,
+    _other_cases,
 )
+
+
+class _Case(NamedTuple):
+    """One op's case. ``exact`` is False where the kernel returns a tensor a compiled call
+    cannot be held equal to; the contract there is the traced graph plus the shapes and
+    dtypes the op promises. ``marks`` are its pytest marks, such as the architecture its
+    kernel needs."""
+
+    name: str
+    build: Callable[[], tuple]
+    exact: bool = True
+    marks: tuple = ()
 
 
 def _cases():
@@ -530,66 +858,96 @@ def _cases():
     that enforces the compile-contract gate, where a CUDA tensor built at import time
     would fail before any test is selected.
     """
-    return [pytest.param(builder, id=name) for family in _FAMILIES for name, builder in family()]
+    cases = [_Case(*entry) for family in _FAMILIES for entry in family()]
+    return [pytest.param(case, id=case.name, marks=case.marks) for case in cases]
 
 
+# A spec-only entry's case runs but is not registered: only an implemented entry's
+# declaration is contract evidence.
 for _op_cls in (
-    GroupedQueryAttentionDenseFwdOp,
-    GroupedQueryAttentionBwdOp,
-    GroupedQueryAttentionPrefillVarlenFwdOp,
-    GroupedQueryAttentionSlidingWindowVarlenFwdOp,
-    GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp,
-    GroupedQueryAttentionDecodePagedWithKVCacheFwdOp,
-    MultiHeadAttentionBwdOp,
-    MultiHeadAttentionDecodePagedWithKVCacheFwdOp,
-    MultiHeadLatentAttentionDecodeWithKVCacheFwdOp,
-    NSAFwdVarlenOp,
-    NSACmpFwdVarlenOp,
-    NSATopkVarlenOp,
-    DeepSeekSparseAttentionDecodeWithKVCacheFwdOp,
+    GQADenseFwdOp,
+    GQADenseWithLSEFwdOp,
+    GQADenseBwdOp,
+    GQAVarlenFwdOp,
+    GQAPagedFwdOp,
+    MHAPagedFwdOp,
+    MLADenseDecodeFwdOp,
+    MLADenseBwdOp,
+    MLAVarlenBwdOp,
+    MLAVarlenFwdOp,
+    NSAVarlenFwdOp,
+    NSACompressedVarlenFwdOp,
+    NSATopKVarlenFwdOp,
+    DSADenseFwdOp,
+    DSAPagedFwdOp,
     FP8LightningIndexerFwdOp,
-    TopkSelectorFwdOp,
-    GemmFwdOp,
-    GemmFp8FwdOp,
-    GemmW4A16FwdOp,
-    GroupedGemmFwdOp,
-    BmmFwdOp,
-    BmmFp8FwdOp,
-    DaCumsumFwdOp,
-    CBProducerFwdOp,
+    TopKSelectFwdOp,
+    GEMMFwdOp,
+    GEMMFP8FwdOp,
+    GEMMINT8W8A8FwdOp,
+    GEMMW4A16FwdOp,
+    GEMMW4A8FwdOp,
+    GroupedGEMMFwdOp,
+    BMMFwdOp,
+    BMMFP8FwdOp,
+    CausalConv1dFwdOp,
+    CausalConv1dUpdateFwdOp,
+    SelectiveScanFwdOp,
+    SSDChunkCumsumFwdOp,
+    SSDChunkCouplingFwdOp,
     SSDChunkStateFwdOp,
     SSDStatePassingFwdOp,
     SSDChunkScanFwdOp,
-    SSDDecodeFwdOp,
+    SSDRecurrentFwdOp,
+    GLAChunkFwdOp,
+    GLAChunkBwdOp,
+    GLARecurrentFwdOp,
     GLAFwdOp,
-    GLABwdOp,
-    GLADecodeFwdOp,
+    DeltaNetChunkFwdOp,
+    DeltaNetChunkBwdOp,
+    DeltaNetRecurrentFwdOp,
     DeltaNetFwdOp,
-    DeltaNetBwdOp,
-    DeltaNetDecodeFwdOp,
+    GDNFwdOp,
+    KDAFwdOp,
+    FFTC2CFwdOp,
+    HadamardTransformFwdOp,
+    FP8QuantPerTokenGroupFwdOp,
+    ChainSpeculativeSamplingFwdOp,
+    FP8QuantPerBlockFwdOp,
+    INT4QuantPerGroupFwdOp,
+    INT8DequantPerBlockFwdOp,
+    INT8DequantPerChannelFwdOp,
+    INT8DequantPerTensorFwdOp,
+    INT8QuantPerTokenGroupFwdOp,
+    INT8QuantPerChannelFwdOp,
+    INT8QuantPerTensorFwdOp,
+    SmoothQuantFwdOp,
+    MeanPoolingFwdOp,
+    MinPMaskFwdOp,
+    SamplingFromProbsFwdOp,
+    TopPMaskFwdOp,
     EngramGateConvFwdOp,
     EngramGateConvBwdOp,
     EngramDecodeFwdOp,
     MHCPreFwdOp,
     MHCPostFwdOp,
+    RoPEFwdOp,
+    RoPELlama31FwdOp,
+    YaRNFwdOp,
+    LongRoPEFwdOp,
+    RoPENeoxPositionIdsFwdOp,
+    TopKMaskFwdOp,
+    TopKTopPMaskFwdOp,
 ):
     register_compile_contract(_op_cls)
 
 
-# Two kernels return a tensor a compiled call cannot be held equal to, so for these the
-# contract is the graph the op traces to plus the shapes and dtypes it promises. The top-k
-# selector picks the same set every time but lets the atomic increments that claim the
-# slots decide which index lands where. Sparse MLA reads storage it was not handed, which
-# a NaN-filled caching allocator turns its whole output into.
-_NONDETERMINISTIC = frozenset({"topk-selector", "dsa-decode"})
-
-
 @pytest.mark.smoke
 @pytest.mark.usefixtures("isolated_dynamo")
-@pytest.mark.parametrize("build_case", _cases())
-def test_a_cold_op_traces_fullgraph_and_matches_eager(build_case, request) -> None:
+@pytest.mark.parametrize("case", _cases())
+def test_a_cold_op_traces_fullgraph_and_matches_eager(case) -> None:
     """Cold is the whole contract: a warm op has nothing left for dynamo to trace into."""
-    op, inputs = build_case()
+    op, inputs = case.build()
     # Its own copies per call: a paged op writes its cache pages. ``detach`` because a
     # backward op's operator carries no autograd formula to answer a history-tracking input.
     compiled_inputs = tuple(None if t is None else t.detach().clone() for t in inputs)
@@ -597,17 +955,15 @@ def test_a_cold_op_traces_fullgraph_and_matches_eager(build_case, request) -> No
 
     compiled = torch.compile(op, fullgraph=True)(*compiled_inputs)
 
-    assert_same_result(
-        compiled, op(*eager_inputs), exact=request.node.callspec.id not in _NONDETERMINISTIC
-    )
+    assert_same_result(compiled, op(*eager_inputs), exact=case.exact)
 
 
 @pytest.mark.smoke
 @pytest.mark.usefixtures("isolated_dynamo")
-@pytest.mark.parametrize("build_case", _cases())
-def test_the_fake_reports_what_the_op_returns(build_case) -> None:
+@pytest.mark.parametrize("case", _cases())
+def test_the_fake_reports_what_the_op_returns(case) -> None:
     """The fake is the op's whole promise to the compiler, so it must be the truth."""
-    op, inputs = build_case()
+    op, inputs = case.build()
     inputs = tuple(None if t is None else t.detach() for t in inputs)
 
     assert_fake_matches_eager(op, *inputs)
@@ -615,10 +971,10 @@ def test_the_fake_reports_what_the_op_returns(build_case) -> None:
 
 @pytest.mark.smoke
 @pytest.mark.usefixtures("isolated_dynamo")
-@pytest.mark.parametrize("build_case", _cases())
-def test_the_traced_graph_holds_only_this_ops_operator(build_case) -> None:
+@pytest.mark.parametrize("case", _cases())
+def test_the_traced_graph_holds_only_this_ops_operator(case) -> None:
     """The node is the op's, so replacing the kernel cannot change the graph."""
-    op, inputs = build_case()
+    op, inputs = case.build()
     inputs = tuple(None if t is None else t.detach() for t in inputs)
 
     assert_op_owns_graph_nodes(op, *inputs)

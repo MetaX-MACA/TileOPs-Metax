@@ -4,8 +4,9 @@ Op classes exercised cold with ``torch.compile(op, fullgraph=True)`` by the
 curated compile tests are registered here at evidence-module import time —
 parametrized case tables register their ``op_cls`` entries directly, direct
 tests call :func:`register_compile_contract` next to the test they back.
-:func:`compile_contract_ops` aggregates the registered evidence set the
-manifest's ``torch_compile_fullgraph`` declarations must mirror.
+:func:`compile_contract_ops` aggregates the registered evidence set, which must
+equal the implemented entries that have a compile boundary: a call-time tensor
+input and no composition.
 
 Exploratory or regression compile tests that do not back the fullgraph
 contract must not register here.
@@ -22,9 +23,15 @@ _EVIDENCE_MODULES = (
     "tests.ops.test_compile_boundary",
     "tests.ops.test_convolution",
     "tests.ops.test_elementwise_compile",
+    "tests.ops.test_fused_qk_norm_rope",
     "tests.ops.test_moe_compile",
+    "tests.ops.test_merge_attention_states",
+    "tests.ops.test_mla_paged",
     "tests.ops.test_norm_compile",
+    "tests.ops.test_mla_kv_cache_write",
+    "tests.ops.test_paged_kv_cache_write",
     "tests.ops.test_pool",
+    "tests.ops.test_paged_cache_gather",
     "tests.ops.test_reduction_compile",
     "tests.ops.test_rms_norm",
 )
@@ -107,6 +114,10 @@ def assert_same_result(compiled, eager, *, exact: bool) -> None:
     compiled = compiled if isinstance(compiled, tuple) else (compiled,)
     eager = eager if isinstance(eager, tuple) else (eager,)
     for got, want in zip(compiled, eager, strict=True):
+        # A nullable output absent on this call is None on both sides.
+        if want is None:
+            assert got is None
+            continue
         assert got.shape == want.shape and got.dtype == want.dtype
         if exact:
             torch.testing.assert_close(got, want)
@@ -135,6 +146,9 @@ def assert_fake_matches_eager(op, *inputs, **kwargs) -> None:
         f"{type(op).__name__}: the fake returns {len(faked)} tensors, the op {len(real)}"
     )
     for i, (claimed, actual) in enumerate(zip(faked, real, strict=True)):
+        if actual is None:
+            assert claimed is None, f"{type(op).__name__} output {i}: the op returns None"
+            continue
         assert claimed.dtype == actual.dtype, (
             f"{type(op).__name__} output {i}: the fake reports {claimed.dtype}, the op "
             f"returns {actual.dtype}"

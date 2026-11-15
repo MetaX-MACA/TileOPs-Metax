@@ -4,6 +4,10 @@ The timing layer owns the measurement and nothing else -- it knows how to run a 
 n times and return each run's device latency. What the numbers mean, and where they are
 written, belong to the layers above.
 
+A CUDA device is timed through CUPTI. Another accelerator is timed with torch's device
+events, which bracket each call: its ``timing`` reads ``events``, and the busy time equals
+the latency.
+
 A kernel belongs to the iteration whose external correlation id it carries, so nothing
 is inferred from timestamps and a kernel shorter than the host overhead around it is
 attributed as reliably as a long one. CUPTI's id stack is per-thread, which is this
@@ -15,7 +19,6 @@ it to another thread (``Tensor.backward`` hands it to autograd's engine thread;
 import contextlib
 import ctypes
 import logging
-import os
 import statistics
 import sys
 import threading
@@ -23,25 +26,26 @@ from typing import Any, Callable, NamedTuple, Optional
 
 import torch
 
+from tileops._utils import is_maca
+from tileops._utils.device import device_context, empty_accelerator_cache, on_current_index
+from workloads.device import run_device
+
 _logger = logging.getLogger("tileops.bench")
 
-# Per-phase wall-time budgets in ms, divided by the cost of one cold-isolated iteration.
-# That cost includes the L2 flush, which the reading excludes and which on its own
-# outweighs a microsecond kernel, so most ops take their count from _MAX_ITERS instead.
+# Per-phase wall-time budgets in ms, divided by the cost of one iteration: reset, L2
+# flush and call. That cost includes the flush, which the reading excludes and which on
+# its own outweighs a microsecond kernel, so most ops take their count from _MAX_ITERS.
 DRY_RUN_MS = 25.0
 REPEAT_MS = 100.0
-_CALIBRATION_ITERS = 3
 # Counts are clamped: attribution requires every repeat to reach the GPU, so an
 # unbounded count turns one hiccup into a failed case.
 _MIN_ITERS = 10
 _MAX_ITERS = 200
 
 # Latest bench_kernel measurement metadata; deviations from the default protocol are
-# surfaced in results by BenchmarkBase._build_result.
+# surfaced in every recorded result.
 _bench_meta = threading.local()
 _cuda_runtime = None
-_cuda_runtime_unavailable = False
-_torch_profiler_failed = False
 
 # CUPTI activity collection, via NVIDIA's cupti-python binding.
 
@@ -53,24 +57,27 @@ _CALLBACKS_REGISTERED = False
 # few megabytes stalls iterations of a short call. Only latency_ms picks the stall up;
 # the records are the same either way.
 _BUFFER_BYTES = 256 * 1024
-_BUFFER_ALIGN = 8
 # What the next buffer request answers with. A phase that lost records raises it for
 # the retry: a stall costs one iteration's latency_ms, a lost record costs the case.
 _buffer_bytes = _BUFFER_BYTES
 _KERNELS: list[dict[str, Any]] = []
 _ITERATION_OF: dict[int, int] = {}
-_ATTRIBUTION_ATTEMPTS = 3
 _DROPPED_COUNT_UNREADABLE = False
 _DROP_COUNTER_LIVE: Optional[bool] = None
 # Pushed around the L2 flush and anything else run between iterations. Labelling that
 # work is what lets a kernel with no id at all mean one thing only: a thread the id was
 # never pushed on launched it. Out of range of any iteration index.
 _PREPARE_ID = 1 << 32
-_KERNEL_REGION = "tileops.bench.kernel"
 
 
-# L2 cache flush buffer, allocated lazily.
-_l2_flush_cache: Optional[torch.Tensor] = None
+# L2 cache flush buffer per device, allocated lazily. Keyed by the whole device: two
+# device types both number their first device 0.
+_l2_flush_caches: dict[torch.device, torch.Tensor] = {}
+# Cache preparation identifiers separate incompatible historical measurements.
+_L2_FLUSH_CUDA = "triton-read-2x-l2"
+_L2_FLUSH_OTHER = "torch-max-2x-l2"
+# The L2 assumed for a device whose torch module reports none.
+_FALLBACK_L2_BYTES = int(256e6)
 
 
 def _clamp_iters(raw: float, max_iters: int = _MAX_ITERS, min_iters: int = _MIN_ITERS) -> int:
@@ -99,7 +106,7 @@ def _load_cupti():
         return _CUPTI
     try:
         from cupti import cupti
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise CUPTIError(
             "cupti-python is unavailable. Install it with "
             "`pip install --no-deps cupti-python==13.2.0`; --no-deps is required "
@@ -110,7 +117,8 @@ def _load_cupti():
 
 
 def _buffer_requested():
-    return _buffer_bytes, _BUFFER_ALIGN
+    buffer_alignment = 8
+    return _buffer_bytes, buffer_alignment
 
 
 def _read_dropped() -> Optional[int]:
@@ -122,7 +130,7 @@ def _read_dropped() -> Optional[int]:
         # Kernel records land on the global queue, which is context 0, and the binding
         # takes the out-parameter as an address rather than returning it.
         cupti.activity_get_num_dropped_records(0, 0, ctypes.addressof(dropped))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         if not _DROPPED_COUNT_UNREADABLE:
             _DROPPED_COUNT_UNREADABLE = True
             _logger.warning(
@@ -149,7 +157,7 @@ def _drop_counter_is_live() -> bool:
     with _phase_session(buffer_bytes=8):  # too small to hold one record
         for _ in range(probe_kernels):
             probe.zero_()
-        torch.cuda.synchronize()
+        torch.cuda.synchronize()  # lint: device-api allow: CUPTI runs on CUDA only
         _load_cupti().activity_flush_all(1)
     dropped = _read_dropped()
     _DROP_COUNTER_LIVE = bool(dropped)
@@ -218,7 +226,7 @@ def _trace_launches_only(cupti) -> None:
                 continue
             try:
                 toggle(int(cbid), 1 if any(word in name for word in issuers) else 0)
-            except Exception:  # noqa: BLE001, S112
+            except Exception:
                 # The enums carry sentinels (INVALID, SIZE) that CUPTI refuses.
                 continue
 
@@ -253,7 +261,7 @@ def _phase_session(buffer_bytes: int = _BUFFER_BYTES):
         for kind in kinds:
             cupti.activity_enable(kind)
         _trace_launches_only(cupti)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         _buffer_bytes = previous_bytes
         raise CUPTIError(f"CUPTI collector failed to start: {exc}") from exc
     _COLLECTOR_ACTIVE = True
@@ -265,17 +273,17 @@ def _phase_session(buffer_bytes: int = _BUFFER_BYTES):
         try:
             for kind in reversed(kinds):
                 cupti.activity_disable(kind)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise CUPTIError(f"CUPTI collector failed to stop: {exc}") from exc
 
 
 def _flush() -> tuple[list[dict[str, Any]], dict[int, int]]:
     """Return the kernels recorded since the previous flush, and their iteration map."""
     cupti = _load_cupti()
-    torch.cuda.synchronize()
+    torch.cuda.synchronize()  # lint: device-api allow: CUPTI runs on CUDA only
     try:
         cupti.activity_flush_all(1)  # CUPTI_ACTIVITY_FLAG_FLUSH_FORCED
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise CUPTIError(f"CUPTI flush failed: {exc}") from exc
     kernels, iteration_of = list(_KERNELS), dict(_ITERATION_OF)
     _KERNELS.clear()
@@ -324,7 +332,7 @@ def collect_repeats(
                 prepare_one(i)
             with _labelled(i):
                 run_one(i)
-            torch.cuda.synchronize()
+            torch.cuda.synchronize()  # lint: device-api allow: CUPTI runs on CUDA only
         kernels, iteration_of = _flush()
         # Counted after the flush, once CUPTI has handed back what it did keep. Unproven
         # counter reports None, not zero: it is the only evidence separating a lost
@@ -377,12 +385,20 @@ def _kernel_busy_us(kernels: list[dict]) -> float:
     return (total + current_end - current_start) / 1000.0
 
 
-def _cuda_events_fallback_enabled() -> bool:
-    # The standalone cupti-python binding is not present in many MACA images,
-    # even though PyTorch itself can still create CUDA-compatible events. Keep
-    # benchmarks runnable there; set the variable to 0 when strict CUPTI-only
-    # measurements are required.
-    return os.getenv("TILEOPS_ALLOW_CUDA_EVENTS_FALLBACK", "1") == "1"
+# Whether this run may time with CUDA events where CUPTI cannot attribute a phase.
+# The run sets it (``--tileops-allow-events-fallback`` in ``benchmarks/conftest.py``).
+_events_fallback_allowed = False
+
+
+def events_fallback_allowed() -> bool:
+    """Whether this run lets ``bench_kernel`` fall back to CUDA events; ``False`` unless set."""
+    return _events_fallback_allowed
+
+
+def set_events_fallback_allowed(allowed: bool) -> None:
+    """Let ``bench_kernel`` fall back to CUDA events from now on, or refuse to."""
+    global _events_fallback_allowed
+    _events_fallback_allowed = allowed
 
 
 def _attributed_samples(
@@ -481,8 +497,9 @@ def _collect_attributed(
     and only its reading is gone, so the phase is run again, each attempt asking for a
     larger buffer. Anything the drop counter does not explain fails on the first attempt.
     """
+    attribution_attempts = 3
     buffer_bytes = _BUFFER_BYTES
-    for attempt in range(_ATTRIBUTION_ATTEMPTS):
+    for attempt in range(attribution_attempts):
         trace = collect_repeats(run_one, n_repeat, prepare_one, buffer_bytes)
         try:
             return _attributed_samples(
@@ -494,7 +511,7 @@ def _collect_attributed(
             )
         except _CUPTIRecordsLostError as exc:
             _bench_meta.attribution_retries = attempt + 1
-            if attempt == _ATTRIBUTION_ATTEMPTS - 1:
+            if attempt == attribution_attempts - 1:
                 raise
             buffer_bytes *= 4
             _logger.warning(
@@ -502,55 +519,9 @@ def _collect_attributed(
                 exc,
                 buffer_bytes // 1024,
                 attempt + 2,
-                _ATTRIBUTION_ATTEMPTS,
+                attribution_attempts,
             )
     raise AssertionError("the loop returns or raises on its last attempt")
-
-
-def _collect_torch_profiler(
-    run_one: Callable[[int], None],
-    n_repeat: int,
-    prepare_one: Callable[[int], None],
-) -> list[Sample]:
-    """Collect kernel timings through PyTorch's Kineto/CUPTI integration.
-
-    This path is important on MACA: PyTorch may expose the CUDA-compatible profiler
-    backend while the standalone ``cupti`` Python binding is absent.
-    """
-    with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ]
-    ) as profiler:
-        for i in range(n_repeat):
-            prepare_one(i)
-            with torch.profiler.record_function(_KERNEL_REGION):
-                run_one(i)
-            torch.cuda.synchronize()
-    total_us, n_regions = _sum_kernel_time_us(profiler.key_averages())
-    if n_regions != n_repeat:
-        raise _CUPTIAttributionError(
-            f"PyTorch profiler projected {n_regions}/{n_repeat} benchmark regions"
-        )
-    if total_us <= 0:
-        raise _CUPTIAttributionError(
-            f"PyTorch profiler projected {n_regions}/{n_repeat} benchmark regions "
-            "but reported no device time"
-        )
-    # Kineto event iteration above aggregates all kernels in the trace. Use the
-    # profiler's per-region device time as a conservative common sample when the
-    # backend does not expose correlation IDs (the normal MACA case).
-    per_iter_ms = (total_us / n_repeat) * 1e-3
-    return [Sample(per_iter_ms, per_iter_ms, None) for _ in range(n_repeat)]
-
-
-def _sum_kernel_time_us(events) -> tuple[float, int]:
-    """Return the device time and invocation count for benchmark regions."""
-    for event in events:
-        if event.key == _KERNEL_REGION:
-            return float(event.device_time_total), int(event.count)
-    return 0.0, 0
 
 
 def _sample_spread_ms(samples: list[float]) -> tuple[float, float] | tuple[None, None]:
@@ -569,43 +540,72 @@ def _sample_spread_ms(samples: list[float]) -> tuple[float, float] | tuple[None,
 
 
 def _reset_persisting_l2_cache() -> None:
-    global _cuda_runtime, _cuda_runtime_unavailable
-    if _cuda_runtime_unavailable:
-        return
+    global _cuda_runtime
     if _cuda_runtime is None:
-        try:
-            from cuda.bindings import runtime as cuda_runtime
-        except ModuleNotFoundError:
-            # cuda-python is NVIDIA-specific. MACA uses torch.cuda-compatible
-            # tensors but does not provide cuda.bindings; the buffer flush below
-            # remains available as the portable cache-isolation fallback.
-            _cuda_runtime_unavailable = True
-            _logger.info(
-                "cuda.bindings is unavailable; skipping persisting-L2 reset "
-                "and using the portable flush buffer"
-            )
-            return
+        from cuda.bindings import runtime as cuda_runtime
 
         _cuda_runtime = cuda_runtime
 
     result = _cuda_runtime.cudaCtxResetPersistingL2Cache()
     if isinstance(result, tuple):
         result = result[0]
-    torch.cuda.check_error(int(result))
+    torch.cuda.check_error(int(result))  # lint: device-api allow: CUPTI runs on CUDA only
 
 
-def _get_l2_flush_cache() -> torch.Tensor:
-    global _l2_flush_cache
-    if _l2_flush_cache is None:
-        l2_bytes = torch.cuda.get_device_properties(0).L2_cache_size
+def _read_sweep(buffer: torch.Tensor) -> None:
+    # Imported on first use: Triton is needed only where a CUDA device is timed.
+    from benchmarks._l2_sweep import read_sweep
+
+    read_sweep(buffer)
+
+
+def bench_device() -> torch.device:
+    """The device this run times on: ``--tileops-device``, with its index filled in."""
+    return on_current_index(torch.device(run_device()))
+
+
+def _instrument_for(device: torch.device) -> str:
+    """How a call on *device* is timed: ``cupti`` on CUDA, ``events`` on any other device."""
+    # MACA exposes CUDA-compatible tensors, but does not provide NVIDIA's
+    # cuda-python/CUPTI bindings used by the attribution path.
+    return "cupti" if device.type == "cuda" and not is_maca() else "events"
+
+
+def _get_l2_flush_cache(device: torch.device) -> torch.Tensor:
+    """Cache a private int32 buffer covering twice the device's L2 capacity.
+
+    Read-only eviction avoids buffer-sized dirty writebacks during the timed call.
+    Private CPU-generated random values preserve benchmark RNG state and resist memory
+    compression. Missing capacity reports use ``_FALLBACK_L2_BYTES``.
+    """
+    cache = _l2_flush_caches.get(device)
+    if cache is None:
+        module = torch.get_device_module(device.type)
+        properties = getattr(module, "get_device_properties", None)
+        l2_bytes = getattr(properties(device.index), "L2_cache_size", 0) if properties else 0
+        reported = l2_bytes
         if l2_bytes <= 0:
+            l2_bytes = _FALLBACK_L2_BYTES
+        values = torch.randint(
+            -(2**31),
+            2**31 - 1,
+            (-(-2 * l2_bytes // 4),),
+            dtype=torch.int32,
+            device="cpu",
+            generator=torch.Generator().manual_seed(0),
+        )
+        cache = values.to(device)
+        if reported <= 0:
             _logger.warning(
-                "L2 cache size query returned %d; flushing a 256 MB buffer instead",
+                "L2 cache size query on %s returned %d; assuming %d bytes of L2, so each "
+                "flush reads %d bytes",
+                device,
+                reported,
                 l2_bytes,
+                cache.numel() * cache.element_size(),
             )
-            l2_bytes = int(256e6)
-        _l2_flush_cache = torch.empty(2 * l2_bytes, dtype=torch.int8, device="cuda")
-    return _l2_flush_cache
+        _l2_flush_caches[device] = cache
+    return cache
 
 
 def _native_output_suppressor():
@@ -633,7 +633,7 @@ def _capture_bench_meta() -> dict:
     """Snapshot how the last measurement was taken."""
     return {
         key: value
-        for key in ("timing", "fallback_reason", "attribution_retries")
+        for key in ("timing", "fallback_reason", "attribution_retries", "l2_flush")
         if (value := getattr(_bench_meta, key, None)) is not None
     }
 
@@ -655,54 +655,115 @@ def bench_kernel(
     max_iters: int = _MAX_ITERS,
     min_iters: int = _MIN_ITERS,
     count_copies: bool = False,
+    allow_events_fallback: Optional[bool] = None,
+    reset: Optional[Callable[[], None]] = None,
+    device: Optional[torch.device] = None,
 ) -> list[Sample]:
-    """Time *fn* through CUPTI, one :class:`Sample` per iteration.
+    """Time *fn* on *device*, one :class:`Sample` per iteration.
 
-    A calibration pass measures one cold-isolated iteration and the millisecond budgets
-    divide into it, clamped to ``[min_iters, max_iters]``; an op faster than the L2 flush
-    takes its count from the clamp. L2 is cleared before every iteration, and each call
-    is drained before the next begins. Each kernel is attributed to the iteration that
-    launched it, so *fn* must launch its own work rather than hand it to another thread.
+    Every call uses the same preparation: restore mutable inputs, reset persisting L2
+    priority on CUDA, then read a private eviction buffer. Preparation is excluded from
+    timing. Warm-up and timed calls drain the device after preparation; calibration
+    measures three consecutive prepared calls to set the iteration counts within
+    ``[min_iters, max_iters]``. Each kernel is attributed to the iteration that launched
+    it, so *fn* must launch its own work rather than hand it to another thread.
     A phase whose records CUPTI discarded is measured again; attribution otherwise
-    fails closed unless
-    ``TILEOPS_ALLOW_CUDA_EVENTS_FALLBACK=1``.
+    fails closed unless ``allow_events_fallback`` is true. ``None`` takes the run's
+    setting, ``--tileops-allow-events-fallback``.
 
     ``count_copies`` adds device-to-device copies to what is attributed, for a row whose
     implementations compute part of the result with one. It is off by default because a
     staging copy is not the arithmetic being timed; turn it on for every tag in a row or
     for none, since the two sides are otherwise read off different instruments.
+
+    ``reset`` restores the state *fn* overwrites. Every iteration runs ``reset``, then the
+    L2 flush, then *fn*; ``reset`` is never part of the reading, and the flush evicts what
+    it wrote. ``reset`` enqueues its work on the current stream, the flush's, which is what
+    orders the two.
+
+    Everything runs on *device*, by default :func:`bench_device`. A CUDA device is timed
+    through CUPTI as above; any other is timed with device events, which neither attribute
+    kernels nor fall back.
+
+    Raises:
+        TypeError: *args* is not a tuple.
+        ValueError: A tensor in *args* is on another device than *device*, CPU aside.
     """
     if not isinstance(args, tuple):
         raise TypeError(
             f"bench_kernel expects a tuple of args, got {type(args).__name__}. "
             "Check that gen_inputs() returns a tuple."
         )
+    device = bench_device() if device is None else on_current_index(device)
+    elsewhere = {
+        a.device for a in args if isinstance(a, torch.Tensor) and a.device.type != "cpu"
+    } - {device}
+    if elsewhere:
+        raise ValueError(
+            f"bench_kernel times on {device}, but its args hold tensors on "
+            f"{sorted(map(str, elsewhere))}"
+        )
+    with device_context(device):
+        return _bench_kernel(
+            device,
+            fn,
+            args,
+            dry_run_ms,
+            repeat_ms,
+            max_iters,
+            min_iters,
+            count_copies,
+            allow_events_fallback,
+            reset,
+        )
 
-    global _torch_profiler_failed
-    allow_fallback = _cuda_events_fallback_enabled()
+
+def _bench_kernel(
+    device: torch.device,
+    fn: Callable,
+    args: tuple[Any, ...] = (),
+    dry_run_ms: float = DRY_RUN_MS,
+    repeat_ms: float = REPEAT_MS,
+    max_iters: int = _MAX_ITERS,
+    min_iters: int = _MIN_ITERS,
+    count_copies: bool = False,
+    allow_events_fallback: Optional[bool] = None,
+    reset: Optional[Callable[[], None]] = None,
+) -> list[Sample]:
+    allow_fallback = (
+        events_fallback_allowed() if allow_events_fallback is None else allow_events_fallback
+    )
     _bench_meta.timing = None
     _bench_meta.fallback_reason = None
     _bench_meta.attribution_retries = None
-    cache = _get_l2_flush_cache()
+    cache = _get_l2_flush_cache(device)
+    on_cuda = device.type == "cuda" and not is_maca()
+    _bench_meta.l2_flush = _L2_FLUSH_CUDA if on_cuda else _L2_FLUSH_OTHER
 
-    def _flush_l2():
-        _reset_persisting_l2_cache()
-        cache.zero_()
+    def _reset_and_flush():
+        if reset is not None:
+            reset()
+        if on_cuda:
+            _reset_persisting_l2_cache()
+            _read_sweep(cache)
+        else:
+            cache.max()
 
     def _call_raw():
         return fn(*args) if args else fn()
 
-    _flush_l2()
+    _reset_and_flush()
     _call_raw()
-    torch.cuda.synchronize()
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    torch.accelerator.synchronize()
+    calibration_iters = 3
+    start, end = torch.Event(enable_timing=True), torch.Event(enable_timing=True)
     start.record()
-    for _ in range(_CALIBRATION_ITERS):
-        _flush_l2()
+    for _ in range(calibration_iters):
+        _reset_and_flush()
         _call_raw()
     end.record()
-    torch.cuda.synchronize()
-    per_iter_ms = max(start.elapsed_time(end) / _CALIBRATION_ITERS, 1e-6)
+    torch.accelerator.synchronize()
+    per_iter_ms = max(start.elapsed_time(end) / calibration_iters, 1e-6)
 
     n_warmup = _clamp_iters(dry_run_ms / per_iter_ms, max_iters, min_iters)
     n_repeat = _clamp_iters(repeat_ms / per_iter_ms, max_iters, min_iters)
@@ -711,60 +772,57 @@ def bench_kernel(
         return fn(*args) if args else fn()
 
     def _prepare_iteration(i):
-        _flush_l2()
-        torch.cuda.synchronize()
+        _reset_and_flush()
+        torch.accelerator.synchronize()
 
     for i in range(n_warmup):
         _prepare_iteration(i)
         _run(i)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
+    if _instrument_for(device) == "events":
+        _bench_meta.timing = "events"
+        samples = _event_samples(_run, n_repeat, _prepare_iteration)
+        empty_accelerator_cache()
+        return samples
     try:
         with _native_output_suppressor():
             samples = _collect_attributed(_run, n_repeat, _prepare_iteration, count_copies)
         _bench_meta.timing = "cupti"
     except (_CUPTIAttributionError, CUPTIError) as exc:
-        if isinstance(exc, CUPTIError) and not _torch_profiler_failed:
-            try:
-                with _native_output_suppressor():
-                    samples = _collect_torch_profiler(_run, n_repeat, _prepare_iteration)
-                _bench_meta.timing = "torch-profiler"
-                _bench_meta.fallback_reason = str(exc)
-                torch.cuda.empty_cache()
-                return samples
-            except Exception as profiler_exc:  # noqa: BLE001
-                # Repeated profiler sessions can keep their CPU region count on
-                # MACA while losing every projected device event. Once observed,
-                # retrying it for every later implementation only doubles the run.
-                _torch_profiler_failed = True
-                _logger.warning(
-                    "PyTorch profiler fallback failed (%s); original CUPTI error: %s",
-                    profiler_exc,
-                    exc,
-                )
         if not allow_fallback:
             raise RuntimeError(
                 f"CUPTI profiling failed: {exc}. CUDA-events fallback is disabled "
-                "(TILEOPS_ALLOW_CUDA_EVENTS_FALLBACK=0), which keeps the run from "
-                "silently mixing two timing methods."
+                "(pass --tileops-allow-events-fallback to allow it), which keeps the run "
+                "from silently mixing two timing methods."
             ) from exc
         _bench_meta.timing = "cuda-events"
         _bench_meta.fallback_reason = str(exc)
         _logger.warning("CUPTI timing failed (%s); falling back to CUDA events.", exc)
-        starts = [torch.cuda.Event(enable_timing=True) for _ in range(n_repeat)]
-        ends = [torch.cuda.Event(enable_timing=True) for _ in range(n_repeat)]
-        for i in range(n_repeat):
-            _prepare_iteration(i)
-            starts[i].record()
-            _run(i)
-            ends[i].record()
-        torch.cuda.synchronize()
-        # Events bracket the call, so they cannot separate execution from the gaps
-        # between kernels. Both fields carry the same number and `timing` says why.
-        samples = [
-            Sample(device_busy_ms=elapsed, latency_ms=elapsed, n_kernels=None)
-            for elapsed in (s.elapsed_time(e) for s, e in zip(starts, ends, strict=True))
-        ]
+        samples = _event_samples(_run, n_repeat, _prepare_iteration)
 
-    torch.cuda.empty_cache()
+    empty_accelerator_cache()
     return samples
+
+
+def _event_samples(
+    run: Callable[[int], Any], n_repeat: int, prepare: Callable[[int], None]
+) -> list[Sample]:
+    """Time *n_repeat* iterations of *run* with device events on the current device.
+
+    Events bracket the call, so they cannot separate execution from the gaps between
+    kernels, nor a device-to-device copy from the arithmetic. Both fields carry the same
+    number and ``timing`` says why.
+    """
+    starts = [torch.Event(enable_timing=True) for _ in range(n_repeat)]
+    ends = [torch.Event(enable_timing=True) for _ in range(n_repeat)]
+    for i in range(n_repeat):
+        prepare(i)
+        starts[i].record()
+        run(i)
+        ends[i].record()
+    torch.accelerator.synchronize()
+    return [
+        Sample(device_busy_ms=elapsed, latency_ms=elapsed, n_kernels=None)
+        for elapsed in (s.elapsed_time(e) for s, e in zip(starts, ends, strict=True))
+    ]

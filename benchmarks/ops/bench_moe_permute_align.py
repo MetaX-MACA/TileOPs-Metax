@@ -1,10 +1,9 @@
-"""Benchmark for MoePermuteAlignFwdOp vs Triton and sgl-kernel baselines.
+"""Benchmark for MoEPermuteAlignFwdOp vs Triton and vLLM baselines.
 
 Baselines:
   - Triton: adapted from SGLang's moe_align_block_size (4-stage fallback)
       sglang/sgl-kernel/benchmark/bench_moe_align_block_size.py
-  - sgl-kernel (optional): SGLang's production CUDA kernel; only runs when
-      sgl_kernel is installed (`pip install sgl-kernel`).
+  - vLLM: moe_align_block_size from vllm._custom_ops.
 """
 
 import math
@@ -14,23 +13,11 @@ import torch
 import triton
 import triton.language as tl
 
-try:
-    from sgl_kernel import moe_align_block_size as _sgl_moe_align_block_size
-
-    _SGL_KERNEL_AVAILABLE = True
-except ImportError:
-    _SGL_KERNEL_AVAILABLE = False
-
-from benchmarks.benchmark_base import ManifestBenchmark, fields, workload_params
-from tileops.manifest import load_workloads
-from tileops.ops.moe import MoePermuteAlignFwdOp
-from workloads.moe import MoePermuteAlignWorkload
-
-# Triton baseline (adapted from SGLang, no sgl_kernel dependency)
-
-
-def _ceil_div(a: int, b: int) -> int:
-    return (a + b - 1) // b
+from benchmarks import api as bench
+from benchmarks.baselines import VLLM_TAG, vllm_op
+from tileops._kernels.constants import MAX_BLOCK_THREADS
+from tileops._ops.moe import MoEPermuteAlignFwdOp
+from tileops._utils import WARP_LANES, is_maca
 
 
 @triton.jit
@@ -117,7 +104,7 @@ def _triton_permute_align(
     num_tokens_post_pad: torch.Tensor,
 ) -> None:
     numel = topk_ids.numel()
-    tokens_per_thread = _ceil_div(numel, num_experts)
+    tokens_per_thread = triton.cdiv(numel, num_experts)
     grid = (num_experts,)
     tokens_cnts = torch.zeros(
         (num_experts + 1, num_experts), dtype=torch.int32, device=topk_ids.device
@@ -139,27 +126,16 @@ def _triton_permute_align(
     )
 
 
-@pytest.mark.parametrize(
-    "total_tokens, top_k, num_experts, block_size",
-    workload_params(
-        load_workloads(MoePermuteAlignFwdOp),
-        fields("total_tokens", "top_k", "num_experts", "block_size"),
-    ),
-)
-def test_permute_align_bench(
-    total_tokens: int, top_k: int, num_experts: int, block_size: int
-) -> None:
-    numel = total_tokens * top_k
-    test = MoePermuteAlignWorkload(total_tokens, top_k, num_experts, block_size)
-    inputs = test.gen_inputs()
-
-    op = MoePermuteAlignFwdOp(total_tokens, top_k, num_experts, block_size)
-    bm = ManifestBenchmark(op, test)
-
-    op(*inputs)
-    torch.cuda.synchronize()
-
-    functors = {"tileops": op}
+@pytest.mark.parametrize("case", bench.cases(MoEPermuteAlignFwdOp), ids=lambda case: case.id)
+def test_permute_align_bench(case) -> None:
+    if is_maca():
+        op = MoEPermuteAlignFwdOp(**case.arguments)
+        bench.Runner(op, case).compare_torch()
+        return
+    inputs = case.inputs
+    op = MoEPermuteAlignFwdOp(**case.arguments)
+    num_experts, block_size = op.num_experts, op.block_size
+    numel = inputs[0].numel()
 
     # Triton baseline
     dev = inputs[0].device
@@ -171,40 +147,33 @@ def test_permute_align_bench(
     num_post_pad = torch.empty(1, dtype=torch.int32, device=dev)
 
     def _triton_fn(topk_ids):
-        sorted_ids.fill_(numel)
         _triton_permute_align(
             topk_ids, num_experts, block_size, sorted_ids, expert_ids, num_post_pad
         )
         return sorted_ids, expert_ids, num_post_pad
 
-    _triton_fn(*inputs)
-    torch.cuda.synchronize()
+    def _triton_reset():
+        # The port writes only the routed slots and the blocks they fill; the rest must read
+        # as padding and as no expert.
+        sorted_ids.fill_(numel)
+        expert_ids.fill_(num_experts)
 
-    functors["triton"] = _triton_fn
+    implementations = {"triton": bench.Implementation(run=_triton_fn, reset=_triton_reset)}
+    # vLLM (csrc/moe/moe_align_sum_kernels.cu) refuses an expert count that, rounded up to a
+    # warp, reaches 1024; past 64 experts, it fails on a call with no routes.
+    library_accepts = math.ceil(num_experts / WARP_LANES) * WARP_LANES < MAX_BLOCK_THREADS and (
+        numel > 0 or num_experts <= 64
+    )
+    if library_accepts:
+        align = vllm_op("moe_align_block_size")
+        vllm_sorted = torch.empty_like(sorted_ids)
+        vllm_experts = torch.empty_like(expert_ids)
+        vllm_count = torch.empty_like(num_post_pad)
 
-    # sgl-kernel baseline (optional -- only runs when sgl_kernel is installed)
-    if _SGL_KERNEL_AVAILABLE:
-        sorted_ids_sgl = torch.empty(max_padded, dtype=torch.int32, device=dev)
-        expert_ids_sgl = torch.empty(max_num_blocks, dtype=torch.int32, device=dev)
-        num_post_pad_sgl = torch.empty(1, dtype=torch.int32, device=dev)
-        cumsum_buf = torch.empty(num_experts + 1, dtype=torch.int32, device=dev)
+        def vllm_fn(topk_ids):
+            align(topk_ids, num_experts, block_size, vllm_sorted, vllm_experts, vllm_count)
+            return vllm_sorted, vllm_experts, vllm_count
 
-        def _sgl_fn(topk_ids):
-            sorted_ids_sgl.fill_(numel)
-            _sgl_moe_align_block_size(
-                topk_ids,
-                num_experts,
-                block_size,
-                sorted_ids_sgl,
-                expert_ids_sgl,
-                num_post_pad_sgl,
-                cumsum_buf,
-            )
-            return sorted_ids_sgl, expert_ids_sgl, num_post_pad_sgl
+        implementations[VLLM_TAG] = vllm_fn
 
-        _sgl_fn(*inputs)
-        torch.cuda.synchronize()
-
-        functors["sgl-kernel"] = _sgl_fn
-
-    bm.compare(functors, *inputs)
+    bench.Runner(op, case).compare(implementations)

@@ -8,28 +8,29 @@ import pytest
 import torch
 
 from tests.compile_contract import assert_op_owns_graph_nodes, register_compile_contract
-from tileops.ops.norm import (
+from tileops._ops.norm import (
     AdaLayerNormFwdOp,
     AdaLayerNormZeroFwdOp,
     BatchNormBwdOp,
     BatchNormFwdOp,
     FusedAddLayerNormFwdOp,
     FusedAddRMSNormFwdOp,
+    FusedAddRMSNormPerTokenQuantFwdOp,
     GroupNormFwdOp,
     InstanceNormFwdOp,
     LayerNormFwdOp,
 )
+from workloads.device import run_device
 
 _DTYPE = torch.float16
-_N = 256
 
 
 def _x(*shape, dtype=_DTYPE):
-    return torch.randn(*shape, dtype=dtype, device="cuda")
+    return torch.randn(*shape, dtype=dtype, device=run_device())
 
 
 def _cases():
-    """One builder per op, returning ``(op, inputs)``.
+    """One builder per op, returning ``(op, inputs)``, or ``(op, inputs, keyword inputs)``.
 
     The builders run inside the test: this module is imported on the CPU-only runner
     that enforces the compile-contract gate, where a CUDA tensor built at import time
@@ -37,19 +38,28 @@ def _cases():
     """
 
     def layer_norm():
-        return LayerNormFwdOp(normalized_shape=(_N,)), (_x(8, _N), _x(_N), _x(_N))
+        n = 256
+        return LayerNormFwdOp(normalized_shape=(n,)), (_x(8, n), _x(n), _x(n))
 
     def ada_layer_norm():
-        return AdaLayerNormFwdOp(), (_x(8, _N), _x(8, _N), _x(8, _N))
+        n = 256
+        return AdaLayerNormFwdOp(), (_x(8, n), _x(8, n), _x(8, n))
 
     def ada_layer_norm_zero():
-        return AdaLayerNormZeroFwdOp(), (_x(8, _N), _x(8, _N), _x(8, _N), _x(8, _N))
+        n = 256
+        return AdaLayerNormZeroFwdOp(), (_x(8, n), _x(8, n), _x(8, n), _x(8, n))
 
     def fused_add_layer_norm():
-        return FusedAddLayerNormFwdOp(), (_x(8, _N), _x(8, _N), _x(_N), _x(_N))
+        n = 256
+        return FusedAddLayerNormFwdOp(), (_x(8, n), _x(8, n), _x(n), _x(n))
 
     def fused_add_rms_norm():
-        return FusedAddRMSNormFwdOp(), (_x(8, _N), _x(8, _N), _x(_N))
+        n = 256
+        return FusedAddRMSNormFwdOp(), (_x(8, n), _x(8, n), _x(n))
+
+    def fused_add_rms_norm_per_token_quant():
+        n = 256
+        return FusedAddRMSNormPerTokenQuantFwdOp(), (_x(8, n), _x(8, n), _x(n))
 
     def group_norm():
         return GroupNormFwdOp(num_groups=2), (_x(2, 4, 8, 8), _x(4), _x(4))
@@ -82,12 +92,10 @@ def _cases():
 
     def batch_norm_bwd():
         f32 = dict(dtype=torch.float32)
-        return BatchNormBwdOp(), (
-            _x(2, 4, 8, 8),
-            _x(2, 4, 8, 8),
-            _x(4, **f32),
-            _x(4, **f32),
-            _x(4, **f32).abs(),
+        return (
+            BatchNormBwdOp(),
+            (_x(2, 4, 8, 8), _x(2, 4, 8, 8), _x(4, **f32), _x(4, **f32).abs()),
+            {"weight": _x(4, **f32)},
         )
 
     return [
@@ -98,6 +106,7 @@ def _cases():
             ("ada-layer-norm-zero", ada_layer_norm_zero),
             ("fused-add-layer-norm", fused_add_layer_norm),
             ("fused-add-rms-norm", fused_add_rms_norm),
+            ("fused-add-rms-norm-per-token-quant", fused_add_rms_norm_per_token_quant),
             ("group-norm", group_norm),
             ("group-norm-no-affine", group_norm_no_affine),
             ("instance-norm", instance_norm),
@@ -114,6 +123,7 @@ for _op_cls in (
     AdaLayerNormZeroFwdOp,
     FusedAddLayerNormFwdOp,
     FusedAddRMSNormFwdOp,
+    FusedAddRMSNormPerTokenQuantFwdOp,
     GroupNormFwdOp,
     InstanceNormFwdOp,
     BatchNormFwdOp,
@@ -127,15 +137,16 @@ for _op_cls in (
 @pytest.mark.parametrize("build_case", _cases())
 def test_a_cold_op_traces_fullgraph_and_matches_eager(build_case) -> None:
     """Cold is the whole contract: a warm op has nothing left for dynamo to trace into."""
-    op, inputs = build_case()
+    op, inputs, *keywords = build_case()
+    keywords = dict(*keywords)
     # Each call gets its own copies: an op that writes an input (BatchNorm's running
     # statistics) would otherwise hand the second call a different starting state.
     compiled_inputs = tuple(None if t is None else t.clone() for t in inputs)
     eager_inputs = tuple(None if t is None else t.clone() for t in inputs)
 
-    compiled = torch.compile(op, fullgraph=True)(*compiled_inputs)
+    compiled = torch.compile(op, fullgraph=True)(*compiled_inputs, **keywords)
 
-    torch.testing.assert_close(compiled, op(*eager_inputs))
+    torch.testing.assert_close(compiled, op(*eager_inputs, **keywords))
     # An input the op writes (BatchNorm's running statistics, R22) must come out of the
     # compiled call holding what eager left in it.
     torch.testing.assert_close(compiled_inputs, eager_inputs)
@@ -146,6 +157,6 @@ def test_a_cold_op_traces_fullgraph_and_matches_eager(build_case) -> None:
 @pytest.mark.parametrize("build_case", _cases())
 def test_the_traced_graph_holds_only_this_ops_operator(build_case) -> None:
     """The node is the op's, so replacing the kernel cannot change the graph."""
-    op, inputs = build_case()
+    op, inputs, *keywords = build_case()
 
-    assert_op_owns_graph_nodes(op, *inputs)
+    assert_op_owns_graph_nodes(op, *inputs, **dict(*keywords))
