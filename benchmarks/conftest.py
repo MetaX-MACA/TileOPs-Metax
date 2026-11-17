@@ -1,15 +1,25 @@
 import gc
+import json
 
 import pytest
 import torch
+from _pytest.outcomes import XFailed
 
-# Imported for its side effect: arming the guard that keeps flag_gems from
-# reaching torch's op registry before vllm. See benchmarks.baselines.
 import benchmarks.baselines  # noqa: F401
-from benchmarks.benchmark_base import BenchmarkReport
-from benchmarks.report import _bench_results
-from benchmarks.xfail_whitelist import MACA_XFAIL_PREFIXES, MACA_XFAILS
-from tileops.utils import is_maca
+
+# Imported for its side effect: arm the FlagGems/vLLM import-order guard before test modules load.
+from benchmarks import api
+from benchmarks.report import BenchmarkReport, _bench_results
+from benchmarks.timing import events_fallback_allowed, set_events_fallback_allowed
+from benchmarks.xfail_whitelist import MACA_XFAIL_PREFIXES, MACA_XFAILS, MACA_XPASS_RELEASES
+from tileops._utils import is_maca
+from tileops._utils.device import current_accelerator_type, empty_accelerator_cache
+from tileops.backend import OpNotAvailableError
+
+# What a row carries besides its measurements.
+_NOT_A_MEASUREMENT = frozenset(
+    {"tag", "op", "op_module", "ops", "params", "kernel_config", "result"}
+)
 
 
 def _normalized_benchmark_nodeid(item: pytest.Item) -> str:
@@ -21,11 +31,26 @@ def _normalized_benchmark_nodeid(item: pytest.Item) -> str:
     return nodeid
 
 
-def _is_fp8_e4m3_benchmark(item: pytest.Item) -> bool:
-    callspec = getattr(item, "callspec", None)
-    if callspec is None:
-        return False
-    return callspec.params.get("dtype") == torch.float8_e4m3fn
+def _apply_maca_xfails(items: list[pytest.Item]) -> None:
+    """Mark known MACA benchmark failures without changing non-MACA runs."""
+    if not is_maca():
+        return
+    for item in items:
+        nodeid = _normalized_benchmark_nodeid(item)
+        if nodeid in MACA_XPASS_RELEASES:
+            continue
+        reason = MACA_XFAILS.get(nodeid)
+        if reason is None:
+            reason = next(
+                (
+                    value
+                    for prefix, value in MACA_XFAIL_PREFIXES.items()
+                    if nodeid.startswith(prefix)
+                ),
+                None,
+            )
+        if reason is not None:
+            item.add_marker(pytest.mark.xfail(reason=f"MACA: {reason}", strict=False))
 
 
 def pytest_make_parametrize_id(config, val, argname):
@@ -34,7 +59,7 @@ def pytest_make_parametrize_id(config, val, argname):
     A case id is the workload's name everywhere it is read later — the nightly
     report, the published page, the perf history key. This covers the values
     with no readable repr; it does not invent a name for the case, which is the
-    author's job (see .claude/domain-rules/benchmark.md).
+    author's job (see docs/design/manifest.md § Rows).
     """
     if isinstance(val, torch.dtype):
         return str(val).removeprefix("torch.")
@@ -49,10 +74,6 @@ def pytest_make_parametrize_id(config, val, argname):
     return None
 
 
-# What a row carries besides its measurements.
-_NOT_A_MEASUREMENT = frozenset({"tag", "op", "op_module", "ops", "params", "run_config", "result"})
-
-
 def _prop(value) -> str:
     """Format one measurement for the XML.
 
@@ -64,6 +85,8 @@ def _prop(value) -> str:
         return str(value)
     if isinstance(value, float):
         return str(int(value)) if value.is_integer() else f"{value:.6g}"
+    if isinstance(value, dict):
+        return json.dumps(value, sort_keys=True)
     return str(value)
 
 
@@ -75,46 +98,73 @@ def _emit(item, tag: str, entry: dict) -> None:
     here. Hand-listing them is how the report came to publish a quantity the
     benchmark had stopped comparing.
     """
-    measurements = {**entry["result"], "dtype": entry.get("dtype")}
+    measurements = {
+        **entry["result"],
+        "unverified": (entry.get("params") or {}).get("unverified"),
+        "no_ratio": (entry.get("params") or {}).get("no_ratio"),
+    }
     for key, value in measurements.items():
         if key in _NOT_A_MEASUREMENT or value is None:
             continue
         item.user_properties.append((f"{tag}_{key}", _prop(value)))
 
 
-def _release_cuda_cache_after_case() -> None:
-    """Drop per-case Python references and cached CUDA blocks between benchmarks."""
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-
-def _apply_maca_xfails(items: list[pytest.Item]) -> None:
-    """Mark exact-node known failures on MACA benchmark runs."""
-    if not is_maca():
-        return
-
-    for item in items:
-        nodeid = _normalized_benchmark_nodeid(item)
-        reason = MACA_XFAILS.get(nodeid)
-        if reason is None:
-            reason = next(
-                (
-                    prefix_reason
-                    for prefix, prefix_reason in MACA_XFAIL_PREFIXES.items()
-                    if nodeid.startswith(prefix)
-                ),
-                None,
-            )
-        if reason is not None:
-            item.add_marker(pytest.mark.xfail(reason=f"MACA: {reason}", strict=False))
-
-
 @pytest.fixture(autouse=True)
 def setup() -> None:
+    # Seeds every device's generator, CUDA's and a backend's alike.
     torch.manual_seed(1235)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(1235)
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Register whether a benchmark run may time with CUDA events where CUPTI fails."""
+    parser.addoption(
+        "--tileops-allow-events-fallback",
+        action="store_true",
+        help="Time a case with CUDA events when CUPTI cannot attribute it, instead of "
+        "failing it. Off by default: the report would mix two timing methods.",
+    )
+    parser.addoption(
+        "--tileops-verify",
+        action="store_true",
+        help="Run correctness warmup only, omitting timing. Normal benchmarks also verify "
+        "before sampling.",
+    )
+
+
+# The settings in force before configure, put back at unconfigure.
+_OUTER_EVENTS_FALLBACK = pytest.StashKey[bool]()
+_OUTER_VERIFYING = pytest.StashKey[bool]()
+
+
+def pytest_configure(config):
+    """Refuse a run device that is neither CUDA nor the process's accelerator, and pin the
+    events-fallback setting.
+
+    A CUDA device is timed through CUPTI and another accelerator with its device events.
+    CUDA is accepted on a host without one, where the benchmarks' own tests collect.
+    """
+    device = torch.device(config.getoption("--tileops-device"))
+    if device.type not in ("cuda", current_accelerator_type()):
+        raise pytest.UsageError(
+            f"--tileops-device={device}: benchmarks time on CUDA or on this process's "
+            f"accelerator, which is {current_accelerator_type()}"
+        )
+    config.stash[_OUTER_EVENTS_FALLBACK] = events_fallback_allowed()
+    config.stash[_OUTER_VERIFYING] = api.verifying()
+    api.set_verifying(config.getoption("--tileops-verify"))
+    set_events_fallback_allowed(config.getoption("--tileops-allow-events-fallback"))
+
+
+def pytest_unconfigure(config):
+    """Put back the settings this file replaced."""
+    if _OUTER_EVENTS_FALLBACK in config.stash:
+        set_events_fallback_allowed(config.stash[_OUTER_EVENTS_FALLBACK])
+    if _OUTER_VERIFYING in config.stash:
+        api.set_verifying(config.stash[_OUTER_VERIFYING])
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    _apply_maca_xfails(items)
 
 
 def pytest_sessionstart(session):
@@ -125,31 +175,18 @@ def pytest_sessionfinish(session, exitstatus):
     BenchmarkReport.dump("profile_run.log")
 
 
-def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
-    fp8_e4m3_skip = pytest.mark.skip(
-        reason=(
-            "Skipped under tilelang 0.1.9: fp8 e4m3 benchmark fails due to "
-            "lowering regression; re-enable when fp8 e4m3 benchmarks run "
-            "cleanly against current tilelang."
-        )
-    )
-
-    for item in items:
-        nodeid = _normalized_benchmark_nodeid(item)
-        path = nodeid.split("::", 1)[0]
-
-        if path == "benchmarks/ops/bench_elementwise_fp8.py" and _is_fp8_e4m3_benchmark(item):
-            item.add_marker(fp8_e4m3_skip)
-
-    _apply_maca_xfails(items)
-
-
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_call(item):
     """After bench test execution, attach perf data to the item as properties."""
     _bench_results.entries = []
     try:
-        yield
+        outcome = yield
+        if outcome.excinfo is not None:
+            exc = outcome.excinfo[1]
+            if is_maca() and isinstance(exc, OpNotAvailableError):
+                outcome.force_exception(
+                    XFailed(f"MACA has no TileOps implementation for this case: {exc}")
+                )
         entries = getattr(_bench_results, "entries", [])
         if not entries:
             return
@@ -188,6 +225,12 @@ def pytest_runtest_call(item):
                 _emit(item, "baseline", be)
             if not tileops_entry:
                 continue
+            # A ratio states that two implementations of one function differ in speed. Where
+            # either side carries an exception, that is not what it would state.
+            if (be.get("params") or {}).get("no_ratio") or (tileops_entry.get("params") or {}).get(
+                "no_ratio"
+            ):
+                continue
             # Ratios compare device_busy_ms: two implementations need not have
             # the same number of gaps between kernels.
             tl = tileops_entry["result"].get("device_busy_ms", 0)
@@ -198,4 +241,10 @@ def pytest_runtest_call(item):
                     item.user_properties.append(("baseline_ratio", f"{bl / tl:.4f}"))
     finally:
         _bench_results.entries = []
-        _release_cuda_cache_after_case()
+        for value in getattr(getattr(item, "callspec", None), "params", {}).values():
+            if isinstance(value, api.Case):
+                value._release()
+        # Drop per-case Python references and the device's cached blocks between benchmarks.
+        gc.collect()
+        if current_accelerator_type() is not None:
+            empty_accelerator_cache()

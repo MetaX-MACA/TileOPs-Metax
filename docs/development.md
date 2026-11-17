@@ -6,31 +6,31 @@ Commands here are the ones CI runs. Where CI passes `-c constraints.txt`, use it
 
 ## Install from source
 
-A CUDA-capable GPU is required to run the test suite. See [Prerequisites](../README.md#prerequisites) for supported Python, PyTorch, CUDA, and TileLang versions.
+A CUDA-capable GPU is required for in-tree kernel tests. See [Prerequisites](../README.md#installation) for supported Python, PyTorch, CUDA, and TileLang versions.
 
 ```bash
 git clone https://github.com/tile-ai/TileOPs
 cd TileOPs
-pip install -e '.[dev]' -c constraints.txt
+pip install -e . --group dev -c constraints.txt
 pre-commit install
 ```
 
 If CUDA and TileLang are already installed system-wide and the build fails while re-resolving them, skip build isolation:
 
 ```bash
-PIP_NO_BUILD_ISOLATION=1 pip install -e '.[dev]' -c constraints.txt
+PIP_NO_BUILD_ISOLATION=1 pip install -e . --group dev -c constraints.txt
 ```
 
-`[dev]` adds ruff, codespell, pytest, pytest-xdist, and pyyaml. `[bench]` adds the baseline libraries the benchmarks compare against — see [Benchmarks](#benchmarks).
+The `dev` dependency group (pip 25.1 or later) adds the linters, pre-commit, pytest and its plugins, the references tests import (einops, flash-linear-attention). The `bench` dependency group adds the baseline libraries the benchmarks compare against — see [Benchmarks](#benchmarks).
 
 ## Dev Docker image
 
-The prebuilt dev image ships the whole stack — CUDA 13.2, PyTorch 2.13 (cu132), the TileLang commit CI validates, and the benchmark baselines — so nothing needs resolving locally:
+The prebuilt dev image ships the whole stack — CUDA 13.2, PyTorch 2.13 (cu132), the TileLang release TileOPs declares, and the benchmark baselines — so nothing needs resolving locally:
 
 ```bash
 docker run --rm -it --gpus all \
   -v "$(pwd)":/workspace -w /workspace \
-  ghcr.io/tile-ai/tileops-runner:cu132-torch2.13-tl-afcebed1-dev
+  ghcr.io/tile-ai/tileops-dev:cuda13.2-torch2.13-tilelang0.1.12
 
 # inside the container
 pip install -e . --no-deps
@@ -39,9 +39,7 @@ python -m pytest -q tests -m smoke
 
 `--no-deps` is deliberate: the image already carries the pinned stack, and letting pip resolve dependencies would replace it.
 
-Tags follow `<tilelang-sha>-torch<version>-dev`. The `-dev` tag tracks the TileLang commit CI validates; pull the one matching the Prerequisites line in the README rather than a floating tag. The image is also what the self-hosted CI runners use, so a green run inside it is the same environment CI reports on.
-
-To build the image, roll out a new one, or bump the TileLang commit, see [`.github/runner/README.md`](../.github/runner/README.md).
+Tags follow `cuda<major.minor>-torch<major.minor>-tilelang<version>`, where `<version>` is the release [Prerequisites](../README.md#installation) names; pull that one rather than a floating tag. CI runs on the same software stack.
 
 ## Tests
 
@@ -63,7 +61,39 @@ python -m pytest -q tests/test_validate_manifest.py   # manifest spec validator
 python -m pytest -q benchmarks/tests                  # benchmark base-class contract
 ```
 
-The `packaging` marker is separate from the tiers: it is a minimal wheel-install sanity check, one case per op family, run against an installed wheel rather than a source checkout.
+CI runs on SM90, so it skips every test marked `sm80`, `sm86` or `sm89`: those guard paths a device of that architecture selects. On such a device, run its group across tiers, for example on SM89:
+
+```bash
+python -m pytest -q tests -m sm89
+```
+
+A test that needs CUDA carries `cuda_only("cuda-graph")`, `cuda_only("cuda-kernel")` or `cuda_only("cuda-reference")`, according to what requires CUDA. Run the portable infrastructure tests and CUDA exclusion checks without a GPU using the PrivateUse1 backend (requires a host C++ compiler):
+
+```bash
+python -m pytest -q -p tests.privateuse1 --tileops-device=tileops_test tests benchmarks/tests --ignore=tests/ops
+python -m pytest -q -p tests.privateuse1.target --tileops-device=tileops_test --tileops-target=tileops_test \
+  -m smoke tests/ops tests/test_privateuse1_target.py
+python -m pytest -q -p tests.privateuse1 --tileops-device=tileops_test --tileops-cuda-only-must-fail tests --ignore=tests/ops
+python -m pytest -q -p tests.privateuse1.target --tileops-device=tileops_test --tileops-target=tileops_test \
+  --tileops-cuda-only-must-fail tests/ops
+```
+
+The second command runs the `tests/ops` smoke tests under the `tileops_test` target, whose kernel for each op computes that op's reference on the test device. The last two run only the `cuda_only` tests. Unexpected passes, skips, fixture failures and errors unrelated to the required CUDA capability fail the check. Under the target, a test whose op call the target refuses is reported unvalidated rather than failed. Set `OMP_NUM_THREADS=1` when running these with `-n`: each worker otherwise starts a thread per core.
+
+The `packaging` marker is separate from the tiers: its cases run against an installed wheel rather than a source checkout.
+
+### CUDA Graph validation
+
+[`tests/cuda_graph_contract.py`](../tests/cuda_graph_contract.py) lists the ops with qualified
+calls. Each `cuda_graph(op=...)` test defines its supported shapes, dtypes and options; the
+qualification does not extend to untested specializations or other ops. Run them on H200:
+
+```bash
+python -m pytest -q tests/ops -m cuda_graph
+```
+
+- Warm up with the intended options and any requested tuning before capture.
+- Replay changes tensor contents at captured addresses. Changes to shapes, strides, dtypes, host metadata or dispatch options require a new graph.
 
 ## Lint
 
@@ -111,40 +141,37 @@ Two that bite:
 - **A shape is a product of dimensions.** `` `(flops, bytes)` `` is a return pair
   and stays code.
 
-[`bmm.py`](../src/tileops/ops/gemm/bmm.py) carries all of it and is the one to copy
-from. `scripts/lint/op_docstrings_lint.py` fails a missing docstring,
-reStructuredText, or an `Args:` left on a class; it runs as the
-`op-docstrings-lint` pre-commit hook and in the `pre-commit` CI job.
+[`bmm.py`](../src/tileops/_ops/gemm/bmm.py) carries all of it and is the one to copy
+from. The `op-docstrings-lint` pre-commit hook fails a missing docstring,
+reStructuredText, or an `Args:` left on a class.
 
 ## Benchmarks
 
-Benchmarks compare against external baselines, which the `bench` extra pulls in:
+Benchmarks compare against external baselines, which the `bench` dependency group pulls in (pip 25.1 or later):
 
 ```bash
-PIP_NO_BUILD_ISOLATION=1 pip install -e '.[dev,bench]' -c constraints.txt
+PIP_NO_BUILD_ISOLATION=1 pip install -e . --group dev --group bench -c constraints.txt
 ```
+
+FlashAttention-3 (`flash_attn_interface`) is not on PyPI and is not in the group; build it from the FlashAttention repository's `hopper/` directory, or use the dev image.
 
 `PIP_NO_BUILD_ISOLATION=1` is required here: several baselines build against the installed PyTorch, and an isolated build environment would fetch a different one.
 
-Prefer the dev Docker image, which carries FlashAttention-2/3, flash-linear-attention, vLLM and flashinfer prebuilt against its own CUDA and PyTorch — the FA3 build in particular takes a long time from source. It does not install `sgl-kernel`, so a benchmark that needs that baseline has to install it in the container.
+Prefer the dev Docker image, which carries FlashAttention-2/3, flash-linear-attention, vLLM and flashinfer prebuilt against its own CUDA and PyTorch — the FA3 build in particular takes a long time from source.
 
 ```bash
 python -m pytest benchmarks/            # all benchmarks
-python -m pytest benchmarks/ops/attention/bench_gqa.py -q
+python -m pytest benchmarks/ops/bench_gqa.py -q
 ```
 
 Benchmark reporting rules and tolerances are in [design/testing.md](design/testing.md).
 
 ## Packaging check
 
-To reproduce the wheel checks CI runs before a release:
+To build the wheel and check its metadata:
 
 ```bash
 pip install build twine
 python -m build
 twine check dist/*
 ```
-
-## Working on a change
-
-Design docs and `src/tileops/manifest/` are the authoritative spec — code conforms to the spec, not the other way around. Start from [design/architecture.md](design/architecture.md) for the module map, and [design/ops-design.md](design/ops-design.md) to add an op.

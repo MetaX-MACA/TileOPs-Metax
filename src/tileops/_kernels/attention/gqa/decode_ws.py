@@ -1,0 +1,590 @@
+"""Warp-specialized SM90 dense GQA decode for batched calls.
+
+``GQADecodeWSKernel`` runs one CTA per (KV head, batch entry, KV split): a TMA producer
+warp streams K and V tiles through a slot ring while one WGMMA consumer warpgroup
+keeps the head group's online softmax. One split normalizes in the CTA and writes the
+output; more splits write FP32 partials that a combine kernel merges.
+"""
+
+import math
+from typing import Optional
+
+import tilelang
+import tilelang.language as T
+import torch
+
+from tileops._kernels.attention.call_spec import AttentionCall, GQADenseFwdInterface
+from tileops._kernels.attention.gqa.decode import GQADecodeKernel
+from tileops._kernels.attention.gqa.decode_bs1_common import (
+    COMPILE_FLAGS,
+    make_gqa_decode_bs1_combine,
+)
+from tileops._kernels.attention.online_softmax import make_apply_softcap, make_dense_sink_scale
+from tileops._kernels.build_target import target_cache
+from tileops._kernels.constants import LOG2E
+from tileops._kernels.kernel_base import Entry, Kernel
+from tileops._utils import get_shared_memory_optin, get_sm_count
+
+__all__ = ["GQADecodeWSKernel"]
+
+
+def _as_fp32(value: float) -> float:
+    """*value* as the kernel's FP32 arithmetic holds it."""
+    return float(torch.tensor(value, dtype=torch.float32))
+
+
+@target_cache(maxsize=32)
+def _gqa_decode_ws_kernel(
+    batch, seq_q, heads, groups, dim, sm_scale, softcap, dtype, has_sinks, is_causal
+):
+    """The program over ``seq_q`` query positions: a KV head's query rows are its group's
+    heads at each position, ``seq_q * (heads // groups)`` of them, row ``s * group + g``
+    being head ``g`` of position ``s``."""
+    score_scale = dim**-0.5 if sm_scale is None else sm_scale
+    # The running maximum is taken over raw scores and needs a positive scale: a negative
+    # one reverses their order, so the query is negated on load.
+    query_sign = -1.0 if score_scale < 0 else 1.0
+    score_scale = abs(score_scale)
+    use_softcap = softcap > 0.0
+    scale = LOG2E if use_softcap else score_scale * LOG2E
+    accum_dtype = "float"
+    group_size = heads // groups
+    kv_rows = seq_q * group_size
+    # A causal row of position ``s`` sees the keys up to ``seqlen_kv - seq_q + s``.
+
+    @tilelang.jit(
+        out_idx=[-1],
+        pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
+        compile_flags=COMPILE_FLAGS,
+    )
+    def _func(block_m, block_n, num_split, overlap):
+        # The consumer is one warpgroup: WGMMA tiles the head group 64 rows at a time.
+        consumer_threads = 128
+        producer_threads = 32
+        # A CTA alone on its SM overlaps its softmax with the matrix products and keeps
+        # three tiles in flight; CTAs that share an SM hide each other's softmax, and two
+        # slots keep two of them resident wherever the tiles fit twice.
+        ring = 3 if overlap else 2
+        row_tiles = -(-kv_rows // block_m)
+        fused = num_split == 1
+        seqlen_kv = T.dynamic("seqlen_kv")
+        # Positions and heads flatten to one row index, ``s * heads + h``.
+        shape_q = [batch, seq_q * heads, dim]
+        shape_kv = [batch, seqlen_kv, groups, dim]
+        apply_softcap = (
+            make_apply_softcap(score_scale, softcap, accum_dtype, block_m, block_n)
+            if use_softcap
+            else None
+        )
+        # Packed rows take the sink of their own head: ``head_base`` is the KV head and
+        # ``head_stride`` the tile's first row.
+        sink_scale = make_dense_sink_scale(
+            scale,
+            block_m,
+            head_of=None
+            if seq_q == 1
+            else lambda i, hid, tile_row0: hid * group_size + (tile_row0 + i) % group_size,
+        )
+
+        def flat_row(hid, tile_row0, i):
+            """The flat query row of row ``i`` of the tile starting at KV row ``tile_row0``."""
+            r = tile_row0 + i
+            if seq_q == 1:
+                return hid * group_size + r
+            return r // group_size * heads + hid * group_size + r % group_size
+
+        def saw_keys(tile_row0, i, base, this_len, seqlen_kv):
+            """Whether the tile's row ``i`` sees any key of the split."""
+            if not is_causal:
+                return this_len > 0
+            position = (tile_row0 + i) // group_size
+            return (this_len > 0) & (base <= seqlen_kv - seq_q + position)
+
+        @T.macro
+        def softmax_step(
+            acc_s,
+            scores_max,
+            scores_max_prev,
+            scores_scale,
+            scores_sum,
+            logsum,
+            k,
+            this_len,
+            base,
+            tile_row0,
+            seqlen_kv,
+        ):
+            if use_softcap:
+                apply_softcap(acc_s)
+            for i, j in T.Parallel(block_m, block_n):
+                acc_s[i, j] = T.if_then_else(
+                    (k * block_n + j < this_len)
+                    & (
+                        base + (k * block_n + j)
+                        <= seqlen_kv - seq_q + (tile_row0 + i) // group_size
+                    )
+                    if is_causal
+                    else k * block_n + j < this_len,
+                    acc_s[i, j],
+                    -T.infinity(accum_dtype),
+                )
+            T.copy(scores_max, scores_max_prev)
+            T.reduce_max(acc_s, scores_max, dim=1, clear=False)
+            if is_causal:
+                # A row whose limit precedes every key it has met so far has
+                # an infinite maximum; it keeps a zero state instead of NaN.
+                for i in T.Parallel(block_m):
+                    scores_scale[i] = T.if_then_else(
+                        scores_max[i] == -T.infinity(accum_dtype),
+                        1.0,
+                        T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale),
+                    )
+                for i, j in T.Parallel(block_m, block_n):
+                    acc_s[i, j] = T.if_then_else(
+                        scores_max[i] == -T.infinity(accum_dtype),
+                        0.0,
+                        T.exp2(acc_s[i, j] * scale - scores_max[i] * scale),
+                    )
+            else:
+                for i in T.Parallel(block_m):
+                    scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
+                for i, j in T.Parallel(block_m, block_n):
+                    acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
+            T.reduce_sum(acc_s, scores_sum, dim=1)
+            for i in T.Parallel(block_m):
+                logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
+
+        combine = make_gqa_decode_bs1_combine(
+            batch,
+            seq_q * heads,
+            num_split,
+            dim,
+            dtype,
+            accum_dtype,
+            has_sinks=has_sinks,
+            sink_heads=heads if seq_q > 1 else None,
+        )
+
+        @T.prim_func
+        def gqa_decode_ws(
+            Q: T.Tensor(shape_q, dtype),
+            K: T.Tensor(shape_kv, dtype),
+            V: T.Tensor(shape_kv, dtype),
+            glse: T.Tensor([batch, seq_q * heads, num_split], accum_dtype),
+            Output_partial: T.Tensor([batch, seq_q * heads, num_split, dim], accum_dtype),
+            sinks: T.Tensor([heads] if has_sinks else shape_q, "float32" if has_sinks else dtype),
+            Output: T.Tensor(shape_q, dtype),
+        ):
+            # The KV head varies fastest across CTAs: the heads of one batch entry
+            # interleave row by row in K and V, so CTAs launched together read the
+            # same DRAM pages.
+            with T.Kernel(
+                groups * row_tiles, batch, num_split, threads=consumer_threads + producer_threads
+            ) as (head_tile, bid, sid):
+                hid = head_tile // row_tiles
+                tile_row0 = head_tile % row_tiles * block_m
+                row0 = hid * group_size + tile_row0
+                rows = T.min(kv_rows - tile_row0, block_m)
+
+                q_s = T.alloc_shared([block_m, dim], dtype)
+                k_s = T.alloc_shared([ring, block_n, dim], dtype)
+                v_s = T.alloc_shared([ring, block_n, dim], dtype)
+                layouts = {
+                    q_s: tilelang.layout.make_swizzled_layout(q_s),
+                    k_s: tilelang.layout.make_swizzled_layout(k_s),
+                    v_s: tilelang.layout.make_swizzled_layout(v_s),
+                }
+                if overlap:
+                    k_ready = T.alloc_barrier([producer_threads] * ring)
+                    v_ready = T.alloc_barrier([producer_threads] * ring)
+                    k_free = T.alloc_barrier([consumer_threads] * ring)
+                    v_free = T.alloc_barrier([consumer_threads] * ring)
+                    p_r = T.alloc_fragment([block_m, block_n], dtype)
+                else:
+                    p_s = T.alloc_shared([block_m, block_n], dtype)
+                    layouts[p_s] = tilelang.layout.make_swizzled_layout(p_s)
+                    ready = T.alloc_barrier([producer_threads] * ring)
+                    free = T.alloc_barrier([consumer_threads] * ring)
+                T.annotate_layout(layouts)
+                acc_s = T.alloc_fragment([block_m, block_n], accum_dtype)
+                acc_o = T.alloc_fragment([block_m, dim], accum_dtype)
+                scores_max = T.alloc_fragment([block_m], accum_dtype)
+                scores_max_prev = T.alloc_fragment([block_m], accum_dtype)
+                scores_scale = T.alloc_fragment([block_m], accum_dtype)
+                scores_sum = T.alloc_fragment([block_m], accum_dtype)
+                logsum = T.alloc_fragment([block_m], accum_dtype)
+
+                # Whole KV tiles split as evenly as possible: the first ``extra_tiles``
+                # splits take one tile more than the rest.
+                num_tiles = T.ceildiv(seqlen_kv, block_n)
+                base_tiles = num_tiles // num_split
+                extra_tiles = num_tiles % num_split
+                tiles_this_split = base_tiles + T.if_then_else(sid < extra_tiles, 1, 0)
+                base = (sid * base_tiles + T.min(sid, extra_tiles)) * block_n
+                this_len = T.max(T.min(seqlen_kv - base, tiles_this_split * block_n), 0)
+                loop_range = T.ceildiv(this_len, block_n)
+
+                tx = T.get_thread_binding()
+                if tx >= consumer_threads:
+                    if overlap:
+                        for k in T.serial(loop_range):
+                            T.mbarrier_wait_parity(k_free[k % ring], (k // ring) % 2 ^ 1)
+                            T.tma_copy(
+                                K[bid, base + k * block_n : base + (k + 1) * block_n, hid, :],
+                                k_s[k % ring, :, :],
+                                barrier=k_ready[k % ring],
+                            )
+                            T.mbarrier_arrive(k_ready[k % ring])
+                            T.mbarrier_wait_parity(v_free[k % ring], (k // ring) % 2 ^ 1)
+                            T.tma_copy(
+                                V[bid, base + k * block_n : base + (k + 1) * block_n, hid, :],
+                                v_s[k % ring, :, :],
+                                barrier=v_ready[k % ring],
+                            )
+                            T.mbarrier_arrive(v_ready[k % ring])
+                    else:
+                        for k in T.serial(loop_range):
+                            T.mbarrier_wait_parity(free[k % ring], (k // ring) % 2 ^ 1)
+                            T.tma_copy(
+                                K[bid, base + k * block_n : base + (k + 1) * block_n, hid, :],
+                                k_s[k % ring, :, :],
+                                barrier=ready[k % ring],
+                            )
+                            T.tma_copy(
+                                V[bid, base + k * block_n : base + (k + 1) * block_n, hid, :],
+                                v_s[k % ring, :, :],
+                                barrier=ready[k % ring],
+                            )
+                            T.mbarrier_arrive(ready[k % ring])
+                else:
+                    T.fill(acc_o, 0)
+                    T.fill(logsum, 0)
+                    T.fill(scores_max, -T.infinity(accum_dtype))
+                    for i, j in T.Parallel(block_m, dim):
+                        q_s[i, j] = T.if_then_else(
+                            i < rows,
+                            Q[bid, flat_row(hid, tile_row0, i), j] * T.cast(query_sign, dtype),
+                            T.cast(0, dtype),
+                        )
+                    if overlap:
+                        # The scores of tile ``k`` are taken while the probabilities of tile
+                        # ``k - 1`` multiply its values.
+                        T.mbarrier_wait_parity(k_ready[0], 0)
+                        T.wgmma_gemm(
+                            q_s,
+                            k_s[0, :, :],
+                            acc_s,
+                            transpose_B=True,
+                            policy=T.GemmWarpPolicy.FullRow,
+                            clear_accum=True,
+                        )
+                        T.wait_wgmma(0)
+                        T.mbarrier_arrive(k_free[0])
+                        softmax_step(
+                            acc_s,
+                            scores_max,
+                            scores_max_prev,
+                            scores_scale,
+                            scores_sum,
+                            logsum,
+                            0,
+                            this_len,
+                            base,
+                            tile_row0,
+                            seqlen_kv,
+                        )
+                        T.copy(acc_s, p_r)
+                        for k in T.serial(1, loop_range):
+                            T.mbarrier_wait_parity(k_ready[k % ring], (k // ring) % 2)
+                            T.wgmma_gemm(
+                                q_s,
+                                k_s[k % ring, :, :],
+                                acc_s,
+                                transpose_B=True,
+                                policy=T.GemmWarpPolicy.FullRow,
+                                clear_accum=True,
+                            )
+                            for i, j in T.Parallel(block_m, dim):
+                                acc_o[i, j] *= scores_scale[i]
+                            T.mbarrier_wait_parity(v_ready[(k - 1) % ring], ((k - 1) // ring) % 2)
+                            T.wgmma_gemm(
+                                p_r,
+                                v_s[(k - 1) % ring, :, :],
+                                acc_o,
+                                policy=T.GemmWarpPolicy.FullRow,
+                                clear_accum=False,
+                            )
+                            T.wait_wgmma(1)
+                            T.mbarrier_arrive(k_free[k % ring])
+                            softmax_step(
+                                acc_s,
+                                scores_max,
+                                scores_max_prev,
+                                scores_scale,
+                                scores_sum,
+                                logsum,
+                                k,
+                                this_len,
+                                base,
+                                tile_row0,
+                                seqlen_kv,
+                            )
+                            T.wait_wgmma(0)
+                            T.mbarrier_arrive(v_free[(k - 1) % ring])
+                            T.copy(acc_s, p_r)
+                        for i, j in T.Parallel(block_m, dim):
+                            acc_o[i, j] *= scores_scale[i]
+                        T.mbarrier_wait_parity(
+                            v_ready[(loop_range - 1) % ring], ((loop_range - 1) // ring) % 2
+                        )
+                        T.wgmma_gemm(
+                            p_r,
+                            v_s[(loop_range - 1) % ring, :, :],
+                            acc_o,
+                            policy=T.GemmWarpPolicy.FullRow,
+                            clear_accum=False,
+                        )
+                        T.wait_wgmma(0)
+                        T.mbarrier_arrive(v_free[(loop_range - 1) % ring])
+                    else:
+                        for k in T.serial(loop_range):
+                            T.mbarrier_wait_parity(ready[k % ring], (k // ring) % 2)
+                            T.wgmma_gemm(
+                                q_s,
+                                k_s[k % ring, :, :],
+                                acc_s,
+                                transpose_B=True,
+                                policy=T.GemmWarpPolicy.FullRow,
+                                clear_accum=True,
+                            )
+                            T.wait_wgmma(0)
+                            softmax_step(
+                                acc_s,
+                                scores_max,
+                                scores_max_prev,
+                                scores_scale,
+                                scores_sum,
+                                logsum,
+                                k,
+                                this_len,
+                                base,
+                                tile_row0,
+                                seqlen_kv,
+                            )
+                            for i, j in T.Parallel(block_m, dim):
+                                acc_o[i, j] *= scores_scale[i]
+                            T.copy(acc_s, p_s)
+                            T.wgmma_gemm(
+                                p_s,
+                                v_s[k % ring, :, :],
+                                acc_o,
+                                policy=T.GemmWarpPolicy.FullRow,
+                                clear_accum=False,
+                            )
+                            T.wait_wgmma(0)
+                            T.mbarrier_arrive(free[k % ring])
+                    if fused:
+                        # One split holds every key, so it normalizes here; the sink
+                        # factor needs the completed row sum.
+                        if has_sinks:
+                            if seq_q == 1:
+                                sink_scale(logsum, scores_max, sinks, scores_scale, row0, 1, rows)
+                            else:
+                                sink_scale(
+                                    logsum, scores_max, sinks, scores_scale, hid, tile_row0, rows
+                                )
+                            for i, j in T.Parallel(block_m, dim):
+                                acc_o[i, j] *= scores_scale[i]
+                        for i, j in T.Parallel(block_m, dim):
+                            acc_o[i, j] /= logsum[i]
+                        for i, j in T.Parallel(block_m, dim):
+                            if i < rows:
+                                Output[bid, flat_row(hid, tile_row0, i), j] = acc_o[i, j]
+                    else:
+                        # An empty split weighs nothing in the combine: its log-sum-exp
+                        # is -inf and its partial output zero.
+                        for i, j in T.Parallel(block_m, dim):
+                            acc_o[i, j] /= T.if_then_else(
+                                saw_keys(tile_row0, i, base, this_len, seqlen_kv), logsum[i], 1.0
+                            )
+                        for i in T.Parallel(block_m):
+                            if i < rows:
+                                glse[bid, flat_row(hid, tile_row0, i), sid] = T.if_then_else(
+                                    saw_keys(tile_row0, i, base, this_len, seqlen_kv),
+                                    T.log2(logsum[i]) + scores_max[i] * scale,
+                                    -T.infinity(accum_dtype),
+                                )
+                        for i, j in T.Parallel(block_m, dim):
+                            if i < rows:
+                                Output_partial[bid, flat_row(hid, tile_row0, i), sid, j] = (
+                                    T.if_then_else(
+                                        saw_keys(tile_row0, i, base, this_len, seqlen_kv),
+                                        acc_o[i, j],
+                                        0.0,
+                                    )
+                                )
+            if not fused:
+                combine(glse, Output_partial, Output, sinks)
+
+        return gqa_decode_ws
+
+    return _func
+
+
+class GQADecodeWSKernel(Kernel, GQADenseFwdInterface):
+    """SM90 TMA-fed, warp-specialized dense decode; the split count follows the grid.
+
+    The batch-1 kernels keep the calls they serve: they split one sequence over more
+    CTAs than the batch and KV heads give this plan.
+    """
+
+    supported_archs: list[int] = [90]
+    preferred_over = frozenset({"gqa_dense_decode", "gqa_dense_persistent", "gqa_dense"})
+    # Head dimensions whose tiles this plan is built and tested at.
+    _DIMS = (64, 128, 256)
+
+    @classmethod
+    def refusal(cls, call: AttentionCall) -> Optional[str]:
+        """Unrotated 16-bit dense decode, one query position or the packed positions
+        :attr:`AttentionCall.dense_decode_program` names, at the head dimensions this plan
+        builds for."""
+        if call.return_lse:
+            return "does not return the log-sum-exp"
+        if not (call.dense_decode_region or call.dense_decode_program == "ws"):
+            return "does not serve this call"
+        if call.fuse_rope:
+            return "does not fuse RoPE"
+        if call.dim not in cls._DIMS:
+            return f"requires head dimension in {cls._DIMS}"
+        if call.sm_scale is not None and math.isinf(_as_fp32(abs(call.sm_scale) * LOG2E)):
+            return "requires a score scale whose base-2 form FP32 holds"
+        return GQADecodeKernel._limit_refusal(call.dim, call.seqlen_kv, call.arch)
+
+    @classmethod
+    def entry_for(cls, call: AttentionCall) -> Entry:
+        """The cache length is taken at runtime; the split count follows it per call."""
+        args = GQADecodeKernel.construction_args(call)
+        for rope_arg in call.rope_args:
+            args.pop(rope_arg)
+        # One query position sees every key, so only several positions compile the mask.
+        args.update(seq_len_q=call.max_seqlen_q, is_causal=call.is_causal and call.max_seqlen_q > 1)
+        return tuple(v for k, v in args.items() if k != "seq_len_kv"), lambda: cls(**args)
+
+    def __init__(
+        self,
+        batch,
+        heads,
+        heads_kv,
+        seq_len_kv,
+        dim,
+        dtype=torch.float16,
+        sm_scale: Optional[float] = None,
+        softcap: float = 0.0,
+        config: Optional[dict] = None,
+        *,
+        seq_len_q: int = 1,
+        is_causal: bool = False,
+        has_sinks: bool = False,
+        device_index: Optional[int] = None,
+    ):
+        super().__init__(device_index=device_index)
+        # The program takes the cache length per call.
+        del seq_len_kv
+        if heads_kv <= 0 or heads % heads_kv != 0:
+            raise ValueError("heads must be a positive multiple of heads_kv")
+        if dim not in self._DIMS:
+            raise ValueError(f"{type(self).__name__} requires head dimension in {self._DIMS}")
+        self.batch = batch
+        self.seq_len_q = seq_len_q
+        self.heads = heads
+        self.groups = heads_kv
+        self.dim = dim
+        self.dtype = dtype
+        self.sm_scale = sm_scale
+        self.softcap = softcap
+        self.has_sinks = has_sinks
+        self._sm_count = get_sm_count(device_index)
+        self._smem_budget = get_shared_memory_optin(device_index)
+        self.jit = _gqa_decode_ws_kernel(
+            batch,
+            seq_len_q,
+            heads,
+            heads_kv,
+            dim,
+            sm_scale,
+            softcap,
+            self.dtype_str,
+            has_sinks,
+            is_causal,
+        )
+        self.init_config(config)
+
+    @property
+    def default_config(self) -> dict:
+        # A tile of 128 keys at D64 holds as many bytes as 64 keys at D128, and halves the
+        # per-tile barrier and softmax steps of the narrow head.
+        return {"block_m": 64, "block_n": 128 if self.dim <= 64 else 64}
+
+    def _shared_bytes(self) -> int:
+        """The query rows, two K and V slots and the probability tile, in bytes."""
+        c = self.config
+        elems = c["block_m"] * self.dim + 4 * c["block_n"] * self.dim + c["block_m"] * c["block_n"]
+        return elems * self.dtype.itemsize
+
+    def plan(self, seqlen_kv: int) -> tuple[int, bool]:
+        """Return the split count and whether to overlap softmax with matrix products.
+
+        Splits fill resident CTA slots; multiple splits retain at least four KV tiles each.
+        Overlap requires one row tile per KV head, D128, 64-key tiles and no softcap.
+        Its one-CTA-per-SM grid must match the resident split count, or cover at least
+        two thirds of the SMs with at most 64 KV tiles per CTA.
+        """
+        c = self.config
+        row_tiles = -(-(self.seq_len_q * self.heads // self.groups) // c["block_m"])
+        units = self.batch * self.groups * row_tiles
+        tiles = -(-seqlen_kv // c["block_n"])
+        slots = self._sm_count * max(1, self._smem_budget // self._shared_bytes())
+        limit = max(1, min(slots // units, tiles // 4))
+        split = 1 << (limit.bit_length() - 1)
+        alone = (
+            row_tiles == 1
+            and c["block_n"] == 64
+            and self.dim == 128
+            and self.softcap == 0
+            and units <= self._sm_count
+        )
+        if alone:
+            limit = max(1, min(self._sm_count // units, tiles // 4))
+            lone = 1 << (limit.bit_length() - 1)
+            if lone == split or (3 * units * lone >= 2 * self._sm_count and tiles <= 64 * lone):
+                return lone, True
+        return split, False
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        q_scale: Optional[torch.Tensor] = None,
+        k_scale: Optional[torch.Tensor] = None,
+        v_scale: Optional[torch.Tensor] = None,
+        rope_cos: Optional[torch.Tensor] = None,
+        rope_sin: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        self._require_devices(q=q, k=k, v=v)
+        del q_scale, k_scale, v_scale, rope_cos, rope_sin
+        rows = self.seq_len_q * self.heads
+        query = q.view(self.batch, rows, self.dim)
+        num_split, overlap = self.plan(k.shape[1])
+        glse = torch.empty((self.batch, rows, num_split), dtype=torch.float32, device=q.device)
+        partial = torch.empty(
+            (self.batch, rows, num_split, self.dim), dtype=torch.float32, device=q.device
+        )
+        program = self.program(self._compile, num_split, overlap)
+        output = program(query, k, v, glse, partial, sinks if self.has_sinks else query)
+        return output.view_as(q)
+
+    def _compile(self, cfg: dict, num_split: int, overlap: bool):
+        """The program for *cfg* over *num_split* splits."""
+        return self.jit(cfg["block_m"], cfg["block_n"], num_split, overlap)

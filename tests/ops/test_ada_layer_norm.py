@@ -1,15 +1,19 @@
+"""Tests for AdaLayerNorm and AdaLayerNormZero."""
+
 import pytest
 import torch
-import torch.nn.functional as F
 
-from tests.test_base import FixtureBase, TestBase
-from tileops.kernels.norm.ada_layer_norm import (
-    AdaLayerNormKernel,
-    _should_use_cp_async,
+from tests.workload_test_base import FixtureBase, TestBase
+from tileops._ops.norm.ada_layer_norm import AdaLayerNormFwdOp
+from tileops._ops.norm.ada_layer_norm_zero import AdaLayerNormZeroFwdOp
+from tileops.backend import BUILTIN
+from workloads.device import run_device
+from workloads.norm import (
+    AdaLayerNormWorkload,
+    AdaLayerNormZeroWorkload,
+    LayerNormLargeOffsetWorkload,
 )
-from tileops.ops.norm.ada_layer_norm import AdaLayerNormFwdOp
-from tileops.utils import is_maca
-from workloads.normalization import AdaLayerNormWorkload
+from workloads.numerics import compare_outputs
 
 
 class AdaLayerNormTest(AdaLayerNormWorkload, TestBase):
@@ -42,23 +46,14 @@ class AdaLayerNormFixture(FixtureBase):
     ]
 
 
-def _get_tolerances(dtype: torch.dtype) -> tuple[float, float]:
-    if dtype == torch.float32:
-        return 1e-5, 1e-5
-    elif dtype == torch.float16:
-        return 1e-3, 1e-3
-    else:  # bfloat16
-        return 1.6e-2, 1.6e-2
-
-
 @AdaLayerNormFixture
 def test_ada_layer_norm_op(m: int, n: int, dtype: torch.dtype) -> None:
     test = AdaLayerNormTest(m, n, dtype)
     op = AdaLayerNormFwdOp()
-    atol, rtol = _get_tolerances(dtype)
-    test.check(op, *test.gen_inputs(), atol=atol, rtol=rtol)
+    test.check(op, *test.gen_inputs())
 
 
+@pytest.mark.in_tree_kernels
 @pytest.mark.smoke
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_ada_layer_norm_kernel_handles_natural_unaligned_shape(
@@ -66,67 +61,22 @@ def test_ada_layer_norm_kernel_handles_natural_unaligned_shape(
 ) -> None:
     m, n = 16, 1152
     test = AdaLayerNormTest(m, n, dtype)
-    inputs = test.gen_inputs()
-    kernel = AdaLayerNormKernel(n, test.eps, dtype, has_gate=False)
-    actual = kernel(*inputs)
-    expected = test.ref_program(*inputs)
-    assert actual.shape == (m, n)
-    atol, rtol = _get_tolerances(dtype)
-    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    op = AdaLayerNormFwdOp(eps=test.eps, target=BUILTIN)
+    test.check(op, *test.gen_inputs())
 
 
 @pytest.mark.smoke
-def test_ada_layer_norm_async_copy_handles_row_tail() -> None:
-    """Regression: the async 2-D tile must support block_m > 1 and tail rows."""
-    m, n, block_m = 17, 514, 4
-    dtype = torch.float16
-    test = AdaLayerNormTest(m, n, dtype)
-    inputs = test.gen_inputs()
-    kernel = AdaLayerNormKernel(
-        n,
-        test.eps,
-        dtype,
-        has_gate=False,
-        config={"block_m": block_m, "threads": 128},
-    )
-    assert kernel.use_cp_async is (not is_maca())
-    actual = kernel(*inputs)
-    expected = test.ref_program(*inputs)
-    atol, rtol = _get_tolerances(dtype)
-    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+def test_ada_layer_norm_large_offset() -> None:
+    """A padded row whose mean far outgrows its spread keeps the pad out of the variance."""
+    large = LayerNormLargeOffsetWorkload(4, 1152, torch.float32)
+    test = AdaLayerNormTest(4, 1152, torch.float32)
+    x, _, _ = large.gen_inputs()
+    _, scale, shift = test.gen_inputs()
+    expected = test.ref_program(x, scale, shift)
+    compare_outputs(AdaLayerNormFwdOp()(x, scale, shift), expected, large.verification(x))
 
 
-@pytest.mark.smoke
-def test_ada_layer_norm_async_policy_edges() -> None:
-    cases = [
-        (511, torch.float16, False),
-        (512, torch.float16, False),
-        (513, torch.float16, False),
-        (514, torch.float16, True),
-        (1918, torch.float16, True),
-        (1919, torch.float16, False),
-        (1920, torch.float16, True),
-        (513, torch.float32, True),
-        (1919, torch.float32, True),
-    ]
-    for n, dtype, expected_async in cases:
-        assert _should_use_cp_async(n, dtype, has_gate=False) is expected_async
-
-
-@pytest.mark.smoke
-def test_ada_layer_norm_async_policy_shared_memory_limit() -> None:
-    cases = [
-        (8190, torch.float16, False, True),
-        (8194, torch.float16, False, False),
-        (6142, torch.float16, True, True),
-        (6146, torch.float16, True, False),
-        (4094, torch.float32, False, True),
-        (4098, torch.float32, False, False),
-    ]
-    for n, dtype, has_gate, expected_async in cases:
-        assert _should_use_cp_async(n, dtype, has_gate) is expected_async
-
-
+@pytest.mark.in_tree_kernels
 @pytest.mark.smoke
 @pytest.mark.parametrize(
     "n, dtype",
@@ -141,14 +91,8 @@ def test_ada_layer_norm_async_policy_edge_correctness(
 ) -> None:
     m = 4
     test = AdaLayerNormTest(m, n, dtype)
-    inputs = test.gen_inputs()
-    kernel = AdaLayerNormKernel(n, test.eps, dtype, has_gate=False)
-    if n == 514:
-        assert kernel.use_cp_async is (not is_maca())
-    actual = kernel(*inputs)
-    expected = test.ref_program(*inputs)
-    atol, rtol = _get_tolerances(dtype)
-    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    op = AdaLayerNormFwdOp(eps=test.eps, target=BUILTIN)
+    test.check(op, *test.gen_inputs())
 
 
 class AdaLayerNorm3DFixture(FixtureBase):
@@ -167,25 +111,124 @@ class AdaLayerNorm3DFixture(FixtureBase):
 @AdaLayerNorm3DFixture
 def test_ada_layer_norm_3d(batch: int, seq: int, hidden: int, dtype: torch.dtype) -> None:
     """Test with 3D input (batch, seq, hidden)."""
-    x = torch.randn(batch, seq, hidden, dtype=dtype, device="cuda")
-    scale = torch.randn(batch, seq, hidden, dtype=dtype, device="cuda")
-    shift = torch.randn(batch, seq, hidden, dtype=dtype, device="cuda")
+    x = torch.randn(batch, seq, hidden, dtype=dtype, device=run_device())
+    scale = torch.randn(batch, seq, hidden, dtype=dtype, device=run_device())
+    shift = torch.randn(batch, seq, hidden, dtype=dtype, device=run_device())
 
     op = AdaLayerNormFwdOp()
 
-    # Reference: scale * LayerNorm(x) + shift
-    eps = 1e-5
-    normed = F.layer_norm(
-        x.float(),
-        (hidden,),
-        weight=None,
-        bias=None,
-        eps=eps,
-    )
-    y_ref = (scale.float() * normed + shift.float()).to(dtype)
+    test = AdaLayerNormTest(batch * seq, hidden, dtype)
+    test.check(op, x, scale, shift)
 
-    y = op(x, scale, shift)
-    atol, rtol = _get_tolerances(dtype)
-    assert torch.allclose(y, y_ref, atol=atol, rtol=rtol), (
-        f"3D test failed, max err: {(y - y_ref).abs().max()}"
-    )
+
+class AdaLayerNormZeroTest(AdaLayerNormZeroWorkload, TestBase):
+    pass
+
+
+class AdaLayerNormZeroFixture(FixtureBase):
+    PARAMS = [
+        (
+            "m, n, dtype",
+            [
+                # Standard aligned shapes -- fp32
+                pytest.param(1024, 4096, torch.float32, marks=pytest.mark.smoke),
+                # Standard aligned shapes -- fp16
+                pytest.param(1024, 4096, torch.float16, marks=pytest.mark.smoke),
+                # Standard aligned shapes -- bf16
+                pytest.param(1024, 4096, torch.bfloat16, marks=pytest.mark.smoke),
+                pytest.param(4096, 4096, torch.float32, marks=pytest.mark.full),
+                pytest.param(4096, 4096, torch.float16, marks=pytest.mark.full),
+                pytest.param(4096, 4096, torch.bfloat16, marks=pytest.mark.full),
+                # Non-power-of-two hidden dims
+                pytest.param(1024, 3000, torch.float32, marks=pytest.mark.full),
+                pytest.param(1024, 3000, torch.float16, marks=pytest.mark.full),
+                pytest.param(1024, 3000, torch.bfloat16, marks=pytest.mark.full),
+                # Tail-M: M not divisible by block_m
+                pytest.param(1025, 4096, torch.float16, marks=pytest.mark.full),
+                pytest.param(1025, 4096, torch.bfloat16, marks=pytest.mark.full),
+            ],
+        ),
+    ]
+
+
+@AdaLayerNormZeroFixture
+def test_ada_layer_norm_zero_op(m: int, n: int, dtype: torch.dtype) -> None:
+    test = AdaLayerNormZeroTest(m, n, dtype)
+    op = AdaLayerNormZeroFwdOp()
+    test.check(op, *test.gen_inputs())
+
+
+@pytest.mark.in_tree_kernels
+@pytest.mark.smoke
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_ada_layer_norm_zero_kernel_handles_natural_unaligned_shape(
+    dtype: torch.dtype,
+) -> None:
+    m, n = 16, 1152
+    test = AdaLayerNormZeroTest(m, n, dtype)
+    op = AdaLayerNormZeroFwdOp(eps=test.eps, target=BUILTIN)
+    test.check(op, *test.gen_inputs())
+
+
+class AdaLayerNormZero3DFixture(FixtureBase):
+    PARAMS = [
+        (
+            "batch, seq, hidden, dtype",
+            [
+                pytest.param(2, 512, 4096, torch.float32, marks=pytest.mark.smoke),
+                pytest.param(2, 512, 4096, torch.float16, marks=pytest.mark.smoke),
+                pytest.param(2, 512, 4096, torch.bfloat16, marks=pytest.mark.smoke),
+            ],
+        ),
+    ]
+
+
+@AdaLayerNormZero3DFixture
+def test_ada_layer_norm_zero_3d(batch: int, seq: int, hidden: int, dtype: torch.dtype) -> None:
+    """Test with 3D input (batch, seq, hidden)."""
+    x = torch.randn(batch, seq, hidden, dtype=dtype, device=run_device())
+    scale = torch.randn(batch, seq, hidden, dtype=dtype, device=run_device())
+    shift = torch.randn(batch, seq, hidden, dtype=dtype, device=run_device())
+    gate = torch.randn(batch, seq, hidden, dtype=dtype, device=run_device())
+
+    op = AdaLayerNormZeroFwdOp()
+
+    test = AdaLayerNormZeroTest(batch * seq, hidden, dtype)
+    test.check(op, x, scale, shift, gate)
+
+
+_TUNE = [pytest.param(False, marks=pytest.mark.smoke), pytest.param(True, marks=pytest.mark.full)]
+
+
+@pytest.mark.parametrize("tune", _TUNE)
+def test_ada_layer_norm_under_tuning(tune: bool) -> None:
+    test = AdaLayerNormTest(17, 514, torch.float16)
+    op = AdaLayerNormFwdOp(eps=test.eps)
+    if tune:
+        op.request_tune()
+    test.check(op, *test.gen_inputs())
+
+
+@pytest.mark.parametrize("tune", _TUNE)
+def test_ada_layer_norm_zero_under_tuning(tune: bool) -> None:
+    test = AdaLayerNormZeroTest(17, 514, torch.float16)
+    op = AdaLayerNormZeroFwdOp(eps=test.eps)
+    if tune:
+        op.request_tune()
+    test.check(op, *test.gen_inputs())
+
+
+def _misaligned(t: torch.Tensor) -> torch.Tensor:
+    """*t* copied into a contiguous view that starts one element into its storage."""
+    view = torch.empty(t.numel() + 1, dtype=t.dtype, device=t.device)[1:].view(t.shape)
+    view.copy_(t)
+    return view
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("zero", [False, True], ids=["ada", "ada-zero"])
+def test_ada_layer_norm_reads_inputs_off_the_vector_boundary(zero: bool) -> None:
+    """A contiguous input and modulation tensors may start anywhere in their storage."""
+    test = (AdaLayerNormZeroTest if zero else AdaLayerNormTest)(4, 1024, torch.float16)
+    op = AdaLayerNormZeroFwdOp() if zero else AdaLayerNormFwdOp()
+    test.check(op, *(_misaligned(t) for t in test.gen_inputs()))

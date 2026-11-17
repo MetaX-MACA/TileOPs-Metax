@@ -8,13 +8,14 @@ load/merge surface.
 from pathlib import Path
 
 import pytest
+import yaml
 
 from tileops.manifest import load_manifest, load_workloads, manifest_files
 
 pytestmark = pytest.mark.smoke
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-MANIFEST_DIR = REPO_ROOT / "src" / "tileops" / "manifest"
+MANIFEST_DIR = REPO_ROOT / "src" / "tileops" / "manifest" / "spec"
 
 
 class TestManifestStructure:
@@ -41,7 +42,7 @@ class TestManifestAPI:
         workloads = load_workloads("RMSNormFwdOp")
         assert isinstance(workloads, list)
         assert len(workloads) >= 1
-        assert "x_shape" in workloads[0]
+        assert "label" in workloads[0]
 
     def test_load_workloads_unknown_op_raises(self):
         with pytest.raises(KeyError, match="NonexistentOp"):
@@ -64,68 +65,68 @@ class TestManifestAPI:
             assert not hasattr(manifest, name)
 
 
-class TestForwardTensorArgumentCount:
-    """A workspace is a forward argument wherever the manifest is read positionally.
+@pytest.fixture
+def manifest_from(monkeypatch):
+    """Point `load_manifest` at the given spec files, uncached."""
+    import tileops.manifest as manifest
 
-    ``Op._refuse_empty_input`` zips the manifest's tensor names against the call's
-    tensors and skips when the two lengths disagree, so an entry that declares a
-    workspace outside ``signature.inputs`` silently loses the empty-input guard
-    unless the workspace names are counted too.
+    def use(*paths: Path) -> None:
+        monkeypatch.setattr(manifest, "manifest_files", lambda: list(paths))
+        load_manifest.cache_clear()
+
+    yield use
+    load_manifest.cache_clear()
+
+
+def test_a_missing_entry_is_none_and_a_broken_manifest_raises(manifest_from, tmp_path):
+    from tileops.manifest import _try_load_entry
+
+    good = tmp_path / "probe.yaml"
+    good.write_text("ProbeFwdOp:\n  family: probe\n")
+    manifest_from(good)
+    assert _try_load_entry("ProbeFwdOp") == {"family": "probe"}
+    assert _try_load_entry("MissingFwdOp") is None
+
+    broken = tmp_path / "broken.yaml"
+    broken.write_text("ProbeFwdOp: [unclosed\n")
+    manifest_from(broken)
+    with pytest.raises(yaml.YAMLError, match="broken.yaml"):
+        _try_load_entry("MissingFwdOp")
+
+
+@pytest.mark.parametrize(
+    ("text", "line", "key"),
+    [
+        ("ProbeFwdOp:\n  family: probe\nProbeFwdOp:\n  family: probe\n", 3, "ProbeFwdOp"),
+        ("ProbeFwdOp:\n  family: probe\n  signature:\n    a: 1\n    a: 2\n", 5, "a"),
+    ],
+)
+def test_a_duplicate_key_at_any_level_raises(manifest_from, tmp_path, text, line, key):
+    path = tmp_path / "probe.yaml"
+    path.write_text(text)
+    manifest_from(path)
+    with pytest.raises(ValueError, match=rf"probe\.yaml:{line}: duplicate key '{key}'"):
+        load_manifest()
+
+
+def test_family_file_named_after_another_family_raises():
+    from tileops.manifest import _check_family_file
+
+    with pytest.raises(ValueError, match="FFTC2CFwdOp.*family 'fft'"):
+        _check_family_file("sequence_modeling.yaml", {"FFTC2CFwdOp": {"family": "fft"}})
+
+
+def test_every_implemented_roofline_func_is_an_exported_formula():
+    """An implemented entry's ``roofline.func`` is a formula ``formulas.__all__`` exports.
+
+    A spec-only entry may name a formula not written yet, as the validator allows.
     """
+    import tileops._perf.formulas as formulas
 
-    @staticmethod
-    def _manifest_tensor_names(entry: dict) -> list[str]:
-        workspaces = (entry.get("resources") or {}).get("workspaces") or []
-        return list(entry["signature"]["inputs"]) + [w["name"] for w in workspaces]
-
-    @staticmethod
-    def _op_class(op_name: str, entry: dict):
-        import importlib
-
-        module = entry["source"]["op"].removesuffix(".py").replace("/", ".")
-        return getattr(importlib.import_module(module), op_name)
-
-    def test_every_entry_with_workspaces_matches_its_forward_arity(self):
-        import inspect
-
-        checked = 0
-        for op_name, entry in load_manifest().items():
-            if entry.get("status") != "implemented" or not entry.get("resources"):
-                continue
-            cls = self._op_class(op_name, entry)
-            params = [
-                p.name
-                for p in inspect.signature(cls.forward).parameters.values()
-                if p.name != "self" and p.kind is not inspect.Parameter.VAR_KEYWORD
-            ]
-            expected = self._manifest_tensor_names(entry)
-            assert params[: len(expected)] == expected, op_name
-            checked += 1
-        assert checked, "no implemented entry declares resources.workspaces"
-
-
-class TestEmptyInputGuardCountsWorkspaces:
-    """The guard must still fire for an op whose workspaces live under ``resources``.
-
-    It compares the manifest's tensor names against the call's tensors by length and
-    returns early when they disagree, so counting only ``signature.inputs`` would
-    disable the refusal for every op that declares a workspace.
-    """
-
-    def test_guard_fires_with_workspaces_declared_outside_inputs(self):
-        import torch
-
-        from tileops.ops.moe.routed_expert.fused_routed_expert import FusedMoEExpertsFwdOp
-
-        entry = load_manifest()["FusedMoEExpertsFwdOp"]
-        assert entry["resources"]["workspaces"], "entry no longer exercises this path"
-
-        op = FusedMoEExpertsFwdOp.__new__(FusedMoEExpertsFwdOp)
-        empty = torch.zeros(0, 8)
-        rest = torch.zeros(1, 8)
-        # output, hidden_states, w_gate_up, w_down, topk_weights, topk_ids,
-        # workspace1, workspace2 — eight tensors, six of them manifest inputs.
-        call = (empty, empty, rest, rest, rest, rest, rest, rest)
-
-        with pytest.raises(ValueError, match="does not support an empty tensor"):
-            op._refuse_empty_input(call)
+    named = {
+        entry["roofline"]["func"].removeprefix("tileops._perf.formulas.")
+        for entry in load_manifest().values()
+        if entry.get("status") == "implemented" and "func" in (entry.get("roofline") or {})
+    }
+    assert named - set(formulas.__all__) == set()
+    assert all(callable(getattr(formulas, name)) for name in named)
