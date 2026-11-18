@@ -11,7 +11,7 @@ import benchmarks.baselines  # noqa: F401
 from benchmarks import api
 from benchmarks.report import BenchmarkReport, _bench_results
 from benchmarks.timing import events_fallback_allowed, set_events_fallback_allowed
-from benchmarks.xfail_whitelist import MACA_XFAIL_PREFIXES, MACA_XFAILS, MACA_XPASS_RELEASES
+from benchmarks.xfail_whitelist import MACA_XFAIL_PREFIXES, MACA_XFAILS
 from tileops._utils import is_maca
 from tileops._utils.device import current_accelerator_type, empty_accelerator_cache
 from tileops.backend import OpNotAvailableError
@@ -37,8 +37,6 @@ def _apply_maca_xfails(items: list[pytest.Item]) -> None:
         return
     for item in items:
         nodeid = _normalized_benchmark_nodeid(item)
-        if nodeid in MACA_XPASS_RELEASES:
-            continue
         reason = MACA_XFAILS.get(nodeid)
         if reason is None:
             reason = next(

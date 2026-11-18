@@ -4,7 +4,7 @@ from unittest.mock import Mock
 import pytest
 
 import tests.conftest as test_config
-from tests.xfail_whitelist import MACA_XFAILS, MACA_XPASS_RELEASES
+from tests.xfail_whitelist import MACA_XFAILS
 
 pytestmark = pytest.mark.smoke
 
@@ -15,7 +15,7 @@ def _make_item(nodeid: str) -> SimpleNamespace:
 
 def test_maca_xfail_allowlist_matches_exact_nodeids(monkeypatch) -> None:
     monkeypatch.setattr(test_config, "is_maca", lambda: True)
-    known_nodeid = next(nodeid for nodeid in MACA_XFAILS if nodeid not in MACA_XPASS_RELEASES)
+    known_nodeid = next(iter(MACA_XFAILS))
     known = _make_item(known_nodeid)
     unknown = _make_item("tests/ops/test_unknown.py::test_unknown")
 
