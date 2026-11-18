@@ -12,7 +12,6 @@ from tests.xfail_whitelist import (
     MACA_XFAIL_NO_RUN,
     MACA_XFAIL_PREFIXES,
     MACA_XFAILS,
-    MACA_XPASS_RELEASES,
 )
 from tileops._utils import is_maca
 from tileops._utils.device import (
@@ -60,8 +59,6 @@ def _apply_maca_xfails(items: list[pytest.Item]) -> None:
         return
     for item in items:
         nodeid = _normalized_test_nodeid(item)
-        if nodeid in MACA_XPASS_RELEASES:
-            continue
         reason = _maca_xfail_reason(nodeid)
         if reason is not None:
             item._tileops_maca_xfail = True
