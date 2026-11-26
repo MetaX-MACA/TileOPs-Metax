@@ -6,7 +6,8 @@ folded into the score and output rescale instead of promoting every element.
 """
 
 import itertools
-from typing import Callable, ClassVar, Optional
+from collections.abc import Callable
+from typing import ClassVar
 
 import tilelang
 import tilelang.language as T
@@ -19,6 +20,12 @@ from tileops._kernels.attention.fp8_fa3_layouts import (
     fa3_qk_acc_column,
     fa3_qk_row_fragment,
 )
+from tileops._kernels.attention.gqa.prefill_varlen import (
+    _aligned_bytes,
+    stages_score_tile,
+    varlen_key_tiles,
+    varlen_visible,
+)
 from tileops._kernels.attention.online_softmax import (
     finite_max_floor,
     make_online_softmax_with_mask_guard,
@@ -27,10 +34,9 @@ from tileops._kernels.attention.online_softmax import (
 )
 from tileops._kernels.attention.varlen import VarlenKernel
 from tileops._kernels.attention.varlen_rope import make_varlen_query_rope
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.constants import (
     LOG2E,
-    SHARED_BUFFER_ALIGN_BYTES,
     TMA_DTYPE_BFLOAT16,
     TMA_DTYPE_FLOAT16,
     TMA_DTYPE_UINT8,
@@ -43,7 +49,6 @@ from tileops._kernels.constants import (
     WGMMA_ROWS,
 )
 from tileops._kernels.grouped_tiling import GroupTiling
-from tileops._utils import get_shared_memory_optin, get_sm_count
 
 __all__ = ["GQAVarlenFP8FwdKernel", "GQAVarlenFP8WSFwdKernel"]
 
@@ -57,17 +62,16 @@ def _gqa_varlen_fp8_fwd_kernel(
     heads_kv: int,
     dim: int,
     is_causal: bool,
-    sm_scale: Optional[float] = None,
+    sm_scale: float | None = None,
     softcap: float = 0.0,
     out_dtype: str = "float16",
     window_size_left: int = -1,
     window_size_right: int = -1,
     has_sinks: bool = False,
+    qk_dtype: str = _FP8_DTYPE,
 ) -> Callable:
     score_scale = dim**-0.5 if sm_scale is None else sm_scale
     use_softcap = softcap > 0.0
-    has_left = window_size_left >= 0
-    has_right = window_size_right >= 0
     if heads % heads_kv != 0:
         raise ValueError("heads must be divisible by heads_kv")
     groups = heads // heads_kv
@@ -78,7 +82,7 @@ def _gqa_varlen_fp8_fwd_kernel(
         pass_configs={
             tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
         },
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
     )
     def _gqa_varlen_fp8_fwd_func(
         block_m: int, block_n: int, num_stages: int, threads: int
@@ -100,8 +104,8 @@ def _gqa_varlen_fp8_fwd_kernel(
 
         @T.prim_func
         def _gqa_varlen_fp8_fwd_main(
-            q: T.Tensor(q_shape, _FP8_DTYPE),  # type: ignore
-            k: T.Tensor(kv_shape, _FP8_DTYPE),  # type: ignore
+            q: T.Tensor(q_shape, qk_dtype),  # type: ignore
+            k: T.Tensor(kv_shape, qk_dtype),  # type: ignore
             v: T.Tensor(kv_shape, _FP8_DTYPE),  # type: ignore
             cu_seqlens_q: T.Tensor([batch + 1], T.int32),  # type: ignore
             cu_seqlens_kv: T.Tensor([batch + 1], T.int32),  # type: ignore
@@ -112,8 +116,8 @@ def _gqa_varlen_fp8_fwd_kernel(
             Sinks: T.Tensor([heads], "float32"),  # type: ignore
         ) -> None:
             with T.Kernel(num_q_tiles, heads, threads=threads) as (q_tile, by):
-                q_shared = T.alloc_shared([block_m, dim], _FP8_DTYPE)
-                k_shared = T.alloc_shared([block_n, dim], _FP8_DTYPE)
+                q_shared = T.alloc_shared([block_m, dim], qk_dtype)
+                k_shared = T.alloc_shared([block_n, dim], qk_dtype)
                 v_shared = T.alloc_shared([block_n, dim], _FP8_DTYPE)
                 p_shared = T.alloc_shared([block_m, block_n], _FP8_DTYPE)
                 o_shared = T.alloc_shared([block_m, dim], out_dtype)
@@ -154,38 +158,17 @@ def _gqa_varlen_fp8_fwd_kernel(
                     for i, d in T.Parallel(block_m, dim):
                         q_pos = q_row[0] + i
                         q_shared[i, d] = T.if_then_else(
-                            q_pos < q_len, q[q_start + q_pos, by, d], T.cast(0, _FP8_DTYPE)
+                            q_pos < q_len, q[q_start + q_pos, by, d], T.cast(0, qk_dtype)
                         )
 
                     T.clear(acc_o)
                     T.clear(logsum)
                     T.fill(scores_max, -T.infinity(accum_dtype))
 
-                    if is_causal:
-                        loop_range = T.max(
-                            0,
-                            T.ceildiv(T.min(kv_len, causal_offset + q_row[0] + block_m), block_n),
-                        )
-                    elif has_right:
-                        loop_range = T.max(
-                            0,
-                            T.ceildiv(
-                                T.min(
-                                    kv_len,
-                                    causal_offset + q_row[0] + block_m + window_size_right,
-                                ),
-                                block_n,
-                            ),
-                        )
-                    else:
-                        loop_range = T.ceildiv(kv_len, block_n)
-                    # Key tiles wholly left of the window are skipped, not masked.
-                    if has_left:
-                        k_first = T.max(0, causal_offset + q_row[0] - window_size_left) // block_n
-                        loop_range = T.max(0, loop_range - k_first)
-                    else:
-                        k_first = 0
-
+                    k_first, loop_range = varlen_key_tiles(
+                        q_row[0], block_m, kv_len, causal_offset, block_n,
+                        is_causal, window_size_left, window_size_right,
+                    )  # fmt: skip
                     for k_idx in T.Pipelined(loop_range, num_stages=num_stages):
                         tile_start = (k_first + k_idx) * block_n
                         tile_end = tile_start + block_n
@@ -205,7 +188,7 @@ def _gqa_varlen_fp8_fwd_kernel(
                                     k_shared[j, d] = k[kv_start + kv_pos, cur_kv_head, d]
                                     v_shared[j, d] = v[kv_start + kv_pos, cur_kv_head, d]
                                 else:
-                                    k_shared[j, d] = T.cast(0, _FP8_DTYPE)
+                                    k_shared[j, d] = T.cast(0, qk_dtype)
                                     v_shared[j, d] = T.cast(0, _FP8_DTYPE)
 
                         T.gemm(
@@ -219,22 +202,10 @@ def _gqa_varlen_fp8_fwd_kernel(
                         for i, j in T.Parallel(block_m, block_n):
                             q_pos = q_row[0] + i
                             kv_pos = tile_start + j
-                            if is_causal:
-                                valid = (
-                                    (q_pos < q_len)
-                                    & (kv_pos < kv_len)
-                                    & (kv_pos <= q_pos + causal_offset)
-                                )
-                            elif has_right:
-                                valid = (
-                                    (q_pos < q_len)
-                                    & (kv_pos < kv_len)
-                                    & (kv_pos <= q_pos + causal_offset + window_size_right)
-                                )
-                            else:
-                                valid = (q_pos < q_len) & (kv_pos < kv_len)
-                            if has_left:
-                                valid = valid & (kv_pos >= q_pos + causal_offset - window_size_left)
+                            valid = varlen_visible(
+                                q_pos, kv_pos, q_len, kv_len, causal_offset,
+                                is_causal, window_size_left, window_size_right,
+                            )  # fmt: skip
                             if use_softcap:
                                 logit = T.cast(softcap * LOG2E, accum_dtype) * T.tanh(
                                     acc_s[i, j] * qk_scale / T.cast(softcap, accum_dtype)
@@ -287,7 +258,7 @@ def _gqa_varlen_fp8_ws_kernel(
     heads_kv: int,
     dim: int,
     is_causal: bool,
-    sm_scale: Optional[float],
+    sm_scale: float,
     softcap: float,
     out_dtype: str,
     window_size_left: int,
@@ -310,8 +281,6 @@ def _gqa_varlen_fp8_ws_kernel(
     ``T.wgmma_gemm`` has no FP8 lowering, and the value contraction takes the previous
     key tile's probabilities from registers.
     """
-    if heads % heads_kv != 0:
-        raise ValueError("heads must be divisible by heads_kv")
     groups = heads // heads_kv
     accum_dtype = "float"
     # The CUTE helpers are written for the FA3 tile: a 64-row WGMMA per warpgroup,
@@ -328,7 +297,7 @@ def _gqa_varlen_fp8_ws_kernel(
     claim_write_barrier = 6
     # Key and value tiles in flight: one more than either compute warpgroup needs, so
     # one of them can be a tile ahead of the other. A fourth does not fit beside the
-    # query and output buffers; ``_shared_bytes`` is what prices that.
+    # query and output buffers.
     stages = 3
     # A tile holds the group's query heads side by side, so it spans this many query
     # positions and its causal bound advances once every ``groups`` rows. The tiling
@@ -340,8 +309,7 @@ def _gqa_varlen_fp8_ws_kernel(
     packed_store_tail = (
         f"tileops::fp8_fa3_o_smem_store_global_packed_64x128_tail<{positions_per_half}>"
     )
-    attention_scale = dim**-0.5 if sm_scale is None else sm_scale
-    scale = attention_scale * LOG2E
+    scale = sm_scale * LOG2E
     use_softcap = softcap > 0.0
     capped_softmax_scale = softcap * LOG2E
     has_left = window_size_left >= 0
@@ -359,7 +327,6 @@ def _gqa_varlen_fp8_ws_kernel(
             rope_layout,
             max_position,
             _FP8_DTYPE,
-            rope_dtype,
             positions=positions_per_half,
         )
         if fuse_rope
@@ -372,7 +339,7 @@ def _gqa_varlen_fp8_ws_kernel(
             tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
         },
         compile_flags=[
-            "-O3",
+            *CUDA_COMPILE_FLAGS,
             "-DENABLE_BF16",
             "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
             *csrc_include("fp8_gqa_helper.h"),
@@ -445,7 +412,7 @@ def _gqa_varlen_fp8_ws_kernel(
             T.barrier_wait(v_raw_full[slot], phase)
             T.call_extern(
                 "handle",
-                "tileops::fp8_transpose_v_128x224_fa3_src_ldsm_stsm_barrier_each_iter",
+                "tileops::fp8_transpose_v_128x224_fa3_src_ldsm_stsm<true>",
                 T.access_ptr(v_smem[slot, 0, 0], "rw"),
                 T.access_ptr(v_smem[slot, 0, 0], "w"),
             )
@@ -486,7 +453,7 @@ def _gqa_varlen_fp8_ws_kernel(
             """Fill meta for item *work*: KV head, offsets, lengths, first position, key tiles."""
             # Items are handed out from the last query tile of the call. Under the causal
             # mask a later tile scans more keys, so the longest go first and the closing
-            # wave carries the short ones; claiming in the opposite order costs 8%.
+            # wave carries the short ones.
             q_tiling.decode(
                 tile_cum[batch] - 1 - work // heads_kv, tile_cum, lo, hi, request, q_row
             )
@@ -518,6 +485,235 @@ def _gqa_varlen_fp8_ws_kernel(
                 last = T.ceildiv(meta[4], block_n)
             meta[6] = T.max(1, last - meta[8])
             meta[7] = request[0]
+
+        @T.macro
+        def consumer(
+            wg: int, q_shared, o_shared, ss_shared, ls_shared, acc_s, acc_o, sm, smp, ss, ssum, ls,
+            item_ring, item_full, item_empty, q_full, q_free, k_smem, k_full, k_empty, v_smem,
+            v_full, v_empty, meta, QD, KD, VD, RopeCos, RopeSin, Sinks, O, tx,
+        ):  # fmt: skip
+            """Compute warpgroup *wg*: positions ``wg * positions_per_half`` onward of each item.
+
+            The warpgroups take turns at the tensor cores: each waits on named barrier
+            ``1 + wg`` and arrives on the other's; ``3 + wg`` closes its query tile and epilogue.
+            """
+            lead = 128 * (wg + 1)  # the warpgroup's first thread, which issues its bulk stores
+            T.inc_max_nreg(240)
+            # The previous key tile's probabilities as the value contraction's
+            # operand registers.
+            p_regs = T.alloc_local([28], "uint32")
+            gi_k = T.alloc_var("int32", init=0)
+            gi_v = T.alloc_var("int32", init=0)
+            work = T.alloc_var("int32", init=0)
+            taken = T.alloc_var("int32", init=0)
+            T.barrier_wait(item_full[0], 0)
+            work = item_ring[0, 9]
+            if wg == 1:
+                T.named_barrier_arrive(1, compute_threads)  # let warpgroup 0 take the first turn
+            while work >= 0:
+                for i in T.unroll(9):
+                    meta[i] = item_ring[taken % 2, i]
+                T.barrier_arrive(item_empty[taken % 2])
+                head_kv = meta[0]
+                head_base = head_kv * groups
+                q_at = meta[1] + wg * positions_per_half
+                q_len = meta[3]
+                kv_len = meta[4]
+                pos_base = meta[5] + wg * positions_per_half
+                eff = meta[6]
+                first = meta[8]
+                causal_offset = kv_len - q_len
+                qk_descale = T.alloc_var(
+                    accum_dtype, init=QD[meta[7], head_kv] * KD[meta[7], head_kv]
+                )
+                value_descale = T.alloc_var(accum_dtype, init=VD[meta[7], head_kv])
+                T.barrier_wait(q_full[wg], taken % 2)
+                if fuse_rope:
+                    # Query token i of a request sits at position kv_len - q_len + i.
+                    rotate_query_tile(q_shared, RopeCos, RopeSin, causal_offset + pos_base)
+                    T.fence_proxy_async()
+                    T.sync_threads(barrier_id=3 + wg, arrive_count=128)
+                T.clear(acc_o)
+                T.clear(ls)
+                T.fill(sm, -T.infinity(accum_dtype))
+                for n_idx in T.Pipelined(eff, num_stages=0):
+                    # The turn to issue passes between the compute warpgroups, so one
+                    # folds its score tile while the other runs its contractions. Each
+                    # contraction retires before the next is issued and before the loop
+                    # repeats: a contraction still in flight across either makes ptxas
+                    # serialize every WGMMA of the kernel.
+                    T.sync_threads(1 + wg, compute_threads)
+                    if n_idx > 0:
+                        # The previous tile's values, from its probabilities, under the
+                        # factor its softmax left.
+                        T.call_extern(
+                            "handle",
+                            "tileops::fp8_fa3_raw_acc_rescale_keep_ptx_layout_64x128",
+                            acc_o.data,
+                            ss_shared.access_ptr("r"),
+                        )
+                        T.barrier_wait(v_full[gi_v % stages], (gi_v // stages) % 2)
+                        T.call_extern(
+                            "handle",
+                            "tileops::fp8_pv_from_p_regs_fa3_raw_64x128x224",
+                            p_regs.data,
+                            T.access_ptr(v_smem[gi_v % stages, 0, 0], "r"),
+                            acc_o.data,
+                        )
+                        T.wait_wgmma(0)
+                        T.warpgroup_fence_operand(acc_o, num_regs=64)
+                        T.barrier_arrive(v_empty[gi_v % stages])
+                        gi_v = gi_v + 1
+                    T.barrier_wait(k_full[gi_k % stages], (gi_k // stages) % 2)
+                    T.call_extern(
+                        "handle",
+                        "tileops::fp8_qk_cute_grouped_fa3_raw_64x224x128",
+                        q_shared.access_ptr("r"),
+                        T.access_ptr(k_smem[gi_k % stages, 0, 0], "r"),
+                        acc_s.data,
+                    )
+                    T.named_barrier_arrive(2 - wg, compute_threads)
+                    T.wait_wgmma(0)
+                    T.warpgroup_fence_operand(acc_s, num_regs=112)
+                    T.barrier_arrive(k_empty[gi_k % stages])
+                    if n_idx == eff - 1:
+                        T.barrier_arrive(q_free[wg])
+                    gi_k = gi_k + 1
+                    if use_softcap:
+                        T.call_extern(
+                            "handle",
+                            "tileops::fp8_apply_softcap_raw_acc_64x224",
+                            acc_s.data,
+                            qk_descale * sm_scale / softcap,
+                        )
+                    # Only a tile the request's end or a mask boundary cuts
+                    # needs the per-element pass; one wholly inside the
+                    # visible range keeps every score it computed.
+                    tile_end = (first + n_idx + 1) * block_n
+                    cut = tile_end > kv_len
+                    if is_causal:
+                        cut = cut | (tile_end > causal_offset + pos_base + 1)
+                    elif has_right:
+                        cut = cut | (tile_end > causal_offset + pos_base + window_size_right + 1)
+                    if has_left:
+                        cut = cut | (
+                            (first + n_idx) * block_n
+                            < causal_offset + pos_base + positions_per_half - window_size_left
+                        )
+                    if cut:
+                        for i, j in T.Parallel(half_m, block_n):
+                            kv_pos = (first + n_idx) * block_n + fa3_qk_acc_column(j)
+                            limit = causal_offset + pos_base + i % positions_per_half
+                            if is_causal:
+                                visible = (kv_pos < kv_len) & (kv_pos <= limit)
+                            elif has_right:
+                                visible = (kv_pos < kv_len) & (kv_pos <= limit + window_size_right)
+                            else:
+                                visible = kv_pos < kv_len
+                            if has_left:
+                                visible = visible & (kv_pos >= limit - window_size_left)
+                            acc_s[i, j] = T.if_then_else(
+                                visible, acc_s[i, j], -T.infinity(accum_dtype)
+                            )
+                    online_softmax(acc_s, sm, smp, ss, ssum, ls, qk_descale)
+                    T.copy(ss, ss_shared)
+                    T.call_extern(
+                        "handle",
+                        "tileops::fp8_acc_to_fa3_p_regs_64x224_no_cute",
+                        acc_s.data,
+                        p_regs.data,
+                    )
+                    T.warpgroup_fence_operand(p_regs, num_regs=28)
+                T.call_extern(
+                    "handle",
+                    "tileops::fp8_fa3_raw_acc_rescale_keep_ptx_layout_64x128",
+                    acc_o.data,
+                    ss_shared.access_ptr("r"),
+                )
+                T.barrier_wait(v_full[gi_v % stages], (gi_v // stages) % 2)
+                T.call_extern(
+                    "handle",
+                    "tileops::fp8_pv_from_p_regs_fa3_raw_64x128x224",
+                    p_regs.data,
+                    T.access_ptr(v_smem[gi_v % stages, 0, 0], "r"),
+                    acc_o.data,
+                )
+                T.wait_wgmma(0)
+                T.warpgroup_fence_operand(acc_o, num_regs=64)
+                T.barrier_arrive(v_empty[gi_v % stages])
+                gi_v = gi_v + 1
+                # The lane partials of the row sum combine once, here.
+                for i in T.Parallel(half_m):
+                    ls[i] = ls[i] + T.shfl_xor(ls[i], 1)
+                    ls[i] = ls[i] + T.shfl_xor(ls[i], 2)
+                if has_sinks:
+                    apply_sink(Sinks, head_base, sm, ls, ss, ss_shared, acc_o)
+                else:
+                    # Fully masked rows have a zero accumulator and denominator.
+                    for i in T.Parallel(half_m):
+                        ls[i] = T.if_then_else(ls[i] > 0, ls[i], 1)
+                T.copy(ls, ls_shared)
+                # The previous item's bulk store has to have read the tile first.
+                if tx == lead:
+                    T.call_extern("handle", "tileops::fp8_bulk_store_wait_read")
+                T.sync_threads(barrier_id=3 + wg, arrive_count=128)
+                T.call_extern(
+                    "handle",
+                    "tileops::fp8_fa3_raw_acc_finalize_store_smem_cute_64x128",
+                    acc_o.data,
+                    ls_shared.access_ptr("r"),
+                    value_descale,
+                    o_shared.access_ptr("w"),
+                )
+                T.fence_proxy_async()
+                T.sync_threads(barrier_id=3 + wg, arrive_count=128)
+                if pos_base + positions_per_half <= q_len:
+                    if tx == lead:
+                        # O as [dim, heads, tokens]; one box is one head's
+                        # positions over 64 columns.
+                        o_desc = T.create_tma_descriptor(
+                            o_tma_dtype,
+                            3,
+                            O.data,
+                            dim,
+                            heads,
+                            total_q,
+                            2,
+                            dim * 2,
+                            heads * dim * 2,
+                            dim // 2,
+                            1,
+                            positions_per_half,
+                            1,
+                            1,
+                            1,
+                            TMA_INTERLEAVE_NONE,
+                            TMA_SWIZZLE_128B,
+                            TMA_L2_PROMOTION_128B,
+                            TMA_OOB_FILL_NONE,
+                        )
+                        T.call_extern(
+                            "handle",
+                            packed_bulk_store,
+                            o_desc,
+                            o_shared.access_ptr("r"),
+                            head_base,
+                            q_at,
+                        )
+                elif pos_base < q_len:
+                    T.call_extern(
+                        "handle",
+                        packed_store_tail,
+                        o_shared.access_ptr("r"),
+                        T.address_of(O[q_at, head_base, 0]),
+                        heads * dim,
+                        q_len - pos_base,
+                    )
+                taken = taken + 1
+                T.barrier_wait(item_full[taken % 2], (taken // 2) % 2)
+                work = item_ring[taken % 2, 9]
+            if tx == lead:
+                T.call_extern("handle", "tileops::fp8_bulk_store_wait")
 
         @T.prim_func
         def main(
@@ -605,6 +801,10 @@ def _gqa_varlen_fp8_ws_kernel(
                 q_tiling.cumsum_offsets(CuQ, tile_cum)
                 T.sync_threads()
                 tx = T.get_thread_binding()
+                shared = (
+                    item_ring, item_full, item_empty, q_full, q_free, k_smem, k_full, k_empty,
+                    v_smem, v_full, v_empty, meta, QD, KD, VD, RopeCos, RopeSin, Sinks, O, tx,
+                )  # fmt: skip
                 if tx < 128:
                     T.dec_max_nreg(24)
                     issued = T.alloc_var("int32", init=0)
@@ -728,498 +928,62 @@ def _gqa_varlen_fp8_ws_kernel(
                             Claim[0] = 0
                             Claim[1] = 0
                 elif tx < 256:
-                    T.inc_max_nreg(240)
-                    # The previous key tile's probabilities as the value contraction's
-                    # operand registers.
-                    p_regs = T.alloc_local([28], "uint32")
-                    gi_k = T.alloc_var("int32", init=0)
-                    gi_v = T.alloc_var("int32", init=0)
-                    work = T.alloc_var("int32", init=0)
-                    taken = T.alloc_var("int32", init=0)
-                    T.barrier_wait(item_full[0], 0)
-                    work = item_ring[0, 9]
-                    while work >= 0:
-                        for i in T.unroll(9):
-                            meta[i] = item_ring[taken % 2, i]
-                        T.barrier_arrive(item_empty[taken % 2])
-                        head_kv = meta[0]
-                        head_base = head_kv * groups
-                        q_at = meta[1] + 0
-                        kv_start = meta[2]
-                        q_len = meta[3]
-                        kv_len = meta[4]
-                        pos_base = meta[5] + 0
-                        eff = meta[6]
-                        first = meta[8]
-                        causal_offset = kv_len - q_len
-                        qk_descale = T.alloc_var(
-                            accum_dtype, init=QD[meta[7], head_kv] * KD[meta[7], head_kv]
-                        )
-                        value_descale = T.alloc_var(accum_dtype, init=VD[meta[7], head_kv])
-                        T.barrier_wait(q_full[0], taken % 2)
-                        if fuse_rope:
-                            # Query token i of a request sits at position kv_len - q_len + i.
-                            rotate_query_tile(
-                                q_shared_1, RopeCos, RopeSin, causal_offset + pos_base
-                            )
-                            T.fence_proxy_async()
-                            T.sync_threads(barrier_id=3, arrive_count=128)
-                        T.clear(acc_o_1)
-                        T.clear(ls_1)
-                        T.fill(sm_1, -T.infinity(accum_dtype))
-                        for n_idx in T.Pipelined(eff, num_stages=0):
-                            # The turn to issue passes between the compute warpgroups, so one
-                            # folds its score tile while the other runs its contractions. Each
-                            # contraction retires before the next is issued and before the loop
-                            # repeats: a contraction still in flight across either makes ptxas
-                            # serialize every WGMMA of the kernel.
-                            T.sync_threads(1, compute_threads)
-                            if n_idx > 0:
-                                # The previous tile's values, from its probabilities, under the
-                                # factor its softmax left.
-                                T.call_extern(
-                                    "handle",
-                                    "tileops::fp8_fa3_raw_acc_rescale_keep_ptx_layout_64x128",
-                                    acc_o_1.data,
-                                    ss_shared_1.access_ptr("r"),
-                                )
-                                T.barrier_wait(v_full[gi_v % stages], (gi_v // stages) % 2)
-                                T.call_extern(
-                                    "handle",
-                                    "tileops::fp8_pv_from_p_regs_fa3_raw_64x128x224",
-                                    p_regs.data,
-                                    T.access_ptr(v_smem[gi_v % stages, 0, 0], "r"),
-                                    acc_o_1.data,
-                                )
-                                T.wait_wgmma(0)
-                                T.warpgroup_fence_operand(acc_o_1, num_regs=64)
-                                T.barrier_arrive(v_empty[gi_v % stages])
-                                gi_v = gi_v + 1
-                            T.barrier_wait(k_full[gi_k % stages], (gi_k // stages) % 2)
-                            T.call_extern(
-                                "handle",
-                                "tileops::fp8_qk_cute_grouped_fa3_raw_64x224x128",
-                                q_shared_1.access_ptr("r"),
-                                T.access_ptr(k_smem[gi_k % stages, 0, 0], "r"),
-                                acc_s_1.data,
-                            )
-                            T.named_barrier_arrive(2, compute_threads)
-                            T.wait_wgmma(0)
-                            T.warpgroup_fence_operand(acc_s_1, num_regs=112)
-                            T.barrier_arrive(k_empty[gi_k % stages])
-                            if n_idx == eff - 1:
-                                T.barrier_arrive(q_free[0])
-                            gi_k = gi_k + 1
-                            if use_softcap:
-                                T.call_extern(
-                                    "handle",
-                                    "tileops::fp8_apply_softcap_raw_acc_64x224",
-                                    acc_s_1.data,
-                                    qk_descale * attention_scale / softcap,
-                                )
-                            # Only a tile the request's end or a mask boundary cuts
-                            # needs the per-element pass; one wholly inside the
-                            # visible range keeps every score it computed.
-                            tile_end = (first + n_idx + 1) * block_n
-                            cut = tile_end > kv_len
-                            if is_causal:
-                                cut = cut | (tile_end > causal_offset + pos_base + 1)
-                            elif has_right:
-                                cut = cut | (
-                                    tile_end > causal_offset + pos_base + window_size_right + 1
-                                )
-                            if has_left:
-                                cut = cut | (
-                                    (first + n_idx) * block_n
-                                    < causal_offset
-                                    + pos_base
-                                    + positions_per_half
-                                    - window_size_left
-                                )
-                            if cut:
-                                for i, j in T.Parallel(half_m, block_n):
-                                    kv_pos = (first + n_idx) * block_n + fa3_qk_acc_column(j)
-                                    limit = causal_offset + pos_base + i % positions_per_half
-                                    if is_causal:
-                                        visible = (kv_pos < kv_len) & (kv_pos <= limit)
-                                    elif has_right:
-                                        visible = (kv_pos < kv_len) & (
-                                            kv_pos <= limit + window_size_right
-                                        )
-                                    else:
-                                        visible = kv_pos < kv_len
-                                    if has_left:
-                                        visible = visible & (kv_pos >= limit - window_size_left)
-                                    acc_s_1[i, j] = T.if_then_else(
-                                        visible, acc_s_1[i, j], -T.infinity(accum_dtype)
-                                    )
-                            online_softmax(acc_s_1, sm_1, smp_1, ss_1, ssum_1, ls_1, qk_descale)
-                            T.copy(ss_1, ss_shared_1)
-                            T.call_extern(
-                                "handle",
-                                "tileops::fp8_acc_to_fa3_p_regs_64x224_no_cute",
-                                acc_s_1.data,
-                                p_regs.data,
-                            )
-                            T.warpgroup_fence_operand(p_regs, num_regs=28)
-                        T.call_extern(
-                            "handle",
-                            "tileops::fp8_fa3_raw_acc_rescale_keep_ptx_layout_64x128",
-                            acc_o_1.data,
-                            ss_shared_1.access_ptr("r"),
-                        )
-                        T.barrier_wait(v_full[gi_v % stages], (gi_v // stages) % 2)
-                        T.call_extern(
-                            "handle",
-                            "tileops::fp8_pv_from_p_regs_fa3_raw_64x128x224",
-                            p_regs.data,
-                            T.access_ptr(v_smem[gi_v % stages, 0, 0], "r"),
-                            acc_o_1.data,
-                        )
-                        T.wait_wgmma(0)
-                        T.warpgroup_fence_operand(acc_o_1, num_regs=64)
-                        T.barrier_arrive(v_empty[gi_v % stages])
-                        gi_v = gi_v + 1
-                        # The lane partials of the row sum combine once, here.
-                        for i in T.Parallel(half_m):
-                            ls_1[i] = ls_1[i] + T.shfl_xor(ls_1[i], 1)
-                            ls_1[i] = ls_1[i] + T.shfl_xor(ls_1[i], 2)
-                        if has_sinks:
-                            apply_sink(Sinks, head_base, sm_1, ls_1, ss_1, ss_shared_1, acc_o_1)
-                        else:
-                            # Fully masked rows have a zero accumulator and denominator.
-                            for i in T.Parallel(half_m):
-                                ls_1[i] = T.if_then_else(ls_1[i] > 0, ls_1[i], 1)
-                        T.copy(ls_1, ls_shared_1)
-                        # The previous item's bulk store has to have read the tile first.
-                        if tx == 128:
-                            T.call_extern("handle", "tileops::fp8_bulk_store_wait_read")
-                        T.sync_threads(barrier_id=3, arrive_count=128)
-                        T.call_extern(
-                            "handle",
-                            "tileops::fp8_fa3_raw_acc_finalize_store_smem_cute_64x128",
-                            acc_o_1.data,
-                            ls_shared_1.access_ptr("r"),
-                            4,
-                            value_descale,
-                            o_shared_1.access_ptr("w"),
-                        )
-                        T.fence_proxy_async()
-                        T.sync_threads(barrier_id=3, arrive_count=128)
-                        if pos_base + positions_per_half <= q_len:
-                            if tx == 128:
-                                # O as [dim, heads, tokens]; one box is one head's
-                                # positions over 64 columns.
-                                o_desc = T.create_tma_descriptor(
-                                    o_tma_dtype,
-                                    3,
-                                    O.data,
-                                    dim,
-                                    heads,
-                                    total_q,
-                                    2,
-                                    dim * 2,
-                                    heads * dim * 2,
-                                    dim // 2,
-                                    1,
-                                    positions_per_half,
-                                    1,
-                                    1,
-                                    1,
-                                    TMA_INTERLEAVE_NONE,
-                                    TMA_SWIZZLE_128B,
-                                    TMA_L2_PROMOTION_128B,
-                                    TMA_OOB_FILL_NONE,
-                                )
-                                T.call_extern(
-                                    "handle",
-                                    packed_bulk_store,
-                                    o_desc,
-                                    o_shared_1.access_ptr("r"),
-                                    head_base,
-                                    q_at,
-                                )
-                        elif pos_base < q_len:
-                            T.call_extern(
-                                "handle",
-                                packed_store_tail,
-                                o_shared_1.access_ptr("r"),
-                                T.address_of(O[q_at, head_base, 0]),
-                                heads * dim,
-                                q_len - pos_base,
-                            )
-                        taken = taken + 1
-                        T.barrier_wait(item_full[taken % 2], (taken // 2) % 2)
-                        work = item_ring[taken % 2, 9]
-                    if tx == 128:
-                        T.call_extern("handle", "tileops::fp8_bulk_store_wait")
+                    consumer(
+                        0, q_shared_1, o_shared_1, ss_shared_1, ls_shared_1, acc_s_1, acc_o_1,
+                        sm_1, smp_1, ss_1, ssum_1, ls_1, *shared,
+                    )  # fmt: skip
                 else:
-                    T.inc_max_nreg(240)
-                    # The previous key tile's probabilities as the value contraction's
-                    # operand registers.
-                    p_regs = T.alloc_local([28], "uint32")
-                    gi_k = T.alloc_var("int32", init=0)
-                    gi_v = T.alloc_var("int32", init=0)
-                    work = T.alloc_var("int32", init=0)
-                    taken = T.alloc_var("int32", init=0)
-                    T.barrier_wait(item_full[0], 0)
-                    work = item_ring[0, 9]
-                    T.named_barrier_arrive(
-                        1, compute_threads
-                    )  # let warpgroup 0 take the first turn
-                    while work >= 0:
-                        for i in T.unroll(9):
-                            meta[i] = item_ring[taken % 2, i]
-                        T.barrier_arrive(item_empty[taken % 2])
-                        head_kv = meta[0]
-                        head_base = head_kv * groups
-                        q_at = meta[1] + positions_per_half
-                        kv_start = meta[2]
-                        q_len = meta[3]
-                        kv_len = meta[4]
-                        pos_base = meta[5] + positions_per_half
-                        eff = meta[6]
-                        first = meta[8]
-                        causal_offset = kv_len - q_len
-                        qk_descale = T.alloc_var(
-                            accum_dtype, init=QD[meta[7], head_kv] * KD[meta[7], head_kv]
-                        )
-                        value_descale = T.alloc_var(accum_dtype, init=VD[meta[7], head_kv])
-                        T.barrier_wait(q_full[1], taken % 2)
-                        if fuse_rope:
-                            # Query token i of a request sits at position kv_len - q_len + i.
-                            rotate_query_tile(
-                                q_shared_2, RopeCos, RopeSin, causal_offset + pos_base
-                            )
-                            T.fence_proxy_async()
-                            T.sync_threads(barrier_id=4, arrive_count=128)
-                        T.clear(acc_o_2)
-                        T.clear(ls_2)
-                        T.fill(sm_2, -T.infinity(accum_dtype))
-                        for n_idx in T.Pipelined(eff, num_stages=0):
-                            # The turn to issue passes between the compute warpgroups, so one
-                            # folds its score tile while the other runs its contractions. Each
-                            # contraction retires before the next is issued and before the loop
-                            # repeats: a contraction still in flight across either makes ptxas
-                            # serialize every WGMMA of the kernel.
-                            T.sync_threads(2, compute_threads)
-                            if n_idx > 0:
-                                # The previous tile's values, from its probabilities, under the
-                                # factor its softmax left.
-                                T.call_extern(
-                                    "handle",
-                                    "tileops::fp8_fa3_raw_acc_rescale_keep_ptx_layout_64x128",
-                                    acc_o_2.data,
-                                    ss_shared_2.access_ptr("r"),
-                                )
-                                T.barrier_wait(v_full[gi_v % stages], (gi_v // stages) % 2)
-                                T.call_extern(
-                                    "handle",
-                                    "tileops::fp8_pv_from_p_regs_fa3_raw_64x128x224",
-                                    p_regs.data,
-                                    T.access_ptr(v_smem[gi_v % stages, 0, 0], "r"),
-                                    acc_o_2.data,
-                                )
-                                T.wait_wgmma(0)
-                                T.warpgroup_fence_operand(acc_o_2, num_regs=64)
-                                T.barrier_arrive(v_empty[gi_v % stages])
-                                gi_v = gi_v + 1
-                            T.barrier_wait(k_full[gi_k % stages], (gi_k // stages) % 2)
-                            T.call_extern(
-                                "handle",
-                                "tileops::fp8_qk_cute_grouped_fa3_raw_64x224x128",
-                                q_shared_2.access_ptr("r"),
-                                T.access_ptr(k_smem[gi_k % stages, 0, 0], "r"),
-                                acc_s_2.data,
-                            )
-                            T.named_barrier_arrive(1, compute_threads)
-                            T.wait_wgmma(0)
-                            T.warpgroup_fence_operand(acc_s_2, num_regs=112)
-                            T.barrier_arrive(k_empty[gi_k % stages])
-                            if n_idx == eff - 1:
-                                T.barrier_arrive(q_free[1])
-                            gi_k = gi_k + 1
-                            if use_softcap:
-                                T.call_extern(
-                                    "handle",
-                                    "tileops::fp8_apply_softcap_raw_acc_64x224",
-                                    acc_s_2.data,
-                                    qk_descale * attention_scale / softcap,
-                                )
-                            # Only a tile the request's end or a mask boundary cuts
-                            # needs the per-element pass; one wholly inside the
-                            # visible range keeps every score it computed.
-                            tile_end = (first + n_idx + 1) * block_n
-                            cut = tile_end > kv_len
-                            if is_causal:
-                                cut = cut | (tile_end > causal_offset + pos_base + 1)
-                            elif has_right:
-                                cut = cut | (
-                                    tile_end > causal_offset + pos_base + window_size_right + 1
-                                )
-                            if has_left:
-                                cut = cut | (
-                                    (first + n_idx) * block_n
-                                    < causal_offset
-                                    + pos_base
-                                    + positions_per_half
-                                    - window_size_left
-                                )
-                            if cut:
-                                for i, j in T.Parallel(half_m, block_n):
-                                    kv_pos = (first + n_idx) * block_n + fa3_qk_acc_column(j)
-                                    limit = causal_offset + pos_base + i % positions_per_half
-                                    if is_causal:
-                                        visible = (kv_pos < kv_len) & (kv_pos <= limit)
-                                    elif has_right:
-                                        visible = (kv_pos < kv_len) & (
-                                            kv_pos <= limit + window_size_right
-                                        )
-                                    else:
-                                        visible = kv_pos < kv_len
-                                    if has_left:
-                                        visible = visible & (kv_pos >= limit - window_size_left)
-                                    acc_s_2[i, j] = T.if_then_else(
-                                        visible, acc_s_2[i, j], -T.infinity(accum_dtype)
-                                    )
-                            online_softmax(acc_s_2, sm_2, smp_2, ss_2, ssum_2, ls_2, qk_descale)
-                            T.copy(ss_2, ss_shared_2)
-                            T.call_extern(
-                                "handle",
-                                "tileops::fp8_acc_to_fa3_p_regs_64x224_no_cute",
-                                acc_s_2.data,
-                                p_regs.data,
-                            )
-                            T.warpgroup_fence_operand(p_regs, num_regs=28)
-                        T.call_extern(
-                            "handle",
-                            "tileops::fp8_fa3_raw_acc_rescale_keep_ptx_layout_64x128",
-                            acc_o_2.data,
-                            ss_shared_2.access_ptr("r"),
-                        )
-                        T.barrier_wait(v_full[gi_v % stages], (gi_v // stages) % 2)
-                        T.call_extern(
-                            "handle",
-                            "tileops::fp8_pv_from_p_regs_fa3_raw_64x128x224",
-                            p_regs.data,
-                            T.access_ptr(v_smem[gi_v % stages, 0, 0], "r"),
-                            acc_o_2.data,
-                        )
-                        T.wait_wgmma(0)
-                        T.warpgroup_fence_operand(acc_o_2, num_regs=64)
-                        T.barrier_arrive(v_empty[gi_v % stages])
-                        gi_v = gi_v + 1
-                        # The lane partials of the row sum combine once, here.
-                        for i in T.Parallel(half_m):
-                            ls_2[i] = ls_2[i] + T.shfl_xor(ls_2[i], 1)
-                            ls_2[i] = ls_2[i] + T.shfl_xor(ls_2[i], 2)
-                        if has_sinks:
-                            apply_sink(Sinks, head_base, sm_2, ls_2, ss_2, ss_shared_2, acc_o_2)
-                        else:
-                            # Fully masked rows have a zero accumulator and denominator.
-                            for i in T.Parallel(half_m):
-                                ls_2[i] = T.if_then_else(ls_2[i] > 0, ls_2[i], 1)
-                        T.copy(ls_2, ls_shared_2)
-                        # The previous item's bulk store has to have read the tile first.
-                        if tx == 256:
-                            T.call_extern("handle", "tileops::fp8_bulk_store_wait_read")
-                        T.sync_threads(barrier_id=4, arrive_count=128)
-                        T.call_extern(
-                            "handle",
-                            "tileops::fp8_fa3_raw_acc_finalize_store_smem_cute_64x128",
-                            acc_o_2.data,
-                            ls_shared_2.access_ptr("r"),
-                            4,
-                            value_descale,
-                            o_shared_2.access_ptr("w"),
-                        )
-                        T.fence_proxy_async()
-                        T.sync_threads(barrier_id=4, arrive_count=128)
-                        if pos_base + positions_per_half <= q_len:
-                            if tx == 256:
-                                # O as [dim, heads, tokens]; one box is one head's
-                                # positions over 64 columns.
-                                o_desc = T.create_tma_descriptor(
-                                    o_tma_dtype,
-                                    3,
-                                    O.data,
-                                    dim,
-                                    heads,
-                                    total_q,
-                                    2,
-                                    dim * 2,
-                                    heads * dim * 2,
-                                    dim // 2,
-                                    1,
-                                    positions_per_half,
-                                    1,
-                                    1,
-                                    1,
-                                    TMA_INTERLEAVE_NONE,
-                                    TMA_SWIZZLE_128B,
-                                    TMA_L2_PROMOTION_128B,
-                                    TMA_OOB_FILL_NONE,
-                                )
-                                T.call_extern(
-                                    "handle",
-                                    packed_bulk_store,
-                                    o_desc,
-                                    o_shared_2.access_ptr("r"),
-                                    head_base,
-                                    q_at,
-                                )
-                        elif pos_base < q_len:
-                            T.call_extern(
-                                "handle",
-                                packed_store_tail,
-                                o_shared_2.access_ptr("r"),
-                                T.address_of(O[q_at, head_base, 0]),
-                                heads * dim,
-                                q_len - pos_base,
-                            )
-                        taken = taken + 1
-                        T.barrier_wait(item_full[taken % 2], (taken // 2) % 2)
-                        work = item_ring[taken % 2, 9]
-                    if tx == 256:
-                        T.call_extern("handle", "tileops::fp8_bulk_store_wait")
+                    consumer(
+                        1, q_shared_2, o_shared_2, ss_shared_2, ls_shared_2, acc_s_2, acc_o_2,
+                        sm_2, smp_2, ss_2, ssum_2, ls_2, *shared,
+                    )  # fmt: skip
 
         return main
 
     return func
 
 
-def fp8_prefill_shared_bytes(config: dict, *, batch: int, dim: int, element: int) -> int:
+def fp8_prefill_shared_bytes(
+    config: dict, *, batch: int, dim: int, element: int, qk_element: int = 1
+) -> int:
     """Shared memory a *config* allocates, buffer by buffer as TileLang does."""
     block_m, block_n = config["block_m"], config["block_n"]
     stages = config["num_stages"]
     tile = block_n * dim
     buffers = [
-        block_m * dim,
-        stages * tile,
+        block_m * dim * qk_element,
+        stages * tile * qk_element,
         stages * tile,
         block_m * block_n,
         block_m * dim * element,
         4 * (batch + 1),
     ]
-    # TileLang stages the score tile through shared memory when a warpgroup
-    # holds fewer than one WGMMA atom's rows.
-    if block_m // (config["threads"] // WARPGROUP_THREADS) < WGMMA_ROWS:
+    if stages_score_tile(block_m, config["threads"]):
         buffers += [4 * config["threads"], 4 * config["threads"]]
-    align = SHARED_BUFFER_ALIGN_BYTES
-    return sum(-(-b // align) * align for b in buffers)
+    return _aligned_bytes(buffers)
 
 
 class GQAVarlenFP8FwdKernel(VarlenKernel):
     """Packed prefill over FP8 Q/K/V with one dequantization scale per request and KV head."""
 
-    supported_archs: list[int] = [90]
+    supported_archs: list[int] = [89, 90]
     # A call without rotation still hands the program its tables, so the placeholder's
     # innermost extent is a whole vectorized access, which the packed ABI requires.
     _ROPE_PLACEHOLDER_WIDTH = VECTOR_ACCESS_BYTES // 2
 
     @classmethod
-    def refusal(cls, call: AttentionCall) -> Optional[str]:
+    def refusal(cls, call: AttentionCall) -> str | None:
         """Why this class does not serve *call*, or ``None`` when it does."""
+        reason = cls._contract_refusal(call)
+        if reason is not None or not call.smem_budget:
+            return reason
+        if cls._fitting_config(call.batch, call.dim, call.dtype.itemsize, call.smem_budget) is None:
+            return f"no tile fits the {call.smem_budget} bytes of shared memory a block may take"
+        return None
+
+    @staticmethod
+    def _contract_refusal(call: AttentionCall) -> str | None:
+        """The inputs the FP8 programs take, apart from the resources one needs."""
         if not call.is_fp8:
             return "requires float8_e4m3fn q, k and v"
         if call.dim != 128:
@@ -1228,54 +992,32 @@ class GQAVarlenFP8FwdKernel(VarlenKernel):
             return "does not serve fused RoPE"
         return None
 
-    def __init__(
-        self,
-        batch: int,
-        heads: int,
-        heads_kv: int,
-        dim: int,
-        is_causal: bool,
-        dtype: torch.dtype,
-        sm_scale: Optional[float] = None,
-        softcap: float = 0.0,
-        window_size_left: int = -1,
-        window_size_right: int = -1,
-        accum_dtype: torch.dtype = torch.float32,
-        config: Optional[dict] = None,
-        *,
-        fuse_rope: bool = False,
-        max_position: int = 1,
-        rotary_dim: int = 0,
-        rope_layout: str = "neox",
-        device_index: Optional[int] = None,
-        has_sinks: bool = False,
-    ) -> None:
-        if dtype not in ATTENTION_DTYPES:
-            raise ValueError("FP8 packed-varlen GQA outputs float16 or bfloat16")
-        self._rope_placeholder: Optional[torch.Tensor] = None
-        super().__init__(
-            batch,
-            heads,
-            heads_kv,
-            dim,
-            is_causal,
-            dtype,
-            sm_scale=sm_scale,
-            softcap=softcap,
-            window_size_left=window_size_left,
-            window_size_right=window_size_right,
-            accum_dtype=accum_dtype,
-            config=config,
-            fuse_rope=fuse_rope,
-            max_position=max_position,
-            rotary_dim=rotary_dim,
-            rope_layout=rope_layout,
-            device_index=device_index,
-            has_sinks=has_sinks,
+    @staticmethod
+    def _fitting_config(batch: int, dim: int, element: int, budget: int) -> dict | None:
+        """The first default candidate *budget* bytes of shared memory hold, or ``None``."""
+        wide = {"block_m": 128, "block_n": 128, "num_stages": 2, "threads": 256}
+        candidates = [
+            wide,
+            {**wide, "num_stages": 1},
+            {"block_m": 64, "block_n": 64, "num_stages": 1, "threads": 128},
+        ]
+        return next(
+            (
+                c
+                for c in candidates
+                if fp8_prefill_shared_bytes(c, batch=batch, dim=dim, element=element) <= budget
+            ),
+            None,
         )
 
+    def __init__(self, *args, dtype: torch.dtype, **kwargs) -> None:
+        if dtype not in ATTENTION_DTYPES:
+            raise ValueError("FP8 packed-varlen GQA outputs float16 or bfloat16")
+        self._rope_placeholder: torch.Tensor | None = None
+        super().__init__(*args, dtype=dtype, **kwargs)
+
     def _rope_tables(
-        self, rope_cos: Optional[torch.Tensor], rope_sin: Optional[torch.Tensor]
+        self, rope_cos: torch.Tensor | None, rope_sin: torch.Tensor | None
     ) -> "tuple[torch.Tensor, torch.Tensor]":
         """The rotation tables, or the placeholder a call without rotation passes instead."""
         if self.key_rope is None:
@@ -1357,19 +1099,11 @@ class GQAVarlenFP8FwdKernel(VarlenKernel):
     @property
     def default_config(self) -> dict:
         """The first candidate the device's shared memory holds."""
-        wide = {"block_m": 128, "block_n": 128, "num_stages": 2, "threads": 256}
-        candidates = [
-            wide,
-            {**wide, "num_stages": 1},
-            {"block_m": 64, "block_n": 64, "num_stages": 1, "threads": 128},
-        ]
-        cap = get_shared_memory_optin(self.device_index)
-        return next((c for c in candidates if self._shared_bytes(c) <= cap), candidates[-1])
-
-    def _shared_bytes(self, config: dict) -> int:
-        return fp8_prefill_shared_bytes(
-            config, batch=self.batch, dim=self.dim, element=self.dtype.itemsize
-        )
+        cap = self.build_target.smem_budget
+        config = self._fitting_config(self.batch, self.dim, self.dtype.itemsize, cap)
+        if config is None:
+            raise ValueError(f"no tile fits the {cap} bytes of shared memory a block may take")
+        return config
 
     @property
     def autotune_configs(self) -> list[dict]:
@@ -1385,12 +1119,12 @@ class GQAVarlenFP8FwdKernel(VarlenKernel):
         v: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
         cu_seqlens_kv: torch.Tensor,
-        q_scale: Optional[torch.Tensor] = None,
-        k_scale: Optional[torch.Tensor] = None,
-        v_scale: Optional[torch.Tensor] = None,
-        rope_cos: Optional[torch.Tensor] = None,
-        rope_sin: Optional[torch.Tensor] = None,
-        sinks: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+        rope_cos: torch.Tensor | None = None,
+        rope_sin: torch.Tensor | None = None,
+        sinks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if q_scale is None or k_scale is None or v_scale is None:
             raise ValueError(f"{type(self).__name__} requires q_scale, k_scale and v_scale")
@@ -1421,11 +1155,13 @@ class GQAVarlenFP8WSFwdKernel(GQAVarlenFP8FwdKernel):
     values through mbarriers; the compute warpgroups take 64 rows each.
     """
 
+    supported_archs: list[int] = [90]
+
     preferred_over: ClassVar[frozenset[str]] = frozenset({"gqa_varlen_fp8"})
     # Which CTA runs which item follows the order the claims land in, which is not fixed
     # between launches. An item owns a disjoint slice of the output, so the result does
     # not depend on that order.
-    _claim: Optional[torch.Tensor] = None
+    _claim: torch.Tensor | None = None
     # The work counter the persistent CTAs claim from: the next item to hand out, and the
     # CTAs that have stopped claiming. The program leaves both at zero, so one buffer serves
     # every launch and no call has to clear it.
@@ -1436,9 +1172,9 @@ class GQAVarlenFP8WSFwdKernel(GQAVarlenFP8FwdKernel):
     _MAX_BATCH: int = 2048
 
     @classmethod
-    def refusal(cls, call: AttentionCall) -> Optional[str]:
+    def refusal(cls, call: AttentionCall) -> str | None:
         """Why this class does not serve *call*, or ``None`` when it does."""
-        base = GQAVarlenFP8FwdKernel.refusal(call)
+        base = GQAVarlenFP8FwdKernel._contract_refusal(call)
         # The rotation is this class's alone: it rotates the query tile inside the CTA
         # that owns it, which the pipelined program has no warpgroup split to do.
         if base is not None and base != "does not serve fused RoPE":
@@ -1474,7 +1210,7 @@ class GQAVarlenFP8WSFwdKernel(GQAVarlenFP8FwdKernel):
             self.rope_layout,
             self.rope_table_dtype_str,
             self._ROPE_PLACEHOLDER_WIDTH,
-            get_sm_count(self.device_index),
+            self.build_target.sm_count,
             self._CLAIM_SLOTS,
             self.has_sinks,
         )
@@ -1484,7 +1220,7 @@ class GQAVarlenFP8WSFwdKernel(GQAVarlenFP8FwdKernel):
         return {}
 
     @property
-    def autotune_configs(self) -> Optional[list[dict]]:
+    def autotune_configs(self) -> list[dict] | None:
         return None
 
     def forward(
@@ -1494,12 +1230,12 @@ class GQAVarlenFP8WSFwdKernel(GQAVarlenFP8FwdKernel):
         v: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
         cu_seqlens_kv: torch.Tensor,
-        q_scale: Optional[torch.Tensor] = None,
-        k_scale: Optional[torch.Tensor] = None,
-        v_scale: Optional[torch.Tensor] = None,
-        rope_cos: Optional[torch.Tensor] = None,
-        rope_sin: Optional[torch.Tensor] = None,
-        sinks: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+        rope_cos: torch.Tensor | None = None,
+        rope_sin: torch.Tensor | None = None,
+        sinks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if q_scale is None or k_scale is None or v_scale is None:
             raise ValueError(f"{type(self).__name__} requires q_scale, k_scale and v_scale")

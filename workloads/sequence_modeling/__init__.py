@@ -7,17 +7,29 @@ from workloads.sequence_modeling.engram import (
     engram_gate_conv_fwd_torch,
     ref_engram_gate_conv_bwd,
 )
-from workloads.sequence_modeling.mhc import MHCPostWorkload, MHCPreWorkload, mhc_pre_ref
+from workloads.sequence_modeling.hyper_connection import (
+    HyperConnectionHeadWorkload,
+    HyperConnectionPostWorkload,
+    HyperConnectionPreCall,
+    hc_head,
+    hc_post,
+    hc_pre,
+)
+from workloads.sequence_modeling.ngram_hash import ngram_hash
 
 __all__ = [
     "CONV_KERNEL_SIZE",
     "EngramDecodeWorkload",
     "EngramGateConvBwdWorkload",
     "EngramGateConvFwdWorkload",
-    "MHCPostWorkload",
-    "MHCPreWorkload",
+    "HyperConnectionHeadWorkload",
+    "HyperConnectionPostWorkload",
+    "HyperConnectionPreCall",
     "engram_decode_step_torch",
     "engram_gate_conv_fwd_torch",
-    "mhc_pre_ref",
+    "hc_head",
+    "hc_post",
+    "hc_pre",
+    "ngram_hash",
     "ref_engram_gate_conv_bwd",
 ]

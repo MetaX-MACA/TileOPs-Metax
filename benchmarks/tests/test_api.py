@@ -13,12 +13,14 @@ import torch
 from torch._inductor.exc import InductorError, TritonMissing
 
 from benchmarks import api as bench
-from benchmarks import timing
+from benchmarks import conftest, timing
 from benchmarks._cases import Entry, default_binder
 from benchmarks.baselines import compiled_reference, private_inputs
+from benchmarks.outcomes import UNAVAILABLE_PROPERTY
 from benchmarks.report import BenchmarkReport
 from benchmarks.timing import Sample
 from tileops._utils.device import current_accelerator_type
+from tileops.backend import OpNotAvailableError
 from tileops.backend import _registry as registry
 from tileops.manifest import load_adts, load_manifest
 from tileops.manifest._signature import parse_signature
@@ -88,8 +90,12 @@ def timed(monkeypatch):
     """Record every bench_kernel call, answered with one sample, and every recorded row."""
     runs, rows = [], []
 
-    def bench_kernel(run, args=(), reset=None, count_copies=False, **_):
-        runs.append(SimpleNamespace(run=run, args=args, reset=reset, count_copies=count_copies))
+    def bench_kernel(run, args=(), reset=None, count_copies=False, start_block=None, **_):
+        runs.append(
+            SimpleNamespace(
+                run=run, args=args, reset=reset, count_copies=count_copies, start_block=start_block
+            )
+        )
         return [Sample(device_busy_ms=1.0, latency_ms=1.0, n_kernels=1)]
 
     monkeypatch.setattr(bench, "bench_kernel", bench_kernel)
@@ -154,6 +160,42 @@ def test_the_reference_row_is_unverified_where_the_reference_could_not_run(timed
     case = _case(reference=_out_of_memory)
     bench.Runner(SumFwdOp(), case).compare({"torch": case.reference})
     assert all(row["ratio"] is False and "memory" in row["unverified"] for row in timed.rows)
+
+
+@pytest.mark.parametrize("serves", [False, True])
+def test_a_row_whose_reference_fails_is_unavailable_only_where_the_op_says_so(timed, serves):
+    def unserved(self, x):
+        raise OpNotAvailableError("no implementation serves this call")
+
+    def reference(x):
+        raise RuntimeError("the reference has no such mode")
+
+    op = SumFwdOp() if serves else type("SumFwdOp", (SumFwdOp,), {"__call__": unserved})()
+    with pytest.raises(RuntimeError if serves else OpNotAvailableError):
+        bench.Runner(op, _case(reference=reference)).compare({})
+
+
+@pytest.mark.parametrize("error", [OpNotAvailableError("unserved"), ValueError("bad")])
+def test_only_an_unserved_row_is_reported_as_an_unavailable_skip(error):
+    item = SimpleNamespace(
+        path="b.py",
+        location=("b.py", 4, "t"),
+        user_properties=[],
+        callspec=SimpleNamespace(params={"case": _case()}),
+    )
+    report = SimpleNamespace(outcome="failed", longrepr=None)
+    hook = conftest.pytest_runtest_makereport(
+        item, SimpleNamespace(when="call", excinfo=SimpleNamespace(value=error))
+    )
+    next(hook)
+    with pytest.raises(StopIteration):
+        hook.send(SimpleNamespace(get_result=lambda: report))
+    unserved = isinstance(error, OpNotAvailableError)
+    assert report.outcome == ("skipped" if unserved else "failed")
+    expected = [(UNAVAILABLE_PROPERTY, "unserved"), ("ops", "SumFwdOp")] if unserved else []
+    assert item.user_properties == expected
+    if unserved:
+        assert report.longrepr == ("b.py", 5, "unavailable: unserved")
 
 
 def test_a_callable_that_overwrites_the_shared_inputs_fails_before_timing(timed):
@@ -254,6 +296,96 @@ def test_a_single_implementation_is_reported_as_baseline(timed):
     assert [row["tag"] for row in timed.rows] == ["tileops", "baseline"]
 
 
+def _passes_reporting(monkeypatch, passes: list) -> None:
+    """Have every implementation's two passes report *passes*' ``block_samples`` in turn,
+    ``None`` for a pass whose blocks held every sample, and the preparation that implies."""
+    metas = iter(
+        {
+            "timing": "cupti",
+            "l2_flush": timing._L2_FLUSH_CUDA_DRAINED if held == 0 else timing._L2_FLUSH_CUDA,
+        }
+        | ({} if held is None else {"block_samples": held})
+        for held in passes * 2
+    )
+    monkeypatch.setattr(bench, "_capture_bench_meta", lambda: next(metas))
+
+
+@pytest.mark.parametrize("passes, pooled", [([3, None], 3), ([None, 3], 3), ([0, 0], 0)])
+def test_a_row_keeps_the_smallest_block_either_pass_fell_back_to(
+    timed, monkeypatch, passes, pooled
+):
+    """A pass whose samples had to be queued in smaller blocks says so in the pooled row,
+    whichever pass it was."""
+    _passes_reporting(monkeypatch, passes)
+    results = bench.Runner(SumFwdOp(), _case()).compare({})
+    assert results["tileops"]["block_samples"] == pooled
+
+
+@pytest.mark.parametrize("retries, pooled", [([2, None], 2), ([2, 1], 3)])
+def test_a_row_counts_the_retries_of_both_passes(timed, monkeypatch, retries, pooled):
+    """Each pass reports the attribution retries of its own reading; the pooled row sums them."""
+    metas = iter(
+        {"timing": "cupti"} | ({} if n is None else {"attribution_retries": n}) for n in retries * 2
+    )
+    monkeypatch.setattr(bench, "_capture_bench_meta", lambda: next(metas))
+    results = bench.Runner(SumFwdOp(), _case()).compare({})
+    assert results["tileops"]["attribution_retries"] == pooled
+
+
+@pytest.mark.parametrize("block", [3, None, 0])
+def test_the_second_pass_starts_from_the_block_the_first_settled_on(timed, monkeypatch, block):
+    """The same call on the same inputs fills the launch queue at the same sample, so the
+    second pass does not find the block size again through a block that times out."""
+    _passes_reporting(monkeypatch, [block, block])
+    bench.Runner(SumFwdOp(), _case()).compare({})
+    assert [run.start_block for run in timed.runs] == [None, block]
+
+
+@pytest.mark.parametrize("reference_ms, passes", [(10.0, 1), (9.0, 2)])
+def test_the_nightly_sweep_times_a_reference_ten_times_the_fastest_baseline_once(
+    timed, monkeypatch, reference_ms, passes
+):
+    """A baseline reads 1 ms: a 10 ms reference gets one pass, a 9 ms one two."""
+    monkeypatch.setattr(bench, "_nightly", True)
+    case = _case()
+    stub = bench.bench_kernel
+
+    def bench_kernel(run, **kwargs):
+        stub(run, **kwargs)
+        busy = reference_ms if run is case.reference else 1.0
+        return [Sample(device_busy_ms=busy, latency_ms=busy, n_kernels=1)]
+
+    monkeypatch.setattr(bench, "bench_kernel", bench_kernel)
+    bench.Runner(SumFwdOp(), case).compare({"torch-ref": case.reference, "fast": lambda x: x * 2})
+    assert sum(run.run is case.reference for run in timed.runs) == passes
+    assert {row["tag"] for row in timed.rows} == {"tileops", "torch-ref", "fast"}
+
+
+def test_samples_no_blocker_held_are_not_pooled_with_held_ones(timed, monkeypatch):
+    """A pass without the blocker drained its samples, which is another method than a held
+    pass's."""
+    _passes_reporting(monkeypatch, [None, 0])
+    held, drained = timing._L2_FLUSH_CUDA, timing._L2_FLUSH_CUDA_DRAINED
+    with pytest.raises(RuntimeError, match=f"cupti {held} then cupti {drained}"):
+        bench.Runner(SumFwdOp(), _case()).compare({})
+
+
+def test_a_row_reports_the_mean_sm_clock_of_both_passes(timed, monkeypatch):
+    """nvbench summarizes a cold measurement's clock as the mean over its samples; a sample
+    whose clock was not read takes no part."""
+    clocks = iter([[1.4e9, None], [1.6e9]])
+
+    def bench_kernel(*_, **__):
+        return [
+            Sample(device_busy_ms=1.0, latency_ms=1.0, n_kernels=1, sm_clock_hz=hz)
+            for hz in next(clocks)
+        ]
+
+    monkeypatch.setattr(bench, "bench_kernel", bench_kernel)
+    results = bench.Runner(SumFwdOp(), _case()).compare({})
+    assert results["tileops"]["sm_clock_mhz"] == pytest.approx(1500)
+
+
 def test_a_row_records_the_case_params(timed):
     bench.Runner(SumFwdOp(), _case()).compare({})
     assert timed.rows[0]["params"] == {"input": ((4,), "float32"), "dim": [0]}
@@ -274,7 +406,7 @@ def small_flush_buffer(monkeypatch):
     """Exercise real event timing without a benchmark-sized cache eviction buffer."""
     monkeypatch.setattr(
         timing,
-        "_get_l2_flush_cache",
+        "l2_flush_buffer",
         lambda device: torch.empty(1024, dtype=torch.int32, device=device),
     )
 

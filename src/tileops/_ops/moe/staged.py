@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import ClassVar, Mapping
+from collections.abc import Mapping
+from typing import ClassVar
 
 import torch
 
@@ -19,16 +20,39 @@ from tileops._kernels.moe import (
     PrePermuteCall,
     PrePermuteFwdInterface,
 )
-from tileops._ops.moe.contracts import ContiguousLayoutSpec, MaskedLayoutSpec, RoutingEpilogueSpec
+from tileops._ops.moe.contracts import (
+    ContiguousLayoutSpec,
+    MaskedLayoutSpec,
+    RoutingEpilogueSpec,
+    layout_call_fields,
+)
 from tileops._ops.op_base import Op
 from tileops._perf.profile import tensor_core_roof
 
 __all__ = [
     "MoEExpertMLPFwdOp",
     "MoEGroupedGEMMFwdOp",
+    "MoELayoutRowsRoofline",
     "MoEPostPermuteFwdOp",
     "MoEPrePermuteFwdOp",
 ]
+
+
+class MoELayoutRowsRoofline:
+    """The roofline terms of an op over expert layout rows, mixed in before ``Op``."""
+
+    def roofline_data_terms(self) -> dict[str, int]:
+        """The valid rows this call's layout metadata marks, which its flops follow."""
+        from tileops._perf.formulas import moe_layout_rows
+
+        return {"valid_rows": moe_layout_rows(self.last_call)}
+
+    def eval_roofline_read_bytes(self) -> int:
+        """``bytes`` less the write of ``output``, which a masked slab makes on its valid rows
+        only, where the base class would take the whole output off."""
+        from tileops._perf.formulas import moe_slab_bytes
+
+        return int(self.eval_roofline()[1]) - moe_slab_bytes(self.last_call, "output")
 
 
 class MoEPrePermuteFwdOp(Op):
@@ -97,13 +121,12 @@ class MoEPrePermuteFwdOp(Op):
                 num_tokens=hidden_states.shape[0],
                 hidden_size=hidden_states.shape[1],
                 top_k=local_expert_ids.shape[1],
-                routing_input_kind="local_expert_ids",
             ),
         )
         return kernel(hidden_states, local_expert_ids)
 
 
-class MoEGroupedGEMMFwdOp(Op):
+class MoEGroupedGEMMFwdOp(MoELayoutRowsRoofline, Op):
     """M-grouped GEMM over expert-materialized rows: ``out[rows of g] = a[rows of g] @ b[g]^T``.
 
     It groups rows by an MoE expert layout and can fuse a gated activation and a bias,
@@ -150,19 +173,6 @@ class MoEGroupedGEMMFwdOp(Op):
     interfaces: ClassVar[Mapping[str, type[KernelInterface]]] = {
         "grouped_gemm": MGroupedGEMMFwdInterface
     }
-
-    def roofline_data_terms(self) -> "dict[str, int]":
-        """The valid rows this call's layout metadata marks, which its flops follow."""
-        from tileops._perf.formulas import moe_layout_rows
-
-        return {"valid_rows": moe_layout_rows(self.last_call)}
-
-    def eval_roofline_read_bytes(self) -> int:
-        """``bytes`` less the write of ``output``, which a masked slab makes on its valid rows
-        only, where the base class would take the whole output off."""
-        from tileops._perf.formulas import moe_slab_bytes
-
-        return int(self.eval_roofline()[1]) - moe_slab_bytes(self.last_call, "output")
 
     def __init__(
         self,
@@ -218,19 +228,13 @@ class MoEGroupedGEMMFwdOp(Op):
         Returns:
             ``[M, N]`` or ``[E, max_m, N]`` in the operand dtype, or fp32 when asked for.
         """
-        layout = self.layout
-        masked = isinstance(layout, MaskedLayoutSpec)
         num_experts, n, k = b.shape
         device = a.device
         kernel = self.kernel_for(
             "grouped_gemm",
             lambda: MGroupedGEMMCall(
                 device=device,
-                kind=layout.kind,
-                packing=None if masked else layout.packing.value,
-                metadata_kind=None if masked else layout.metadata_kind.value,
-                alignment=getattr(layout, "alignment", 1),
-                max_m=layout.max_m,
+                **layout_call_fields(self.layout),
                 activation=self.activation,
                 has_bias=bias is not None,
                 ab_dtype=a.dtype,
@@ -244,7 +248,7 @@ class MoEGroupedGEMMFwdOp(Op):
         return kernel(a, b, layout_metadata, out=out, bias=bias)
 
 
-class MoEExpertMLPFwdOp(Op):
+class MoEExpertMLPFwdOp(MoELayoutRowsRoofline, Op):
     """Two grouped GEMMs on one expert layout, the gated activation fused into the first.
 
     It takes rows already grouped by expert and returns one unweighted result row per input
@@ -270,19 +274,6 @@ class MoEExpertMLPFwdOp(Op):
         "gate_up": MoEGroupedGEMMFwdOp,
         "down": MoEGroupedGEMMFwdOp,
     }
-
-    def roofline_data_terms(self) -> "dict[str, int]":
-        """The valid rows this call's layout metadata marks, which its flops follow."""
-        from tileops._perf.formulas import moe_layout_rows
-
-        return {"valid_rows": moe_layout_rows(self.last_call)}
-
-    def eval_roofline_read_bytes(self) -> int:
-        """``bytes`` less the write of ``output``, which a masked slab makes on its valid rows
-        only, where the base class would take the whole output off."""
-        from tileops._perf.formulas import moe_slab_bytes
-
-        return int(self.eval_roofline()[1]) - moe_slab_bytes(self.last_call, "output")
 
     def __init__(
         self,
@@ -354,9 +345,12 @@ class MoEExpertMLPFwdOp(Op):
 class MoEPostPermuteFwdOp(Op):
     """Restore token order and apply the declared local routing epilogue.
 
-    A caller-provided ``out`` must not overlap ``expert_output``, ``topk_weights``
-    or ``inverse_indices``. Overlap raises ``ValueError`` before any write;
+    A caller-provided ``out`` must not overlap ``expert_output``, ``topk_weights``,
+    ``inverse_indices`` or ``residual``. Overlap raises ``ValueError`` before any write;
     disjoint views of one buffer are accepted.
+
+    A ``residual``, such as DeepSeek-V4-Flash's shared-expert output, is added to the
+    scaled float32 reduction before the one cast.
     """
 
     kernel_types: ClassVar[Mapping[str, type[Kernel]]] = {
@@ -396,6 +390,7 @@ class MoEPostPermuteFwdOp(Op):
         inverse_indices: torch.Tensor,
         *,
         out: torch.Tensor | None = None,
+        residual: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Restore token order, apply routing weights, reduce top-k, and cast.
 
@@ -407,6 +402,8 @@ class MoEPostPermuteFwdOp(Op):
             inverse_indices: ``int32`` row of ``expert_output`` each route sits in,
                 $[T \\cdot K]$.
             out: Buffer $[T \\times H]$ to write the result into, or ``None``.
+            residual: $[T \\times H]$ in the dtype of ``expert_output``, added before the
+                cast, or ``None``.
 
         Returns:
             The reduced result, $[T \\times H]$, in ``out_dtype`` or else the dtype of
@@ -422,13 +419,13 @@ class MoEPostPermuteFwdOp(Op):
                 max_m=self.layout.max_m,
                 epilogue=RoutingEpilogueSpec() if self.epilogue is None else self.epilogue,
                 input_dtype=expert_output.dtype,
-                routing_weight_dtype=topk_weights.dtype,
                 output_dtype=expert_output.dtype if self.out_dtype is None else self.out_dtype,
                 num_experts=expert_output.shape[0] if masked else 0,
                 materialized_rows=expert_output.numel() // expert_output.shape[-1],
                 num_tokens=topk_weights.shape[0],
                 hidden_size=expert_output.shape[-1],
                 top_k=topk_weights.shape[1],
+                has_residual=residual is not None,
             ),
         )
-        return kernel(expert_output, inverse_indices, topk_weights, out=out)
+        return kernel(expert_output, inverse_indices, topk_weights, out=out, residual=residual)

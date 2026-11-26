@@ -65,8 +65,6 @@ class GroupTiling:
         """Build the tile-count prefix sum from packed row offsets.
 
         ``(offsets[g + 1] - offsets[g]) * rows_per_offset`` is the row count of group ``g``.
-        Varlen operators already receive that representation, so they should
-        not materialize a second sizes tensor merely to schedule row tiles.
         The offsets are read at whatever integer width they arrive in.
         """
         block_m, rows = self.block_m, self.rows_per_offset
@@ -114,8 +112,8 @@ def _tile_prefix_sum(num_groups, tiles):
     shuffles, and adds the totals of the warps before it. The macro ends with a block
     barrier, and every thread of the block must reach it.
     """
-    # Up to this many groups the scan's shuffles and barriers cost paged attention up to
-    # 5% over a loop on every thread (H200); from 16 groups on the scan is no slower.
+    # Up to this many groups a loop on every thread costs less than the scan's shuffles
+    # and barriers.
     serial_groups = 8
     if num_groups <= serial_groups or is_maca():
 
@@ -130,15 +128,23 @@ def _tile_prefix_sum(num_groups, tiles):
 
         return group_tile_prefix_sum
 
+    def first_row(cond, rest_y, rest_z):
+        """*cond* for the threads at y = z = 0 of the block."""
+        if rest_y != 1:
+            cond = cond & (T.get_thread_binding(1) == 0)
+        if rest_z != 1:
+            cond = cond & (T.get_thread_binding(2) == 0)
+        return cond
+
     @T.macro
     def group_tile_prefix_scan(src, s_cum):
         threads, rest_y, rest_z = KernelLaunchFrame.Current().get_thread_extents()
-        if threads % WARP_LANES != 0 or rest_y * rest_z != 1:
+        if threads % WARP_LANES != 0:
             raise ValueError(f"the scan needs whole warps along threadIdx.x, got {threads}")
         # Only as many warps as there are runs of WARP_LANES groups take part. A thread
         # holds one tile count a round in registers, and the rounds unroll: past
         # `max_rounds` rounds the CTA scans in passes, each carrying the passes before it.
-        # 32 rounds is 4096 groups on 128 threads, and holds 56 registers (H200).
+        # 32 rounds is 4096 groups on 128 threads.
         max_rounds = 32
         runs = -(-num_groups // WARP_LANES)
         warps = min(threads // WARP_LANES, runs)
@@ -153,7 +159,7 @@ def _tile_prefix_sum(num_groups, tiles):
         carry = T.alloc_local([1], "int32")
         for p in T.serial(passes):
             first = p * span + warp * WARP_LANES * rounds + lane
-            if tx < warps * WARP_LANES:
+            if first_row(tx < warps * WARP_LANES, rest_y, rest_z):
                 for r in T.unroll(rounds):
                     vals[r] = T.int32(0)
                     if first + r * WARP_LANES < num_groups:
@@ -181,13 +187,13 @@ def _tile_prefix_sum(num_groups, tiles):
                     if w < warp:
                         carry[0] = carry[0] + s_cum[p * span + w + 1]
                 T.sync_threads()
-            if tx < warps * WARP_LANES:
+            if first_row(tx < warps * WARP_LANES, rest_y, rest_z):
                 for r in T.unroll(rounds):
                     if first + r * WARP_LANES < num_groups:
                         s_cum[first + r * WARP_LANES + 1] = vals[r] + carry[0]
             if passes > 1:
                 T.sync_threads()
-        if tx == 0:
+        if first_row(tx == 0, rest_y, rest_z):
             s_cum[0] = T.int32(0)
         T.sync_threads()
 

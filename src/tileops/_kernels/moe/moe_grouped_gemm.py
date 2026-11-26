@@ -1,7 +1,7 @@
 """MoE adapter for the shared persistent grouped GEMM template, and its MMA counterpart."""
 
 import itertools
-from typing import Callable, Optional
+from collections.abc import Callable
 
 import tilelang
 import tilelang.language as T
@@ -20,6 +20,7 @@ from tileops._kernels.gemm.persistent.heuristics import (
 from tileops._kernels.gemm.persistent.template import GEMMTemplate
 from tileops._kernels.kernel_base import Kernel
 from tileops._kernels.moe.call_spec import MGroupedGEMMCall, MGroupedGEMMFwdInterface
+from tileops._kernels.moe.layout import aligned_group
 from tileops.manifest.primitives import moe_layout_metadata
 
 __all__ = ["MoEGroupedGEMMKernel", "MoEGroupedGEMMMMAKernel"]
@@ -96,8 +97,7 @@ def _moe_grouped_gemm_mma_kernel(
                 # so a tile holds the rows of one group and its padding.
                 row0[0] = bx * block_m
                 row_end[0] = m
-                if (layout[row0[0]] >= 0) & (layout[row0[0]] < num_groups):
-                    group[0] = layout[row0[0]]
+                group[0] = aligned_group(layout, row0[0], num_groups)
             else:
                 seen[0] = 0
                 prev_end[0] = 0
@@ -261,7 +261,7 @@ class MoEGroupedGEMMKernel(Kernel, MGroupedGEMMFwdInterface):
     # Where both run, a caller's replacement of this key wins over the MMA kernel.
     preferred_over = frozenset({"grouped_gemm_mma"})
 
-    _TYPES: dict[tuple[str, Optional[str], Optional[str]], GEMMType] = {
+    _TYPES: dict[tuple[str, str | None, str | None], GEMMType] = {
         ("contiguous", "tight", "physical_psum"): GEMMType.M_GROUPED_TIGHT_PSUM,
         ("contiguous", "tight", "per_row"): GEMMType.M_GROUPED_TIGHT_PER_ROW,
         ("contiguous", "aligned", "physical_psum"): GEMMType.M_GROUPED_ALIGNED_PSUM,
@@ -271,7 +271,7 @@ class MoEGroupedGEMMKernel(Kernel, MGroupedGEMMFwdInterface):
     _ALIGNED_TILE_HEIGHTS = (64, 128, 256)
 
     @classmethod
-    def refusal(cls, call: MGroupedGEMMCall) -> Optional[str]:
+    def refusal(cls, call: MGroupedGEMMCall) -> str | None:
         """The layouts, dtypes and extents the template instantiates."""
         if (call.kind, call.packing, call.metadata_kind) not in cls._TYPES:
             return f"does not serve the {call.kind} {call.packing} {call.metadata_kind} layout"
@@ -285,13 +285,13 @@ class MoEGroupedGEMMKernel(Kernel, MGroupedGEMMFwdInterface):
             return f"fuses only {sorted(ACTIVATIONS)}, got {call.activation}"
         if call.k % 8:
             return f"steps K by 8, got K = {call.k}"
-        n_step = 8 if call.activation is None else 16
+        n_step = 8 if call.activation in (None, "none") else 16
         if call.n % n_step:
             return f"needs N a multiple of {n_step} here, got N = {call.n}"
         return None
 
     def __init__(self, call: MGroupedGEMMCall) -> None:
-        device_index = call.device.index if call.device is not None else None
+        device_index = call.device_index
         super().__init__(device_index=device_index)
         self.call = call
         self.inner = GEMMTemplate(
@@ -308,9 +308,9 @@ class MoEGroupedGEMMKernel(Kernel, MGroupedGEMMFwdInterface):
         a: torch.Tensor,
         b: torch.Tensor,
         layout_metadata: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
+        out: torch.Tensor | None = None,
         *,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run each expert's grouped product, with its bias and fused activation when requested."""
         return self.inner(a, b, grouped_layout=layout_metadata, out=out, bias=bias)
@@ -323,7 +323,7 @@ class MoEGroupedGEMMMMAKernel(MoEGroupedGEMMKernel):
     preferred_over = frozenset()
 
     def __init__(self, call: MGroupedGEMMCall) -> None:
-        device_index = call.device.index if call.device is not None else None
+        device_index = call.device_index
         Kernel.__init__(self, device_index=device_index)
         self.call = call
         self.kernel = _moe_grouped_gemm_mma_kernel(
@@ -398,9 +398,9 @@ class MoEGroupedGEMMMMAKernel(MoEGroupedGEMMKernel):
         a: torch.Tensor,
         b: torch.Tensor,
         layout_metadata: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
+        out: torch.Tensor | None = None,
         *,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run each expert's grouped product, with its bias and fused activation when requested."""
         call = self.call

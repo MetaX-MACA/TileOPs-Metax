@@ -11,7 +11,6 @@ Strategy: explicit_parallel (N elements per thread) with per-thread RNG state.
 
 import dataclasses
 from abc import abstractmethod
-from typing import Optional
 
 import tilelang
 import tilelang.language as T
@@ -19,6 +18,7 @@ import torch
 
 from tileops._kernels.build_target import target_cache
 from tileops._kernels.call_spec import CallSpec
+from tileops._kernels.elementwise._dtype import FLOAT_DTYPES
 from tileops._kernels.kernel_base import Entry, Kernel, KernelInterface
 
 __all__ = ["DropoutCall", "DropoutFwdInterface", "DropoutKernel"]
@@ -30,7 +30,7 @@ class DropoutCall(CallSpec):
 
     count: int = 0
     p: float = 0.5
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
 
 
 class DropoutFwdInterface(KernelInterface):
@@ -64,7 +64,7 @@ class DropoutFwdInterface(KernelInterface):
 
 
 @target_cache(maxsize=32)
-def _make_dropout_kernel(N, dtype, p, threads=256, num_per_thread=8):
+def _make_dropout_kernel(N, dtype, p, threads, num_per_thread):
     """Build a dropout kernel using TileLang RNG.
 
     Each thread calls T.rng_init(seed, off=offset) which initialises per-thread RNG state
@@ -125,7 +125,7 @@ class DropoutKernel(Kernel, DropoutFwdInterface):
 
     supported_archs: list[int] = [80, 86, 89, 90]
     # The RNG produces a float mask and scales only floating-point elements.
-    SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+    SUPPORTED_DTYPES = FLOAT_DTYPES
 
     @classmethod
     def entry_for(cls, call: DropoutCall) -> Entry:

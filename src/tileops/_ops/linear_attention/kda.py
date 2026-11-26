@@ -1,11 +1,7 @@
-"""Kimi Delta Attention (KDA) operator (L2 Op layer).
+"""Kimi Delta Attention (KDA) operator (L2 Op layer)."""
 
-Provides:
-  - KDAFwdOp: the gated delta rule whose decay is one log-space
-    value per key channel, returning the output and the FP32 final state.
-"""
-
-from typing import ClassVar, Mapping, Optional, Tuple
+from collections.abc import Mapping
+from typing import ClassVar
 
 import torch
 
@@ -25,7 +21,7 @@ __all__ = ["KDAFwdOp"]
 
 
 class KDAFwdOp(Op):
-    """Kimi Delta Attention (KDA): the gated delta rule with a per-key-channel decay.
+    """Kimi Delta Attention (KDA) forward; updates a state pool in place given slot indices.
 
     ``q`` and ``k`` use ``[B, T, H, K]``. ``v``, ``beta`` and the output use
     ``HV`` recurrent heads, where ``HV`` is a multiple of ``H``; ``g`` carries
@@ -38,7 +34,9 @@ class KDAFwdOp(Op):
     packed sequences.
 
     By default ``g`` contains the precomputed log-space decay and ``beta`` the
-    post-sigmoid update strength. ``use_gate_in_kernel=True`` instead treats
+    post-sigmoid update strength. A precomputed ``g`` is a decay, ``g <= 0``, as both
+    raw-gate forms below produce; a positive value grows the state instead and is
+    unsupported. ``use_gate_in_kernel=True`` instead treats
     ``g`` as the raw gate and requires ``A_log``;
     ``use_beta_sigmoid_in_kernel=True`` treats ``beta`` as raw logits, and with
     ``allow_neg_eigval=True`` the beta transform is ``2 * sigmoid(beta)``.
@@ -53,8 +51,10 @@ class KDAFwdOp(Op):
     128-wide square state with precomputed beta and either precomputed or raw gates.
     Raw gates use ``-exp(A_log) * softplus(g + dt_bias)`` without a lower bound,
     or ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))`` with one; an omitted
-    ``dt_bias`` is zero. Raw beta, value-major state and other state widths still
-    require an external target implementation.
+    ``dt_bias`` is zero. A value-major state and a state pool (``state_indices``)
+    are served by decode and prefill. Raw beta,
+    ``num_accepted_tokens``, other state widths and the other calls still require
+    an external target implementation.
     """
 
     kernel_types: ClassVar[Mapping[str, type[Kernel]]] = {
@@ -66,13 +66,13 @@ class KDAFwdOp(Op):
 
     def __init__(
         self,
-        scale: Optional[float] = None,
+        scale: float | None = None,
         use_qk_l2norm_in_kernel: bool = False,
         use_beta_sigmoid_in_kernel: bool = False,
         allow_neg_eigval: bool = False,
         state_v_first: bool = False,
         use_gate_in_kernel: bool = False,
-        lower_bound: Optional[float] = None,
+        lower_bound: float | None = None,
         *,
         validate_inputs: bool = False,
         target: Target = None,
@@ -95,7 +95,10 @@ class KDAFwdOp(Op):
             lower_bound: Lower bound of the forget gate in log space, or
                 ``None``. Only used with ``use_gate_in_kernel=True``.
             validate_inputs: Check on the CPU that ``cu_seqlens`` (and
-                ``cu_seqlens_cpu``) start at 0, never decrease and end at ``S``.
+                ``cu_seqlens_cpu``) start at 0, never decrease, end at ``S`` and, with
+                ``num_accepted_tokens``, hold no sequence longer than a ``state_indices`` row,
+                and that ``state_indices`` and ``num_accepted_tokens`` lie in their manifest
+                ranges.
                 It synchronizes the device; leave it off under CUDA Graph capture.
             target: Backend target, or ``None`` to resolve from the input device.
         """
@@ -120,12 +123,15 @@ class KDAFwdOp(Op):
         v: torch.Tensor,
         g: torch.Tensor,
         beta: torch.Tensor,
-        initial_state: Optional[torch.Tensor] = None,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        cu_seqlens_cpu: Optional[torch.Tensor] = None,
-        A_log: Optional[torch.Tensor] = None,
-        dt_bias: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        initial_state: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
+        A_log: torch.Tensor | None = None,
+        dt_bias: torch.Tensor | None = None,
+        *,
+        state_indices: torch.Tensor | None = None,
+        num_accepted_tokens: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run prefill or decode and return ``(o, final_state)``.
 
         Args:
@@ -147,12 +153,22 @@ class KDAFwdOp(Op):
                 ``use_gate_in_kernel``.
             dt_bias: ``float32`` gate bias, $[\\mathit{HV} \\cdot K]$, or ``None`` for zero.
                 Only used under ``use_gate_in_kernel``.
+            state_indices: ``int32`` slots of a state pool, or ``None``. With it,
+                ``initial_state`` is the pool, $[P \\times \\mathit{HV} \\times \\ldots]$, updated in
+                place: $[N]$, the slot each sequence starts from and ends in; with
+                ``num_accepted_tokens``, $[N \\times L]$, slot ``t`` taking the state after
+                token ``t``. A slot of -1 is never written; a sequence starting
+                from it has unspecified outputs and leaves unspecified states in its other
+                slots.
+            num_accepted_tokens: ``int32`` $[N]$, or ``None``: sequence ``n`` starts from its
+                slot ``num_accepted_tokens[n] - 1``.
 
         Returns:
             ``(o, final_state)``. ``o`` is the output,
             $[B \\times S \\times \\mathit{HV} \\times V]$, in the dtype of ``q``.
             ``final_state`` is the ``float32`` state after the last token, in the layout
-            ``initial_state`` takes. $N = B$ unless ``cu_seqlens`` is given.
+            ``initial_state`` takes, or the pool itself with ``state_indices``.
+            $N = B$ unless ``cu_seqlens`` is given.
         """
         inputs = tuple(
             tensor.contiguous() if tensor is not None else None
@@ -167,11 +183,12 @@ class KDAFwdOp(Op):
                 cu_seqlens_cpu,
                 A_log,
                 dt_bias,
+                state_indices,
             )
         )
         batch, seq_len, heads, dim_k = q.shape
         value_heads, dim_v = v.shape[2:]
-        return self.kernel_for(
+        o, final_state = self.kernel_for(
             "kda",
             lambda: KDACall(
                 batch=batch,
@@ -192,6 +209,13 @@ class KDAFwdOp(Op):
                 allow_neg_eigval=self.allow_neg_eigval,
                 lower_bound=self.lower_bound,
                 has_dt_bias=dt_bias is not None,
+                pooled=state_indices is not None,
+                rollback=num_accepted_tokens is not None,
                 device=q.device,
             ),
         )(*inputs)
+        if state_indices is not None and final_state is not initial_state:
+            # A strided pool was advanced as a contiguous copy; the call updates the caller's.
+            initial_state.copy_(final_state)
+            final_state = initial_state
+        return o, final_state

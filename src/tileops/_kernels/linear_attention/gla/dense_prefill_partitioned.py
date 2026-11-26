@@ -1,12 +1,13 @@
 """Partitioned long-context GLA prefill kernels."""
 
-from typing import Callable, NamedTuple, Optional
+from collections.abc import Callable
+from typing import NamedTuple
 
 import tilelang
 import torch
 from tilelang import language as T
 
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.constants import LOG2E
 from tileops._kernels.kernel_base import CompiledProgram, Entry
 from tileops._kernels.linear_attention.gla.call_spec import (
@@ -238,8 +239,7 @@ def _gla_fwd_partitioned_replay_kernel(
 ) -> Callable:
     """Replay independent partitions while producing output in the same CTA.
 
-    This is the GLA specialization of the GDN prefill replay skeleton.  GLA
-    has no delta-rule correction, so the transform warpgroup only prepares
+    GLA has no delta-rule correction, so the transform warpgroup only prepares
     gate-adjusted Q/K while the state and output warpgroups run concurrently.
     """
     accum_dtype = "float32"
@@ -258,7 +258,7 @@ def _gla_fwd_partitioned_replay_kernel(
     @tilelang.jit(
         out_idx=[-2, -1],
         pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
     )
     def _replay_func(threads=512):
         qk_shape = [batch, seq_len, heads, dim_k]
@@ -380,7 +380,7 @@ def _gla_fwd_partitioned_replay_kernel(
 
 
 class _PartitionFit(NamedTuple):
-    """Where a 16-chunk partition beats the serial-state kernel on one calibrated board."""
+    """The shapes a board serves with 16-chunk partitions rather than the serial-state kernel."""
 
     dim: int
     min_seq_len: int
@@ -398,7 +398,7 @@ class GLADensePrefillPartitionedKernel(GLAChunkedFwdKernel, GLAFwdInterface):
     _PARTITION_FITS = {"h200": _PartitionFit(dim=64, min_seq_len=16384, min_ctas=128)}
 
     @classmethod
-    def refusal(cls, call: GLACall) -> Optional[str]:
+    def refusal(cls, call: GLACall) -> str | None:
         fit = cls._PARTITION_FITS.get(call.calibration)
         if fit is None:
             return "has no partition fit for this board"
@@ -436,7 +436,7 @@ class GLADensePrefillPartitionedKernel(GLAChunkedFwdKernel, GLAFwdInterface):
         scale: float,
         dtype: torch.dtype,
         has_initial_state: bool = False,
-        device_index: Optional[int] = None,
+        device_index: int | None = None,
     ) -> None:
         self.has_initial_state = has_initial_state
         if seq_len % (64 * 16):
@@ -465,7 +465,6 @@ class GLADensePrefillPartitionedKernel(GLAChunkedFwdKernel, GLAFwdInterface):
             "partition_chunks": 16,
             "num_v_partitions": 1,
             "num_k_partitions": 2,
-            "g_num_stages": 2,
             "g_threads": 128,
             "h_num_stages": 2,
             "h_threads": 128,
@@ -490,7 +489,7 @@ class GLADensePrefillPartitionedKernel(GLAChunkedFwdKernel, GLAFwdInterface):
             64,
             self.dtype_name,
             gate_dtype,
-        )(cfg["g_num_stages"], cfg["g_threads"])
+        )(cfg["g_threads"])
         summary_fn = _gla_fwd_h_summary_kernel(
             self.batch,
             self.seq_len,
@@ -542,9 +541,9 @@ class GLADensePrefillPartitionedKernel(GLAChunkedFwdKernel, GLAFwdInterface):
         k: torch.Tensor,
         v: torch.Tensor,
         g: torch.Tensor,
-        initial_state: Optional[torch.Tensor] = None,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        cu_seqlens_cpu: Optional[torch.Tensor] = None,
+        initial_state: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if cu_seqlens is not None or cu_seqlens_cpu is not None:
             raise ValueError("the in-tree GLA dense-prefill kernel does not support packed varlen")

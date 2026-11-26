@@ -6,7 +6,7 @@ The 3D cases model video CNN spatiotemporal pooling patterns such as
 I3D/SlowFast-style feature stages.
 """
 
-from typing import Callable, Optional
+from collections.abc import Callable
 
 import pytest
 import torch
@@ -20,6 +20,7 @@ from benchmarks.baselines import (
 )
 from benchmarks.cudnn_resample import cudnn_pool_fn
 from tileops._utils import is_maca
+from tileops._ops._spatial import per_axis_values
 from tileops.pool import (
     AdaptiveAvgPool2dFwdOp,
     AdaptiveMaxPool2dFwdOp,
@@ -47,8 +48,6 @@ _BASELINE: dict[str, tuple[str, str, int]] = {
     "MaxPool2dIndicesFwdOp": (FLAGGEMS_TAG, "max", 2),
     "MaxPool3dFwdOp": ("cudnn", "max", 3),
 }
-# Autotuning is a bench-run policy; manifest workloads do not carry it.
-_TUNE = True
 
 
 def flaggems_pool_fn(
@@ -59,9 +58,9 @@ def flaggems_pool_fn(
     ceil_mode: bool,
     count_include_pad: bool = True,
     dilation: tuple = (1, 1),
-    divisor_override: Optional[int] = None,
+    divisor_override: int | None = None,
     return_indices: bool = False,
-) -> Optional[Callable]:
+) -> Callable | None:
     """Return a FlagGems 2D pooling callable, or None if unsupported.
 
     FlagGems 5.0.2's LibEntry cache misaligns kernel arguments under triton 3.7 and
@@ -179,12 +178,6 @@ def flaggems_pool_fn(
     return None
 
 
-def _as_tuple(value, ndim: int) -> tuple:
-    if isinstance(value, (tuple, list)):
-        return tuple(value)
-    return (value,) * ndim
-
-
 def pool_baseline(op_name: str, workload) -> tuple:
     """Return (tag, callable) for op_name's baseline.
 
@@ -198,11 +191,11 @@ def pool_baseline(op_name: str, workload) -> tuple:
         return "torch-ref", getattr(workload, "torch_program", workload.ref_program)
 
     choice, kind, ndim = selected
-    kernel = _as_tuple(workload.kernel_size, ndim)
-    stride = kernel if workload.stride is None else _as_tuple(workload.stride, ndim)
+    kernel = per_axis_values(workload.kernel_size, ndim)
+    stride = kernel if workload.stride is None else per_axis_values(workload.stride, ndim)
     kwargs = dict(
         count_include_pad=getattr(workload, "count_include_pad", True),
-        dilation=_as_tuple(getattr(workload, "dilation", 1), ndim),
+        dilation=per_axis_values(getattr(workload, "dilation", 1), ndim),
         divisor_override=getattr(workload, "divisor_override", None),
     )
     if kind == "max":
@@ -210,11 +203,17 @@ def pool_baseline(op_name: str, workload) -> tuple:
 
     factory = cudnn_pool_fn if choice == "cudnn" else flaggems_pool_fn
     fn = factory(
-        kind, kernel, stride, _as_tuple(workload.padding, ndim), workload.ceil_mode, **kwargs
+        kind, kernel, stride, per_axis_values(workload.padding, ndim), workload.ceil_mode, **kwargs
     )
     if fn is None:
         return "torch-ref", getattr(workload, "torch_program", workload.ref_program)
     return choice, fn
+
+
+def _avg_pool2d_window(workload) -> tuple:
+    kernel = tuple(per_axis_values(workload.kernel_size, 2))
+    stride = kernel if workload.stride is None else tuple(per_axis_values(workload.stride, 2))
+    return kernel, stride, tuple(per_axis_values(workload.padding, 2))
 
 
 def _bench(op_cls: type, case: bench.Case) -> None:
@@ -224,12 +223,21 @@ def _bench(op_cls: type, case: bench.Case) -> None:
     _tag, _baseline_fn = pool_baseline(op_cls.__name__, case.workload)
     # torch stays alongside the library baseline: it is what the nightly's ratio alert and
     # its history were measured against, and both numbers belong in the same row.
+    compiled = compiled_reference(case.torch)
+    # FIXME(staged-rollout): torch-compile is timed but not verified on these avg_pool2d calls.
+    #
+    # Broken invariant: every timed implementation is verified against the reference.
+    # Why: Inductor in torch 2.14 returns wrong values at the first and last two output
+    # columns of avg_pool2d with these (kernel_size, stride, padding).
+    # Cleanup: remove an entry once the runner image's torch builds that call correctly.
+    inductor_miscompiled = {((5, 5), (2, 2), (2, 2))}
+    if op_cls is AvgPool2dFwdOp and _avg_pool2d_window(case.workload) in inductor_miscompiled:
+        compiled = bench.Implementation(
+            run=compiled,
+            noncomparable_reason=f"Inductor in torch {torch.__version__} miscompiles this call",
+        )
     bench.Runner(op, case).compare(
-        {
-            _tag: _baseline_fn,
-            "torch-ref": case.torch,
-            TORCH_COMPILE_TAG: compiled_reference(case.torch),
-        }
+        {_tag: _baseline_fn, "torch-ref": case.torch, TORCH_COMPILE_TAG: compiled}
     )
 
 
@@ -385,8 +393,7 @@ def test_mean_pooling_bench(case) -> None:
         return
     workload = case.workload
     op = MeanPoolingFwdOp(**case.arguments)
-    if _TUNE:
-        op.request_tune()
+    op.request_tune()
 
     inputs = case.inputs
 

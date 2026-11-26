@@ -22,13 +22,18 @@ import torch.nn.functional as F
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from tests.roofline_binder import signature_class
+from tileops._ops._signature_codegen import leaves
 from tileops.manifest import load_adts, load_manifest
 from tileops.manifest._plan import entry_plan
-from tileops.manifest._workload import instantiate
-from workloads import sampling
+from tileops.manifest._workload import TensorSpec, instantiate
+from workloads import mamba, moe, sampling
+from workloads.attention.gated_pool_compress import gated_pool_compress
 from workloads.attention.merge_states import MergeAttentionStatesWorkload
+from workloads.attention.nsa import NSAFwdWorkload
+from workloads.norm import mrope_rows, rms_norm_gated
 from workloads.quantization import int8_dequant
 from workloads.quantization import quantize as quantization
+from workloads.sequence_modeling import hc_head, hc_post, hc_pre, ngram_hash
 
 pytestmark = pytest.mark.smoke
 
@@ -66,6 +71,15 @@ _int4_per_group = _outputs(
     group_size="group_size",
 )
 _smooth_quant = _outputs(("q", "scale"), quantization.smooth_quant, "x", "smooth")
+
+
+def _fp4_per_group(p, t):
+    q, scale, output = quantization.fp4_quant_per_group(t["x"], p["block_size"], p["inplace"])
+    if p["inplace"]:
+        assert q is None and scale is None and output is t["x"]
+        return {"output": output}
+    assert output is None
+    return {"q": q, "scale": scale}
 
 
 # ---------------------------------------------------------------- sampling
@@ -174,10 +188,39 @@ def _paged_kv_cache_write(p, t):
     return {}
 
 
+def _nsa_varlen(p, t):
+    q, k = t["q"], t["k"]
+    if k.shape != t["v"].shape:
+        raise ValueError("k and v must agree")
+    group, selected = q.shape[1] // k.shape[1], t["block_indices"].shape[-1]
+    workload = NSAFwdWorkload(
+        0, q.shape[1], q.shape[0], q.shape[-1], p["is_causal"], p["sm_scale"],
+        p["block_size"], group, selected, q.dtype,
+    )  # fmt: skip
+    # The selection meets q's device; the offsets are read on the host.
+    picks = (t[n].to(q.device) for n in ("block_indices", "block_counts"))
+    names = ("cu_seqlens", "token_indices", "cu_seqlens_k")
+    return {"o": workload.ref_program(q, k, t["v"], *picks, *(t[n] for n in names))}
+
+
+def _mrope_angles(cos_sin, positions, sections, interleaved):
+    """The ``[N, R]`` cos ‖ sin rows of ``positions [3, N]``: each frequency from the row of
+    the temporal, height or width position its section names.
+
+    vllm.model_executor.layers.rotary_embedding.mrope.MRotaryEmbedding.forward_native.
+    """
+    if positions.dim() != 2 or positions.shape[0] != 3 or sum(sections) != cos_sin.shape[1] // 2:
+        raise ValueError("MRoPE takes [3, N] positions and sections summing to R / 2")
+    halves = cos_sin[positions].chunk(2, -1)
+    return torch.cat([mrope_rows(part, sections, interleaved) for part in halves], -1)
+
+
 def _rope(x, cos_sin, positions, layout):
-    """Rotate ``x [N, ..., R']`` on its first ``R`` columns by ``cos_sin [P, R]`` at ``positions``."""
+    """Rotate ``x [N, ..., R']`` on its first ``R`` columns by ``cos_sin [P, R]`` at ``positions``;
+    ``positions`` may instead be the ``[N, R]`` cos ‖ sin rows themselves, a floating tensor."""
     half = cos_sin.shape[1] // 2
-    cos, sin = cos_sin[positions].float().chunk(2, -1)
+    rows = positions if positions.is_floating_point() else cos_sin[positions]
+    cos, sin = rows.float().chunk(2, -1)
     shape = (x.shape[0],) + (1,) * (x.dim() - 2) + (half,)
     cos, sin = cos.view(shape), sin.view(shape)
     rot, rest = x[..., : 2 * half].float(), x[..., 2 * half :]
@@ -202,14 +245,19 @@ def _mla_kv_cache_write(p, t):
 
 
 def _fused_qk_norm_rope(p, t):
-    qkv, eps = t["qkv"], p["eps"]
+    # vLLM fused_qk_norm_rope; GemmaRMSNorm for zero_centered, MRotaryEmbedding for MRoPE.
+    qkv, eps, cos_sin = t["qkv"], p["eps"], t["cos_sin_cache"]
     heads, kv_heads = p["num_heads"], p["num_kv_heads"]
     dim = t["q_weight"].shape[0]
     tokens = qkv.shape[0]
+    positions = t["positions"]
+    if p["mrope_section"] is not None:
+        positions = _mrope_angles(cos_sin, positions, p["mrope_section"], p["mrope_interleaved"])
     for first, count, weight in ((0, heads, t["q_weight"]), (heads, kv_heads, t["k_weight"])):
         view = qkv[:, first * dim : (first + count) * dim].view(tokens, count, dim)
-        normed = F.rms_norm(view.float(), (dim,), weight.float(), eps).to(qkv.dtype)
-        view.copy_(_rope(normed, t["cos_sin_cache"], t["positions"], p["rope_layout"]))
+        scale = weight.float() + 1 if p["zero_centered"] else weight.float()
+        normed = F.rms_norm(view.float(), (dim,), scale, eps)
+        view.copy_(_rope(normed, cos_sin, positions, p["rope_layout"]))
     return {}
 
 
@@ -231,18 +279,29 @@ def _dsa_paged(p, t):
     page_size = cache.shape[1]
     scale = p["sm_scale"] if p["sm_scale"] is not None else dk**-0.5
     flat = cache.view(-1, cache.shape[-1])
+    fp8 = cache.dtype == torch.uint8
+    if (cache.shape[-1] != 656 or dk != 576) if fp8 else cache.shape[-1] != dk:
+        raise ValueError("q and the cache row disagree")
+    sink = t["attn_sink"]
     outs, lses = [], []
     for b in range(batch):
         for s in range(s_q):
             pos = indices[b, s].long()
             pos = pos[(pos >= 0) & (pos < lens[b])]
             rows = flat[table[b][pos // page_size].long() * page_size + pos % page_size]
-            latent = rows[:, :512].view(torch.float8_e4m3fn).float()
-            scales = rows[:, 512:528].view(torch.float32).repeat_interleave(128, 1)
-            value = latent * scales
-            key = torch.cat([value, rows[:, 528:].view(torch.bfloat16).float()], -1)
+            if fp8:
+                latent = rows[:, :512].view(torch.float8_e4m3fn).float()
+                scales = rows[:, 512:528].view(torch.float32).repeat_interleave(128, 1)
+                value = latent * scales
+                key = torch.cat([value, rows[:, 528:].view(torch.bfloat16).float()], -1)
+            else:
+                key = rows.float()
+                value = key[:, : p["head_dim_v"]]
             visible = torch.ones(1, key.shape[0], dtype=torch.bool)
             o, lse = _attend(q[b, s : s + 1], key, value, scale, visible)
+            if sink is not None:
+                # The sink joins the denominator: o * e^lse / (e^lse + e^sink); lse unchanged.
+                o = o * torch.sigmoid(lse - sink.float()).nan_to_num(0.0)[..., None]
             outs.append(o[0])
             lses.append(lse[0])
     shape = (batch, s_q)
@@ -261,6 +320,142 @@ def _paged_kv_cache_gather(p, t):
         if t.get("kv_scale") is not None:
             rows = rows.float() * t["kv_scale"]
         out[a:e] = rows.to(out.dtype)
+    return {"output": out}
+
+
+def _gated_pool_compress(p, t):
+    names = ("kv", "score", "ape", "kv_state", "score_state", "cu_seqlens", "start_pos")
+    entries, valid = gated_pool_compress(
+        *(t[n] for n in names), t["state_slots"], p["ratio"], p["overlap"]
+    )
+    return {"entries": entries, "valid": valid}
+
+
+# ---------------------------------------------------------------- moe
+
+
+def _moe_grouped_gemm_mxfp4(p, t):
+    names = ("a", "a_scale", "b", "b_scale", "layout_metadata")
+    return {"output": moe.ref_moe_grouped_gemm_mxfp4(*(t[n] for n in names), p["layout"])}
+
+
+# ---------------------------------------------------------------- sequence modeling
+
+
+def _hyper_connection_pre(p, t):
+    names = ("residual", "fn", "hc_scale", "hc_base")
+    post_mix, comb_mix, layer_input = hc_pre(*(t[n] for n in names), **p)
+    return {"post_mix": post_mix, "comb_mix": comb_mix, "layer_input": layer_input}
+
+
+def _hyper_connection_post(p, t):
+    names = ("x", "residual", "post_layer_mix", "comb_res_mix")
+    return {"output": hc_post(*(t[n] for n in names))}
+
+
+def _hyper_connection_head(p, t):
+    names = ("hidden_states", "hc_fn", "hc_scale", "hc_base")
+    return {"output": hc_head(*(t[n] for n in names), p["rms_norm_eps"], p["hc_eps"])}
+
+
+def _ngram_hash(p, t):
+    names = ("input_ids", "context", "multipliers", "primes", "offsets")
+    optional = ("cu_seqlens", "context_indices", "num_accepted_tokens")
+    ids = ngram_hash(*(t[n] for n in names), p["eos_token_id"], *(t[n] for n in optional))
+    return {"ngram_ids": ids}
+
+
+# ---------------------------------------------------------------- indexing
+
+
+def _embedding(p, t):
+    params = ("padding_idx", "max_norm", "norm_type", "scale_grad_by_freq", "sparse")
+    return {"output": F.embedding(t["input"], t["weight"], **{k: p[k] for k in params})}
+
+
+def _masked_scatter(p, t):
+    return {"output": torch.masked_scatter(t["input"], t["mask"], t["source"])}
+
+
+# ---------------------------------------------------------------- norm
+
+
+def _rms_norm_gated(p, t):
+    # mamba_ssm.ops.triton.layernorm_gated.rms_norm_ref; the sigmoid gate follows
+    # fla.modules.norm.fused_norm_gate.rms_norm_gated
+    x, z, weight, bias = t["x"], t["z"], t["weight"], t["bias"]
+    n = x.shape[-1]
+    group = n if p["group_size"] is None else p["group_size"]
+    if (
+        weight.shape != (n,)
+        or (bias is not None and bias.shape != (n,))
+        or (z is not None and z.shape != x.shape)
+        or group <= 0
+        or n % group
+    ):
+        raise ValueError("weight, bias, z and group_size must match x")
+    output = rms_norm_gated(
+        x,
+        weight,
+        bias,
+        z,
+        p["eps"],
+        p["group_size"],
+        p["norm_before_gate"],
+        p["activation"],
+    )
+    return {"output": output}
+
+
+# ---------------------------------------------------------------- mamba
+
+
+def _causal_conv1d(p, t):
+    names = ("x", "weight", "conv_state", "cu_seqlens", "bias", "has_initial_state")
+    silu = p["activation"] is not None
+    output = mamba.causal_conv1d_ref(
+        *(t[n] for n in names), silu, t["cache_indices"], p["dilation"]
+    )
+    return {"output": output}
+
+
+def _causal_conv1d_update(p, t):
+    names = ("conv_state_indices", "num_accepted_tokens", "query_start_loc")
+    silu = p["activation"] is not None
+    output = mamba.causal_conv1d_update_ref(
+        t["x"], t["weight"], t["conv_state"], t["bias"], silu, *(t[n] for n in names),
+        p["dilation"],
+    )  # fmt: skip
+    return {"output": output}
+
+
+# ---------------------------------------------------------------- rope
+
+
+def _rope_cos_sin(p, t):
+    # flash_attn.layers.rotary.apply_rotary_emb: one offset, or one per sequence
+    x, cos, sin, cu = t["x"], t["cos"], t["sin"], t["cu_seqlens"]
+    if cos.shape != sin.shape or 2 * cos.shape[-1] > x.shape[-1]:
+        raise ValueError("cos and sin must share a shape of at most half the head")
+    r, off = 2 * cos.shape[-1], t["seqlen_offsets"]
+    lengths = [x.shape[1]] * x.shape[0] if cu is None else (cu[1:] - cu[:-1]).tolist()
+    offsets = off.tolist() if isinstance(off, torch.Tensor) else [off] * len(lengths)
+    rows = [torch.arange(n) + o for n, o in zip(lengths, offsets, strict=True)]
+    if cu is None:
+        rows = torch.stack(rows) if rows else torch.zeros(0, x.shape[1], dtype=torch.long)
+        c, s = cos[rows][:, :, None].float(), sin[rows][:, :, None].float()
+    else:
+        rows = torch.cat(rows)
+        c, s = cos[rows][:, None].float(), sin[rows][:, None].float()
+    h = x[..., :r].float()
+    if p["interleaved"]:
+        x1, x2 = h[..., 0::2], h[..., 1::2]
+        rotated = torch.stack((x1 * c - x2 * s, x2 * c + x1 * s), dim=-1).flatten(-2)
+    else:
+        x1, x2 = h.chunk(2, dim=-1)
+        rotated = torch.cat((x1 * c - x2 * s, x2 * c + x1 * s), dim=-1)
+    out = x if p["inplace"] else x.clone()
+    out[..., :r] = rotated.to(x.dtype)
     return {"output": out}
 
 
@@ -284,9 +479,34 @@ def _unsqueeze(name):
     return edit
 
 
+def _as_float(name):
+    def edit(tensors):
+        tensors[name] = tensors[name].float()
+
+    return edit
+
+
 def _empty_rows(name):
     def edit(tensors):
         tensors[name] = tensors[name][:0]
+
+    return edit
+
+
+# ---------------------------------------------------------------- indexing
+
+
+def _concat(p, t):
+    return {"output": torch.cat(t["tensors"], p["dim"])}
+
+
+def _narrow_element(name, k, axis):
+    """A rejected call: element *k* of tensor sequence *name* one element shorter along *axis*."""
+
+    def edit(tensors):
+        items = list(tensors[name])
+        items[k] = items[k].narrow(axis, 0, items[k].shape[axis] - 1)
+        tensors[name] = items
 
     return edit
 
@@ -322,6 +542,21 @@ REFERENCES = {
     "MergeAttentionStatesFwdOp": (_merge_attention_states, _narrow("v_b")),
     "DSAPagedFwdOp": (_dsa_paged, _narrow("kv_cache")),
     "PagedKVCacheGatherFwdOp": (_paged_kv_cache_gather, _narrow("out")),
+    "EmbeddingFwdOp": (_embedding, _as_float("input")),
+    "MaskedScatterFwdOp": (_masked_scatter, _narrow("mask", 0)),
+    "RMSNormGatedFwdOp": (_rms_norm_gated, _narrow("weight")),
+    "RoPECosSinFwdOp": (_rope_cos_sin, _narrow("sin")),
+    "ConcatFwdOp": (_concat, _narrow_element("tensors", 1, 0)),
+    "GatedPoolCompressFwdOp": (_gated_pool_compress, _narrow("ape")),
+    "NSAVarlenFwdOp": (_nsa_varlen, _narrow("v")),
+    "FP4QuantPerGroupFwdOp": (_fp4_per_group, _narrow("x")),
+    "MoEGroupedGEMMMXFP4FwdOp": (_moe_grouped_gemm_mxfp4, _narrow("b_scale")),
+    "HyperConnectionPreFwdOp": (_hyper_connection_pre, _narrow("hc_base")),
+    "HyperConnectionPostFwdOp": (_hyper_connection_post, _narrow("comb_res_mix")),
+    "HyperConnectionHeadFwdOp": (_hyper_connection_head, _narrow("hc_base")),
+    "NGramHashFwdOp": (_ngram_hash, _narrow("offsets")),
+    "CausalConv1dFwdOp": (_causal_conv1d, _narrow("weight", 0)),
+    "CausalConv1dUpdateFwdOp": (_causal_conv1d_update, _narrow("weight", 0)),
 }
 
 
@@ -356,11 +591,16 @@ def _calls(name):
             meta = call.materialize("meta")
             host = dict(meta)
             for n, spec in call.specs.items():
-                if spec is not None and spec.values is not None and n in meta:
+                if isinstance(spec, TensorSpec) and spec.values is not None and n in meta:
                     host[n] = torch.tensor(spec.values, dtype=getattr(torch, spec.dtype)).reshape(
                         spec.shape
                     )
             yield row["label"], case, plan, call, meta, host
+
+
+def _numel(values):
+    """The elements of the tensors among *values*, a tensor sequence's counted over its elements."""
+    return sum(t.numel() for t in leaves(tuple(values)) if isinstance(t, torch.Tensor))
 
 
 def _smallest_calls(name, cls):
@@ -369,12 +609,12 @@ def _smallest_calls(name, cls):
     smallest = {}
     for label, case, plan, call, meta, host in _calls(name):
         sig = plan.sig
-        arguments = call.arguments(meta)
+        arguments = call.arguments()
         op = cls(**arguments)
         inputs = {n: meta[n] for n in sig.inputs}
         params = sorted((p, repr(arguments.get(p))) for p in sig.params)
         key = (cls._signature.key(cls._signature.point(op, inputs)), sorted(case.items()), params)
-        size = sum(t.numel() for t in inputs.values() if t is not None)
+        size = _numel(inputs.values())
         if repr(key) not in smallest or size < smallest[repr(key)][0]:
             smallest[repr(key)] = (size, (label, case, plan, call, meta, host, op))
     return [c for _, c in smallest.values()]
@@ -390,14 +630,18 @@ def test_reference_agrees_with_the_signature(name):
         checked = cls._signature.check(op, {n: meta[n] for n in plan.sig.inputs})
         inputs = {n: host[n] for n in plan.sig.inputs}
         with _Writes() as writes:
-            outputs = reference(call.arguments(meta), inputs)
-        declared = {n: call.tensors[n] for n in plan.sig.outputs}
+            outputs = reference(call.arguments(), inputs)
+        declared = {n: call.tensors[n] for n in plan.sig.outputs if n in call.tensors}
         got = {n: (tuple(v.shape), str(v.dtype).removeprefix("torch.")) for n, v in outputs.items()}
         assert got == {n: (tuple(s), d) for n, (s, d) in declared.items()}, where
         written = {
             n
             for n, v in inputs.items()
-            if v is not None and v.untyped_storage()._cdata in writes.storages
+            if any(
+                t.untyped_storage()._cdata in writes.storages
+                for t in leaves((v,))
+                if isinstance(t, torch.Tensor)
+            )
         }
         assert written == set(checked.written), where
 
@@ -408,7 +652,7 @@ def test_a_call_the_signature_rejects_the_reference_rejects(name):
     cls = signature_class(name, load_manifest()[name])
     label, case, plan, call, meta, host, op = min(
         _smallest_calls(name, cls),
-        key=lambda c: sum(t.numel() for n in c[2].sig.inputs if (t := c[4][n]) is not None),
+        key=lambda c: _numel(c[4][n] for n in c[2].sig.inputs),
     )
     bad_meta = {n: meta[n] for n in plan.sig.inputs}
     bad_host = {n: host[n] for n in plan.sig.inputs}
@@ -417,7 +661,7 @@ def test_a_call_the_signature_rejects_the_reference_rejects(name):
     with pytest.raises((ValueError, TypeError)):
         cls._signature.check(op, bad_meta)
     with pytest.raises((RuntimeError, ValueError, IndexError, TypeError)):
-        reference(call.arguments(meta), bad_host)
+        reference(call.arguments(), bad_host)
 
 
 def test_a_write_only_buffer_is_written_whole():
@@ -429,5 +673,21 @@ def test_a_write_only_buffer_is_written_whole():
     call = instantiate(plan, {**row, "some": ["seq_starts"], "label": "s"}, {"KV": "bfloat16"})
     tensors = call.materialize("cpu")
     tensors["out"].fill_(math.nan)
-    _paged_kv_cache_gather(call.arguments(tensors), {n: tensors[n] for n in plan.sig.inputs})
+    _paged_kv_cache_gather(call.arguments(), {n: tensors[n] for n in plan.sig.inputs})
     assert not tensors["out"].isnan().any()
+
+
+def test_the_nsa_reference_attends_a_block_selected_twice_twice():
+    """parallel_nsa_fwd attends each selected slot, so a repeated block weighs double."""
+    params = {"block_size": 1, "sm_scale": None, "is_causal": False}
+    tensors = {
+        "q": torch.zeros(1, 1, 1),
+        "k": torch.zeros(2, 1, 1),
+        "v": torch.tensor([0.0, 3.0]).view(2, 1, 1),
+        "block_indices": torch.tensor([[[0, 0, 1]]], dtype=torch.int32),
+        "block_counts": torch.tensor([[3]], dtype=torch.int32),
+        "cu_seqlens": torch.tensor([0, 1], dtype=torch.int32),
+        "token_indices": torch.tensor([[0, 0]], dtype=torch.int32),
+        "cu_seqlens_k": torch.tensor([0, 2], dtype=torch.int32),
+    }
+    assert _nsa_varlen(params, tensors)["o"].item() == pytest.approx(1.0)

@@ -11,14 +11,13 @@ element once; the fp32 kernel runs one block a head.
 """
 
 import math
-from typing import Optional, Tuple
 
 import tilelang
 import tilelang.language as T
 import torch
 
-from tileops._kernels.autotune import TUNING_FATAL
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.autotune import candidate_busy_ms
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.constants import LOG2E
 from tileops._kernels.kernel_base import Entry, Kernel
 from tileops._kernels.linear_attention.call_spec import (
@@ -26,7 +25,11 @@ from tileops._kernels.linear_attention.call_spec import (
     GLADecodeFwdInterface,
     head_count_refusal,
 )
-from tileops._utils import get_sm_count
+from tileops._kernels.linear_attention.deltanet.recurrent import (
+    k_tile_refusal,
+    stream_state_configs,
+    tune_decode,
+)
 
 __all__ = ["GLADecodeFP32Kernel", "GLADecodeKernel"]
 
@@ -73,7 +76,7 @@ def _gla_decode_tl(
     @tilelang.jit(
         out_idx=[-2, -1],
         pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: False},
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
     )
     def decode():
         state_layout = T.Fragment(
@@ -132,13 +135,25 @@ def _gla_decode_tl(
     return decode()
 
 
+def _decode_inputs(kernel: Kernel, dtype: torch.dtype) -> tuple[torch.Tensor, ...]:
+    """Random ``(q, k, v, gk, state)`` of *kernel*'s shape to time its candidates on."""
+    B, H, DK, DV = kernel.batch, kernel.head, kernel.dim_k, kernel.dim_v
+    return (
+        torch.randn(B, H, DK, device="cuda", dtype=dtype),
+        torch.randn(B, H, DK, device="cuda", dtype=dtype),
+        torch.randn(B, H, DV, device="cuda", dtype=dtype),
+        -torch.rand(B, H, DK, device="cuda", dtype=dtype),
+        torch.randn(B, H, DK, DV, device="cuda", dtype=dtype),
+    )
+
+
 def _decode_entry(cls: type, call: GLADecodeCall) -> Entry:
     """The entry for a GLA decode kernel: both take the same construction arguments.
 
     The device index is in the identity because the kernel is compiled for the
     architecture it is built on.
     """
-    index = call.device.index if call.device is not None else None
+    index = call.device_index
     dtype = Kernel.dtype_to_str(call.dtype)
     identity = (call.batch, call.heads, call.dim_k, call.dim_v, call.scale, dtype, index)
     return identity, lambda: cls(
@@ -159,8 +174,8 @@ class GLADecodeKernel(Kernel, GLADecodeFwdInterface):
     general = True
 
     @classmethod
-    def refusal(cls, call: GLADecodeCall) -> Optional[str]:
-        return head_count_refusal(call.heads)
+    def refusal(cls, call: GLADecodeCall) -> str | None:
+        return head_count_refusal(call.heads) or super().refusal(call)
 
     @classmethod
     def entry_for(cls, call: GLADecodeCall) -> Entry:
@@ -174,8 +189,8 @@ class GLADecodeKernel(Kernel, GLADecodeFwdInterface):
         dim_v: int,
         scale: float,
         dtype: str = "float32",
-        config: Optional[dict] = None,
-        device_index: Optional[int] = None,
+        config: dict | None = None,
+        device_index: int | None = None,
     ):
         super().__init__(device_index=device_index)
         self.batch = batch
@@ -209,47 +224,18 @@ class GLADecodeKernel(Kernel, GLADecodeFwdInterface):
 
     def autotune(self, warmup: int = 10, rep: int = 20) -> None:
         """Sweep block_v and threads, then publish the fastest config."""
-        from tilelang.profiler import do_bench
-
-        best_time = float("inf")
-        best_config = None
-
-        B, H, DK, DV = self.batch, self.head, self.dim_k, self.dim_v
-        torch_dtype = getattr(torch, self.dtype_str)
-        q = torch.randn(B, H, DK, device="cuda", dtype=torch_dtype)
-        k = torch.randn(B, H, DK, device="cuda", dtype=torch_dtype)
-        v = torch.randn(B, H, DV, device="cuda", dtype=torch_dtype)
-        gk = -torch.rand(B, H, DK, device="cuda", dtype=torch_dtype)
-        state = torch.randn(B, H, DK, DV, device="cuda", dtype=torch_dtype)
-
-        candidates = self.tuning_candidates(
-            [
-                {"block_v": block_v, "threads": threads}
-                for block_v in self._block_v_options()
-                for threads in (128, 256)
-            ]
-        )
-        for config in candidates:
-            try:
-                fn = _gla_decode_tl(
-                    B, H, DK, DV, config["block_v"], config["threads"], self.dtype_str, self.scale
-                )
-                t = do_bench(lambda _fn=fn: _fn(q, k, v, gk, state), warmup=warmup, rep=rep)
-                if t < best_time:
-                    best_time = t
-                    best_config = config
-            except TUNING_FATAL:
-                raise
-            except Exception:
-                continue
-
-        if best_config is not None:
-            self._publish(best_config, self._compile)
+        configs = [
+            {"block_v": block_v, "threads": threads}
+            for block_v in self._block_v_options()
+            for threads in (128, 256)
+        ]
+        inputs = _decode_inputs(self, getattr(torch, self.dtype_str))
+        tune_decode(self, configs, inputs, warmup, rep, candidate_busy_ms)
 
     @property
     def default_config(self) -> dict:
         """The narrowest value slice whose blocks fit one wave, and 128 threads."""
-        sm_count = get_sm_count(self.device_index)
+        sm_count = self.build_target.sm_count
         sequences = self.batch * self.head
         options = self._block_v_options()
         block_v = next(
@@ -264,11 +250,9 @@ class GLADecodeKernel(Kernel, GLADecodeFwdInterface):
         v: torch.Tensor,
         gk: torch.Tensor,
         state: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.program(self._compile)(q, k, v, gk, state)
-
-
-# FP32-precision decode kernel (no T.gemm → avoids TF32 mantissa truncation)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        tensors = (q, k, v, gk, state)
+        return self.program(self._compile)(*(tensor.contiguous() for tensor in tensors))
 
 
 @target_cache(maxsize=32)
@@ -280,13 +264,8 @@ def _gla_decode_fp32_tl(
     k_tile: int,
     scale: float,
 ):
-    """FP32 decode kernel using element-wise matvec instead of T.gemm.
-
-    T.gemm on fp32 inputs uses TF32 tensor cores which truncate the mantissa
-    to 10 bits (~1e-3 error per op).  For multi-step decode the error
-    compounds through the recurrent state.  This kernel avoids T.gemm
-    entirely, computing S@q_gated via scalar accumulation in full fp32.
-    """
+    """FP32 decode kernel: one block a head computes ``S @ q_gated`` by scalar fp32
+    accumulation, then streams the state through shared memory in *k_tile*-row tiles."""
     dtype = "float32"
     accum_dtype = "float32"
     if dim_k % k_tile != 0:
@@ -306,7 +285,7 @@ def _gla_decode_fp32_tl(
         pass_configs={
             tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: False,
         },
-        compile_flags=["-O3"],
+        compile_flags=[*CUDA_COMPILE_FLAGS],
     )
     def _decode_func(num_stages, threads=128):
         @T.prim_func
@@ -321,17 +300,15 @@ def _gla_decode_fp32_tl(
         ):
             with T.Kernel(batch, head, threads=threads) as (bid, hid):
                 h_tile = T.alloc_shared([k_tile, dim_v], dtype)
-                # Fragment accumulator for S @ q_gated (full fp32, no TF32)
                 sq_frag = T.alloc_fragment([dim_v], accum_dtype)
                 qk_dot = T.alloc_local([1], accum_dtype)
-                # Preload q, k, v, gk into shared memory to avoid global access
-                # in pipelined loop (fixes TileLang warp-specialization issue)
+                # The pipelined loop reads no global memory, which TileLang's warp
+                # specialization requires here.
                 q_shared = T.alloc_shared([dim_k], dtype)
                 k_shared = T.alloc_shared([dim_k], dtype)
                 v_shared = T.alloc_shared([dim_v], dtype)
                 gk_shared = T.alloc_shared([dim_k], dtype)
 
-                # Preload tensors into shared memory
                 for i in T.Parallel(dim_k):
                     q_shared[i] = q[bid, hid, i]
                     k_shared[i] = k[bid, hid, i]
@@ -375,24 +352,22 @@ def _gla_decode_fp32_tl(
 
 
 class GLADecodeFP32Kernel(Kernel, GLADecodeFwdInterface):
-    """FP32-precision GLA decode kernel (no TF32 tensor cores).
-
-    Uses element-wise matvec instead of T.gemm to avoid TF32 mantissa
-    truncation that causes ~1e-3 error per step, compounding over multi-step
-    decode.  Intended for fp32 dtype only.
-    """
+    """GLA decode for fp32 inputs, one block a head; the state streams in key tiles."""
 
     supported_archs: list[int] = [80, 89, 90]
-    # The key-dimension tile the untuned decode program splits the state into.
+    # The key-dimension tile the untuned decode program splits the state into, so it is
+    # what decides which key dims this kernel serves.
     _DEFAULT_K_TILE = 16
 
     @classmethod
     def refusal(cls, call: GLADecodeCall) -> "str | None":
         if call.dtype != torch.float32:
             return f"serves float32, got {call.dtype}"
-        if call.dim_k % cls._DEFAULT_K_TILE:
-            return f"requires dim_k a multiple of {cls._DEFAULT_K_TILE}, got {call.dim_k}"
-        return head_count_refusal(call.heads) or super().refusal(call)
+        return (
+            k_tile_refusal(call.dim_k, cls._DEFAULT_K_TILE)
+            or head_count_refusal(call.heads)
+            or super().refusal(call)
+        )
 
     @classmethod
     def entry_for(cls, call: GLADecodeCall) -> Entry:
@@ -406,8 +381,8 @@ class GLADecodeFP32Kernel(Kernel, GLADecodeFwdInterface):
         dim_v: int,
         scale: float,
         dtype: str = "float32",
-        config: Optional[dict] = None,
-        device_index: Optional[int] = None,
+        config: dict | None = None,
+        device_index: int | None = None,
     ):
         super().__init__(device_index=device_index)
         if dtype != "float32":
@@ -434,48 +409,8 @@ class GLADecodeFP32Kernel(Kernel, GLADecodeFwdInterface):
 
     def autotune(self, warmup: int = 10, rep: int = 20) -> None:
         """Sweep k_tile, num_stages and threads, then publish the fastest config."""
-        from tilelang.profiler import do_bench
-
-        best_time = float("inf")
-        best_config = None
-        B, H, DK, DV = self.batch, self.head, self.dim_k, self.dim_v
-
-        q = torch.randn(B, H, DK, device="cuda", dtype=torch.float32)
-        k = torch.randn(B, H, DK, device="cuda", dtype=torch.float32)
-        v = torch.randn(B, H, DV, device="cuda", dtype=torch.float32)
-        gk = -torch.rand(B, H, DK, device="cuda", dtype=torch.float32)
-        state = torch.randn(B, H, DK, DV, device="cuda", dtype=torch.float32)
-
-        candidates = self.tuning_candidates(
-            [
-                {"num_stages": num_stages, "threads": threads, "k_tile": k_tile}
-                for k_tile in (16, 32, 64)
-                if DK % k_tile == 0
-                for num_stages in (1, 2, 3)
-                for threads in (128, 256)
-            ]
-        )
-        for config in candidates:
-            try:
-                fn = _gla_decode_fp32_tl(
-                    B,
-                    H,
-                    DK,
-                    DV,
-                    config["k_tile"],
-                    self.scale,
-                )(config["num_stages"], config["threads"])
-                t = do_bench(lambda _fn=fn: _fn(q, k, v, gk, state), warmup=warmup, rep=rep)
-                if t < best_time:
-                    best_time = t
-                    best_config = config
-            except TUNING_FATAL:
-                raise
-            except Exception:
-                continue
-
-        if best_config is not None:
-            self._publish(best_config, self._compile)
+        inputs = _decode_inputs(self, torch.float32)
+        tune_decode(self, stream_state_configs(self.dim_k), inputs, warmup, rep, candidate_busy_ms)
 
     @property
     def default_config(self) -> dict:
@@ -492,5 +427,6 @@ class GLADecodeFP32Kernel(Kernel, GLADecodeFwdInterface):
         v: torch.Tensor,
         gk: torch.Tensor,
         state: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.program(self._compile)(q, k, v, gk, state)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        tensors = (q, k, v, gk, state)
+        return self.program(self._compile)(*(tensor.contiguous() for tensor in tensors))

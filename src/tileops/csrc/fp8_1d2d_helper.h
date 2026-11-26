@@ -18,6 +18,8 @@
 #include <cutlass/gemm/collective/builders/sm90_common.inl>
 #include <type_traits>
 
+#include "cluster_partials.h"
+
 namespace tileops {
 
 template <int BlockN>
@@ -239,12 +241,44 @@ __device__ __forceinline__ void fp8_wave_fold_split(float* final_accum,
   }
 }
 
-__device__ __forceinline__ void fp8_wave_fold_split_56(float* f, float const* p,
-                                                       float const* rs,
-                                                       float const* rs1,
-                                                       int former) {
-  fp8_wave_fold_split<56>(f, p, rs, rs1, former);
+__device__ __forceinline__ void fp8_wave_fold_split_112(
+    float* f, float const* p, float const* rs, float const* rs1, int former) {
+  fp8_wave_fold_split<112>(f, p, rs, rs1, former);
 }
+
+// The two CTAs of a K-split pair each hold a 128 x BlockN partial over half of
+// K; each keeps the 64 rows of the consumer warpgroup whose index is its rank
+// and receives the peer's partial of those rows, BlockN / 2 floats a thread,
+// through send_partials and add_partials.
+//
+// Arrives once on ``bar``, expecting a peer warpgroup's half-K partial of
+// BlockN columns.
+// ``landing`` is named only to start its shared-memory lifetime here: the peer
+// writes it while this CTA still runs its own K loop.
+template <int BlockN>
+__device__ __forceinline__ void fp8_wave_expect_half(void* bar,
+                                                     float* landing) {
+  (void)landing;
+  expect_partials(bar, 128 * (BlockN / 2) * 4);
+}
+
+#define TILEOPS_DEFINE_FP8_WAVE_PAIR(N)                                \
+  __device__ __forceinline__ void fp8_wave_send_half_##N(              \
+      float const* a, float* l, void* bar, int peer, int t) {          \
+    send_partials<N / 2>(a, l, bar, peer, t);                          \
+  }                                                                    \
+  __device__ __forceinline__ void fp8_wave_add_half_##N(               \
+      float* a, float const* l, int t) {                               \
+    add_partials<N / 2>(a, l, t);                                      \
+  }                                                                    \
+  __device__ __forceinline__ void fp8_wave_expect_half_##N(void* bar,  \
+                                                           float* l) { \
+    fp8_wave_expect_half<N>(bar, l);                                   \
+  }
+
+TILEOPS_DEFINE_FP8_WAVE_PAIR(112)
+
+#undef TILEOPS_DEFINE_FP8_WAVE_PAIR
 
 // Fold one 64xN WGMMA partial into its accumulator when the tile can span three
 // 128x128 ``scale_b`` blocks: columns below ``Former`` take ``row_scale``, the
@@ -310,8 +344,8 @@ TILEOPS_DEFINE_FP8_WAVE_FOLD_PER_COLUMN(192, 8)
     fp8_wave_wgmma_64xN<N>(acc, a, b, g);                \
   }
 
-TILEOPS_DEFINE_FP8_WAVE_WGMMA(56)
 TILEOPS_DEFINE_FP8_WAVE_WGMMA(64)
+TILEOPS_DEFINE_FP8_WAVE_WGMMA(112)
 TILEOPS_DEFINE_FP8_WAVE_WGMMA(128)
 TILEOPS_DEFINE_FP8_WAVE_WGMMA(176)
 TILEOPS_DEFINE_FP8_WAVE_WGMMA(192)

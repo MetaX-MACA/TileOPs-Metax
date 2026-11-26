@@ -1,7 +1,5 @@
 """Single-token DeltaNet inference decode."""
 
-from typing import Optional, Tuple
-
 import torch
 
 from tileops._kernels.kernel_base import Entry, Kernel
@@ -26,7 +24,7 @@ class DeltaNetDenseDecodeFwdKernel(Kernel, DeltaNetFwdInterface):
     supported_archs = [80, 89, 90]
 
     @classmethod
-    def refusal(cls, call: DeltaNetCall) -> Optional[str]:
+    def refusal(cls, call: DeltaNetCall) -> str | None:
         """Why this kernel does not serve *call*, or ``None`` when it does.
 
         One 16-bit token over a 64- or 128-wide square float32 state.
@@ -50,11 +48,13 @@ class DeltaNetDenseDecodeFwdKernel(Kernel, DeltaNetFwdInterface):
             )
             if present
         ]
-        return "does not support " + ", ".join(unsupported) if unsupported else None
+        if unsupported:
+            return "does not support " + ", ".join(unsupported)
+        return super().refusal(call)
 
     @classmethod
     def entry_for(cls, call: DeltaNetCall) -> Entry:
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         identity = (
             call.batch,
             call.heads,
@@ -98,9 +98,7 @@ class DeltaNetDenseDecodeFwdKernel(Kernel, DeltaNetFwdInterface):
         self.l2norm = l2norm
         self.init_config()
         self.program(self._compile)
-        device = (
-            torch.device("cuda", device_index) if device_index is not None else torch.device("cuda")
-        )
+        device = self._build_device
         # The parameters an ungated build leaves unread are declared one element wide.
         self._unread_gate = torch.empty(1, dtype=dtype, device=device)
         self._unread = torch.empty(1, dtype=torch.float32, device=device)
@@ -128,7 +126,7 @@ class DeltaNetDenseDecodeFwdKernel(Kernel, DeltaNetFwdInterface):
     @property
     def default_config(self) -> dict:
         """The block shape this call's grid calls for, over a key-major state."""
-        return decode_launch(self.batch, self.heads, self.dim, False, self.device_index)
+        return decode_launch(self.batch, self.heads, self.dim, False, self.build_target.sm_count)
 
     def forward(
         self,
@@ -139,7 +137,7 @@ class DeltaNetDenseDecodeFwdKernel(Kernel, DeltaNetFwdInterface):
         initial_state: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor | None = None,
         cu_seqlens_cpu: torch.Tensor | None = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         del cu_seqlens, cu_seqlens_cpu
         self._require_devices(q=q, k=k, v=v, beta=beta)
         if self.has_initial_state and initial_state is None:

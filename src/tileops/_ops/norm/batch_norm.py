@@ -19,7 +19,8 @@ Input tensors accept any shape ``(N, C, *spatial)``; the kernels take its contig
 """
 
 import math
-from typing import ClassVar, Mapping, Optional, Tuple
+from collections.abc import Mapping
+from typing import ClassVar
 
 import torch
 
@@ -111,11 +112,11 @@ class BatchNormFwdOp(Op):
     def forward(
         self,
         input: torch.Tensor,
-        running_mean: Optional[torch.Tensor] = None,
-        running_var: Optional[torch.Tensor] = None,
-        weight: Optional[torch.Tensor] = None,
-        bias: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        running_mean: torch.Tensor | None,
+        running_var: torch.Tensor | None,
+        weight: torch.Tensor | None = None,
+        bias: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Run batch normalization forward pass.
 
         The ``training`` mode is bound at ctor time. Construct a separate
@@ -123,8 +124,8 @@ class BatchNormFwdOp(Op):
 
         Args:
             input: Input tensor of shape ``(N, C, *spatial)``.
-            running_mean: Running mean of shape $[C]$, ``torch.float32``; updated in place
-                in training, required in inference.
+            running_mean: Running mean of shape $[C]$, ``torch.float32``, or ``None``; updated
+                in place in training, not ``None`` in inference.
             running_var: Running variance, the same; passed exactly when ``running_mean`` is.
             weight: Affine scale (gamma) of shape $[C]$, ``torch.float32``, or ``None``.
             bias: Affine shift (beta) of shape $[C]$, ``torch.float32``, or ``None``.
@@ -173,7 +174,7 @@ class BatchNormFwdOp(Op):
         # absent one. The running statistics are written, so normalizing them is not
         # enough: whoever serves this op writes the tensor it was handed, and a copy would
         # swallow that write. ``contiguous()`` returns the same object when it has nothing
-        # to do, so what came back tells us whether a write-back is owed.
+        # to do, so what came back says whether a write-back is owed.
         stats = (running_mean, running_var)
         handed = stats if running_mean is None else tuple(stat.contiguous() for stat in stats)
         weight = None if weight is None else weight.contiguous()
@@ -231,8 +232,8 @@ class BatchNormBwdOp(Op):
         save_mean: torch.Tensor,
         save_invstd: torch.Tensor,
         *,
-        weight: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        weight: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run batch normalization backward pass.
 
         Args:

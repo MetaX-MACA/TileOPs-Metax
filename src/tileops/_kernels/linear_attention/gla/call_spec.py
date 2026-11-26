@@ -3,7 +3,6 @@ and the kernel interface its implementations inherit."""
 
 import dataclasses
 from abc import abstractmethod
-from typing import Optional
 
 import torch
 
@@ -29,7 +28,7 @@ class GLACall(CallSpec):
     heads: int = 0
     dim_k: int = 0
     dim_v: int = 0
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
     scale: float = 0.0
     varlen: bool = False
     # Whether the call supplies initial_state, rather than starting the recurrence from zero.
@@ -49,9 +48,9 @@ class GLAFwdInterface(KernelInterface):
         k: torch.Tensor,
         v: torch.Tensor,
         g: torch.Tensor,
-        initial_state: Optional[torch.Tensor] = None,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        cu_seqlens_cpu: Optional[torch.Tensor] = None,
+        initial_state: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run the recurrence from *initial_state* over the call's sequence.
 
@@ -73,14 +72,14 @@ class GLAFwdInterface(KernelInterface):
         """
 
 
-def dense_refusal(call: GLACall) -> Optional[str]:
+def dense_refusal(call: GLACall) -> str | None:
     """Why *call* is not a dense (not packed) call with K = V in {64, 128} in fp16 or bf16."""
     if call.varlen:
         return "serves a dense call, not a packed one"
     return extents_refusal(call)
 
 
-def extents_refusal(call: GLACall) -> Optional[str]:
+def extents_refusal(call: GLACall) -> str | None:
     """Why the in-tree GLA kernels do not compile *call*'s head count, widths and dtype."""
     reason = head_count_refusal(call.heads)
     if reason is not None:
@@ -94,6 +93,6 @@ def extents_refusal(call: GLACall) -> Optional[str]:
 
 def build_entry(cls: type, call: GLACall, **build_arguments: int | bool) -> Entry:
     """Build *cls* from the call's scale, dtype and device plus the *build_arguments* it compiles."""
-    device_index = call.device.index if call.device is not None else None
+    device_index = call.device_index
     arguments = dict(build_arguments, scale=call.scale, dtype=call.dtype, device_index=device_index)
     return tuple(sorted(arguments.items(), key=lambda item: item[0])), lambda: cls(**arguments)

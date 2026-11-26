@@ -1,28 +1,162 @@
 import copy
 import itertools
-from typing import Optional
 
 import tilelang
 import tilelang.language as T
 import torch
 
 from tileops._kernels.attention.call_spec import AttentionCall, GQADenseFwdInterface
+from tileops._kernels.attention.gqa.decode_bs1_common import (
+    allocate_partials,
+    balanced_split,
+    make_gqa_decode_bs1_combine,
+    rope_partner,
+)
 from tileops._kernels.attention.online_softmax import (
     make_apply_softcap,
     make_dense_sink_scale,
-    make_dense_split_sink_merge,
     make_online_softmax,
     make_rescale,
 )
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.constants import LOG2E
 from tileops._kernels.kernel_base import Entry, Kernel
-from tileops._utils import get_shared_memory_optin, is_maca
+from tileops._utils import is_maca
 
-__all__ = ["GQADecodeKernel"]
+__all__ = ["GQADecodeKernel", "GQADecodeNarrowGroupKernel"]
 
 
-# JIT kernel: no-split variant
+@target_cache(maxsize=32)
+@tilelang.jit(out_idx=[3])
+def _narrow_group_decode(groups: int, parts: int, score_scale: float, keys_per_part: int):
+    head_dim = 128
+    heads_per_group = 8
+    heads = groups * heads_per_group
+    cache_length = parts * keys_per_part
+    dtype = "float16"
+
+    @T.prim_func
+    def attend(
+        query: T.Tensor((1, 1, heads, head_dim), dtype),
+        key: T.Tensor((1, cache_length, groups, head_dim), dtype),
+        value: T.Tensor((1, cache_length, groups, head_dim), dtype),
+        output: T.Tensor((1, 1, heads, head_dim), dtype),
+    ):
+        partial = T.alloc_global((heads, parts, head_dim), "float32")
+        stats = T.alloc_global((heads, parts, 2), "float32")
+        with T.Kernel(parts, groups, threads=64) as (part, group):
+            q = T.alloc_shared((heads_per_group, head_dim), dtype)
+            k = T.alloc_shared((keys_per_part, head_dim), dtype)
+            v = T.alloc_shared((keys_per_part, head_dim), dtype)
+            scores = T.alloc_fragment((keys_per_part, heads_per_group), "float32")
+            probabilities = T.alloc_shared((keys_per_part, heads_per_group), dtype)
+            product = T.alloc_fragment((head_dim, heads_per_group), "float32")
+            peaks = T.alloc_fragment((heads_per_group,), "float32")
+            sums = T.alloc_fragment((heads_per_group,), "float32")
+            for h, d in T.Parallel(heads_per_group, head_dim):
+                q[h, d] = query[0, 0, group * heads_per_group + h, d]
+            for i, d in T.Parallel(keys_per_part, head_dim):
+                k[i, d] = key[0, part * keys_per_part + i, group, d]
+                v[i, d] = value[0, part * keys_per_part + i, group, d]
+            # Put the eight query heads on the narrow axis of both MMA products.
+            T.gemm(k, q, scores, transpose_B=True, clear_accum=True)
+            for i, h in T.Parallel(keys_per_part, heads_per_group):
+                scores[i, h] *= score_scale
+            T.reduce_max(scores, peaks, dim=0)
+            for i, h in T.Parallel(keys_per_part, heads_per_group):
+                scores[i, h] = T.exp2(scores[i, h] - peaks[h])
+                probabilities[i, h] = T.cast(scores[i, h], dtype)
+            T.reduce_sum(scores, sums, dim=0)
+            T.gemm(v, probabilities, product, transpose_A=True, clear_accum=True)
+            for d, h in T.Parallel(head_dim, heads_per_group):
+                partial[group * heads_per_group + h, part, d] = product[d, h]
+            for h in T.Parallel(heads_per_group):
+                stats[group * heads_per_group + h, part, 0] = peaks[h]
+                stats[group * heads_per_group + h, part, 1] = sums[h]
+
+        with T.Kernel(heads, threads=128) as head:
+            peaks = T.alloc_fragment((parts,), "float32")
+            sums = T.alloc_fragment((parts,), "float32")
+            peak = T.alloc_fragment((1,), "float32")
+            denom = T.alloc_fragment((1,), "float32")
+            acc = T.alloc_fragment((head_dim,), "float32")
+            weights = T.alloc_shared((parts,), "float32")
+            for part in T.Parallel(parts):
+                peaks[part] = stats[head, part, 0]
+            T.reduce_max(peaks, peak, dim=0)
+            for part in T.Parallel(parts):
+                sums[part] = T.exp2(peaks[part] - peak[0])
+                weights[part] = sums[part]
+                sums[part] *= stats[head, part, 1]
+            T.reduce_sum(sums, denom, dim=0)
+            T.clear(acc)
+            for part in T.serial(parts):
+                for d in T.Parallel(head_dim):
+                    acc[d] += weights[part] * partial[head, part, d]
+            for d in T.Parallel(head_dim):
+                output[0, 0, head, d] = T.cast(acc[d] / denom[0], dtype)
+
+    return attend
+
+
+class GQADecodeNarrowGroupKernel(Kernel, GQADenseFwdInterface):
+    """Decode eight FP16 heads per KV head with transposed score tiles."""
+
+    supported_archs: list[int] = [90]
+    preferred_over = frozenset({"gqa_dense_decode_split"})
+
+    @classmethod
+    def refusal(cls, call: AttentionCall) -> str | None:
+        """Serve single-query decode when the KV tiles fill half to one SM90 wave."""
+        if call.dense_decode_program != "split" or call.return_lse or call.batch != 1:
+            return "requires single-request split decode with output only"
+        if call.dtype != torch.float16 or call.dim != 128 or call.heads != 8 * call.heads_kv:
+            return "requires eight FP16 query heads of width 128 per KV head"
+        if (
+            call.fuse_rope
+            or call.has_sinks
+            or call.softcap
+            or call.sm_scale not in (None, 128**-0.5)
+        ):
+            return "serves plain attention at the default scale"
+        parts, tail = divmod(call.seqlen_kv, cls._keys_per_part(call.seqlen_kv))
+        if (
+            tail
+            or parts not in (16, 32)
+            or not call.sm_count // 2 <= parts * call.heads_kv <= call.sm_count
+        ):
+            return "requires a half to one wave of whole short context tiles"
+        return super().refusal(call)
+
+    @staticmethod
+    def _keys_per_part(seqlen_kv: int) -> int:
+        """Keys a CTA of one KV head attends to: 128 from 2048 keys, 32 below."""
+        return 128 if seqlen_kv >= 2048 else 32
+
+    def __init__(self, call: AttentionCall) -> None:
+        super().__init__(device_index=call.device_index)
+        self.groups = call.heads_kv
+        self.keys_per_part = self._keys_per_part(call.seqlen_kv)
+        self.parts = call.seqlen_kv // self.keys_per_part
+        self.scale = call.dim**-0.5 * LOG2E
+
+    def _compile(self, _config: dict):
+        return _narrow_group_decode(self.groups, self.parts, self.scale, self.keys_per_part)
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        q_scale: torch.Tensor | None = None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+        rope_cos: torch.Tensor | None = None,
+        rope_sin: torch.Tensor | None = None,
+        sinks: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        self._require_devices(q=q, k=k, v=v)
+        return self.program(self._compile)(q, k, v)
 
 
 @target_cache(maxsize=32)
@@ -40,9 +174,8 @@ def gqa_decode_no_split_kernel(
     rope_layout="neox",
     has_sinks=False,
 ):
-    score_scale = dim**-0.5 if sm_scale is None else sm_scale
     use_softcap = softcap > 0.0
-    scale = LOG2E if use_softcap else score_scale * LOG2E
+    scale = LOG2E if use_softcap else sm_scale * LOG2E
     accum_dtype = "float"
 
     @tilelang.jit(
@@ -50,7 +183,7 @@ def gqa_decode_no_split_kernel(
         pass_configs={
             tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
         },
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
     )
     def _func(block_H, block_N, num_stages, threads):
         seqlen_kv = T.dynamic("seqlen_kv")
@@ -67,7 +200,7 @@ def gqa_decode_no_split_kernel(
 
         online_softmax = make_online_softmax(scale, accum_dtype, block_H, block_N)
         apply_softcap = (
-            make_apply_softcap(score_scale, softcap, accum_dtype, block_H, block_N)
+            make_apply_softcap(sm_scale, softcap, accum_dtype, block_H, block_N)
             if use_softcap
             else None
         )
@@ -108,20 +241,7 @@ def gqa_decode_no_split_kernel(
                     for i, j in T.Parallel(block_H, dim):
                         if i < rows:
                             if j < rotary_dim:
-                                if rope_layout == "neox":
-                                    freq = T.if_then_else(
-                                        j < rotary_dim // 2, j, j - rotary_dim // 2
-                                    )
-                                    partner = T.if_then_else(
-                                        j < rotary_dim // 2,
-                                        j + rotary_dim // 2,
-                                        j - rotary_dim // 2,
-                                    )
-                                    sign = T.if_then_else(j < rotary_dim // 2, -1.0, 1.0)
-                                else:
-                                    freq = j // 2
-                                    partner = T.if_then_else(j % 2 == 0, j + 1, j - 1)
-                                    sign = T.if_then_else(j % 2 == 0, -1.0, 1.0)
+                                freq, partner, sign = rope_partner(rope_layout, rotary_dim, j)
                                 x = T.cast(Q[bid, head_base + i, j], "float")
                                 x_partner = T.cast(Q[bid, head_base + i, partner], "float")
                                 cos = T.cast(rope_cos[seqlen_kv - 1, freq], "float")
@@ -150,20 +270,7 @@ def gqa_decode_no_split_kernel(
                             position = k * block_N + i
                             if position < seqlen_kv:
                                 if j < rotary_dim:
-                                    if rope_layout == "neox":
-                                        freq = T.if_then_else(
-                                            j < rotary_dim // 2, j, j - rotary_dim // 2
-                                        )
-                                        partner = T.if_then_else(
-                                            j < rotary_dim // 2,
-                                            j + rotary_dim // 2,
-                                            j - rotary_dim // 2,
-                                        )
-                                        sign = T.if_then_else(j < rotary_dim // 2, -1.0, 1.0)
-                                    else:
-                                        freq = j // 2
-                                        partner = T.if_then_else(j % 2 == 0, j + 1, j - 1)
-                                        sign = T.if_then_else(j % 2 == 0, -1.0, 1.0)
+                                    freq, partner, sign = rope_partner(rope_layout, rotary_dim, j)
                                     x = T.cast(K[bid, position, cur_kv_head, j], "float")
                                     x_partner = T.cast(
                                         K[bid, position, cur_kv_head, partner], "float"
@@ -249,14 +356,10 @@ def gqa_decode_no_split_kernel(
     return _func
 
 
-# JIT kernel: split variant (split + combine)
-
-
 @target_cache(maxsize=32)
 def _gqa_decode_split_kernel(batch, heads, groups, dim, sm_scale, softcap, dtype, has_sinks=False):
-    score_scale = dim**-0.5 if sm_scale is None else sm_scale
     use_softcap = softcap > 0.0
-    scale = LOG2E if use_softcap else score_scale * LOG2E
+    scale = LOG2E if use_softcap else sm_scale * LOG2E
     accum_dtype = "float"
 
     @tilelang.jit(
@@ -264,10 +367,9 @@ def _gqa_decode_split_kernel(batch, heads, groups, dim, sm_scale, softcap, dtype
         pass_configs={
             tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
         },
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
     )
     def _func(block_H, block_N, num_split, num_stages, threads):
-        sink_merge = make_dense_split_sink_merge(accum_dtype)
         seqlen_kv = T.dynamic("seqlen_kv")
         shape_q = [batch, heads, dim]
         shape_k = [batch, seqlen_kv, groups, dim]
@@ -279,11 +381,10 @@ def _gqa_decode_split_kernel(batch, heads, groups, dim, sm_scale, softcap, dtype
         valid_block_H = min(block_H, kv_group_num)
         blocks_per_kv = -(-kv_group_num // valid_block_H)
         tail_rows = kv_group_num - (blocks_per_kv - 1) * valid_block_H
-        valid_block_N = block_N
 
-        online_softmax_split = make_online_softmax(scale, accum_dtype, block_H, valid_block_N)
+        online_softmax_split = make_online_softmax(scale, accum_dtype, block_H, block_N)
         apply_softcap = (
-            make_apply_softcap(score_scale, softcap, accum_dtype, block_H, valid_block_N)
+            make_apply_softcap(sm_scale, softcap, accum_dtype, block_H, block_N)
             if use_softcap
             else None
         )
@@ -306,11 +407,11 @@ def _gqa_decode_split_kernel(batch, heads, groups, dim, sm_scale, softcap, dtype
                 bz,
             ):
                 Q_shared = T.alloc_shared([block_H, dim], dtype)
-                K_shared = T.alloc_shared([valid_block_N, dim], dtype)
-                V_shared = T.alloc_shared([valid_block_N, dim], dtype)
+                K_shared = T.alloc_shared([block_N, dim], dtype)
+                V_shared = T.alloc_shared([block_N, dim], dtype)
                 O_shared = T.alloc_shared([valid_block_H, dim], dtype)
-                acc_s = T.alloc_fragment([block_H, valid_block_N], accum_dtype)
-                acc_s_cast = T.alloc_fragment([block_H, valid_block_N], dtype)
+                acc_s = T.alloc_fragment([block_H, block_N], accum_dtype)
+                acc_s_cast = T.alloc_fragment([block_H, block_N], dtype)
                 acc_o = T.alloc_fragment([block_H, dim], accum_dtype)
                 scores_max = T.alloc_fragment([block_H], accum_dtype)
                 scores_max_prev = T.alloc_fragment([block_H], accum_dtype)
@@ -331,17 +432,9 @@ def _gqa_decode_split_kernel(batch, heads, groups, dim, sm_scale, softcap, dtype
                     )
                 )
 
-                # Partition whole KV tiles as evenly as possible (recipe from
-                # gqa_decode_bs1): every CTA derives its own tile range from
-                # the runtime sequence extent, so the autotuner times the same
-                # distribution forward runs and no split is left empty.
-                num_tiles = T.ceildiv(seqlen_kv, block_N)
-                base_tiles = num_tiles // num_split
-                extra_tiles = num_tiles % num_split
-                tiles_this_split = base_tiles + T.if_then_else(sid < extra_tiles, 1, 0)
-                tile_begin = sid * base_tiles + T.min(sid, extra_tiles)
-                base = tile_begin * block_N
-                this_len = T.max(T.min(seqlen_kv - base, tiles_this_split * block_N), 0)
+                # Every CTA derives its tile range from the runtime sequence extent, so the
+                # autotuner times the same distribution forward runs.
+                base, this_len = balanced_split(seqlen_kv, block_N, num_split, sid)
 
                 if tail_rows == valid_block_H:
                     T.copy(Q[bid, head_base : head_base + block_H, :], Q_shared)
@@ -361,7 +454,7 @@ def _gqa_decode_split_kernel(batch, heads, groups, dim, sm_scale, softcap, dtype
                     T.copy(
                         K[
                             bid,
-                            base + k * valid_block_N : base + (k + 1) * valid_block_N,
+                            base + k * block_N : base + (k + 1) * block_N,
                             cur_kv_head,
                             :,
                         ],
@@ -371,7 +464,7 @@ def _gqa_decode_split_kernel(batch, heads, groups, dim, sm_scale, softcap, dtype
                     T.gemm(
                         Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow
                     )
-                    for i, j in T.Parallel(block_H, valid_block_N):
+                    for i, j in T.Parallel(block_H, block_N):
                         acc_s[i, j] = T.if_then_else(
                             (base + k * block_N + j < seqlen_kv),
                             acc_s[i, j],
@@ -387,7 +480,7 @@ def _gqa_decode_split_kernel(batch, heads, groups, dim, sm_scale, softcap, dtype
                     T.copy(
                         V[
                             bid,
-                            base + k * valid_block_N : base + (k + 1) * valid_block_N,
+                            base + k * block_N : base + (k + 1) * block_N,
                             cur_kv_head,
                             :,
                         ],
@@ -419,46 +512,9 @@ def _gqa_decode_split_kernel(batch, heads, groups, dim, sm_scale, softcap, dtype
                         if i < rows:
                             Output_partial[bid, head_base + i, sid, j] = O_shared[i, j]
 
-        @T.macro
-        def combine(
-            glse: T.Tensor([batch, heads, num_split], accum_dtype),
-            Output_partial: T.Tensor(part_shape, dtype),
-            Output: T.Tensor(shape_o, dtype),
-            sinks,
-        ):
-            with T.Kernel(heads, batch, threads=128) as (by, bz):
-                #
-                glse_vec = T.alloc_fragment([num_split], accum_dtype)
-                for k in T.Parallel(num_split):
-                    glse_vec[k] = glse[bz, by, k]
-                lse_max = T.alloc_fragment([1], accum_dtype)
-                T.fill(lse_max, -T.infinity(accum_dtype))
-                T.reduce_max(glse_vec, lse_max, dim=0, clear=False)
-
-                #
-                lse_logsum = T.alloc_local([1], accum_dtype)
-                lse_logsum[0] = 0
-                if has_sinks:
-                    sink_merge(sinks[by], lse_max, lse_logsum)
-                for k in T.serial(num_split):
-                    lse_logsum[0] += T.exp2(glse[bz, by, k] - lse_max[0])
-                if not has_sinks:
-                    lse_logsum[0] = T.log2(lse_logsum[0]) + lse_max[0]
-
-                #
-                o_accum = T.alloc_fragment([dim], accum_dtype)
-                T.clear(o_accum)
-                for k in T.serial(num_split):
-                    if has_sinks:
-                        # Keep the denominator separate: adding log2(sum) to a
-                        # large maximum can round away the sink contribution.
-                        w = T.exp2(glse[bz, by, k] - lse_max[0]) / lse_logsum[0]
-                    else:
-                        w = T.exp2(glse[bz, by, k] - lse_logsum[0])
-                    for i in T.Parallel(dim):
-                        o_accum[i] += Output_partial[bz, by, k, i] * w
-                for i in T.Parallel(dim):
-                    Output[bz, by, i] = o_accum[i]
+        combine = make_gqa_decode_bs1_combine(
+            batch, heads, num_split, dim, dtype, accum_dtype, has_sinks=has_sinks
+        )
 
         @T.prim_func
         def gqa_decode_split(
@@ -484,6 +540,8 @@ class GQADecodeKernel(Kernel, GQADenseFwdInterface):
     general: bool = True
     # The split counts the autotune sweep offers.
     _SPLIT_CANDIDATES = (1, 2, 4, 8, 16, 32)
+    # The architectures whose programs fold attention sinks into the softmax.
+    _SINK_ARCHS = (89, 90)
 
     @classmethod
     def effective_num_split(cls, num_split: int, block_N: int, real_seqlen_kv: int) -> int:
@@ -497,20 +555,20 @@ class GQADecodeKernel(Kernel, GQADenseFwdInterface):
         return max(candidate for candidate in cls._SPLIT_CANDIDATES if candidate <= limit)
 
     @classmethod
-    def refusal(cls, call: AttentionCall) -> Optional[str]:
+    def refusal(cls, call: AttentionCall) -> str | None:
         """The contiguous decode region and the limits the program builds within."""
         if call.return_lse:
             return "does not return the log-sum-exp"
         if not call.dense_decode_region:
             return "does not serve this call"
-        if call.has_sinks and call.arch != 90:
-            return "attention sinks require SM90"
+        if call.has_sinks and call.arch not in cls._SINK_ARCHS:
+            return "attention sinks require SM89 or SM90"
         if call.fuse_rope and call.arch != 90:
             return "fuses RoPE on SM90 only"
         return cls._limit_refusal(call.dim, call.seqlen_kv, call.arch)
 
     @staticmethod
-    def _limit_refusal(dim: int, seq_len_kv: int, arch: int) -> Optional[str]:
+    def _limit_refusal(dim: int, seq_len_kv: int, arch: int) -> str | None:
         """Why the program cannot build this shape; read by the region and the constructor,
         which a caller can reach directly. D256 uses the narrow, one-stage tile.
         """
@@ -542,7 +600,7 @@ class GQADecodeKernel(Kernel, GQADenseFwdInterface):
             softcap=call.softcap,
             has_sinks=call.has_sinks,
             **call.rope_args,
-            device_index=call.device.index if call.device is not None else None,
+            device_index=call.device_index,
         )
 
     @classmethod
@@ -560,16 +618,16 @@ class GQADecodeKernel(Kernel, GQADenseFwdInterface):
         seq_len_kv,
         dim,
         dtype="float16",
-        sm_scale: Optional[float] = None,
+        sm_scale: float | None = None,
         softcap: float = 0.0,
-        config: Optional[dict] = None,
+        config: dict | None = None,
         *,
         fuse_rope: bool = False,
         max_position: int = 1,
         rotary_dim: int = 0,
         rope_layout: str = "neox",
         has_sinks: bool = False,
-        device_index: Optional[int] = None,
+        device_index: int | None = None,
     ):
         super().__init__(device_index=device_index)
         self.has_sinks = has_sinks
@@ -585,16 +643,13 @@ class GQADecodeKernel(Kernel, GQADenseFwdInterface):
         self.max_position = max_position
         self.rotary_dim = rotary_dim
         self.rope_layout = rope_layout
-        from tileops._utils import get_sm_version
-
-        arch = get_sm_version(device_index)
-        if has_sinks and arch != 90:
-            raise ValueError("attention sinks require SM90")
+        arch = self.build_target.arch
+        if has_sinks and arch not in self._SINK_ARCHS:
+            raise ValueError("attention sinks require SM89 or SM90")
         self._is_sm90 = arch == 90
-        self._shared_memory_optin = get_shared_memory_optin(device_index)
+        self._shared_memory_optin = self.build_target.smem_budget
         if fuse_rope and arch != 90:
-            raise ValueError("fused RoPE decode currently requires SM90")
-        self.use_ws_rope = fuse_rope
+            raise ValueError("fused RoPE decode requires SM90")
         if self.groups <= 0:
             raise ValueError("heads_kv must be positive")
         if self.heads % self.groups != 0:
@@ -635,7 +690,7 @@ class GQADecodeKernel(Kernel, GQADenseFwdInterface):
             has_sinks=self.has_sinks,
         )
         self.ws_rope_jit = None
-        if self.use_ws_rope:
+        if fuse_rope:
             # decode_bs1 imports this module.
             from tileops._kernels.attention.gqa.decode_bs1 import gqa_decode_bs1_ctx_kernel
 
@@ -714,10 +769,8 @@ class GQADecodeKernel(Kernel, GQADenseFwdInterface):
         """Shared memory one program allocates for *config*: the query rows, a K and a V
         tile per stage and, in the no-split program, the output rows.
 
-        Both programs stage their output rows. TileLang 0.1.12 places them in the query
-        rows' space, which the loop no longer reads, in the split program with two or more
-        splits and, for SM90, in the no-split program too; forward launches the split
-        program only with two or more.
+        The split program stages its output rows in the query rows' space; the no-split count
+        includes them, so it never undercounts.
         """
         rows = config["block_H"] + 2 * config["num_stages"] * config["block_N"]
         if not split:
@@ -744,7 +797,7 @@ class GQADecodeKernel(Kernel, GQADenseFwdInterface):
         parameters it takes."""
         if num_split == 1:
             return "no_split", {key: value for key, value in config.items() if key != "num_split"}
-        if self.use_ws_rope:
+        if self.fuse_rope:
             # The warp-specialized program runs one warpgroup of 64 head rows and a
             # producer warp; it takes only the tile length and the split count.
             params = {"block_M": 64, "block_N": config["block_N"], "ctx_splits": num_split}
@@ -763,10 +816,11 @@ class GQADecodeKernel(Kernel, GQADenseFwdInterface):
     def autotune_configs(self) -> list[dict]:
         block_N = [64]
         block_H = [64]
-        num_split = [ns for ns in [1, 2, 4, 8, 16, 32] if ns <= self.seqlen_kv] or [1]
-        num_stages = [0, 1, 2]
+        num_stages = [0, 1, 2] if is_maca() else [1, 2, 3]
         threads = [128]
-        _configs = list(itertools.product(block_N, block_H, num_split, num_stages, threads))
+        _configs = list(
+            itertools.product(block_N, block_H, self._SPLIT_CANDIDATES, num_stages, threads)
+        )
 
         # Every split keeps at least one full KV tile, and every candidate fits the
         # shared memory of the program forward launches for it.
@@ -821,12 +875,12 @@ class GQADecodeKernel(Kernel, GQADenseFwdInterface):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        q_scale: Optional[torch.Tensor] = None,
-        k_scale: Optional[torch.Tensor] = None,
-        v_scale: Optional[torch.Tensor] = None,
-        rope_cos: Optional[torch.Tensor] = None,
-        rope_sin: Optional[torch.Tensor] = None,
-        sinks: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+        rope_cos: torch.Tensor | None = None,
+        rope_sin: torch.Tensor | None = None,
+        sinks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         self._require_devices(q=q, k=k, v=v)
         del q_scale, k_scale, v_scale
@@ -844,18 +898,10 @@ class GQADecodeKernel(Kernel, GQADenseFwdInterface):
                 output = program(Q, k, v, sinks if sinks is not None else Q)
             return output.unsqueeze(1)
 
-        if self.use_ws_rope:
-            # The SM90 producer/consumer kernel supports arbitrary batch
-            # sizes; use it here so RoPE stays fused without replacing TMA and
-            # WGMMA with scalar global-memory loads.
-            glse = torch.empty(
-                (self.batch, self.heads, num_split), dtype=torch.float32, device=Q.device
-            )
-            Output_partial = torch.empty(
-                (self.batch, self.heads, num_split, self.dim),
-                dtype=torch.float32,
-                device=Q.device,
-            )
+        if self.fuse_rope:
+            # The SM90 producer/consumer kernel serves any batch, so RoPE stays fused
+            # without replacing TMA and WGMMA with scalar global-memory loads.
+            glse, Output_partial = allocate_partials(Q, self.batch, self.heads, self.dim, num_split)
             output = program(
                 Q, k, v, rope_cos, rope_sin, glse, Output_partial, sinks if self.has_sinks else Q
             )
@@ -899,17 +945,22 @@ class GQADecodeKernel(Kernel, GQADenseFwdInterface):
         )(*launch)
 
 
-class GQADecodeLongContextKernel(GQADecodeKernel):
+class GQADecodeSplitKernel(GQADecodeKernel):
     """The general decode program with its keys in 32 parts, for the calls
     :attr:`AttentionCall.dense_decode_program` names ``"split"``."""
 
     general: bool = False
-    # The region is measured on SM90.
+    # The region is fitted to SM90.
     supported_archs: list[int] = [90]
-    preferred_over = frozenset({"gqa_dense_decode_bs1", "gqa_dense_decode_ws"})
+    preferred_over = frozenset({"gqa_dense_decode_ws"})
+    # The program's 64-row block of a KV head's group, its base key tile and its key parts,
+    # which the region in ``AttentionCall.dense_decode_program`` counts CTAs by.
+    HEAD_BLOCK = 64
+    KEY_TILE = 64
+    PARTS = 32
 
     @classmethod
-    def refusal(cls, call: AttentionCall) -> Optional[str]:
+    def refusal(cls, call: AttentionCall) -> str | None:
         """The split's region, within what the general decode program serves."""
         if call.return_lse:
             return "does not return the log-sum-exp"
@@ -933,9 +984,11 @@ class GQADecodeLongContextKernel(GQADecodeKernel):
     @property
     def default_config(self) -> dict:
         return {
-            "block_H": 64,
-            "block_N": 128 if self._is_sm90 and self.sequence_bucket(self.seqlen_kv) else 64,
-            "num_split": 32,
+            "block_H": self.HEAD_BLOCK,
+            "block_N": 128
+            if self._is_sm90 and self.sequence_bucket(self.seqlen_kv)
+            else self.KEY_TILE,
+            "num_split": self.PARTS,
             "num_stages": 2,
             "threads": 128,
         }

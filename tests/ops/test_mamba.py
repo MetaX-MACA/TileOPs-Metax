@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from tests.workload_test_base import TestBase
+from tests.workload_test_base import FixtureBase, TestBase
 from tileops._ops.mamba.mamba2_fwd import Mamba2FwdOp
 from tileops._ops.mamba.ssd_chunk_coupling import SSDChunkCouplingFwdOp
 from tileops._ops.mamba.ssd_chunk_cumsum import SSDChunkCumsumFwdOp
@@ -11,16 +11,12 @@ from tileops._ops.mamba.ssd_recurrent import SSDRecurrentFwdOp
 from tileops._ops.mamba.ssd_state_passing import SSDStatePassingFwdOp
 from workloads.device import run_device
 from workloads.mamba import (
-    SSDChunkCumsumFwdFixture,
     SSDChunkCumsumFwdWorkload,
-    SSDChunkScanFwdFixture,
     SSDChunkScanFwdWorkload,
-    SSDChunkStateFwdFixture,
     SSDChunkStateFwdWorkload,
-    SSDDecodeFixture,
     SSDDecodeWorkload,
-    SSDStatePassingFwdFixture,
     SSDStatePassingFwdWorkload,
+    SSDStatePassingUnitWorkload,
     coupling_verification,
     mamba2_fwd_ref,
     mamba2_verification,
@@ -29,6 +25,213 @@ from workloads.mamba import (
     ssd_decode_result,
 )
 from workloads.numerics import compare_outputs
+
+
+class SSDChunkCumsumFwdFixture(FixtureBase):
+    PARAMS = [
+        (
+            "batch, num_chunks, chunk_len, n_heads, has_dt_bias, dt_softplus, dtype, tune",
+            [
+                # feature: no bias, no softplus (baseline path)
+                pytest.param(
+                    1, 2, 64, 4, False, False, torch.float16, False, marks=pytest.mark.smoke
+                ),
+                # feature: bias only (has_dt_bias branch, no softplus)
+                pytest.param(
+                    1, 2, 64, 4, True, False, torch.bfloat16, False, marks=pytest.mark.smoke
+                ),
+                # feature: softplus only (no bias, dt_softplus branch)
+                pytest.param(
+                    1, 2, 64, 4, False, True, torch.float16, False, marks=pytest.mark.smoke
+                ),
+                # feature: bias + softplus (full pipeline)
+                pytest.param(
+                    1, 2, 64, 4, True, True, torch.bfloat16, False, marks=pytest.mark.full
+                ),
+                # shape: larger batch and chunk count
+                pytest.param(
+                    2, 4, 64, 8, False, False, torch.float16, False, marks=pytest.mark.full
+                ),
+                # shape: larger chunk_len tile
+                pytest.param(
+                    1, 2, 128, 4, False, False, torch.bfloat16, False, marks=pytest.mark.full
+                ),
+                # shape + feature: large shape with full pipeline
+                pytest.param(
+                    2, 4, 128, 16, True, True, torch.float16, False, marks=pytest.mark.full
+                ),
+            ],
+        ),
+    ]
+
+
+class SSDChunkScanFwdFixture(FixtureBase):
+    PARAMS = [
+        (
+            "batch, num_chunks, chunk_len, n_heads, d_head, d_state, n_groups, dtype, tune",
+            [
+                pytest.param(1, 2, 64, 4, 64, 32, 1, torch.float16, False, marks=pytest.mark.smoke),
+                pytest.param(
+                    1, 2, 128, 4, 128, 32, 1, torch.bfloat16, False, marks=pytest.mark.smoke
+                ),
+                pytest.param(2, 4, 64, 8, 64, 64, 2, torch.float16, False, marks=pytest.mark.full),
+                pytest.param(2, 2, 64, 4, 64, 32, 2, torch.bfloat16, False, marks=pytest.mark.full),
+            ],
+        ),
+    ]
+
+
+class SSDChunkStateFwdFixture(FixtureBase):
+    PARAMS = [
+        (
+            "batch, num_chunks, chunk_len, n_heads, d_head, d_state, n_groups, dtype, tune, has_seq_idx",
+            [
+                pytest.param(
+                    1,
+                    2,
+                    64,
+                    4,
+                    64,
+                    32,
+                    1,
+                    torch.float16,
+                    False,
+                    False,
+                    marks=pytest.mark.smoke,
+                ),
+                pytest.param(
+                    1,
+                    2,
+                    128,
+                    4,
+                    128,
+                    32,
+                    1,
+                    torch.bfloat16,
+                    False,
+                    False,
+                    marks=pytest.mark.smoke,
+                ),
+                pytest.param(
+                    2,
+                    4,
+                    64,
+                    8,
+                    64,
+                    64,
+                    2,
+                    torch.float16,
+                    False,
+                    False,
+                    marks=pytest.mark.full,
+                ),
+                pytest.param(
+                    2,
+                    2,
+                    64,
+                    4,
+                    64,
+                    32,
+                    2,
+                    torch.bfloat16,
+                    False,
+                    False,
+                    marks=pytest.mark.full,
+                ),
+                pytest.param(
+                    2,
+                    4,
+                    64,
+                    8,
+                    64,
+                    64,
+                    2,
+                    torch.float16,
+                    False,
+                    True,
+                    marks=pytest.mark.full,
+                ),
+                # A d_state that is not a whole number of 16-column GEMM steps.
+                pytest.param(
+                    1,
+                    2,
+                    64,
+                    4,
+                    64,
+                    24,
+                    1,
+                    torch.float16,
+                    False,
+                    False,
+                    marks=pytest.mark.full,
+                ),
+            ],
+        ),
+    ]
+
+
+class SSDDecodeFixture(FixtureBase):
+    PARAMS = [
+        (
+            "batch, n_heads, d_head, d_state, n_groups, dtype, tune",
+            [
+                pytest.param(
+                    1,
+                    4,
+                    64,
+                    16,
+                    1,
+                    torch.float16,
+                    False,
+                    marks=pytest.mark.smoke,
+                ),
+                pytest.param(
+                    1,
+                    4,
+                    64,
+                    16,
+                    1,
+                    torch.bfloat16,
+                    False,
+                    marks=pytest.mark.smoke,
+                ),
+                pytest.param(
+                    2,
+                    8,
+                    64,
+                    32,
+                    2,
+                    torch.float16,
+                    False,
+                    marks=pytest.mark.full,
+                ),
+                pytest.param(
+                    2,
+                    8,
+                    128,
+                    64,
+                    4,
+                    torch.bfloat16,
+                    False,
+                    marks=pytest.mark.full,
+                ),
+            ],
+        ),
+    ]
+
+
+class SSDStatePassingFwdFixture(FixtureBase):
+    PARAMS = [
+        (
+            "batch, num_chunks, n_heads, d_state, dtype, tune",
+            [
+                pytest.param(1, 2, 4, 32, torch.float16, False, marks=pytest.mark.smoke),
+                pytest.param(1, 2, 4, 32, torch.bfloat16, False, marks=pytest.mark.smoke),
+                pytest.param(2, 4, 8, 64, torch.float16, False, marks=pytest.mark.full),
+                pytest.param(2, 4, 8, 64, torch.bfloat16, False, marks=pytest.mark.full),
+            ],
+        ),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -45,8 +248,8 @@ from workloads.numerics import compare_outputs
             marks=[pytest.mark.smoke, pytest.mark.packaging(family="mamba")],
         ),
         pytest.param(1, 2, 64, 1, 64, torch.bfloat16, False, marks=pytest.mark.smoke),
-        pytest.param(1, 2, 64, 2, 64, torch.float16, False, marks=pytest.mark.smoke),
         pytest.param(1, 2, 64, 1, 64, torch.float16, True, marks=pytest.mark.full),
+        pytest.param(1, 2, 64, 2, 64, torch.float16, False, marks=pytest.mark.full),
         pytest.param(1, 2, 64, 1, 96, torch.float16, False, marks=pytest.mark.full),
         pytest.param(1, 2, 128, 1, 64, torch.bfloat16, False, marks=pytest.mark.full),
         pytest.param(1, 2, 256, 1, 64, torch.float16, False, marks=pytest.mark.full),
@@ -180,8 +383,6 @@ def test_ssd_chunk_state_fwd_seq_idx_semantics():
     dA_cumsum = -torch.rand(b, h, c, Q, dtype=torch.float32, device=run_device()).cumsum(-1)
     dt = torch.rand(b, h, c, Q, dtype=torch.float32, device=run_device()) * 0.1 + 0.01
 
-    # First chunk ends with seq_idx == -1 (whole chunk should zero out).
-    # Second chunk is a normal sequence (seq_idx == 1 throughout).
     seq_idx = torch.ones(b, seq_len, dtype=torch.int32, device=run_device())
     seq_idx[:, :Q] = -1
 
@@ -192,17 +393,37 @@ def test_ssd_chunk_state_fwd_seq_idx_semantics():
     workload = SSDChunkStateFwdWorkload(b, c, Q, h, p, n, g, dtype, True)
     compare_outputs(out, ref, workload.verification(x))
 
-    # Pin the semantic: chunk 0 (seq_idx == -1 throughout) must be exactly zero;
-    # chunk 1 (seq_idx == 1 throughout) must have non-zero state.
+    # A chunk whose sequence is -1 throughout is all zero.
     assert torch.count_nonzero(out[:, 0]) == 0
     assert out[:, 1].abs().max().item() > 0
 
+    # A call without seq_idx must not read the freed seq_idx's memory.
     poison = torch.full((b, seq_len), -1, dtype=torch.int32, device=run_device())
     torch.accelerator.synchronize()
     del poison
     out = op(x, Bmat, dt, dA_cumsum)
     ref = ssd_chunk_state_fwd_ref(x, Bmat, dt, dA_cumsum, g)
     compare_outputs(out, ref, workload.verification(x))
+
+
+@pytest.mark.smoke
+@pytest.mark.in_tree_kernels
+@pytest.mark.sm90
+def test_ssd_chunk_state_fp16_tma_masks_packed_sequences():
+    from tileops.backend import BUILTIN
+
+    test = SSDChunkStateFwdTest(1, 16, 256, 48, 64, 128, 1, torch.float16, True)
+    x, bmat, dt, da, seq_idx = test.gen_inputs()
+    seq_idx[:, :256] = -1
+    seq_idx[:, 256:416] = 0
+    seq_idx[:, 416:] = 1
+    op = SSDChunkStateFwdOp(target=BUILTIN)
+    inputs = (x, bmat, dt, da, seq_idx)
+    out = op(*inputs)
+    compare_outputs(out, test.ref_program(*inputs), test.verification(*inputs))
+    (kernel,) = op.iter_kernels()
+    assert kernel._uses_tma_panels()
+    assert torch.count_nonzero(out[:, 0]) == 0
 
 
 class SSDStatePassingFwdTest(SSDStatePassingFwdWorkload, TestBase):
@@ -232,14 +453,15 @@ def test_ssd_decode(batch, n_heads, d_head, d_state, n_groups, dtype, tune):
     test.check(op, *test.gen_inputs(), runs=lambda *args: ssd_decode_result(op, *args))
 
 
-@pytest.mark.smoke
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
-    "batch,seqlen,n_heads,d_head,d_state,n_groups,chunk_size",
+    "batch,seqlen,n_heads,d_head,d_state,n_groups,chunk_size,dtype",
     [
-        (1, 256, 4, 64, 32, 1, 256),
-        (2, 512, 8, 64, 64, 2, 256),
-        (1, 512, 4, 64, 128, 1, 256),  # d_state=16 not supported by SSDChunkScanFwdKernel
+        pytest.param(1, 256, 4, 64, 32, 1, 256, torch.float16, marks=pytest.mark.smoke),
+        pytest.param(1, 256, 4, 64, 32, 1, 256, torch.bfloat16, marks=pytest.mark.smoke),
+        pytest.param(2, 512, 8, 64, 64, 2, 256, torch.float16, marks=pytest.mark.full),
+        pytest.param(2, 512, 8, 64, 64, 2, 256, torch.bfloat16, marks=pytest.mark.full),
+        pytest.param(1, 512, 4, 64, 128, 1, 256, torch.float16, marks=pytest.mark.full),
+        pytest.param(1, 512, 4, 64, 128, 1, 256, torch.bfloat16, marks=pytest.mark.full),
     ],
 )
 def test_mamba2_fwd_e2e(batch, seqlen, n_heads, d_head, d_state, n_groups, chunk_size, dtype):
@@ -274,3 +496,59 @@ def test_ssd_state_passing_fwd_prefetched_scan(dtype):
     """A wide state over 16 chunks: four elements a thread, eight chunks loaded ahead."""
     test = SSDStatePassingFwdTest(1, 16, 4, 8192, dtype)
     test.check(SSDStatePassingFwdOp(), *test.gen_inputs())
+
+
+@pytest.mark.smoke
+def test_ssd_scan_retains_a_small_coefficient_on_a_large_value() -> None:
+    test = SSDChunkScanFwdTest(1, 1, 64, 4, 64, 32, 1, torch.bfloat16)
+    x, cb, decay, c, state, dt = test.gen_inputs()
+    x.zero_()
+    x[:, 0] = 1e8
+    cb.zero_()
+    cb[..., -1, 0] = 1
+    decay.zero_()
+    decay[..., 32:] = -20
+    test.check(SSDChunkScanFwdOp(), x, cb, decay, c.zero_(), state.zero_(), dt.fill_(1))
+
+
+class SSDStatePassingUnitTest(SSDStatePassingUnitWorkload, TestBase):
+    pass
+
+
+@pytest.mark.parametrize(
+    "chunks,width,dtype,initial,period,tune",
+    [
+        pytest.param(
+            32768, 32, torch.float32, True, 0, False, id="long-fp32", marks=pytest.mark.smoke
+        ),
+        pytest.param(
+            32768, 32, torch.float16, True, 0, False, id="long-fp16", marks=pytest.mark.smoke
+        ),
+        pytest.param(
+            32768, 32, torch.bfloat16, True, 0, False, id="long-bf16", marks=pytest.mark.smoke
+        ),
+        pytest.param(
+            257, 128, torch.float32, False, 251, False, id="reset-tail", marks=pytest.mark.full
+        ),
+        pytest.param(
+            264,
+            4096,
+            torch.bfloat16,
+            True,
+            251,
+            False,
+            id="wide-reset-tail",
+            marks=pytest.mark.full,
+        ),
+        pytest.param(
+            257, 128, torch.float16, True, 251, True, id="tuned-reset-tail", marks=pytest.mark.full
+        ),
+    ],
+)
+def test_ssd_state_passing_fwd_long_and_reset_scans(chunks, width, dtype, initial, period, tune):
+    """Long scans and reset tails preserve previous and final states through the op."""
+    test = SSDStatePassingUnitTest(1, chunks, 1, width, dtype, initial, reset_period=period)
+    op = SSDStatePassingFwdOp()
+    if tune:
+        op.request_tune()
+    test.check(op, *test.gen_inputs())

@@ -1,11 +1,13 @@
-from typing import ClassVar, Mapping, Optional
+from collections.abc import Mapping
+from typing import ClassVar
 
 import torch
 
 from tileops._kernels.attention import (
     GQADecodeBs1Kernel,
     GQADecodeKernel,
-    GQADecodeLongContextKernel,
+    GQADecodeNarrowGroupKernel,
+    GQADecodeSplitKernel,
     GQADecodeWSKernel,
     GQADenseFP8DecodeKernel,
     GQADenseFP8Kernel,
@@ -21,7 +23,11 @@ from tileops._kernels.attention.call_spec import (
 )
 from tileops._kernels.constants import LOG2E
 from tileops._kernels.kernel_base import Kernel, KernelInterface
-from tileops._ops.attention.gqa.parameters import rope_rotary_dim, score_softcap
+from tileops._ops.attention.gqa.parameters import (
+    attention_window,
+    rope_rotary_dim,
+    score_softcap,
+)
 from tileops._ops.op_base import Op
 from tileops._perf.profile import tensor_core_roof
 from tileops.backend import Target
@@ -46,7 +52,8 @@ class _GQADenseFwdOpBase(Op):
         "gqa_dense_decode_bs1": GQADecodeBs1Kernel,
         "gqa_dense_fp8": GQADenseFP8Kernel,
         "gqa_dense_fp8_decode": GQADenseFP8DecodeKernel,
-        "gqa_dense_decode_long_context": GQADecodeLongContextKernel,
+        "gqa_dense_decode_split": GQADecodeSplitKernel,
+        "gqa_dense_decode_narrow_group": GQADecodeNarrowGroupKernel,
         "gqa_dense_decode_ws": GQADecodeWSKernel,
         "gqa_dense_sliding_window": GQADenseSlidingWindowKernel,
         "gqa_dense_sliding_window_band": GQADenseSlidingWindowBandKernel,
@@ -56,9 +63,9 @@ class _GQADenseFwdOpBase(Op):
     # Whether the kernel also returns each query row's log-sum-exp.
     _returns_lse: ClassVar[bool] = False
     pos_encoding_mode: str = "none"
-    rotary_dim: Optional[int] = None
+    rotary_dim: int | None = None
     rope_layout: str = "neox"
-    out_dtype: Optional[torch.dtype] = None
+    out_dtype: torch.dtype | None = None
 
     @property
     def _zero_query(self) -> bool:
@@ -72,7 +79,7 @@ class _GQADenseFwdOpBase(Op):
         """Dense attention's contractions are priced on tensor cores."""
         return tensor_core_roof(self.last_call.tensors["q"][1])
 
-    def _dense_call(self, inputs: tuple[Optional[torch.Tensor], ...]) -> AttentionCall:
+    def _dense_call(self, inputs: tuple[torch.Tensor | None, ...]) -> AttentionCall:
         """State what one contiguous call is, for selection to filter against."""
         q, k, _v, _q_scale, _k_scale, _v_scale, rope_cos, _rope_sin, sinks = inputs
         assert q is not None and k is not None
@@ -81,6 +88,7 @@ class _GQADenseFwdOpBase(Op):
         rope_on = self.pos_encoding_mode == "rope"
         is_fp8 = q.dtype == torch.float8_e4m3fn
         zero_query = self._zero_query
+        positions = max(seq_len_q, seq_len_kv)
         return AttentionCall(
             # The element type an implementation is compiled for. FP8 inputs are
             # computed in the type the op was constructed with.
@@ -94,8 +102,8 @@ class _GQADenseFwdOpBase(Op):
             is_causal=self.is_causal,
             sm_scale=1.0 if zero_query else self.sm_scale,
             softcap=0.0 if zero_query else self.softcap,
-            window_size_left=self.window_size_left,
-            window_size_right=self.window_size_right,
+            window_size_left=attention_window(self.window_size_left, positions),
+            window_size_right=attention_window(self.window_size_right, positions),
             is_fp8=is_fp8,
             has_sinks=sinks is not None,
             fuse_rope=rope_on,
@@ -106,7 +114,7 @@ class _GQADenseFwdOpBase(Op):
             device=q.device,
         )
 
-    def _run_dense(self, *tensors: Optional[torch.Tensor]):
+    def _run_dense(self, *tensors: torch.Tensor | None):
         """Run the kernel serving the nine tensor slots, each made contiguous."""
         inputs = tuple(tensor.contiguous() if tensor is not None else None for tensor in tensors)
         if self._zero_query:
@@ -139,8 +147,9 @@ class GQADenseFwdOp(_GQADenseFwdOpBase):
     of $p_i$, ``-1`` meaning unlimited. $Q'$ and $K'$ are $Q$ and $K$ times ``q_scale`` and
     ``k_scale`` for FP8 input, rotated under ``pos_encoding_mode="rope"`` at positions $p_i$
     and $j$; $V'$ is $V$ times ``v_scale``. A sink is neither scaled nor capped, and the
-    in-tree kernels serve ``sinks`` on SM90 only. Accumulation is FP32; the output takes the
-    input dtype, or ``out_dtype`` for FP8 input.
+    in-tree kernels serve ``sinks`` on SM90, and on SM89 for FP16/BF16 prefill and decode
+    without fused RoPE for decode. Accumulation is FP32; the output takes the input dtype,
+    or ``out_dtype`` for FP8 input.
     """
 
     def __init__(
@@ -148,12 +157,12 @@ class GQADenseFwdOp(_GQADenseFwdOpBase):
         is_causal: bool = False,
         window_size_left: int = -1,
         window_size_right: int = -1,
-        sm_scale: Optional[float] = None,
-        softcap: Optional[float] = None,
+        sm_scale: float | None = None,
+        softcap: float | None = None,
         pos_encoding_mode: str = "none",
-        rotary_dim: Optional[int] = None,
+        rotary_dim: int | None = None,
         rope_layout: str = "neox",
-        out_dtype: Optional[torch.dtype] = None,
+        out_dtype: torch.dtype | None = None,
         *,
         target: Target = None,
     ) -> None:
@@ -207,12 +216,12 @@ class GQADenseFwdOp(_GQADenseFwdOpBase):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        q_scale: Optional[torch.Tensor] = None,
-        k_scale: Optional[torch.Tensor] = None,
-        v_scale: Optional[torch.Tensor] = None,
-        rope_cos: Optional[torch.Tensor] = None,
-        rope_sin: Optional[torch.Tensor] = None,
-        sinks: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+        rope_cos: torch.Tensor | None = None,
+        rope_sin: torch.Tensor | None = None,
+        sinks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         r"""Run dense GQA attention over one set of $Q$/$K$/$V$ tensors.
 
@@ -244,7 +253,8 @@ class GQADenseFwdOp(_GQADenseFwdOpBase):
                 ``rope_cos``.
             sinks: Optional ``float32`` logits, shape ``[H]``, shared across
                 batches and query positions. Each contributes no value.
-                Supported by in-tree kernels on SM90 only, for prefill and decode.
+                Supported by in-tree kernels on SM90 for prefill and decode,
+                and on SM89 for FP16/BF16 prefill and decode (without fused RoPE for decode).
 
         Returns:
             Attention output, $[B \times S_q \times H \times D]$, laid out
@@ -285,8 +295,8 @@ class GQADenseWithLSEFwdOp(_GQADenseFwdOpBase):
         is_causal: bool = False,
         window_size_left: int = -1,
         window_size_right: int = -1,
-        sm_scale: Optional[float] = None,
-        softcap: Optional[float] = None,
+        sm_scale: float | None = None,
+        softcap: float | None = None,
         *,
         target: Target = None,
     ) -> None:

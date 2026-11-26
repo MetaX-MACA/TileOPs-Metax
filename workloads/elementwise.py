@@ -20,23 +20,6 @@ class ReLUWorkload(WorkloadBase):
         return _REFERENCES["ReLUFwdOp"]({}, x)
 
 
-class FusedGatedBenchCase:
-    """Minimal workload for fused gated ops."""
-
-    def __init__(self, M: int, N: int, dtype: torch.dtype):
-        self.M = M
-        self.N = N
-        self.n_total = M * N
-        self.dtype = dtype
-        self.output_dtype = dtype
-
-    def gen_inputs(self) -> tuple[torch.Tensor]:
-        return (torch.randn(self.M, 2 * self.N, device=run_device(), dtype=self.dtype),)
-
-    def verification(self, *inputs):
-        return fused_gated_verification(inputs[0].dtype)
-
-
 class AddBroadcastWorkload(WorkloadBase):
     def __init__(self, a_shape: tuple, b_shape: tuple, dtype: torch.dtype):
         self.a_shape = a_shape
@@ -84,21 +67,6 @@ class BitwiseNotWorkload(WorkloadBase):
         return _REFERENCES["BitwiseNotFwdOp"]({}, x)
 
 
-class AddCompileWorkload(WorkloadBase):
-    def __init__(self, a_shape, b_shape, dtype):
-        self.a_shape = a_shape
-        self.b_shape = b_shape
-        self.dtype = dtype
-
-    def gen_inputs(self):
-        a = torch.randn(self.a_shape, dtype=self.dtype, device=run_device())
-        b = torch.randn(self.b_shape, dtype=self.dtype, device=run_device())
-        return a, b
-
-    def ref_program(self, a, b):
-        return _REFERENCES["AddFwdOp"]({}, a, b)
-
-
 class EqCompileWorkload(WorkloadBase):
     def __init__(self, a_shape, b_shape, dtype):
         self.a_shape = a_shape
@@ -114,23 +82,6 @@ class EqCompileWorkload(WorkloadBase):
 
     def ref_program(self, a, b):
         return _REFERENCES["EqFwdOp"]({}, a, b)
-
-
-class SiLUAndMulCompileWorkload(WorkloadBase):
-    def __init__(self, M, N, dtype):
-        self.M = M
-        self.N = N
-        self.dtype = dtype
-
-    def gen_inputs(self):
-        x = torch.randn(self.M, 2 * self.N, dtype=self.dtype, device=run_device())
-        return (x,)
-
-    def ref_program(self, x):
-        return _REFERENCES["SiLUAndMulFwdOp"]({}, x)
-
-    def verification(self, *inputs):
-        return fused_gated_verification(inputs[0].dtype)
 
 
 class LogicalNotWorkload(WorkloadBase):
@@ -156,47 +107,6 @@ class LogicalNotWorkload(WorkloadBase):
 
     def ref_program(self, x: torch.Tensor) -> torch.Tensor:
         return _REFERENCES["LogicalNotFwdOp"]({}, x)
-
-
-class BitwiseWorkload(WorkloadBase):
-    def __init__(self, n_total: int):
-        self.n_total = n_total
-        self.dtype = torch.int32
-
-    def gen_inputs(self) -> tuple[torch.Tensor, torch.Tensor]:
-        a = torch.randint(-1000, 1000, (self.n_total,), dtype=torch.int32, device=run_device())
-        b = torch.randint(-1000, 1000, (self.n_total,), dtype=torch.int32, device=run_device())
-        return a, b
-
-
-class LogicalWorkload(WorkloadBase):
-    def __init__(self, n_total: int, dtype: torch.dtype):
-        self.n_total = n_total
-        self.dtype = dtype
-
-    def gen_inputs(self) -> tuple[torch.Tensor, torch.Tensor]:
-        a = torch.randn(self.n_total, dtype=self.dtype, device=run_device()) > 0
-        b = torch.randn(self.n_total, dtype=self.dtype, device=run_device()) > 0
-        a = a.to(self.dtype)
-        b = b.to(self.dtype)
-        return a, b
-
-
-class SpecialWorkload(WorkloadBase):
-    def __init__(self, n_total: int, dtype: torch.dtype, gen_fn=None):
-        self.n_total = n_total
-        self.dtype = dtype
-        self._gen_fn = gen_fn
-
-    def gen_inputs(self) -> tuple[torch.Tensor]:
-        if self._gen_fn is not None:
-            return (self._gen_fn(self.n_total, self.dtype),)
-        x = torch.randn(self.n_total, device=run_device(), dtype=self.dtype)
-        quarter = self.n_total // 4
-        x[:quarter] = float("nan")
-        x[quarter : 2 * quarter] = float("inf")
-        x[2 * quarter : 3 * quarter] = float("-inf")
-        return (x,)
 
 
 class RandnFlatWorkload(WorkloadBase):
@@ -255,9 +165,6 @@ class GatedRandnWorkload(WorkloadBase):
         return (torch.randn(self.m, 2 * self.n, dtype=self.dtype, device=run_device()),)
 
 
-# One manifest call of an elementwise op (docs/design/manifest.md § Workloads).
-
-
 def _draw_normal(shape: tuple, dtype: torch.dtype, device) -> torch.Tensor:
     if dtype == torch.bool:
         return torch.randint(0, 2, shape, device=device).bool()
@@ -312,6 +219,27 @@ _DOMAINS = {
     **dict.fromkeys(("LogicalNotFwdOp", "LogicalAndFwdOp", "LogicalOrFwdOp"), _draw_sparse),
     **dict.fromkeys(("IsnanFwdOp", "IsinfFwdOp", "IsfiniteFwdOp"), _draw_special),
 }
+
+
+def _every_16bit(dtype: torch.dtype) -> torch.Tensor:
+    """Every bit pattern of the 16-bit *dtype*, in code order from ``+0``."""
+    codes = torch.arange(1 << 16, dtype=torch.int32, device=run_device()).to(torch.int16)
+    return codes.view(dtype)
+
+
+def _same_bits(description: str, int_dtype: torch.dtype, nan_as_nan: bool = False):
+    """A verification requiring the reference's bits, viewed as *int_dtype*; with
+    *nan_as_nan*, any NaN matches any NaN."""
+    from workloads.numerics import Custom
+
+    def validate(got, expected):
+        if nan_as_nan:
+            nan = expected.isnan()
+            assert torch.equal(got.isnan(), nan)
+            got, expected = got[~nan], expected[~nan]
+        assert torch.equal(got.view(int_dtype), expected.view(int_dtype))
+
+    return Custom(validate, description)
 
 
 def alibi_reference(seq_len: int, num_heads: int, dtype: torch.dtype, device=None) -> torch.Tensor:
@@ -372,6 +300,28 @@ def _gated(activation):
     return _in_float32(torch_gated)
 
 
+def _silu_and_mul_torch(
+    a: dict, x: torch.Tensor, scale: torch.Tensor | None = None
+) -> torch.Tensor:
+    """silu(gate) * value, the halves clamped under a positive ``swiglu_limit``, as torch
+    computes it in *x*'s dtype; a ``scale`` multiplies each row in float32 before one cast."""
+    half = x.shape[-1] // 2
+    gate, value = x[..., :half], x[..., half:]
+    limit = a.get("swiglu_limit", 0.0)
+    if limit > 0:
+        gate, value = gate.clamp(max=limit), value.clamp(-limit, limit)
+    out = F.silu(gate) * value
+    return out if scale is None else (out.float() * scale.float().unsqueeze(-1)).to(out.dtype)
+
+
+def _silu_and_mul(a: dict, x: torch.Tensor, scale: torch.Tensor | None = None) -> torch.Tensor:
+    """:func:`_silu_and_mul_torch` in float32, rounded once to *x*'s dtype."""
+    return _silu_and_mul_torch(a, x.float(), scale).to(x.dtype)
+
+
+_silu_and_mul.torch = _silu_and_mul_torch
+
+
 # Each op's reference: its constructor arguments, then its inputs in signature order.
 _REFERENCES = {
     "ExpFwdOp": _in_float32(lambda a, x: torch.exp(x)),
@@ -418,14 +368,12 @@ _REFERENCES = {
     "SoftplusFwdOp": _in_float32(
         lambda a, x: F.softplus(x, a.get("beta", 1.0), a.get("threshold", 20.0))
     ),
-    "ClampTensorFwdOp": lambda a, x, lo=None, hi=None: torch.clamp(x, lo, hi),
-    "ClampScalarFwdOp": lambda a, x: torch.clamp(x, a.get("min", None), a.get("max", None)),
+    "ClampFwdOp": lambda a, x, lo=None, hi=None: torch.clamp(x, lo, hi),
     "NanToNumFwdOp": lambda a, x: torch.nan_to_num(
         x, a.get("nan", 0.0), a.get("posinf", None), a.get("neginf", None)
     ),
     "PReLUFwdOp": _in_float32(lambda a, x, w: F.prelu(x, w)),
-    "MaskedFillTensorFwdOp": lambda a, x, m, v: x.masked_fill(m, v),
-    "MaskedFillScalarFwdOp": lambda a, x, m: x.masked_fill(m, a["value"]),
+    "MaskedFillFwdOp": lambda a, x, m, v: x.masked_fill(m, v),
     "AddFwdOp": _in_float32(lambda a, x, y: torch.add(x, y, alpha=a.get("alpha", 1.0))),
     "SubFwdOp": _in_float32(lambda a, x, y: torch.sub(x, y, alpha=a.get("alpha", 1.0))),
     "MulFwdOp": _in_float32(lambda a, x, y: torch.mul(x, y)),
@@ -436,7 +384,6 @@ _REFERENCES = {
     "RemainderFwdOp": lambda a, x, y: torch.remainder(x, y),
     "PowFwdOp": _in_float32(lambda a, x, y: torch.pow(x, y)),
     "FloorDivideFwdOp": lambda a, x, y: torch.floor_divide(x, y),
-    "LerpScalarFwdOp": _in_float32(lambda a, x, y: torch.lerp(x, y, a.get("weight", 0.5))),
     "MaximumFwdOp": lambda a, x, y: torch.maximum(x, y),
     "MinimumFwdOp": lambda a, x, y: torch.minimum(x, y),
     "EqFwdOp": lambda a, x, y: torch.eq(x, y),
@@ -451,8 +398,8 @@ _REFERENCES = {
     "BitwiseOrFwdOp": lambda a, x, y: torch.bitwise_or(x, y),
     "BitwiseXorFwdOp": lambda a, x, y: torch.bitwise_xor(x, y),
     "WhereFwdOp": lambda a, c, x, y: torch.where(c, x, y),
-    "LerpTensorFwdOp": _in_float32(lambda a, x, e, w: torch.lerp(x, e, w)),
-    "SiLUAndMulFwdOp": _gated(lambda a, g: F.silu(g)),
+    "LerpFwdOp": _in_float32(lambda a, x, e, w: torch.lerp(x, e, w)),
+    "SiLUAndMulFwdOp": _silu_and_mul,
     "GELUAndMulFwdOp": _gated(lambda a, g: F.gelu(g, approximate=a.get("approximate", "none"))),
     "AlibiFwdOp": lambda a: alibi_reference(
         a["seq_len"], a["num_heads"], a["out_dtype"], a["device"]
@@ -497,16 +444,14 @@ class ElementwiseWorkload(WorkloadBase):
             "FloorDivideFwdOp",
             "RemainderFwdOp",
             "WhereFwdOp",
-            "ClampScalarFwdOp",
-            "ClampTensorFwdOp",
-            "MaskedFillScalarFwdOp",
-            "MaskedFillTensorFwdOp",
+            "ClampFwdOp",
+            "MaskedFillFwdOp",
             "MaximumFwdOp",
             "MinimumFwdOp",
             "NanToNumFwdOp",
         } or (name == "DivFwdOp" and self.arguments().get("rounding_mode") is not None):
             return Exact(atol=0, rtol=0)
-        if name == "LerpScalarFwdOp":
+        if name == "LerpFwdOp" and not isinstance(inputs[2], torch.Tensor):
             return lerp_verification(inputs[0].dtype)
         if name != "DropoutFwdOp":
             return Exact()
@@ -547,16 +492,16 @@ class ElementwiseCall(CallWorkload, ElementwiseWorkload):
 
     def gen_inputs(self) -> tuple:
         draw = _DOMAINS.get(self.call.signature.name, _draw_normal)
-        specs = (self.call.specs[t] for t in self.call.signature.inputs)
         return tuple(
-            None if s is None else draw(s.shape, getattr(torch, s.dtype), self.device)
-            for s in specs
+            self.call.scalars.get(t)
+            if s is None
+            else draw(s.shape, getattr(torch, s.dtype), self.device)
+            for t, s in ((t, self.call.specs[t]) for t in self.call.signature.inputs)
         )
 
     def arguments(self) -> dict:
-        # No elementwise op takes a construction-time tensor. A tensorless op's unset
-        # `device` parameter follows the workload's device.
-        arguments = self.call.arguments({})
+        # A tensorless op's unset `device` parameter follows the workload's device.
+        arguments = self.call.arguments()
         if "device" in arguments and arguments["device"] is None:
             arguments["device"] = self.device
         return arguments
@@ -570,11 +515,6 @@ def fused_gated_verification(dtype):
         if dtype == torch.float16
         else Exact(**reference_tolerance(dtype))
     )
-
-
-class ReLUCompileCase(RandnFlatWorkload):
-    def ref_program(self, x):
-        return _REFERENCES["ReLUFwdOp"]({}, x)
 
 
 class AbsCompileCase(RandnFlatWorkload):
@@ -607,11 +547,6 @@ class GELUAndMulCase(GatedRandnWorkload):
         return fused_gated_verification(inputs[0].dtype)
 
 
-class AddSameShapeCase(RandnPairWorkload):
-    def ref_program(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return _REFERENCES["AddFwdOp"]({}, a, b)
-
-
 class BinarySameShapeCase(RandnPairWorkload, ElementwiseWorkload):
     """Input fixture using the shared operator reference and verification."""
 
@@ -628,66 +563,62 @@ class BinaryPositiveCase(PositivePairWorkload, ElementwiseWorkload):
         ElementwiseWorkload.__init__(self, op_name, (), **parameters)
 
 
-class RemainderCase(PositivePairWorkload):
-    def ref_program(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return _REFERENCES["RemainderFwdOp"]({}, a, b)
-
-    def verification(self, *inputs):
-        from workloads.numerics import Exact
-
-        return Exact(atol=0, rtol=0)
-
-
-class FloorDivideCase(PositivePairWorkload):
-    def ref_program(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return _REFERENCES["FloorDivideFwdOp"]({}, a, b)
-
-    def verification(self, *inputs):
-        from workloads.numerics import Exact
-
-        return Exact(atol=0, rtol=0)
-
-
 class LerpCase(RandnPairWorkload):
+    """Two same-shape ``randn`` vectors and a Number weight."""
+
     def __init__(self, n_total: int, dtype, weight: float = 0.5):
         super().__init__(n_total, dtype)
         self.weight = weight
 
-    def ref_program(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return _REFERENCES["LerpScalarFwdOp"]({"weight": self.weight}, a, b)
+    def gen_inputs(self) -> tuple:
+        return (*super().gen_inputs(), self.weight)
+
+    def ref_program(self, a: torch.Tensor, b: torch.Tensor, weight: float) -> torch.Tensor:
+        return _REFERENCES["LerpFwdOp"]({}, a, b, weight)
 
     def verification(self, *inputs):
         return lerp_verification(inputs[0].dtype)
 
 
-class SpecialCase(SpecialWorkload, ElementwiseWorkload):
-    """Input fixture using the shared operator reference and verification."""
+class SpecialCase(RandnFlatWorkload, ElementwiseWorkload):
+    """A quarter each of NaN, +Inf, -Inf and finite values, unless *gen_fn* draws the input."""
 
     def __init__(self, n_total, dtype, op_name, gen_fn=None, **parameters):
-        SpecialWorkload.__init__(self, n_total, dtype, gen_fn=gen_fn)
+        RandnFlatWorkload.__init__(self, n_total, dtype, gen_fn=gen_fn)
         ElementwiseWorkload.__init__(self, op_name, (), **parameters)
 
+    def gen_inputs(self) -> tuple[torch.Tensor]:
+        if self._gen_fn is not None:
+            return (self._gen_fn(self.n_total, self.dtype),)
+        return (_draw_special((self.n_total,), self.dtype, run_device()),)
 
-class BitwiseCase(BitwiseWorkload, ElementwiseWorkload):
-    """Input fixture using the shared operator reference and verification."""
+
+class BitwiseCase(ElementwiseWorkload):
+    """Two int32 vectors in ``[-1000, 1000)``."""
 
     def __init__(self, n_total, op_name, **parameters):
-        BitwiseWorkload.__init__(self, n_total)
         ElementwiseWorkload.__init__(self, op_name, (), **parameters)
+        self.n_total = n_total
+        self.dtype = torch.int32
+
+    def gen_inputs(self) -> tuple[torch.Tensor, torch.Tensor]:
+        a = torch.randint(-1000, 1000, (self.n_total,), dtype=torch.int32, device=run_device())
+        b = torch.randint(-1000, 1000, (self.n_total,), dtype=torch.int32, device=run_device())
+        return a, b
 
 
 class FullRangeCase(ElementwiseWorkload):
     """Operands of given shapes and dtypes for one operator's shared reference.
 
     Each operand is ``(shape, dtype)``: an integer operand spans its dtype's whole range,
-    a bool operand is a fair coin.
+    a bool operand is a fair coin. *arguments* follow the operands as further inputs.
     """
 
-    def __init__(self, operands, op_name, **parameters):
+    def __init__(self, operands, op_name, *arguments, **parameters):
         ElementwiseWorkload.__init__(self, op_name, (), **parameters)
-        self.operands = tuple(operands)
+        self.operands, self.trailing = tuple(operands), arguments
 
-    def gen_inputs(self) -> tuple[torch.Tensor, ...]:
+    def gen_inputs(self) -> tuple:
         inputs = []
         for shape, dtype in self.operands:
             if dtype == torch.bool:
@@ -697,7 +628,7 @@ class FullRangeCase(ElementwiseWorkload):
                 inputs.append(
                     torch.randint(info.min, info.max, shape, dtype=dtype, device=run_device())
                 )
-        return tuple(inputs)
+        return (*inputs, *self.trailing)
 
 
 class UnaryActivationCase(RandnFlatWorkload, ElementwiseWorkload):
@@ -708,40 +639,33 @@ class UnaryActivationCase(RandnFlatWorkload, ElementwiseWorkload):
         ElementwiseWorkload.__init__(self, op_name, (), **parameters)
 
 
-class UnaryMathCase(RandnFlatWorkload, ElementwiseWorkload):
-    """Input fixture using the shared operator reference and verification."""
-
-    def __init__(self, n_total, dtype, op_name, gen_fn=None, **parameters):
-        RandnFlatWorkload.__init__(self, n_total, dtype, gen_fn=gen_fn)
-        ElementwiseWorkload.__init__(self, op_name, (), **parameters)
-
-
 class Every16BitCase(ElementwiseWorkload):
-    """Every bit pattern of a 16-bit float dtype, NaN and infinities included, as one input."""
+    """Every bit pattern of a 16-bit float dtype, NaN and infinities included, as one input.
 
-    def __init__(self, dtype, op_name, **parameters):
+    *arguments* follow it as the call's further inputs.
+    """
+
+    def __init__(self, dtype, op_name, *arguments, **parameters):
         ElementwiseWorkload.__init__(self, op_name, (), **parameters)
+        self.dtype, self.trailing = dtype, arguments
+
+    def gen_inputs(self) -> tuple:
+        bits = torch.arange(-(2**15), 2**15, device=run_device(), dtype=torch.int32)
+        return (bits.to(torch.int16).view(self.dtype), *self.trailing)
+
+
+class LogicalCase(ElementwiseWorkload):
+    """Two vectors of zeros and ones in *dtype*, each element a fair coin."""
+
+    def __init__(self, n_total, dtype, op_name, **parameters):
+        ElementwiseWorkload.__init__(self, op_name, (), **parameters)
+        self.n_total = n_total
         self.dtype = dtype
 
-    def gen_inputs(self) -> tuple[torch.Tensor]:
-        bits = torch.arange(-(2**15), 2**15, device=run_device(), dtype=torch.int32)
-        return (bits.to(torch.int16).view(self.dtype),)
-
-
-class ComparisonCase(RandnPairWorkload, ElementwiseWorkload):
-    """Input fixture using the shared operator reference and verification."""
-
-    def __init__(self, n_total, dtype, op_name, **parameters):
-        RandnPairWorkload.__init__(self, n_total, dtype)
-        ElementwiseWorkload.__init__(self, op_name, (), **parameters)
-
-
-class LogicalCase(LogicalWorkload, ElementwiseWorkload):
-    """Input fixture using the shared operator reference and verification."""
-
-    def __init__(self, n_total, dtype, op_name, **parameters):
-        LogicalWorkload.__init__(self, n_total, dtype)
-        ElementwiseWorkload.__init__(self, op_name, (), **parameters)
+    def gen_inputs(self) -> tuple[torch.Tensor, torch.Tensor]:
+        a = torch.randn(self.n_total, dtype=self.dtype, device=run_device()) > 0
+        b = torch.randn(self.n_total, dtype=self.dtype, device=run_device()) > 0
+        return a.to(self.dtype), b.to(self.dtype)
 
 
 def lerp_verification(dtype):
@@ -783,8 +707,7 @@ class GELUSignWorkload(ElementwiseWorkload):
     """Every 16-bit input; GELU of a negative input is never positive."""
 
     def __init__(self, dtype):
-        codes = torch.arange(1 << 16, dtype=torch.int32, device=run_device()).to(torch.int16)
-        super().__init__("GELUFwdOp", (codes.view(dtype),))
+        super().__init__("GELUFwdOp", (_every_16bit(dtype),))
 
     def verification(self, *inputs):
         from workloads.numerics import Custom
@@ -803,18 +726,12 @@ class SiLUAndMulGateSweepWorkload(ElementwiseWorkload):
     """Every bfloat16 gate against a value of one; each result is torch's, bit for bit."""
 
     def __init__(self):
-        codes = torch.arange(1 << 16, dtype=torch.int32, device=run_device()).to(torch.int16)
-        gate = codes.view(torch.bfloat16)
+        gate = _every_16bit(torch.bfloat16)
         super().__init__("SiLUAndMulFwdOp", (torch.cat([gate, torch.ones_like(gate)])[None],))
 
     def verification(self, *inputs):
-        from workloads.numerics import Custom
-
-        def validate(got, expected):
-            # Bit patterns, not values: zero tolerances still pass -0 for +0.
-            assert torch.equal(got.view(torch.int16), expected.view(torch.int16))
-
-        return Custom(validate, "torch's bfloat16 bit pattern at every gate")
+        # Bit patterns, not values: zero tolerances still pass -0 for +0.
+        return _same_bits("torch's bfloat16 bit pattern at every gate", torch.int16)
 
 
 class SigmoidEdgeWorkload(ElementwiseWorkload):
@@ -853,6 +770,21 @@ class SiLUAndMulEdgeWorkload(ElementwiseWorkload):
         return fused_gated_verification(inputs[0].dtype)
 
 
+class SiLUAndMulClampEdgeWorkload(ElementwiseWorkload):
+    """Edge gates against edge values under ``swiglu_limit`` 10, every pair in one row scaled
+    by 1.5: values at, inside and past the limit, infinite and NaN."""
+
+    def __init__(self, dtype):
+        edges = [0.0, -0.0, 1.0, -9.5, 10.0, -10.0, 10.5, -10.5, 1e4, -1e4]
+        edges += [float("inf"), -float("inf"), float("nan")]
+        edge = torch.tensor(edges, device=run_device()).to(dtype)
+        gate, value = torch.cartesian_prod(edge, edge).unbind(1)
+        scale = torch.full((1,), 1.5, device=run_device())
+        super().__init__(
+            "SiLUAndMulFwdOp", (torch.cat([gate, value])[None], scale), swiglu_limit=10.0
+        )
+
+
 class GELUAndMulTailWorkload(ElementwiseWorkload):
     """GELU's saturated tails as gates against a value of one: exact closed forms."""
 
@@ -870,8 +802,7 @@ class ErfRoundingWorkload(ElementwiseWorkload):
     """Exhaust the 16-bit domain; the polynomial must stay within one storage step."""
 
     def __init__(self, dtype):
-        codes = torch.arange(1 << 16, dtype=torch.int32, device=run_device()).to(torch.int16)
-        super().__init__("ErfFwdOp", (codes.view(dtype),))
+        super().__init__("ErfFwdOp", (_every_16bit(dtype),))
 
     def verification(self, *inputs):
         from workloads.numerics import Custom
@@ -901,16 +832,36 @@ class Exhaustive16BitWorkload(ElementwiseWorkload):
     """
 
     def __init__(self, op_name, dtype, repeats=1):
-        codes = torch.arange(1 << 16, dtype=torch.int32, device=run_device()).to(torch.int16)
-        super().__init__(op_name, (codes.view(dtype).repeat(repeats),))
+        super().__init__(op_name, (_every_16bit(dtype).repeat(repeats),))
 
     def verification(self, *inputs):
-        from workloads.numerics import Custom
+        return _same_bits(
+            "the reference's bits at every 16-bit input, NaN payloads included", torch.int16
+        )
 
-        def validate(got, expected):
-            assert torch.equal(got.view(torch.int16), expected.view(torch.int16))
 
-        return Custom(validate, "the reference's bits at every 16-bit input, NaN payloads included")
+class Float16DivisorClassesWorkload(ElementwiseWorkload):
+    """Every float16 numerator over one divisor of each class, as rows of a float16 division.
+
+    Divisors 14 and -30 give subnormal quotients lying exactly on a float16 rounding tie;
+    zero, infinity, the smallest subnormal and the largest finite value give special
+    results. *broadcast* passes the divisors as a column instead of expanding them.
+    """
+
+    DIVISORS = (14.0, -30.0, 0.0, -float("inf"), 2.0**-24, 65504.0)
+
+    def __init__(self, op_name, broadcast=False):
+        codes = torch.arange(-(1 << 15), 1 << 15, dtype=torch.int32, device=run_device())
+        a = codes.to(torch.int16).view(torch.float16).repeat(len(self.DIVISORS), 1)
+        b = torch.tensor(self.DIVISORS, dtype=torch.float16, device=run_device()).unsqueeze(1)
+        super().__init__(op_name, (a, b if broadcast else b.expand_as(a).contiguous()))
+
+    def verification(self, *inputs):
+        return _same_bits(
+            "the reference's bits at every float16 numerator, NaN as NaN",
+            torch.int16,
+            nan_as_nan=True,
+        )
 
 
 class Float32SpecialValuesWorkload(ElementwiseWorkload):
@@ -935,14 +886,11 @@ class Float32SpecialValuesWorkload(ElementwiseWorkload):
         super().__init__(op_name, (codes.repeat(repeats).view(torch.float32),))
 
     def verification(self, *inputs):
-        from workloads.numerics import Custom
-
-        def validate(got, expected):
-            nan = expected.isnan()
-            assert torch.equal(got.isnan(), nan)
-            assert torch.equal(got[~nan].view(torch.int32), expected[~nan].view(torch.int32))
-
-        return Custom(validate, "the reference's bits at every float32 value class, NaN as NaN")
+        return _same_bits(
+            "the reference's bits at every float32 value class, NaN as NaN",
+            torch.int32,
+            nan_as_nan=True,
+        )
 
 
 class Float32BinadeWorkload(ElementwiseWorkload):
@@ -959,12 +907,7 @@ class Float32BinadeWorkload(ElementwiseWorkload):
         super().__init__(op_name, (codes.view(torch.float32),))
 
     def verification(self, *inputs):
-        from workloads.numerics import Custom
-
-        def validate(got, expected):
-            assert torch.equal(got.view(torch.int32), expected.view(torch.int32))
-
-        return Custom(validate, "the reference's bits at every float32 of one binade")
+        return _same_bits("the reference's bits at every float32 of one binade", torch.int32)
 
 
 class LerpCancellationWorkload(ElementwiseWorkload):
@@ -973,7 +916,7 @@ class LerpCancellationWorkload(ElementwiseWorkload):
     def __init__(self, dtype):
         a = torch.full((256,), -4 - 4 * torch.finfo(dtype).eps, dtype=dtype, device=run_device())
         b, w = torch.full_like(a, 4), torch.full_like(a, 0.5)
-        super().__init__("LerpTensorFwdOp", (a, b, w))
+        super().__init__("LerpFwdOp", (a, b, w))
 
     def verification(self, *inputs):
         from workloads.numerics import Exact

@@ -11,18 +11,29 @@ from tileops._kernels.elementwise._broadcast import (
     compute_broadcast_offsets,
     is_contiguous_same_shape,
     row_broadcast_split,
-    row_tile_leaves_tail,
+    row_major_strides,
     strided_offset,
+    takes_flat_grid,
 )
-from tileops._kernels.elementwise._op_body import GuardedOpFunc, op_func_for
+from tileops._kernels.elementwise._op_body import (
+    GuardedOpFunc,
+    LaneMaskedOpFunc,
+    body_operations,
+    op_func_for,
+)
 from tileops._kernels.streaming_load import load16_evict_last
 
-# Threads a 64K-register SM holds at 32 registers each. A guarded body's fast loop
-# keeps every element of a thread in flight, and nvcc left to itself gives it more
-# than 32 registers, which leaves fewer threads resident; asking for blocks enough
-# to fill this many threads holds it at 32. The row-broadcast and register-copy
+# Threads a 64K-register SM holds at 32 registers each. nvcc gives a guarded body's fast
+# loop, which keeps every element of a thread in flight, and a long body whose kernel sets
+# ``FULL_OCCUPANCY`` more than 32 registers, which leaves fewer threads resident; asking for
+# blocks enough to fill this many threads holds it at 32. The row-broadcast and register-copy
 # builders both set this occupancy floor, so they must agree on it.
 _THREADS_AT_32_REGISTERS = 64 * 1024 // 32
+
+
+def _compile_flags(headers):
+    """nvcc flags pre-including *headers*, or none for a program that calls no csrc function."""
+    return csrc_include(*headers) if headers else None
 
 
 def _fast_of(op_func):
@@ -46,24 +57,19 @@ def _backwards(j, count):
 
 
 def _broadcast_index_terms(plan_name):
-    """Return ``(ndim, divisors, a_strides, b_strides)`` for one broadcast plan.
+    """Return ``(divisors, a_strides, b_strides)`` for one broadcast plan.
 
     Called inside a builder, where these lists and tuples may not be closed over.
     """
     plan = broadcast_plan_for(plan_name)
-    ndim = len(plan.coalesced_shape)
-    divisors = [1] * ndim
-    for i in range(ndim - 2, -1, -1):
-        divisors[i] = divisors[i + 1] * plan.coalesced_shape[i + 1]
-    return ndim, divisors, plan.a_strides, plan.b_strides
+    return row_major_strides(plan.coalesced_shape), plan.a_strides, plan.b_strides
 
 
 @target_cache(maxsize=32)
-def make_unary_direct(N, dtype, op_name, output_dtype=None, threads=256, headers=()):
-    """Strategy 1: 1 element per thread."""
-    out_dtype = output_dtype or dtype
+def make_unary_direct(N, dtype, op_name, out_dtype):
+    """One element a thread."""
 
-    @tilelang.jit(out_idx=[1], compile_flags=csrc_include(*headers) if headers else None)
+    @tilelang.jit(out_idx=[1])
     def kernel(threads_arg):
         op_func = op_func_for(op_name)
 
@@ -80,18 +86,17 @@ def make_unary_direct(N, dtype, op_name, output_dtype=None, threads=256, headers
 
 
 @target_cache(maxsize=32)
-def make_unary_regcopy(
-    N, dtype, op_name, output_dtype=None, threads=256, num_per_thread=8, headers=()
-):
-    """Strategy 3: fragment load -> compute -> fragment store.
+def make_unary_regcopy(N, dtype, op_name, out_dtype, headers, full_occupancy):
+    """Fragment load, compute, fragment store.
 
     A ``GuardedOpFunc`` body runs its fast form over a fragment-copy thread's
-    elements, and the full body only in a thread where the guard fails.
+    elements, and the full body only in a thread where the guard fails. The fragment
+    program holds the occupancy floor for a guarded body, and for any body whose kernel
+    sets *full_occupancy*.
     """
-    out_dtype = output_dtype or dtype
     vec = 16 // (DataType(dtype).bits // 8)
 
-    @tilelang.jit(out_idx=[1], compile_flags=csrc_include(*headers) if headers else None)
+    @tilelang.jit(out_idx=[1], compile_flags=_compile_flags(headers))
     def kernel(threads_arg, npt_arg):
         op_func = op_func_for(op_name)
         block_size = threads_arg * npt_arg
@@ -121,7 +126,7 @@ def make_unary_regcopy(
                     for v in T.vectorized(npt_arg):
                         y[base + v] = y_run[v]
                 else:
-                    if fast is not None:
+                    if fast is not None or full_occupancy:
                         T.annotate_min_blocks_per_sm(_THREADS_AT_32_REGISTERS // threads_arg)
                     x_reg = T.alloc_fragment((block_size,), dtype)
                     y_reg = T.alloc_fragment((block_size,), out_dtype)
@@ -129,6 +134,7 @@ def make_unary_regcopy(
                     if fast is None:
                         for i, j in T.Parallel(threads_arg, npt_arg):
                             y_reg[i * npt_arg + j] = op_func(x_reg[i * npt_arg + j])
+                        T.copy(y_reg, y[bx * block_size : (bx + 1) * block_size])
                     else:
                         # Whether the fast form held for every element of this thread.
                         held = T.alloc_local((1,), "bool")
@@ -138,11 +144,14 @@ def make_unary_regcopy(
                             value, holds = fast(x_reg[idx])
                             y_reg[idx] = value
                             held[0] = held[0] and holds
-                        for c, i, v in T.Parallel(chunks, threads_arg, vec):
-                            e = (_backwards(c, chunks) * threads_arg + i) * vec + _backwards(v, vec)
-                            if not held[0]:
+                        T.copy(y_reg, y[bx * block_size : (bx + 1) * block_size])
+                        if not held[0]:
+                            for c, i, v in T.Parallel(chunks, threads_arg, vec):
+                                e = (_backwards(c, chunks) * threads_arg + i) * vec + _backwards(
+                                    v, vec
+                                )
                                 y_reg[e] = op_func(x[bx * block_size + e])
-                    T.copy(y_reg, y[bx * block_size : (bx + 1) * block_size])
+                            T.copy(y_reg, y[bx * block_size : (bx + 1) * block_size])
 
         return main
 
@@ -170,8 +179,11 @@ def _row_broadcast_prim(
     The generic path pays that chain per element and every access is a gather.
     A ragged inner extent splits at trace time. Full blocks always run unguarded.
     Where *num_per_thread* divides the row, the grid indexes vectors and leaves no
-    columns over. Otherwise they go one of two ways, scalar either way: packed end
-    to end across rows into blocks of their own, or left as one guarded block per row.
+    columns over. A row that is not a whole number of a thread's vectors, against an
+    operand that is the whole output, runs one flat grid of the output's vectors.
+    Otherwise the columns past the last full block go one of two ways, scalar either
+    way: packed end to end across rows into blocks of their own, or left as one
+    guarded block per row.
 
     *stage* moves the full blocks through fragments, which keeps the copies wide
     when the body cannot vectorize. It is opt-in because a body that does
@@ -179,16 +191,60 @@ def _row_broadcast_prim(
 
     ``bias_rows`` enables bias-vector reuse across rows when the grid fits
     ``max_resident_threads``. Register-heavy bodies must opt out: this bound only
-    accounts for the device's thread capacity.
+    accounts for the device's thread capacity. A grid of hinted blocks between half a
+    wave and one wave of ``max_resident_threads`` runs in two rounds on half the blocks.
     """
     op_func = op_func_for(op_name)
     fast = _fast_of(op_func)
-    ndim, divisors, a_strides, b_strides = _broadcast_index_terms(plan_name)
+    divisors, a_strides, b_strides = _broadcast_index_terms(plan_name)
     plan = broadcast_plan_for(plan_name)
     inner = plan.coalesced_shape[-1]
     rows = N_total // inner
     a_inner = plan.a_strides[-1]
     b_inner = plan.b_strides[-1]
+    lanes = 128 // DataType(dtype).bits
+    full_strides = (inner, 1)
+    bias_operand = (
+        "b"
+        if plan.b_strides == (0, 1) and plan.a_strides == full_strides
+        else "a"
+        if plan.a_strides == (0, 1) and plan.b_strides == full_strides
+        else None
+    )
+
+    def bias_grid_at(npt):
+        """Whether a launch of *npt* elements a thread takes the bias-row grid."""
+        cols = threads * npt
+        return (
+            bias_rows is not None
+            and max_resident_threads is not None
+            and bias_operand is not None
+            and len(plan.coalesced_shape) == 2
+            and inner % cols == 0
+            and DataType(out_dtype).bits == DataType(dtype).bits
+            and npt == lanes
+            and rows % bias_rows == 0
+            and (inner // cols) * (rows // bias_rows) * threads <= max_resident_threads
+        )
+
+    # Below this many waves of resident threads, a staged block of whole-vector rows takes
+    # two 16-byte vectors a thread on half the blocks. A 2-byte operand's sixteen elements
+    # carry more staged body than the second load hides, and ``default_launch_config`` sets
+    # an 8-byte operand's vectors a thread, so only 4-byte operands qualify.
+    two_vector_max_waves = 8
+    two_vectors = (
+        stage
+        and num_per_thread == lanes
+        and DataType(dtype).bits == 32
+        and DataType(out_dtype).bits == DataType(dtype).bits
+        and max_resident_threads is not None
+        and inner % (2 * threads * num_per_thread) == 0
+        and not bias_grid_at(num_per_thread)
+        and rows * (inner // (threads * num_per_thread)) * threads
+        < two_vector_max_waves * max_resident_threads
+    )
+    if two_vectors:
+        num_per_thread *= 2
     block_cols = threads * num_per_thread
     full_blocks = inner // block_cols
     exact = full_blocks * block_cols == inner
@@ -207,18 +263,24 @@ def _row_broadcast_prim(
     vecs_per_row = inner // num_per_thread if inner % num_per_thread == 0 else 0
     total_vecs = rows * vecs_per_row
     grid_vecs = -(-total_vecs // threads)
-    flat_grid = (
-        not exact
-        and num_per_thread > 1
-        and not row_tile_leaves_tail(inner, rows, threads, num_per_thread, stage)
-    )
+    flat_grid = takes_flat_grid(inner, rows, threads, num_per_thread, stage)
     # A thread's own run needs every row to start on a 16-byte vector boundary.
-    lanes = 128 // DataType(dtype).bits
     contiguous = fast is None and _narrows(dtype, out_dtype) and inner % lanes == 0
 
     @T.macro
     def write_col(a, b, y, a_base, b_base, by, col):
         y[by * inner + col] = op_func(a[a_base + col * a_inner], b[b_base + col * b_inner])
+
+    # A body over two 16-bit lanes (``LaneMaskedOpFunc``) builds a run's bool bytes four a
+    # word, from two lane masks.
+    lane_mask = (
+        op_func.lanes if isinstance(op_func, LaneMaskedOpFunc) and num_per_thread % 4 == 0 else None
+    )
+
+    def both_lanes(x):
+        """A uint32 word holding the 16 bits of *x* in each of its two lanes."""
+        bits = T.Cast("uint32", T.reinterpret(x, "uint16"))
+        return bits | T.shift_left(bits, T.uint32(16))
 
     @T.macro
     def write_run(a, b, y, a_base, b_base, by, col):
@@ -227,7 +289,6 @@ def _row_broadcast_prim(
         A narrower result stored from the fragment layout takes one store per
         vector of the operand; a thread's own run stores it in one.
         """
-        y_run = T.alloc_local((num_per_thread,), out_dtype)
         if a_inner:
             a_run = T.alloc_local((num_per_thread,), dtype)
             for v in T.vectorized(num_per_thread):
@@ -242,13 +303,43 @@ def _row_broadcast_prim(
         else:
             b_held = T.alloc_local((1,), dtype)
             b_held[0] = b[b_base]
-        for v in T.unroll(num_per_thread):
-            y_run[v] = op_func(
-                a_run[v] if a_inner else a_held[0],
-                b_run[v] if b_inner else b_held[0],
-            )
+        if lane_mask is not None:
+            if a_inner:
+                a_word = T.view(a_run, (num_per_thread // 2,), "uint32")
+            else:
+                a_word = T.alloc_local((1,), "uint32")
+                a_word[0] = both_lanes(a_held[0])
+            if b_inner:
+                b_word = T.view(b_run, (num_per_thread // 2,), "uint32")
+            else:
+                b_word = T.alloc_local((1,), "uint32")
+                b_word[0] = both_lanes(b_held[0])
+            y_word = T.alloc_local((num_per_thread // 4,), "uint32")
+            for w in T.unroll(num_per_thread // 4):
+                y_word[w] = T.call_extern(
+                    "uint32",
+                    "tileops::lane_mask_bytes",
+                    lane_mask(a_word[2 * w * a_inner], b_word[2 * w * b_inner]),
+                    lane_mask(a_word[(2 * w + 1) * a_inner], b_word[(2 * w + 1) * b_inner]),
+                )
+            y_run = T.view(y_word, (num_per_thread,), out_dtype)
+        else:
+            y_run = T.alloc_local((num_per_thread,), out_dtype)
+            for v in T.unroll(num_per_thread):
+                y_run[v] = op_func(
+                    a_run[v] if a_inner else a_held[0],
+                    b_run[v] if b_inner else b_held[0],
+                )
         for v in T.vectorized(num_per_thread):
             y[by * inner + col + v] = y_run[v]
+
+    # Layout inference finds no fragment layout for a backward fallback in a ragged row's
+    # block that holds an operand at stride 0; that fallback reads forward.
+    reverse_fallback = exact or (a_inner and b_inner)
+    # The fragment copy hands a thread one vector in each block-wide chunk; the staged
+    # loops walk a thread's elements in that order.
+    stage_vec = lanes if num_per_thread % lanes == 0 else num_per_thread
+    stage_chunks = num_per_thread // stage_vec
 
     @T.macro
     def write_block_staged(a, b, y, a_base, b_base, by, bx):
@@ -276,79 +367,104 @@ def _row_broadcast_prim(
             b_held = T.alloc_local((1,), dtype)
             b_held[0] = b[b_base]
         if fast is None:
-            for i, j in T.Parallel(threads, num_per_thread):
-                idx = i * num_per_thread + j
+            for c, i, v in T.Parallel(stage_chunks, threads, stage_vec):
+                idx = (c * threads + i) * stage_vec + v
                 y_reg[idx] = op_func(
                     a_reg[idx] if a_inner else a_held[0],
                     b_reg[idx] if b_inner else b_held[0],
                 )
+            T.copy(y_reg, y[by * inner + col0 : by * inner + col0 + block_cols])
         else:
             # Whether the fast form held for every element of this thread.
             held = T.alloc_local((1,), "bool")
             held[0] = True
-            for i, j in T.Parallel(threads, num_per_thread):
-                idx = i * num_per_thread + j
+            for c, i, v in T.Parallel(stage_chunks, threads, stage_vec):
+                idx = (c * threads + i) * stage_vec + v
                 value, holds = fast(
                     a_reg[idx] if a_inner else a_held[0],
                     b_reg[idx] if b_inner else b_held[0],
                 )
                 y_reg[idx] = value
                 held[0] = held[0] and holds
-            for i, j in T.Parallel(threads, num_per_thread):
-                e = i * num_per_thread + _backwards(j, num_per_thread)
-                col = col0 + e
-                if not held[0]:
+            T.copy(y_reg, y[by * inner + col0 : by * inner + col0 + block_cols])
+            if not held[0]:
+                for c, i, v in T.Parallel(stage_chunks, threads, stage_vec):
+                    if reverse_fallback:
+                        e = (_backwards(c, stage_chunks) * threads + i) * stage_vec + _backwards(
+                            v, stage_vec
+                        )
+                    else:
+                        e = (c * threads + i) * stage_vec + v
+                    col = col0 + e
                     y_reg[e] = op_func(a[a_base + col * a_inner], b[b_base + col * b_inner])
-        T.copy(y_reg, y[by * inner + col0 : by * inner + col0 + block_cols])
+                T.copy(y_reg, y[by * inner + col0 : by * inner + col0 + block_cols])
 
-    vec = 16 // (DataType(dtype).bits // 8)
     hinted = (
         stage
         and fast is None
         and DataType(out_dtype).bits == 8
-        and num_per_thread % vec == 0
-        and inner % vec == 0
+        and num_per_thread % lanes == 0
+        and inner % lanes == 0
     )
-    chunks = num_per_thread // vec
+    chunks = num_per_thread // lanes
 
     @T.macro
-    def write_block_hinted(a, b, y, a_base, b_base, by, bx):
+    def write_block_hinted(a, b, y, a_base, b_base, by, bx, words=False):
         """One full block, each thread holding one vector in every block-wide chunk.
 
         The thread-to-vector map is the one the fragment copy gives, so the store
         stays one aligned word a chunk. An operand at stride 0 is read once, as in
         ``write_block_staged``. An operand smaller than the output is a row the next
         rows read again, so it stays in L2 evict-last; one as large is read once.
+
+        *words* builds each 4-byte word of the result by adding the selected byte of every
+        element. The rounds grid sets it: there the second round's loads wait on this
+        arithmetic.
         """
         tx = T.get_thread_binding()
         col0 = bx * block_cols
         a_run = T.alloc_local((num_per_thread,), dtype)
         b_run = T.alloc_local((num_per_thread,), dtype)
-        y_run = T.alloc_local((num_per_thread,), out_dtype)
         for c in T.unroll(chunks):
-            at = col0 + (c * threads + tx) * vec
+            at = col0 + (c * threads + tx) * lanes
             if a_inner:
                 if a_numel < N_total:
-                    load16_evict_last(a_run, c * vec, a, a_base + at)
+                    load16_evict_last(a_run, c * lanes, a, a_base + at)
                 else:
-                    for v in T.vectorized(vec):
-                        a_run[c * vec + v] = a[a_base + at + v]
+                    for v in T.vectorized(lanes):
+                        a_run[c * lanes + v] = a[a_base + at + v]
             if b_inner:
                 if b_numel < N_total:
-                    load16_evict_last(b_run, c * vec, b, b_base + at)
+                    load16_evict_last(b_run, c * lanes, b, b_base + at)
                 else:
-                    for v in T.vectorized(vec):
-                        b_run[c * vec + v] = b[b_base + at + v]
+                    for v in T.vectorized(lanes):
+                        b_run[c * lanes + v] = b[b_base + at + v]
         if not a_inner:
             a_run[0] = a[a_base]
         if not b_inner:
             b_run[0] = b[b_base]
-        for e in T.unroll(num_per_thread):
-            y_run[e] = op_func(a_run[e] if a_inner else a_run[0], b_run[e] if b_inner else b_run[0])
+        if words:
+            y_word = T.alloc_local((num_per_thread // 4,), "uint32")
+            for w in T.unroll(num_per_thread // 4):
+                y_word[w] = T.uint32(0)
+            for e in T.unroll(num_per_thread):
+                y_word[e // 4] = y_word[e // 4] + T.if_then_else(
+                    op_func(a_run[e] if a_inner else a_run[0], b_run[e] if b_inner else b_run[0])
+                    != T.cast(0, out_dtype),
+                    T.shift_left(T.uint32(1), T.Cast("uint32", (e % 4) * 8)),
+                    T.uint32(0),
+                )
+            y_run = T.view(y_word, (num_per_thread,), out_dtype)
+        else:
+            y_run = T.alloc_local((num_per_thread,), out_dtype)
+            for e in T.unroll(num_per_thread):
+                y_run[e] = op_func(
+                    a_run[e] if a_inner else a_run[0], b_run[e] if b_inner else b_run[0]
+                )
         for c in T.unroll(chunks):
-            at = by * inner + col0 + (c * threads + tx) * vec
-            for v in T.vectorized(vec):
-                y[at + v] = y_run[c * vec + v]
+            at = by * inner + col0 + (c * threads + tx) * lanes
+            for v in T.vectorized(lanes):
+                y[at + v] = y_run[c * lanes + v]
 
     @T.macro
     def write_held_block(a, b, y, a_base, b_base, by, bxc):
@@ -383,28 +499,15 @@ def _row_broadcast_prim(
         else:
             write_held_block(a, b, y, a_base, b_base, by, bxc)
 
-    full_strides = (inner, 1)
-    bias_operand = (
-        "b"
-        if plan.b_strides == (0, 1) and plan.a_strides == full_strides
-        else "a"
-        if plan.a_strides == (0, 1) and plan.b_strides == full_strides
-        else None
-    )
-    bias_grid = (
-        bias_rows is not None
-        and max_resident_threads is not None
-        and bias_operand is not None
-        and len(plan.coalesced_shape) == 2
-        and exact
-        and fast is None
-        and DataType(out_dtype).bits == DataType(dtype).bits
-        and num_per_thread == lanes
-        and rows % bias_rows == 0
-        and full_blocks * (rows // bias_rows) * threads <= max_resident_threads
-    )
+    bias_grid = bias_grid_at(num_per_thread)
 
     if bias_grid:
+
+        @T.macro
+        def store_bias_rows(y, y_run, by, col):
+            for r in T.unroll(bias_rows):
+                for v in T.vectorized(num_per_thread):
+                    y[(by * bias_rows + r) * inner + col + v] = y_run[r, v]
 
         @T.macro
         def write_bias_rows(bias, full, y, bx, by):
@@ -418,15 +521,38 @@ def _row_broadcast_prim(
             for r in T.unroll(bias_rows):
                 for v in T.vectorized(num_per_thread):
                     full_run[r, v] = full[(by * bias_rows + r) * inner + col + v]
-            for r in T.unroll(bias_rows):
-                for v in T.unroll(num_per_thread):
-                    if bias_operand == "a":
-                        y_run[r, v] = op_func(bias_run[v], full_run[r, v])
-                    else:
-                        y_run[r, v] = op_func(full_run[r, v], bias_run[v])
-            for r in T.unroll(bias_rows):
-                for v in T.vectorized(num_per_thread):
-                    y[(by * bias_rows + r) * inner + col + v] = y_run[r, v]
+            if fast is None:
+                for r in T.unroll(bias_rows):
+                    for v in T.unroll(num_per_thread):
+                        if bias_operand == "a":
+                            y_run[r, v] = op_func(bias_run[v], full_run[r, v])
+                        else:
+                            y_run[r, v] = op_func(full_run[r, v], bias_run[v])
+                store_bias_rows(y, y_run, by, col)
+            else:
+                # Whether the fast form held for every element of this thread.
+                held = T.alloc_local((1,), "bool")
+                held[0] = True
+                for r in T.unroll(bias_rows):
+                    for v in T.unroll(num_per_thread):
+                        if bias_operand == "a":
+                            value, holds = fast(bias_run[v], full_run[r, v])
+                        else:
+                            value, holds = fast(full_run[r, v], bias_run[v])
+                        y_run[r, v] = value
+                        held[0] = held[0] and holds
+                store_bias_rows(y, y_run, by, col)
+                if not held[0]:
+                    for r in T.unroll(bias_rows):
+                        for v in T.unroll(num_per_thread):
+                            rb = _backwards(r, bias_rows)
+                            vb = _backwards(v, num_per_thread)
+                            at = (by * bias_rows + rb) * inner + col + vb
+                            if bias_operand == "a":
+                                y_run[rb, vb] = op_func(bias[col + vb], full[at])
+                            else:
+                                y_run[rb, vb] = op_func(full[at], bias[col + vb])
+                    store_bias_rows(y, y_run, by, col)
 
         @T.prim_func
         def bias_main(
@@ -442,6 +568,143 @@ def _row_broadcast_prim(
 
         return bias_main
 
+    # One resident wave issues every load at once; two rounds issue the second half as the
+    # first returns. Only a one-predicate body takes them, since the second round's loads
+    # wait on the first round's arithmetic.
+    rounds = 2
+    predicates = (
+        sum(node.dtype == "bool" for node in body_operations(op_func, dtype, dtype) or ())
+        if hinted
+        else 0
+    )
+    round_grid = (
+        hinted
+        and exact
+        and predicates == 1
+        and max_resident_threads is not None
+        and body_blocks % rounds == 0
+        and max_resident_threads < rounds * body_blocks * threads <= rounds * max_resident_threads
+    )
+
+    if round_grid:
+
+        @T.prim_func
+        def rounds_main(
+            a: T.Tensor((a_numel,), dtype),
+            b: T.Tensor((b_numel,), dtype),
+            y: T.Tensor((N_total,), out_dtype),
+        ):
+            with T.Kernel(body_blocks // rounds, threads=threads) as bx:
+                # Kept a loop: unrolled, nvcc issues the second round's loads with the first's.
+                for r in T.unroll(rounds, unroll_factor=1):
+                    blk = bx * rounds + r
+                    by = blk // full_blocks
+                    a_base, b_base = compute_broadcast_offsets(
+                        by * inner, divisors, a_strides, b_strides
+                    )
+                    # A word holds four results, so a thread's run must fill whole words.
+                    write_block_hinted(
+                        a, b, y, a_base, b_base, by, blk % full_blocks, num_per_thread % 4 == 0
+                    )
+
+        return rounds_main
+
+    # Where one operand is the whole output, row-major, its vectors stay aligned across
+    # ragged rows. A vector no wider than a row spans at most two rows, so the stride-0
+    # operand is two reads.
+    row_operand = (
+        "b"
+        if tuple(plan.a_strides) == tuple(divisors) and b_inner == 0
+        else "a"
+        if tuple(plan.b_strides) == tuple(divisors) and a_inner == 0
+        else None
+    )
+    ragged_flat = (
+        lanes % num_per_thread == 0
+        and inner % num_per_thread != 0
+        and inner >= num_per_thread
+        and row_operand is not None
+    )
+
+    if ragged_flat:
+        whole_vecs = N_total // num_per_thread
+        leftover = N_total - whole_vecs * num_per_thread
+
+        def ragged_pair(full_run, row_values, split, j):
+            """``(a, b)`` at lane *j*: the full operand's lane and its row's value."""
+            row_value = T.if_then_else(j < split, row_values[0], row_values[1])
+            if row_operand == "b":
+                return full_run[j], row_value
+            return row_value, full_run[j]
+
+        @T.prim_func
+        def ragged_main(
+            a: T.Tensor((a_numel,), dtype),
+            b: T.Tensor((b_numel,), dtype),
+            y: T.Tensor((N_total,), out_dtype),
+        ):
+            grid = T.ceildiv(whole_vecs + (1 if leftover else 0), threads)
+            with T.Kernel(grid, threads=threads) as bx:
+                if fast is not None:
+                    T.annotate_min_blocks_per_sm(_THREADS_AT_32_REGISTERS // threads)
+                v = bx * threads + T.get_thread_binding()
+                with T.If(v < whole_vecs):
+                    with T.Then():
+                        e0 = v * num_per_thread
+                        r0 = e0 // inner
+                        r1 = (e0 + num_per_thread - 1) // inner
+                        a0, b0 = compute_broadcast_offsets(
+                            r0 * inner, divisors, a_strides, b_strides
+                        )
+                        a1, b1 = compute_broadcast_offsets(
+                            r1 * inner, divisors, a_strides, b_strides
+                        )
+                        # Lanes before *split* lie in row r0.
+                        split = (r0 + 1) * inner - e0
+                        full_run = T.alloc_local((num_per_thread,), dtype)
+                        row_values = T.alloc_local((2,), dtype)
+                        y_run = T.alloc_local((num_per_thread,), out_dtype)
+                        for j in T.vectorized(num_per_thread):
+                            full_run[j] = (a if row_operand == "b" else b)[e0 + j]
+                        row_values[0] = b[b0] if row_operand == "b" else a[a0]
+                        row_values[1] = b[b1] if row_operand == "b" else a[a1]
+                        if fast is not None:
+                            # Whether the fast form held for every element of this thread.
+                            held = T.alloc_local((1,), "bool")
+                            held[0] = True
+                        for j in T.unroll(num_per_thread):
+                            x, w = ragged_pair(full_run, row_values, split, j)
+                            if fast is None:
+                                y_run[j] = op_func(x, w)
+                            else:
+                                value, holds = fast(x, w)
+                                y_run[j] = value
+                                held[0] = held[0] and holds
+                        for j in T.vectorized(num_per_thread):
+                            y[e0 + j] = y_run[j]
+                        if fast is not None:  # noqa: SIM102
+                            if not held[0]:
+                                for j in T.unroll(num_per_thread):
+                                    x, w = ragged_pair(
+                                        full_run, row_values, split, _backwards(j, num_per_thread)
+                                    )
+                                    y_run[_backwards(j, num_per_thread)] = op_func(x, w)
+                                for j in T.vectorized(num_per_thread):
+                                    y[e0 + j] = y_run[j]
+                    with T.Else():
+                        # The last vector's thread takes the columns short of a vector.
+                        if leftover:
+                            with T.If(v == whole_vecs):  # noqa: SIM117
+                                with T.Then():
+                                    for j in T.serial(leftover):
+                                        e = whole_vecs * num_per_thread + j
+                                        ta, tb = compute_broadcast_offsets(
+                                            (e // inner) * inner, divisors, a_strides, b_strides
+                                        )
+                                        write_col(a, b, y, ta, tb, e // inner, e % inner)
+
+        return ragged_main
+
     if flat_grid:
         exact_grid = grid_vecs * threads == total_vecs
 
@@ -450,10 +713,16 @@ def _row_broadcast_prim(
             """The *j*-th column of vector *v*, wherever in the grid that lands."""
             row = v // vecs_per_row
             col = (v % vecs_per_row) * num_per_thread + j
-            a_base, b_base = compute_broadcast_offsets(
-                row * inner, ndim, divisors, a_strides, b_strides
-            )
+            a_base, b_base = compute_broadcast_offsets(row * inner, divisors, a_strides, b_strides)
             write_col(a, b, y, a_base, b_base, row, col)
+
+        @T.macro
+        def store_flat_block(y, y_reg, bx):
+            for i, j in T.Parallel(threads, num_per_thread):
+                v = bx * threads + i
+                y[(v // vecs_per_row) * inner + (v % vecs_per_row) * num_per_thread + j] = y_reg[
+                    i * num_per_thread + j
+                ]
 
         @T.macro
         def write_flat_staged(a, b, y, bx):
@@ -476,7 +745,7 @@ def _row_broadcast_prim(
                 v = bx * threads + i
                 col = (v % vecs_per_row) * num_per_thread + j
                 a_base, b_base = compute_broadcast_offsets(
-                    (v // vecs_per_row) * inner, ndim, divisors, a_strides, b_strides
+                    (v // vecs_per_row) * inner, divisors, a_strides, b_strides
                 )
                 if a_inner:
                     a_reg[i * num_per_thread + j] = a[a_base + col * a_inner]
@@ -485,7 +754,6 @@ def _row_broadcast_prim(
             for i in T.Parallel(threads):
                 a_base, b_base = compute_broadcast_offsets(
                     ((bx * threads + i) // vecs_per_row) * inner,
-                    ndim,
                     divisors,
                     a_strides,
                     b_strides,
@@ -501,6 +769,7 @@ def _row_broadcast_prim(
                         a_reg[k] if a_inner else a_held[i],
                         b_reg[k] if b_inner else b_held[i],
                     )
+                store_flat_block(y, y_reg, bx)
             else:
                 # Whether the fast form held for every element of this thread.
                 held = T.alloc_local((1,), "bool")
@@ -513,22 +782,19 @@ def _row_broadcast_prim(
                     )
                     y_reg[k] = value
                     held[0] = held[0] and holds
-                for i, j in T.Parallel(threads, num_per_thread):
-                    v = bx * threads + i
-                    jr = _backwards(j, num_per_thread)
-                    col = (v % vecs_per_row) * num_per_thread + jr
-                    a_base, b_base = compute_broadcast_offsets(
-                        (v // vecs_per_row) * inner, ndim, divisors, a_strides, b_strides
-                    )
-                    if not held[0]:
+                store_flat_block(y, y_reg, bx)
+                if not held[0]:
+                    for i, j in T.Parallel(threads, num_per_thread):
+                        v = bx * threads + i
+                        jr = _backwards(j, num_per_thread)
+                        col = (v % vecs_per_row) * num_per_thread + jr
+                        a_base, b_base = compute_broadcast_offsets(
+                            (v // vecs_per_row) * inner, divisors, a_strides, b_strides
+                        )
                         y_reg[i * num_per_thread + jr] = op_func(
                             a[a_base + col * a_inner], b[b_base + col * b_inner]
                         )
-            for i, j in T.Parallel(threads, num_per_thread):
-                v = bx * threads + i
-                y[(v // vecs_per_row) * inner + (v % vecs_per_row) * num_per_thread + j] = y_reg[
-                    i * num_per_thread + j
-                ]
+                    store_flat_block(y, y_reg, bx)
 
         @T.prim_func
         def flat_main(
@@ -542,7 +808,7 @@ def _row_broadcast_prim(
                 if stage and contiguous:
                     v = bx * threads + T.get_thread_binding()
                     a_base, b_base = compute_broadcast_offsets(
-                        (v // vecs_per_row) * inner, ndim, divisors, a_strides, b_strides
+                        (v // vecs_per_row) * inner, divisors, a_strides, b_strides
                     )
                     write_run(
                         a,
@@ -581,7 +847,7 @@ def _row_broadcast_prim(
                         by = bx // full_blocks
                         bxc = bx % full_blocks
                         a_base, b_base = compute_broadcast_offsets(
-                            by * inner, ndim, divisors, a_strides, b_strides
+                            by * inner, divisors, a_strides, b_strides
                         )
                         write_full_block(a, b, y, a_base, b_base, by, bxc)
                     with T.Else():
@@ -594,7 +860,7 @@ def _row_broadcast_prim(
                                 with T.Then():
                                     tail_row = slot // tail_cols
                                     ta_base, tb_base = compute_broadcast_offsets(
-                                        tail_row * inner, ndim, divisors, a_strides, b_strides
+                                        tail_row * inner, divisors, a_strides, b_strides
                                     )
                                     write_col(
                                         a,
@@ -620,9 +886,7 @@ def _row_broadcast_prim(
         ):
             if fast is not None and stage:
                 T.annotate_min_blocks_per_sm(_THREADS_AT_32_REGISTERS // threads)
-            a_base, b_base = compute_broadcast_offsets(
-                by * inner, ndim, divisors, a_strides, b_strides
-            )
+            a_base, b_base = compute_broadcast_offsets(by * inner, divisors, a_strides, b_strides)
             if exact:
                 write_full_block(a, b, y, a_base, b_base, by, bx)
             else:
@@ -640,30 +904,18 @@ def _row_broadcast_prim(
 
 
 @target_cache(maxsize=32)
-def make_binary_register_copy(
-    N_total,
-    dtype,
-    op_name,
-    output_dtype=None,
-    threads=256,
-    num_per_thread=8,
-):
-    """Binary register_copy: fragment load -> compute -> fragment store."""
-    out_dtype = output_dtype or dtype
+def make_binary_register_copy(N_total, dtype, op_name, out_dtype, headers):
+    """Same-shape operands: fragment load, compute, fragment store."""
 
-    @tilelang.jit(out_idx=[2])
+    @tilelang.jit(out_idx=[2], compile_flags=_compile_flags(headers))
     def kernel(threads, num_per_thread):
-        def _vector_lanes(dtype, count):
-            """Elements of *dtype* in one 16-byte vector, at most *count*."""
-            return min(count, 128 // DataType(dtype).bits)
-
         op_func = op_func_for(op_name)
         block_size = threads * num_per_thread
         # The fragment copy hands a thread one vector in each block-wide chunk, and
         # the guarded loops below walk it in that order. A ragged last block, or a
         # thread holding part of a vector, has no such layout; it runs the body per
         # element instead.
-        lanes = _vector_lanes(dtype, num_per_thread)
+        lanes = min(num_per_thread, 128 // DataType(dtype).bits)
         chunks = num_per_thread // lanes
         whole = N_total % block_size == 0 and num_per_thread % lanes == 0
         fast = _fast_of(op_func) if whole else None
@@ -703,6 +955,7 @@ def make_binary_register_copy(
                         for i, j in T.Parallel(threads, num_per_thread):
                             idx = i * num_per_thread + j
                             y_reg[idx] = op_func(a_reg[idx], b_reg[idx])
+                        T.copy(y_reg, y[bx * block_size : (bx + 1) * block_size])
                     else:
                         # Whether the fast form held for every element of this thread.
                         held = T.alloc_local((1,), "bool")
@@ -712,11 +965,14 @@ def make_binary_register_copy(
                             value, holds = fast(a_reg[idx], b_reg[idx])
                             y_reg[idx] = value
                             held[0] = held[0] and holds
-                        for c, i, v in T.Parallel(chunks, threads, lanes):
-                            e = (_backwards(c, chunks) * threads + i) * lanes + _backwards(v, lanes)
-                            if not held[0]:
+                        T.copy(y_reg, y[bx * block_size : (bx + 1) * block_size])
+                        if not held[0]:
+                            for c, i, v in T.Parallel(chunks, threads, lanes):
+                                e = (_backwards(c, chunks) * threads + i) * lanes + _backwards(
+                                    v, lanes
+                                )
                                 y_reg[e] = op_func(a[bx * block_size + e], b[bx * block_size + e])
-                    T.copy(y_reg, y[bx * block_size : (bx + 1) * block_size])
+                            T.copy(y_reg, y[bx * block_size : (bx + 1) * block_size])
 
         return main
 
@@ -724,23 +980,13 @@ def make_binary_register_copy(
 
 
 @target_cache(maxsize=32)
-def make_binary_direct(
-    N_total,
-    dtype,
-    op_name,
-    plan_name,
-    a_numel,
-    b_numel,
-    output_dtype=None,
-    threads=256,
-):
-    """Binary direct: 1 element per thread with stride-based broadcast."""
-    out_dtype = output_dtype or dtype
+def make_binary_direct(N_total, dtype, op_name, plan_name, a_numel, b_numel, out_dtype, headers):
+    """One element a thread, each operand read at its broadcast strides."""
     plan = broadcast_plan_for(plan_name)
 
     if is_contiguous_same_shape(plan.coalesced_shape, plan.a_strides, plan.b_strides):
 
-        @tilelang.jit(out_idx=[2])
+        @tilelang.jit(out_idx=[2], compile_flags=_compile_flags(headers))
         def kernel(threads):
             op_func = op_func_for(op_name)
 
@@ -761,7 +1007,7 @@ def make_binary_direct(
 
     if row_broadcast_split(plan.coalesced_shape, plan.a_strides, plan.b_strides):
 
-        @tilelang.jit(out_idx=[2])
+        @tilelang.jit(out_idx=[2], compile_flags=_compile_flags(headers))
         def kernel(threads):
             return _row_broadcast_prim(
                 N_total, dtype, out_dtype, op_name, plan_name, a_numel, b_numel, threads, 1
@@ -769,10 +1015,10 @@ def make_binary_direct(
 
         return kernel
 
-    @tilelang.jit(out_idx=[2])
+    @tilelang.jit(out_idx=[2], compile_flags=_compile_flags(headers))
     def kernel(threads):
         op_func = op_func_for(op_name)
-        ndim, divisors, a_strides, b_strides = _broadcast_index_terms(plan_name)
+        divisors, a_strides, b_strides = _broadcast_index_terms(plan_name)
 
         @T.prim_func
         def main(
@@ -785,7 +1031,6 @@ def make_binary_direct(
                     flat_idx = bx * threads + i
                     a_off, b_off = compute_broadcast_offsets(
                         flat_idx,
-                        ndim,
                         divisors,
                         a_strides,
                         b_strides,
@@ -805,25 +1050,23 @@ def make_binary_explicit(
     plan_name,
     a_numel,
     b_numel,
-    output_dtype=None,
-    threads=256,
-    num_per_thread=8,
-    stage=False,
-    bias_rows=None,
-    max_resident_threads=None,
+    out_dtype,
+    headers,
+    stage,
+    bias_rows,
+    max_resident_threads,
 ):
-    """Binary explicit_parallel: N elements per thread with stride-based broadcast.
+    """Several elements a thread, each operand read at its broadcast strides.
 
     *bias_rows* is how many rows a thread walks against one vector of a bias row, and
     *max_resident_threads* the most threads the device holds at once; see
     ``_row_broadcast_prim``.
     """
-    out_dtype = output_dtype or dtype
     plan = broadcast_plan_for(plan_name)
 
     if row_broadcast_split(plan.coalesced_shape, plan.a_strides, plan.b_strides):
 
-        @tilelang.jit(out_idx=[2], compile_flags=csrc_include("streaming_load.h"))
+        @tilelang.jit(out_idx=[2], compile_flags=csrc_include("streaming_load.h", *headers))
         def kernel(threads, num_per_thread):
             return _row_broadcast_prim(
                 N_total,
@@ -844,7 +1087,7 @@ def make_binary_explicit(
 
     if is_contiguous_same_shape(plan.coalesced_shape, plan.a_strides, plan.b_strides):
 
-        @tilelang.jit(out_idx=[2])
+        @tilelang.jit(out_idx=[2], compile_flags=_compile_flags(headers))
         def kernel(threads, num_per_thread):
             op_func = op_func_for(op_name)
             block_size = threads * num_per_thread
@@ -864,10 +1107,10 @@ def make_binary_explicit(
 
         return kernel
 
-    @tilelang.jit(out_idx=[2])
+    @tilelang.jit(out_idx=[2], compile_flags=_compile_flags(headers))
     def kernel(threads, num_per_thread):
         op_func = op_func_for(op_name)
-        ndim, divisors, a_strides, b_strides = _broadcast_index_terms(plan_name)
+        divisors, a_strides, b_strides = _broadcast_index_terms(plan_name)
         block_size = threads * num_per_thread
 
         @T.prim_func
@@ -881,7 +1124,6 @@ def make_binary_explicit(
                     flat_idx = (bx * threads + i) * num_per_thread + j
                     a_off, b_off = compute_broadcast_offsets(
                         flat_idx,
-                        ndim,
                         divisors,
                         a_strides,
                         b_strides,
@@ -894,25 +1136,52 @@ def make_binary_explicit(
 
 
 @target_cache(maxsize=32)
-def make_fused_gated_explicit(M, N, dtype, op_name, threads=256, num_per_thread=8):
-    """FusedGated explicit_parallel: N elements per thread."""
+def make_fused_gated_explicit(M, N, dtype, op_name, row_scaled):
+    """Several elements a thread of ``act(gate) * value``.
 
-    @tilelang.jit(out_idx=[1], compile_flags=csrc_include("approx_math.h"))
+    One block per column block of a row, numbered row-major along a one-dimensional grid, so
+    *M* may exceed the 65535 blocks of a grid's y dimension. A *row_scaled* program takes a
+    float32 ``(M,)`` operand after ``x`` and passes each row's element to the op body as a third
+    argument.
+    """
+
+    @tilelang.jit(out_idx=[2 if row_scaled else 1], compile_flags=csrc_include("approx_math.h"))
     def kernel(threads_arg, npt_arg):
         op_func = op_func_for(op_name)
         block_N = threads_arg * npt_arg
+        col_blocks = T.ceildiv(N, block_N)
 
-        @T.prim_func
-        def main(x: T.Tensor((M, 2 * N), dtype), y: T.Tensor((M, N), dtype)):
-            with T.Kernel(T.ceildiv(N, block_N), M, threads=threads_arg) as (
-                bx,
-                by,
-            ):
+        @T.macro
+        def body(x, scale, y):
+            with T.Kernel(M * col_blocks, threads=threads_arg) as block:
+                by = block // col_blocks
+                bx = block % col_blocks
+                if scale is not None:
+                    row_scale = scale[by]
                 for i, j in T.Parallel(threads_arg, npt_arg):
                     col = (bx * threads_arg + i) * npt_arg + j
                     gate = x[by, col]
                     value = x[by, N + col]
-                    y[by, col] = op_func(gate, value)
+                    if scale is None:
+                        y[by, col] = op_func(gate, value)
+                    else:
+                        y[by, col] = op_func(gate, value, row_scale)
+
+        if row_scaled:
+
+            @T.prim_func
+            def main(
+                x: T.Tensor((M, 2 * N), dtype),
+                scale: T.Tensor((M,), "float32"),
+                y: T.Tensor((M, N), dtype),
+            ):
+                body(x, scale, y)
+
+            return main
+
+        @T.prim_func
+        def main(x: T.Tensor((M, 2 * N), dtype), y: T.Tensor((M, N), dtype)):
+            body(x, None, y)
 
         return main
 
@@ -956,11 +1225,8 @@ def make_strided_multi_input(
     Along a vector an operand moves one element a lane (stride 1) or none (stride 0): the
     first is one vector load, the second one element every lane reads.
     """
-    ndim = len(coalesced_shape)
     inner = coalesced_shape[-1]
-    divisors = [1] * ndim
-    for i in range(ndim - 2, -1, -1):
-        divisors[i] = divisors[i + 1] * coalesced_shape[i + 1]
+    divisors = row_major_strides(coalesced_shape)
     widest = max(DataType(dt).bits for dt in (*dtypes, out_dtype)) // 8
     vec = 1
     while vec * 2 <= min(num_per_thread, 16 // widest) and inner % (vec * 2) == 0:

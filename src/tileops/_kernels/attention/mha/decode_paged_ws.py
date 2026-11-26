@@ -5,7 +5,7 @@ tiles through TMA rings while a consumer warpgroup maintains online softmax
 partials. Shared memory merges consumer and split-block partials.
 """
 
-from typing import Optional
+import operator
 
 import tilelang
 import tilelang.language as T
@@ -17,13 +17,15 @@ from tileops._kernels.attention.call_spec import (
     AttentionCall,
     MHAPagedDecodeFwdInterface,
 )
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.attention.stream_counter import stream_counter
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.constants import (
     BLOCK_SHARED_BYTES_OPT_IN,
     LOG2E,
     VECTOR_ACCESS_BYTES,
 )
 from tileops._kernels.kernel_base import Entry, Kernel
+from tileops._kernels.warp_reduce import warp_reduce
 from tileops._utils import WARP_LANES
 
 __all__ = ["MHADecodePagedWSKernel"]
@@ -57,8 +59,9 @@ def _mha_decode_paged_ws_kernel(
     prod = 128
     # Named barrier the consumer group uses on its own, never block-wide.
     merge_barrier = 1
-    # Finite stand-in for -inf in the running max, so a fully masked tile rescales
-    # by exactly one instead of evaluating exp2(-inf - -inf).
+    # Finite stand-in for -inf in the running max: a warp whose rows are all masked, or a
+    # split past the end of a short cache, rescales by exactly one over a zero accumulator
+    # instead of evaluating exp2(-inf - -inf) = NaN.
     neg_floor = -1.0e38
     # What an empty split publishes as its log-sum-exp, beside a zero partial: finite, so
     # the merge weighs it exp2(empty_lse - peak), zero beside a split that saw a key and
@@ -68,7 +71,7 @@ def _mha_decode_paged_ws_kernel(
     @tilelang.jit(
         out_idx=[-1],
         pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
     )
     def _func(block_N: int, num_split: int, stages: int, group: int):
         rows_per_warp = block_N // cons_warps
@@ -190,11 +193,6 @@ def _mha_decode_paged_ws_kernel(
                                 row_len[g] = T.max(kv_len_block - (group - 1 - g), 0)
                             for c in T.serial(vec):
                                 acc_o[g, c] = 0
-                            # A finite floor, not -inf. A warp whose rows are all
-                            # masked, or a split past the end of a short cache, would
-                            # otherwise reach exp2(-inf - -inf) = NaN and poison the
-                            # merge; from a floor the same arithmetic yields a
-                            # rescale of exactly 1 over a zero accumulator.
                             m_run[g] = neg_floor
                             # This lane's share of the row sum.
                             l_run[g] = 0
@@ -220,10 +218,9 @@ def _mha_decode_paged_ws_kernel(
 
                             # One max per query row and tile, across the warp's rows.
                             for g in T.unroll(group):
-                                for r in T.unroll(lanes_per_row.bit_length() - 1):
-                                    dot[g] += T.shfl_xor(
-                                        dot[g], T.shift_right(lanes_per_row // 2, r)
-                                    )
+                                warp_reduce(
+                                    dot, operator.add, first=g, lanes=lanes_per_row, high_first=True
+                                )
                                 dot[g] = T.if_then_else(
                                     row0 + j_own < row_len[g], dot[g] * scale, -T.infinity(accum)
                                 )
@@ -283,9 +280,6 @@ def _mha_decode_paged_ws_kernel(
                                     l_run[g] += warp_l[g, u] * resc[0]
                                     for c in T.serial(vec):
                                         acc_o[g, c] += warp_o[g, u, d0 + c] * resc[0]
-                                # A split with no rows publishes a zero partial and a
-                                # finite floor, so the cross-split merge weights it
-                                # out exactly instead of multiplying zero by a NaN.
                                 resc[0] = T.if_then_else(l_run[g] > 0, 1.0 / l_run[g], 0.0)
                                 if num_split == 1:
                                     for c in T.serial(vec):
@@ -363,16 +357,12 @@ class MHADecodePagedWSKernel(Kernel, MHAPagedDecodeFwdInterface):
     _ROW_SCALARS = 5
     # Pipeline depths of the K/V ring autotune weighs; the default takes the shallowest.
     _STAGE_CHOICES = (2, 3)
-    # Splits per output, and the grid size past which fewer are taken. Fitted on H200:
-    # 8 splits measured fastest on every manifest row of up to 64 outputs, and a split
-    # that takes the grid past 512 blocks measured slower than one split at every batch
-    # from 2 to 32 requests of 32 heads and 2048 keys; re-measure both to move them.
+    # Splits per output, and the grid size past which fewer are taken.
     _SPLITS = 8
     _MAX_BLOCKS = 512
     # Multiply-adds up to which the kernel serves several query rows, counted as
     # ``batch * heads * seqlen_q * seqlen_kv * dim`` with the pool size bounding every
-    # request. Fitted on H200: the CUDA-core contraction lost to the tensor-core kernel
-    # from 2**28 up; re-measure both kernels near the bound to move it.
+    # request. Past it the tensor-core kernel is faster than this CUDA-core contraction.
     _MAX_MULTI_QUERY_MACS = 2**27
 
     @classmethod
@@ -403,7 +393,7 @@ class MHADecodePagedWSKernel(Kernel, MHAPagedDecodeFwdInterface):
     @classmethod
     def entry_for(cls, call: AttentionCall) -> Entry:
         # The device index is in the identity: the kernel is compiled for its architecture.
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         args = (
             call.batch,
             call.heads,
@@ -428,9 +418,9 @@ class MHADecodePagedWSKernel(Kernel, MHAPagedDecodeFwdInterface):
         page_size: int,
         is_causal: bool = False,
         dtype: torch.dtype = torch.float16,
-        config: Optional[dict] = None,
-        device_index: Optional[int] = None,
-        max_pages_per_req: Optional[int] = None,
+        config: dict | None = None,
+        device_index: int | None = None,
+        max_pages_per_req: int | None = None,
     ) -> None:
         super().__init__(device_index=device_index)
         self.batch = batch
@@ -504,9 +494,8 @@ class MHADecodePagedWSKernel(Kernel, MHAPagedDecodeFwdInterface):
     def _num_split(self, group: int) -> int:
         """``_SPLITS`` splits, halved while the grid would exceed ``_MAX_BLOCKS`` blocks.
 
-        Set by rule: the tuner ranks these few-microsecond candidates with a warm L2
-        and picks split counts the cold-cache benchmark measures slower. It still
-        weighs one split, which wins once the grid fills the device without splitting.
+        Set by rule because the tuner's warm-L2 timing misranks these short candidates.
+        It still weighs one split, which wins once the grid fills the device unsplit.
         """
         work_items = self.batch * (self.seqlen_q // group) * self.heads
         num_split = self._SPLITS
@@ -605,26 +594,12 @@ class MHADecodePagedWSKernel(Kernel, MHAPagedDecodeFwdInterface):
             dtype=torch.float32,
             device=Q.device,
         )
+        # The zeroed per-output split counts; the kernel leaves them zeroed again.
+        arrived = stream_counter(self._arrived, Q.device, self.batch * self.seqlen_q * self.heads)
         return self.program(self._compile)(
-            Q, K, V, real_seqlen_kv, block_table, glse, O_partial, self._arrival_counts(Q.device)
+            Q, K, V, real_seqlen_kv, block_table, glse, O_partial, arrived
         )
 
     def _compile(self, cfg: dict):
         """The program ``forward`` launches, compiled from *cfg*."""
         return self.kernel(cfg["block_N"], cfg["num_split"], cfg["stages"], cfg["group"])
-
-    def _arrival_counts(self, device: torch.device) -> torch.Tensor:
-        """The zeroed per-output split counts; the kernel leaves them zeroed again.
-
-        One buffer per stream, since two launches on different streams would share
-        the counts; a captured graph owns one from its private pool.
-        """
-        size = self.batch * self.seqlen_q * self.heads
-        if torch.cuda.is_current_stream_capturing():
-            return torch.zeros(size, dtype=torch.int32, device=device)
-        stream = torch.cuda.current_stream(device).cuda_stream
-        counts = self._arrived.get(stream)
-        if counts is None:
-            counts = torch.zeros(size, dtype=torch.int32, device=device)
-            self._arrived[stream] = counts
-        return counts

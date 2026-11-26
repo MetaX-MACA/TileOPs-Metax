@@ -1,6 +1,7 @@
 """MoE fused top-k routing operator."""
 
-from typing import ClassVar, Mapping, Optional
+from collections.abc import Mapping
+from typing import ClassVar
 
 import torch
 
@@ -19,13 +20,14 @@ class FusedTopKFwdOp(Op):
     ``TopKSelectFwdOp`` returns key positions inside a per-row attention window and
     ``TopKMaskFwdOp`` returns the logits with every entry outside the top k set to ``-inf``.
 
-    Applies scoring (softmax or sigmoid) to router logits and selects the
-    top-k experts per token. Scoring and selection run in float32 whatever the
+    Applies scoring (softmax, sigmoid or ``sqrt(softplus(x))``) to router logits and selects
+    the top-k experts per token, or takes each token's experts from ``expert_ids``. Scoring and selection run in float32 whatever the
     logits dtype, with fast-math transcendentals, so a score can differ from
     torch's float32 score by a few ulp: an expert, or a group, whose selection
     score is within 1e-5 relative plus 1e-6 absolute of the last one kept may be
     kept in its place; a selection that is not that close matches the float32
-    reference, ties to the lower index. The weights are
+    reference, ties to the lower index. A NaN score ranks above every number, as in
+    ``torch.topk``, and every row returns ``top_k`` distinct experts. The weights are
     within 1e-4 (relative) of the float32 scores of the experts returned.
 
     With ``num_expert_group > 1`` it is DeepSeek grouped routing, as vLLM's
@@ -33,10 +35,19 @@ class FusedTopKFwdOp(Op):
     ``E / num_expert_group`` consecutive experts, each group is scored by the sum of
     its two best biased scores when ``correction_bias`` is passed and by its best
     score otherwise, the ``topk_group`` best groups are kept (ties to the lower
-    group index), and the top-k experts are selected inside them. The returned
+    group index), and the top-k experts are selected inside them; an expert of a dropped
+    group scores -inf there, so it ties with a kept expert scoring -inf. The returned
     weights are the unbiased scores of the selected experts, renormalized when
     ``renormalize``, times ``routed_scaling_factor``. ``num_expert_group=1`` selects
     over all experts.
+
+    ``scoring_func="sqrtsoftplus"`` and ``expert_ids`` follow DeepSeek-V4-Flash's gate,
+    whose first layers take each token's experts from a token-id table; with ``expert_ids``
+    nothing is selected, the correction bias is not read, and the weights are the scores of
+    the given experts. Under sigmoid scoring a logit below about -87, whose float32 score is
+    subnormal, scores 0, and a renormalized row of only such logits returns NaN weights. The
+    in-tree kernel adds a correction bias to sigmoid and sqrt-softplus scores only: a softmax
+    call that selects with a bias raises ``OpNotAvailableError`` when a kernel is selected.
 
     Example:
         ```python linenums="1"
@@ -67,10 +78,10 @@ class FusedTopKFwdOp(Op):
 
         Args:
             top_k: Number of experts to select per token K.
-            scoring_func: "softmax" (Qwen3/Qwen2) or "sigmoid" (DeepSeek-V3/GLM-4/Kimi K2).
-                Passing ``correction_bias`` to ``forward`` requires ``"sigmoid"``: the
-                bias is added to sigmoid scores for selection only, and the output
-                weights stay the original scores.
+            scoring_func: "softmax" (Qwen3/Qwen2), "sigmoid" (DeepSeek-V3/GLM-4/Kimi K2)
+                or "sqrtsoftplus" (DeepSeek-V4). A ``correction_bias`` passed to ``forward``
+                is added to the scores for selection only, and the output weights stay the
+                original scores.
             renormalize: If True, normalize top-k weights to sum to 1.
             num_expert_group: Groups of consecutive experts the selection is restricted
                 by; must divide E. 1 (the default) selects over all experts. DeepSeek-V3: 8.
@@ -92,14 +103,16 @@ class FusedTopKFwdOp(Op):
     def forward(
         self,
         gating_output: torch.Tensor,
-        correction_bias: Optional[torch.Tensor] = None,
+        correction_bias: torch.Tensor | None = None,
+        *,
+        expert_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run top-k routing.
 
         Args:
             gating_output: [T, E] router logits (bf16, fp16, or float32).
-            correction_bias: [E] float32 per-expert bias, or None. Passing it
-                requires scoring_func="sigmoid".
+            correction_bias: [E] float32 per-expert bias, or None.
+            expert_ids: [T, K] int32 experts chosen by the caller, or None to select them.
 
         Returns:
             topk_weights: [T, K] float32, times ``routed_scaling_factor``.
@@ -115,6 +128,7 @@ class FusedTopKFwdOp(Op):
                 scoring_func=self.scoring_func,
                 renormalize=self.renormalize,
                 with_correction_bias=correction_bias is not None,
+                with_expert_ids=expert_ids is not None,
                 num_expert_group=self.num_expert_group,
                 topk_group=self.topk_group,
                 routed_scaling_factor=self.routed_scaling_factor,
@@ -122,4 +136,4 @@ class FusedTopKFwdOp(Op):
                 device=gating_output.device,
             ),
         )
-        return kernel(gating_output, correction_bias)
+        return kernel(gating_output, correction_bias, expert_ids)

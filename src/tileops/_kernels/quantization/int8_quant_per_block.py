@@ -1,6 +1,6 @@
 """Per-block symmetric INT8 quantization: a group of lanes owns each 128-element block."""
 
-from typing import ClassVar, Optional
+from typing import ClassVar
 
 import tilelang
 import tilelang.language as T
@@ -18,7 +18,7 @@ from tileops._kernels.quantization.int8_codes import (
     quantize,
     widen,
 )
-from tileops._utils import WARP_LANES
+from tileops._kernels.warp_reduce import warp_reduce
 
 __all__ = ["INT8QuantPerBlockFwdKernel", "INT8QuantPerBlockShiftedFwdKernel"]
 
@@ -35,7 +35,7 @@ def _int8_quant_per_block_kernel(m: int, k: int, dtype: str):
     n = m * k
     nb = -(-k // QUANT_SCALE_BLOCK)
     blocks = m * nb
-    itemsize = torch.empty((), dtype=getattr(torch, dtype)).element_size()
+    itemsize = getattr(torch, dtype).itemsize
     vec = VECTOR_ACCESS_BYTES // itemsize
     # A vector is held as 32-bit words, ``per_word`` elements to a word.
     words = VECTOR_ACCESS_BYTES // 4
@@ -135,10 +135,7 @@ def _int8_quant_per_block_kernel(m: int, k: int, dtype: str):
                     acc[0] = T.max(acc[0] & T.uint32(0xFFFF), acc[0] >> T.uint32(16))
                 # The lanes of a group are adjacent and aligned, so XOR offsets below
                 # ``lanes`` stay inside it; every lane of the warp takes part.
-                for stage in T.unroll(lanes.bit_length() - 1):
-                    acc[0] = T.max(
-                        acc[0], T.shfl_xor(acc[0], T.int32(lanes // 2) >> stage, width=WARP_LANES)
-                    )
+                warp_reduce(acc, T.max, lanes=lanes, high_first=True)
                 amax = widen(acc[0], 0, dtype)
                 num[0] = T.if_then_else(amax > 0, amax * T.float32(INV_QMAX), T.float32(1.0))
                 if (tx % lanes == 0) & (exact or (b < blocks)):
@@ -170,7 +167,7 @@ def _int8_quant_per_block_shifted_kernel(m: int, k: int, dtype: str):
     n = m * k
     nb = -(-k // QUANT_SCALE_BLOCK)
     blocks = m * nb
-    itemsize = torch.empty((), dtype=getattr(torch, dtype)).element_size()
+    itemsize = getattr(torch, dtype).itemsize
     vec = VECTOR_ACCESS_BYTES // itemsize
     words = VECTOR_ACCESS_BYTES // 4
     per_word = 4 // itemsize
@@ -300,10 +297,7 @@ def _int8_quant_per_block_shifted_kernel(m: int, k: int, dtype: str):
                 if per_word == 2:
                     acc[0] = T.max(acc[0] & T.uint32(0xFFFF), acc[0] >> T.uint32(16))
                 # Every lane of the warp takes part in the shuffles.
-                for stage in T.unroll(lanes.bit_length() - 1):
-                    acc[0] = T.max(
-                        acc[0], T.shfl_xor(acc[0], T.int32(lanes // 2) >> stage, width=WARP_LANES)
-                    )
+                warp_reduce(acc, T.max, lanes=lanes, high_first=True)
                 amax = widen(acc[0], 0, dtype)
                 num[0] = T.if_then_else(amax > 0, amax * T.float32(INV_QMAX), T.float32(1.0))
                 if b < blocks:
@@ -345,15 +339,15 @@ class _INT8QuantPerBlockFwdKernel(Kernel, INT8QuantPerBlockFwdInterface):
     autotune_accepts_random_int_inputs = True
 
     @classmethod
-    def refusal(cls, call: QuantizeCall) -> Optional[str]:
+    def refusal(cls, call: QuantizeCall) -> str | None:
         reason = super().refusal(call)
         # Element indices reach one block past M * K.
         if reason is None and call.rows * call.cols > 2**31 - 1 - QUANT_SCALE_BLOCK:
             return f"indexes elements with int32, and M * K = {call.rows * call.cols}"
         return reason
 
-    def __init__(self, call: QuantizeCall, config: Optional[dict] = None) -> None:
-        super().__init__(device_index=call.device.index if call.device is not None else None)
+    def __init__(self, call: QuantizeCall, config: dict | None = None) -> None:
+        super().__init__(device_index=call.device_index)
         self.call = call
         self.dtype = call.dtype
         self.kernel = self._builder(call.rows, call.cols, self.dtype_str)
@@ -405,7 +399,7 @@ class INT8QuantPerBlockFwdKernel(_INT8QuantPerBlockFwdKernel):
     _WIDE_WAVES: ClassVar[int] = 2
 
     @classmethod
-    def refusal(cls, call: QuantizeCall) -> "str | None":
+    def refusal(cls, call: QuantizeCall) -> str | None:
         if call.cols * call.dtype.itemsize % VECTOR_ACCESS_BYTES:
             return f"requires a row of whole {VECTOR_ACCESS_BYTES}-byte vectors"
         return super().refusal(call)
@@ -413,7 +407,7 @@ class INT8QuantPerBlockFwdKernel(_INT8QuantPerBlockFwdKernel):
     @property
     def default_config(self) -> dict:
         blocks = self.call.rows * -(-self.call.cols // QUANT_SCALE_BLOCK)
-        per_sm = torch.cuda.get_device_properties(self.call.device).max_threads_per_multi_processor
+        per_sm = self.call.threads_per_sm
         wide = blocks * self._LANES >= self._WIDE_WAVES * self.call.sm_count * per_sm
         return {
             "threads": self._WIDE_THREADS if wide else self._THREADS,

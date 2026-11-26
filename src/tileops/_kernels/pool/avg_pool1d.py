@@ -1,18 +1,21 @@
-from typing import ClassVar, Optional, Tuple
+from typing import ClassVar
 
 import tilelang
 import tilelang.language as T
 import torch
 
-from tileops._kernels.build_target import target_cache
-from tileops._kernels.constants import STATIC_SHARED_BYTES
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
+from tileops._kernels.constants import (
+    MAX_GRID_X_BLOCKS,
+    MAX_GRID_YZ_BLOCKS,
+    STATIC_SHARED_BYTES,
+)
 from tileops._kernels.kernel_base import Entry, Kernel
 from tileops._kernels.pool.call_spec import AvgPool1dFwdInterface, AvgPoolCall
 from tileops._kernels.pool.common import (
     ACCUM_DTYPE,
     AvgPoolWindow,
     WindowSpan,
-    dtype_itemsize,
     window_span,
 )
 
@@ -28,10 +31,10 @@ class _WindowStaging:
 
     # Tile widths a launch may take, widest first. The tail below 128 is for a window
     # too wide to stage at 128 outputs.
-    _TILE_CHOICES: ClassVar[Tuple[int, ...]] = (2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1)
+    _TILE_CHOICES: ClassVar[tuple[int, ...]] = (2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1)
     # Outputs a block covers before the shared budget or the output row narrows it.
     _TILE_OUTPUTS: ClassVar[int] = 512
-    _THREAD_CHOICES: ClassVar[Tuple[int, ...]] = (64, 128, 256)
+    _THREAD_CHOICES: ClassVar[tuple[int, ...]] = (64, 128, 256)
     # Taken when every block size is ruled out.
     _FALLBACK_THREADS: ClassVar[int] = 128
     # Threads a launch needs before a narrow block is offered; under this the blocks
@@ -65,10 +68,10 @@ class _WindowStaging:
 
     def widths(self) -> list[int]:
         """The tile widths whose span fits the static shared budget, widest first."""
-        budget = STATIC_SHARED_BYTES // dtype_itemsize(self._dtype)
+        budget = STATIC_SHARED_BYTES // getattr(torch, self._dtype).itemsize
         fitting = [width for width in self._TILE_CHOICES if self._span(width).span <= budget]
         if not fitting:
-            need = self._span(1).span * dtype_itemsize(self._dtype)
+            need = self._span(1).span * getattr(torch, self._dtype).itemsize
             raise ValueError(
                 f"avg_pool1d stages the pooling window in shared memory: kernel_size="
                 f"{self._kernel_l} needs {need} B for a single output, over the "
@@ -117,8 +120,14 @@ def _avg_pool1d_kernel(window: AvgPoolWindow, dtype: str):
     # The outputs whose window lies inside the row, and so divides by the kernel width.
     clean_lo = -(-pad_l // stride_l)
     clean_hi = min((l_in + pad_l - kernel_l) // stride_l, out_l - 1)
+    # Rows past the grid's y axis share grid x with the row's tiles, in chunks of rows whose
+    # tiles grid x holds; grid y counts the chunks.
+    flat = rows > MAX_GRID_YZ_BLOCKS
+    # An input or an output of 2**31 elements or more takes int64 extents: int32 cannot hold
+    # an extent of exactly 2**31, and TileLang widens the offsets of a longer tensor by itself.
+    wide = rows * max(l_in, out_l) >= 2**31
 
-    @tilelang.jit(out_idx=[1], compile_flags=["-O3", "-DENABLE_BF16"])
+    @tilelang.jit(out_idx=[1], compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"])
     def _avg_pool1d_func(block_ol: int, threads: int):
         # A warp taking one output each reads one short stretch of the row `kernel_l`
         # times over. A block stages that stretch with full-width loads instead.
@@ -126,6 +135,9 @@ def _avg_pool1d_kernel(window: AvgPoolWindow, dtype: str):
             block_ol, block_ol * stride_l, l_in, kernel_l, stride_l, pad_l, 1, dtype
         )
         vectors = span // vector_elems
+        # A position of a row that long can pass 2**31 - 1 once a tile's span or the
+        # window's width is added.
+        position_dtype = "int64" if l_in + max(kernel_l, span) >= 2**31 else "int32"
         # The tile holds zeros outside the row, so a tap needs no test and this offset.
         base = head - pad_l
         blocks_per_row = (out_l + block_ol - 1) // block_ol
@@ -186,29 +198,58 @@ def _avg_pool1d_kernel(window: AvgPoolWindow, dtype: str):
         def _reduce(tile, bx, out, out_row):
             """One output per lane, over the outputs this block owns."""
             for j in T.Parallel(block_ol):
-                ol = bx * block_ol + j
+                # Widened at the block index, so every position derived from it is.
+                ol = T.cast(bx, position_dtype) * block_ol + j
                 if tail_free:
                     _store_output(tile, j, ol, out, out_row)
                 else:
                     if ol < out_l:
                         _store_output(tile, j, ol, out, out_row)
 
-        @T.prim_func
-        def _avg_pool1d_main(
-            x: T.Tensor((rows, l_in), dtype),  # type: ignore
-            out: T.Tensor((rows, out_l), dtype),  # type: ignore
-        ):
-            with T.Kernel(blocks_per_row, rows, threads=threads) as (bx, by):
-                tile = T.alloc_shared((span,), dtype)
-                origin = bx * (block_ol * stride_l) - head
-                if edge_free:
+        @T.macro
+        def _pool_tile(x, out, bx, by):
+            """Stage and pool tile ``bx`` of row ``by``."""
+            tile = T.alloc_shared((span,), dtype)
+            origin = T.cast(bx, position_dtype) * (block_ol * stride_l) - head
+            if edge_free:
+                _stage_inside(tile, x, origin, by)
+            else:
+                if (bx > 0) and (bx < blocks_per_row - 1):
                     _stage_inside(tile, x, origin, by)
                 else:
-                    if (bx > 0) and (bx < blocks_per_row - 1):
-                        _stage_inside(tile, x, origin, by)
+                    _stage_edge(tile, x, origin, by)
+            _reduce(tile, bx, out, by)
+
+        x_shape = (T.int64(rows), T.int64(l_in)) if wide else (rows, l_in)
+        out_shape = (T.int64(rows), T.int64(out_l)) if wide else (rows, out_l)
+        chunk = min(rows, MAX_GRID_X_BLOCKS // blocks_per_row)
+        chunks = -(-rows // chunk)
+        # A row past the first chunk can pass 2**31 - 1, which int32 wraps negative.
+        row_dtype = "int64" if chunks > 1 else "int32"
+        if flat:
+
+            @T.prim_func
+            def _avg_pool1d_main(
+                x: T.Tensor(x_shape, dtype),  # type: ignore
+                out: T.Tensor(out_shape, dtype),  # type: ignore
+            ):
+                with T.Kernel(blocks_per_row * chunk, chunks, threads=threads) as (b, c):
+                    row = T.cast(c, row_dtype) * chunk + T.cast(b, row_dtype) // blocks_per_row
+                    if rows % chunk:
+                        if row < rows:
+                            _pool_tile(x, out, b % blocks_per_row, row)
                     else:
-                        _stage_edge(tile, x, origin, by)
-                _reduce(tile, bx, out, by)
+                        _pool_tile(x, out, b % blocks_per_row, row)
+
+        else:
+
+            @T.prim_func
+            def _avg_pool1d_main(
+                x: T.Tensor(x_shape, dtype),  # type: ignore
+                out: T.Tensor(out_shape, dtype),  # type: ignore
+            ):
+                with T.Kernel(blocks_per_row, rows, threads=threads) as (bx, by):
+                    _pool_tile(x, out, bx, by)
 
         return _avg_pool1d_main
 
@@ -224,6 +265,17 @@ class AvgPool1dKernel(Kernel, AvgPool1dFwdInterface):
     """
 
     supported_archs: ClassVar[list[int]] = [80, 86, 89, 90]
+
+    @classmethod
+    def refusal(cls, call: AvgPoolCall) -> str | None:
+        if len(call.size) == 1:
+            (l_in,) = call.size
+            (out_l,) = AvgPoolWindow.of(call).out
+            # TileLang lowers a row of fewer than 2**31 inputs with int32 literals, so an
+            # output row of 2**31 or more, which padding gives such a row, does not compile.
+            if l_in < 2**31 <= out_l:
+                return "serves no output row of 2**31 elements or more from a shorter input row"
+        return super().refusal(call)
 
     @classmethod
     def entry_for(cls, call: AvgPoolCall) -> Entry:
@@ -250,7 +302,7 @@ class AvgPool1dKernel(Kernel, AvgPool1dFwdInterface):
         ceil_mode: bool,
         count_include_pad: bool,
         dtype: torch.dtype,
-        config: Optional[dict] = None,
+        config: dict | None = None,
     ) -> None:
         super().__init__()
         self.n = n

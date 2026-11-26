@@ -1,10 +1,7 @@
 """The fused Kimi Delta Attention (KDA) chunk program: one CTA walks one sequence.
 
-Everything a chunk decides on its own and the recurrence that joins the chunks
-live in the same CTA, so the WY vectors, the gated query and key and the
-intra-chunk attention never leave the chip. What it costs is parallelism: the
-launch is one block per (sequence, value head), so it is the right shape only
-when there are enough of those to cover the machine.
+The chunk-local work and the recurrence share a CTA, so the WY vectors, the gated query
+and key and the intra-chunk attention never leave the chip.
 
 The WY inverse uses stable 16-row diagonal solves and block matrix products.
 Precomputed gates use reference-centred tiles where ``centred_bounds`` holds; other
@@ -19,14 +16,15 @@ import tilelang.language as T
 from tileops._csrc import csrc_include
 from tileops._kernels.build_target import target_cache
 from tileops._kernels.constants import LOG2E
+from tileops._kernels.linear_attention.gdn.prefill_common import L2NORM_EPS
 from tileops._kernels.linear_attention.kda.chunk_programs import (
-    L2_EPS,
     REFERENCE_BLOCK,
     centred_bounds,
     centred_row_bound,
 )
 from tileops._kernels.linear_attention.kda.gate import raw_gate_gram
 from tileops._kernels.linear_attention.kda.inverse import inverse_program
+from tileops._kernels.state_pool import state_row
 
 __all__ = ["fused_chunk_program"]
 
@@ -47,6 +45,8 @@ def fused_chunk_program(
     compact: bool = False,
     *,
     stage: str | None = None,
+    state_v_first: bool = False,
+    pooled: bool = False,
 ):
     """Build the fused chunk program for one static packed shape.
 
@@ -54,6 +54,10 @@ def fused_chunk_program(
     that chunk alone. ``"check"`` forms every chunk from centred tiles and flags each
     (sequence, value head) with a chunk past the bound; ``"rerun"`` walks the flagged ones
     again from their initial state on per-pair entries, overwriting their outputs.
+
+    *state_v_first* lays the states out value-major, ``[N, HV, V, K]``. *pooled* reads
+    sequence ``n``'s state from slot ``slots[n]`` of a state pool and writes its final state
+    back there, returning only the output.
     """
     if compact and (dim_k != 128 or dim_v != 128 or chunk_size != 64):
         raise ValueError("compact storage requires a 64-token chunk and 128-wide state")
@@ -73,8 +77,10 @@ def fused_chunk_program(
     ends = 2 * NC * K
 
     @tilelang.jit(
-        out_idx=[] if stage == "rerun" else ([-3, -2, -1] if stage == "check" else [-2, -1]),
+        out_idx=[-1] if pooled else {"rerun": [], "check": [-3, -2, -1]}.get(stage, [-2, -1]),
         pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
+        # Not CUDA_COMPILE_FLAGS: ptxas's output for this program changes with any added
+        # flag, a warning flag included.
         compile_flags=[
             "-O3",
             "-DENABLE_BF16",
@@ -342,7 +348,7 @@ def fused_chunk_program(
                 T.sync_threads()
 
         @T.macro
-        def walk(q, k, v, g, beta, h0, cu_seqlens, o, ht, flags, iseq, ihv):
+        def walk(q, k, v, g, beta, h0, cu_seqlens, o, ht, flags, slots, iseq, ihv):
             ih = ihv // group
             origin = T.cast(cu_seqlens[iseq], "int32")
             length = T.cast(cu_seqlens[iseq + 1], "int32") - origin
@@ -410,7 +416,10 @@ def fused_chunk_program(
             causal_s = qa_s if compact else m_s
 
             for i, j in T.Parallel(K, V):
-                state_f[i, j] = h0[iseq, ihv, i, j]
+                if state_v_first:
+                    state_f[i, j] = h0[state_row(slots, iseq), ihv, j, i]
+                else:
+                    state_f[i, j] = h0[state_row(slots, iseq), ihv, i, j]
             if stage == "check":
                 flags[iseq, ihv] = 0
 
@@ -475,7 +484,7 @@ def fused_chunk_program(
                 for i, j in T.Parallel(BT, K):
                     qa_s[i, j] = T.cast(
                         T.cast(qa_s[i, j], accum)
-                        * (T.rsqrt(rowsum[i] + L2_EPS) if l2norm else 1.0)
+                        * (T.rsqrt(rowsum[i] + L2NORM_EPS) if l2norm else 1.0)
                         * scale,
                         dtype,
                     )
@@ -495,7 +504,7 @@ def fused_chunk_program(
                 for i, j in T.Parallel(BT, K):
                     ka_s[i, j] = T.cast(
                         T.cast(ka_s[i, j], accum)
-                        * (T.rsqrt(rowsum[i] + L2_EPS) if l2norm else 1.0),
+                        * (T.rsqrt(rowsum[i] + L2NORM_EPS) if l2norm else 1.0),
                         dtype,
                     )
                 if guarded and l2norm:
@@ -582,16 +591,20 @@ def fused_chunk_program(
                 T.sync_threads()
 
             for i, j in T.Parallel(K, V):
-                ht[iseq, ihv, i, j] = state_f[i, j]
+                if state_v_first:
+                    ht[state_row(slots, iseq), ihv, j, i] = state_f[i, j]
+                else:
+                    ht[state_row(slots, iseq), ihv, i, j] = state_f[i, j]
 
         @T.macro
-        def compute(q, k, v, g, beta, h0, cu_seqlens, o, ht, flags):
+        def compute(q, k, v, g, beta, h0, cu_seqlens, o, ht, flags, slots):
             with T.Kernel(num_seqs, HV, threads=threads) as (iseq, ihv):
                 # A rerun walks only the sequences the first launch flagged.
                 if stage != "rerun" or flags[iseq, ihv] != 0:
-                    walk(q, k, v, g, beta, h0, cu_seqlens, o, ht, flags, iseq, ihv)
+                    walk(q, k, v, g, beta, h0, cu_seqlens, o, ht, flags, slots, iseq, ihv)
 
-        if stage is not None:
+        state_shape = [num_seqs, HV, V, K] if state_v_first else [num_seqs, HV, K, V]
+        if pooled:
 
             @T.prim_func
             def main(
@@ -600,13 +613,28 @@ def fused_chunk_program(
                 v: T.Tensor([1, total_tokens, HV, V], dtype),
                 g: T.Tensor([1, total_tokens, HV, K], dtype),
                 beta: T.Tensor([1, total_tokens, HV], dtype),
-                h0: T.Tensor([num_seqs, HV, K, V], accum),
+                h0: T.Tensor([T.dynamic("pool"), *state_shape[1:]], accum),
+                cu_seqlens: T.Tensor([num_seqs + 1], "int64"),
+                slots: T.Tensor([num_seqs], "int32"),
+                o: T.Tensor([1, total_tokens, HV, V], dtype),
+            ):
+                compute(q, k, v, g, beta, h0, cu_seqlens, o, h0, None, slots)
+        elif stage is not None:
+
+            @T.prim_func
+            def main(
+                q: T.Tensor([1, total_tokens, H, K], dtype),
+                k: T.Tensor([1, total_tokens, H, K], dtype),
+                v: T.Tensor([1, total_tokens, HV, V], dtype),
+                g: T.Tensor([1, total_tokens, HV, K], dtype),
+                beta: T.Tensor([1, total_tokens, HV], dtype),
+                h0: T.Tensor(state_shape, accum),
                 cu_seqlens: T.Tensor([num_seqs + 1], "int64"),
                 o: T.Tensor([1, total_tokens, HV, V], dtype),
-                ht: T.Tensor([num_seqs, HV, K, V], accum),
+                ht: T.Tensor(state_shape, accum),
                 flags: T.Tensor([num_seqs, HV], "int32"),
             ):
-                compute(q, k, v, g, beta, h0, cu_seqlens, o, ht, flags)
+                compute(q, k, v, g, beta, h0, cu_seqlens, o, ht, flags, None)
         else:
 
             @T.prim_func
@@ -616,12 +644,12 @@ def fused_chunk_program(
                 v: T.Tensor([1, total_tokens, HV, V], dtype),
                 g: T.Tensor([1, total_tokens, HV, K], dtype),
                 beta: T.Tensor([1, total_tokens, HV], dtype),
-                h0: T.Tensor([num_seqs, HV, K, V], accum),
+                h0: T.Tensor(state_shape, accum),
                 cu_seqlens: T.Tensor([num_seqs + 1], "int64"),
                 o: T.Tensor([1, total_tokens, HV, V], dtype),
-                ht: T.Tensor([num_seqs, HV, K, V], accum),
+                ht: T.Tensor(state_shape, accum),
             ):
-                compute(q, k, v, g, beta, h0, cu_seqlens, o, ht, None)
+                compute(q, k, v, g, beta, h0, cu_seqlens, o, ht, None, None)
 
         return main
 

@@ -1,4 +1,5 @@
-from typing import ClassVar, Mapping, Tuple
+from collections.abc import Mapping
+from typing import ClassVar
 
 import torch
 
@@ -7,6 +8,7 @@ from tileops._kernels.sequence_modeling.engram import (
     EngramDecodeCall,
     EngramDecodeFwdInterface,
     EngramDecodeKernel,
+    EngramDecodeSplitKernel,
 )
 from tileops._ops.op_base import Op
 from tileops.backend import Target
@@ -17,15 +19,14 @@ __all__ = ["EngramDecodeFwdOp"]
 class EngramDecodeFwdOp(Op):
     """Engram fused decode operator — single-token inference.
 
-    Fuses GEMV projection + gating + dilated conv + SiLU into one kernel call.
-
-    Like MHA decode compiles with max_seqlen_kv and accepts real_seqlen_kv
-    at runtime, this op compiles with max_conv_len and accepts the actual
-    conv_state length at runtime without recompilation.
-
+    Fuses GEMV projection + gating + dilated conv + SiLU. It compiles for max_conv_len and
+    accepts any conv_state length up to it without recompiling.
     """
 
-    kernel_types: ClassVar[Mapping[str, type[Kernel]]] = {"engram_decode": EngramDecodeKernel}
+    kernel_types: ClassVar[Mapping[str, type[Kernel]]] = {
+        "engram_decode": EngramDecodeKernel,
+        "engram_decode_split": EngramDecodeSplitKernel,
+    }
     interfaces: ClassVar[Mapping[str, type[KernelInterface]]] = {
         "engram_decode": EngramDecodeFwdInterface
     }
@@ -65,7 +66,7 @@ class EngramDecodeFwdOp(Op):
         rms_w_h: torch.Tensor,
         rms_w_v: torch.Tensor,
         conv_w: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run one decode token through the fused projection, gate and convolution.
 
         Args:

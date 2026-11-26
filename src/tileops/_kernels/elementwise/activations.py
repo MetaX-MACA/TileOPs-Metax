@@ -5,7 +5,7 @@ import tilelang.language as T
 import torch
 
 from tileops._kernels.build_target import target_cache
-from tileops._kernels.constants import GELU_TANH_COEFF, LOG2E, SQRT_2_OVER_PI
+from tileops._kernels.constants import LOG2E
 from tileops._kernels.elementwise._base import (
     FloatUnaryKernel,
     FusedGatedKernel,
@@ -29,6 +29,8 @@ from tileops._kernels.elementwise.call_spec import (
     GELUCall,
     LeakyReLUCall,
     LeakyReLUFwdInterface,
+    SiLUAndMulCall,
+    SiLUAndMulFwdInterface,
     SoftplusCall,
     SoftplusFwdInterface,
     UnaryElementwiseFwdInterface,
@@ -55,14 +57,56 @@ __all__ = [
     "TanhFwdKernel",
 ]
 
+# sqrt(2/pi) and the cubic coefficient of torch's tanh-approximate GELU, which the plain and
+# the gated tanh-GELU kernels must both match.
+_SQRT_2_OVER_PI = 0.7978845608028654
+_GELU_TANH_COEFF = 0.044715
+
+
+def _approx_exp2(exponent):
+    """exp2 of a float32 *exponent* without ``exp2f``'s subnormal guard (``approx_math.h``)."""
+    return T.call_extern("float32", "tileops::approx_exp2", exponent)
+
+
+def _silu(x, float16_divide):
+    """x / (1 + exp2(-x * log2 e)), in fp32: :func:`_wide_silu` of *x* widened."""
+    return _wide_silu(T.cast(x, "float32"), str(x.dtype), float16_divide)
+
+
+def _wide_silu(wide, dtype, float16_divide):
+    """wide / (1 + exp2(-wide * log2 e)) of a float32 *wide* whose result rounds to *dtype*.
+
+    The exponential runs in fp32 for both speed and fp32-reference error, and
+    as exp2, which lowers to one MUFU.EX2 against expf's multi-op sequence.
+
+    16-bit results skip the IEEE divide and ``exp2f``'s subnormal guard: a flushed
+    subnormal vanishes when added to 1. bfloat16 divides with ``quartered_fdiv``,
+    float16 with *float16_divide*.
+    """
+    one = T.cast(1.0, "float32")
+    exponent = -wide * T.cast(LOG2E, "float32")
+    if dtype == "float32":
+        return wide / (one + T.exp2(exponent))
+    den = one + _approx_exp2(exponent)
+    if dtype == "bfloat16":
+        return quartered_fdiv(wide, den)
+    return float16_divide(wide, den)
+
+
+def _approximate_refusal(call, approximate: str, form: str) -> "str | None":
+    """The refusal of a GELU kernel that evaluates *form*, the ``approximate`` it names."""
+    if call.approximate != approximate:
+        return f"evaluates {form}, not approximate={call.approximate!r}"
+    return None
+
 
 class ReLUFwdKernel(FloatUnaryKernel, UnaryElementwiseFwdInterface):
     """ReLU: y = max(x, 0), NaN where x is NaN."""
 
     @staticmethod
     def op_func(x):
-        # Preserve NaN and map either signed zero to +0.0.
-        return T.if_then_else(x <= T.cast(0, x.dtype), T.cast(0, x.dtype), x)
+        # Preserve NaN and the sign of zero, as torch's relu does.
+        return T.if_then_else(x < T.cast(0, x.dtype), T.cast(0, x.dtype), x)
 
 
 class GELUFwdKernel(FloatUnaryKernel, UnaryElementwiseFwdInterface):
@@ -70,16 +114,14 @@ class GELUFwdKernel(FloatUnaryKernel, UnaryElementwiseFwdInterface):
 
     BYTES_PER_THREAD = 32
     # The erf body costs more than its access, so a row the shrink reaches keeps two
-    # elements a thread instead of four: 1 x 14336 bfloat16 runs 56 blocks instead of
-    # 28, as torch-compile does, at 1.344 us against 1.440 us. One element a thread
-    # measured no faster in 16 bits and slower in float32.
+    # elements a thread instead of four.
     MIN_NUM_PER_THREAD = 2
+    # nvcc compiles the erf body past 32 registers at the larger elements-a-thread settings.
+    FULL_OCCUPANCY = True
 
     @classmethod
-    def refusal(cls, call: GELUCall) -> "str | None":
-        if call.approximate != "none":
-            return f"evaluates the erf form, not approximate={call.approximate!r}"
-        return super().refusal(call)
+    def refusal(cls, call: GELUCall) -> str | None:
+        return _approximate_refusal(call, "none", "the erf form") or super().refusal(call)
 
     @staticmethod
     def op_func(x):
@@ -93,16 +135,17 @@ class GELUTanhFwdKernel(FloatUnaryKernel, UnaryElementwiseFwdInterface):
     matching ``torch.nn.functional.gelu(x, approximate='tanh')``.
     """
 
+    # nvcc compiles the tanh body past 32 registers at the larger elements-a-thread settings.
+    FULL_OCCUPANCY = True
+
     @classmethod
-    def refusal(cls, call: GELUCall) -> "str | None":
-        if call.approximate != "tanh":
-            return f"evaluates the tanh approximation, not approximate={call.approximate!r}"
-        return super().refusal(call)
+    def refusal(cls, call: GELUCall) -> str | None:
+        return _approximate_refusal(call, "tanh", "the tanh approximation") or super().refusal(call)
 
     @staticmethod
     def op_func(x):
-        sqrt_2_over_pi = T.cast(SQRT_2_OVER_PI, "float32")
-        coeff = T.cast(GELU_TANH_COEFF, "float32")
+        sqrt_2_over_pi = T.cast(_SQRT_2_OVER_PI, "float32")
+        coeff = T.cast(_GELU_TANH_COEFF, "float32")
         half = T.cast(0.5, "float32")
         one = T.cast(1.0, "float32")
         x_f32 = T.cast(x, "float32")
@@ -123,25 +166,9 @@ class SiLUFwdKernel(FloatUnaryKernel, UnaryElementwiseFwdInterface):
 
     @staticmethod
     def op_func(x):
-        """x / (1 + exp2(-x * log2 e)), in fp32.
-
-        The exponential runs in fp32 for both speed and fp32-reference error, and
-        as exp2, which lowers to one MUFU.EX2 against expf's multi-op sequence.
-
-        16-bit results skip the IEEE divide and ``exp2f``'s subnormal guard: a flushed
-        subnormal vanishes when added to 1. float16 uses ``approx_fdiv``, whose zero
-        past a divisor of ``2**126`` is the float16 result there; bfloat16 uses
-        ``quartered_fdiv``.
-        """
-        one = T.cast(1.0, "float32")
-        wide = T.cast(x, "float32")
-        exponent = -wide * T.cast(LOG2E, "float32")
-        if str(x.dtype) == "float32":
-            return wide / (one + T.exp2(exponent))
-        den = one + T.call_extern("float32", "tileops::approx_exp2", exponent)
-        if str(x.dtype) == "bfloat16":
-            return quartered_fdiv(wide, den)
-        return approx_fdiv(wide, den)
+        # float16 divides with ``approx_fdiv``: its zero past a divisor of ``2**126`` is
+        # the float16 result there.
+        return _silu(x, approx_fdiv)
 
 
 class SigmoidFwdKernel(FloatUnaryKernel, UnaryElementwiseFwdInterface):
@@ -149,13 +176,15 @@ class SigmoidFwdKernel(FloatUnaryKernel, UnaryElementwiseFwdInterface):
 
     CSRC_HEADERS = ("approx_math.h",)
 
-    def __init__(self, N_total, dtype, config=None):
-        # A 16-bit thread holds two 16-byte vectors. float32 holds one once its input
-        # exceeds L2. Why: a smaller input stays in L2 between calls, where two run faster.
-        l2_bytes = torch.cuda.get_device_properties(None).L2_cache_size
-        one = dtype == torch.float32 and N_total * dtype.itemsize > l2_bytes
-        self.BYTES_PER_THREAD = 16 if one else 32
-        super().__init__(N_total, dtype, config=config)
+    @property
+    def BYTES_PER_THREAD(self) -> int:
+        """Two 16-byte vectors a thread; one for float32 once its input exceeds L2.
+
+        Why: a smaller input stays in L2 between calls, where two run faster.
+        """
+        size = self.N_total * self.dtype.itemsize
+        one = self.dtype == torch.float32 and size > self.build_target.l2_bytes
+        return 16 if one else 32
 
     @staticmethod
     def op_func(x):
@@ -173,13 +202,23 @@ class SigmoidFwdKernel(FloatUnaryKernel, UnaryElementwiseFwdInterface):
         exponent = -T.cast(x, "float32") * T.cast(LOG2E, "float32")
         if str(x.dtype) == "float16":
             return refined_reciprocal(one + T.exp2(exponent))
-        return quartered_fdiv(one, one + T.call_extern("float32", "tileops::approx_exp2", exponent))
+        return quartered_fdiv(one, one + _approx_exp2(exponent))
 
 
 class TanhFwdKernel(FloatUnaryKernel, UnaryElementwiseFwdInterface):
     """Element-wise tanh(x)."""
 
     BYTES_PER_THREAD = 32
+
+    @property
+    def FULL_OCCUPANCY(self) -> bool:
+        """Whether the program holds nvcc to the full-occupancy register budget.
+
+        Why: a 16-bit thread holds twice the elements of a float32 thread at the same
+        bytes a thread, and nvcc gives its ``tanhf`` evaluations more than 32 registers;
+        a float32 program stays within the budget without the request.
+        """
+        return self.dtype != torch.float32
 
     @staticmethod
     def op_func(x):
@@ -224,23 +263,22 @@ class HardsigmoidFwdKernel(FloatUnaryKernel, UnaryElementwiseFwdInterface):
 class MishFwdKernel(FloatUnaryKernel, UnaryElementwiseFwdInterface):
     """Element-wise Mish: x * tanh(softplus(x)) = x * tanh(log(1 + exp(x)))."""
 
-    # Where Mish's tanh factor reaches 1 in fp32, and below where ``e**2`` overflows.
-    _SATURATION: float = 20.0
-
     @staticmethod
     def op_func(x):
         """One transcendental where the definition spells out three.
 
         With ``e = exp(x)``, ``tanh(log(1 + e))`` is exactly ``(e^2 + 2e)/(e^2 + 2e + 2)``:
         this avoids extra transcendentals and keeps the small values ``log(1 + e)``
-        rounds away. Past ``_SATURATION`` the ratio is 1 to every bit fp32 carries,
+        rounds away. Past ``saturation`` the ratio is 1 to every bit fp32 carries,
         so clamping the exponent's argument there returns ``x`` on its own and keeps
         ``e^2`` finite. Clamping rather than selecting on it also keeps the element
         loop vectorised, which ``T.if_then_else`` does not.
         """
+        # Where Mish's tanh factor reaches 1 in fp32, and below where ``e**2`` overflows.
+        saturation = 20.0
         two = T.cast(2.0, "float32")
         wide = T.cast(x, "float32")
-        e = T.exp(T.min(wide, T.cast(MishFwdKernel._SATURATION, "float32")))
+        e = T.exp(T.min(wide, T.cast(saturation, "float32")))
         saturated = e * e + two * e
         return wide * saturated / (saturated + two)
 
@@ -344,11 +382,11 @@ class HardtanhFwdKernel(ScalarParamUnaryKernel, BoundedUnaryFwdInterface):
 
 
 @target_cache(maxsize=32)
-def _make_softplus_kernel(N, dtype, beta, threshold, threads=256, npt=8):
+def _make_softplus_kernel(N, dtype, beta, threshold):
     """Build softplus: y = log(1 + exp(x*beta))/beta if x*beta <= threshold else x.
 
     Binding ``softplus`` as a statement lifts the exponential and the logarithm
-    out of the guard. float16 rows are 1.2% slower with them inside it.
+    out of the guard.
     """
 
     @tilelang.jit(out_idx=[1])
@@ -406,27 +444,66 @@ class SoftplusFwdKernel(MultiInputElementwiseKernel, SoftplusFwdInterface):
         return self._run(x=x)
 
 
-class SiLUAndMulFwdKernel(FusedGatedKernel):
-    """SiLU-and-Mul: y = silu(gate) * value = (gate * sigmoid(gate)) * value."""
+class SiLUAndMulFwdKernel(FusedGatedKernel, SiLUAndMulFwdInterface):
+    """SiLU-and-Mul: y = silu(gate) * value = (gate * sigmoid(gate)) * value.
+
+    A positive *swiglu_limit* clamps the gate and the value in float32, keeping NaN, and a
+    *row_scaled* kernel multiplies each row's product by its float32 scale; either way the
+    result rounds once.
+    """
 
     SUPPORTED_DTYPES = FLOAT_DTYPES
 
+    @classmethod
+    def entry_for(cls, call: SiLUAndMulCall) -> Entry:
+        return call, lambda: cls(
+            call.m,
+            call.n,
+            call.dtype,
+            swiglu_limit=call.swiglu_limit,
+            row_scaled=call.has_scale,
+        )
+
+    def __init__(self, M, N, dtype, config=None, *, swiglu_limit=0.0, row_scaled=False):
+        self.swiglu_limit = swiglu_limit
+        self.row_scaled = row_scaled
+        super().__init__(M, N, dtype, config=config)
+
+    def _get_effective_op_func(self):
+        limit = self.swiglu_limit
+        if limit <= 0 and not self.row_scaled:
+            return super()._get_effective_op_func()
+        dtype = self.dtype_str
+
+        def fused_op(gate, value, row_scale=None):
+            g = T.cast(gate, "float32")
+            u = T.cast(value, "float32")
+            if limit > 0:
+                hi = T.cast(limit, "float32")
+                g = T.if_then_else(T.isnan(g), g, T.min(g, hi))
+                u = T.if_then_else(T.isnan(u), u, T.min(T.max(u, -hi), hi))
+            product = _wide_silu(g, dtype, quartered_fdiv) * u
+            return product if row_scale is None else product * row_scale
+
+        cls = type(self)
+        name = (
+            f"{cls.__module__}.{cls.__qualname__}|{dtype}|{self.strategy}"
+            f"|swiglu_limit={limit!r}|row_scaled={self.row_scaled}"
+        )
+        return name, fused_op
+
+    def forward(self, x, scale=None):
+        if scale is None:
+            return super().forward(x)
+        self._require_devices(x=x, scale=scale)
+        return self.program(self._compile)(x, scale)
+
     @staticmethod
     def activation_func(x):
-        """gate / (1 + exp2(-gate * log2 e)), in fp32.
-
-        exp2 lowers to one MUFU.EX2 against expf's multi-op sequence. A 16-bit gate
-        skips ``exp2f``'s subnormal guard, since a flushed subnormal vanishes when added
-        to 1, and divides with ``quartered_fdiv``: the product with an infinite value
-        needs the activation's sign past a divisor of ``2**126``, where ``approx_fdiv``
-        returns zero.
-        """
-        g = T.Cast("float32", x)
-        one = T.cast(1.0, "float32")
-        exponent = -g * T.cast(LOG2E, "float32")
-        if str(x.dtype) == "float32":
-            return g / (one + T.exp2(exponent))
-        return quartered_fdiv(g, one + T.call_extern("float32", "tileops::approx_exp2", exponent))
+        # float16 divides with ``quartered_fdiv`` too: the product with an infinite value
+        # needs the activation's sign past a divisor of ``2**126``, where ``approx_fdiv``
+        # returns zero.
+        return _silu(x, quartered_fdiv)
 
 
 class GELUAndMulFwdKernel(FusedGatedKernel):
@@ -439,10 +516,8 @@ class GELUAndMulFwdKernel(FusedGatedKernel):
     SUPPORTED_DTYPES = FLOAT_DTYPES
 
     @classmethod
-    def refusal(cls, call: GELUAndMulCall) -> "str | None":
-        if call.approximate != "none":
-            return f"evaluates the erf form, not approximate={call.approximate!r}"
-        return super().refusal(call)
+    def refusal(cls, call: GELUAndMulCall) -> str | None:
+        return _approximate_refusal(call, "none", "the erf form") or super().refusal(call)
 
     @staticmethod
     def activation_func(x):
@@ -458,15 +533,13 @@ class GELUTanhAndMulFwdKernel(FusedGatedKernel):
     SUPPORTED_DTYPES = FLOAT_DTYPES
 
     @classmethod
-    def refusal(cls, call: GELUAndMulCall) -> "str | None":
-        if call.approximate != "tanh":
-            return f"evaluates the tanh approximation, not approximate={call.approximate!r}"
-        return super().refusal(call)
+    def refusal(cls, call: GELUAndMulCall) -> str | None:
+        return _approximate_refusal(call, "tanh", "the tanh approximation") or super().refusal(call)
 
     @staticmethod
     def activation_func(x):
-        sqrt_2_over_pi = T.cast(SQRT_2_OVER_PI, "float32")  # sqrt(2/pi)
-        coeff = T.cast(GELU_TANH_COEFF, "float32")  # GELU tanh approx coefficient
+        sqrt_2_over_pi = T.cast(_SQRT_2_OVER_PI, "float32")
+        coeff = T.cast(_GELU_TANH_COEFF, "float32")
         half = T.cast(0.5, x.dtype)
         one = T.cast(1.0, x.dtype)
         x_f32 = T.Cast("float32", x)

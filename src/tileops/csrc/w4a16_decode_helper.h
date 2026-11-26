@@ -5,6 +5,8 @@
 
 #include <cstring>
 
+#include "cluster_partials.h"
+
 namespace tileops {
 
 __device__ __forceinline__ __half2 w4a16_half2_from_bits(unsigned int bits) {
@@ -70,6 +72,29 @@ __device__ __forceinline__ cutlass::half_t w4a16_dequant_word_one_shift(
   }
   const __half r = v == 0 ? __low2half(out) : __high2half(out);
   return cutlass::half_t(r);
+}
+
+// Initializes ``bar`` for one arrival, makes the init visible to the cluster,
+// and arrives on it expecting a peer warpgroup's R accumulators.
+// ``landing`` is taken only so that it is live from the kernel's start: the
+// peer may store into it while this CTA is still in its mainloop.
+template <int R>
+__device__ __forceinline__ void w4a16_pair_init(void* bar, float* landing) {
+  (void)landing;
+  unsigned m = static_cast<unsigned>(__cvta_generic_to_shared(bar));
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(m) : "memory");
+  asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  expect_partials(bar, 128 * R * 4);
+}
+
+// Waits for phase 0 of ``bar``: the peer's stores have landed.
+__device__ __forceinline__ void w4a16_pair_wait(void* bar) {
+  unsigned m = static_cast<unsigned>(__cvta_generic_to_shared(bar));
+  asm volatile(
+      "{\n\t.reg .pred p;\n\tLAB_WAIT:\n\t"
+      "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], 0;\n\t"
+      "@!p bra LAB_WAIT;\n\t}" ::"r"(m)
+      : "memory");
 }
 
 }  // namespace tileops

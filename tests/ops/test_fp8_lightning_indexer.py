@@ -20,11 +20,16 @@ def test_indexer_preserves_small_normal_weights() -> None:
 
 @pytest.mark.smoke
 @pytest.mark.sm90
-def test_indexer_partial_wave_preserves_small_normal_weights() -> None:
-    """133 blocks of four queries over 512 key tiles take the partial-wave launch, whose
-    epilogue doubles the relu terms; small normal weights still count."""
-    workload = FP8LightningIndexerTest(1, 532, 64, 128, 32768, 1)
-    workload.check(FP8LightningIndexerFwdOp(), *workload.gen_weight_boundary_inputs())
+def test_indexer_keeps_large_finite_head_sums() -> None:
+    """A head sum of 2^127 before a key scale of 2^-10 stays finite: 2^117."""
+    workload = FP8LightningIndexerTest(1, 8, 64, 128, 128, 1)
+    q, k, weights, starts, ends, scales = workload.gen_weight_boundary_inputs()
+    q.fill_(1)
+    k.fill_(1)
+    weights.zero_()
+    weights[:, 0] = 2.0**120
+    scales.fill_(2.0**-10)
+    workload.check(FP8LightningIndexerFwdOp(), q, k, weights, starts, ends, scales)
 
 
 @pytest.mark.smoke
@@ -58,8 +63,9 @@ class FP8LightningIndexerFixture(FixtureBase):
             [
                 pytest.param(1, 4096, 32, 64, 8192, 1, True, False, marks=pytest.mark.smoke),
                 # The SM90 warp-specialized kernel's other instance: four queries of 64 heads
-                # of dim 128 a block, where 32 heads of dim 64 take eight.
-                pytest.param(1, 2048, 64, 128, 4096, 1, True, False, marks=pytest.mark.smoke),
+                # of dim 128 a block, where 32 heads of dim 64 take eight. Smoke checks it
+                # through the window tests below.
+                pytest.param(1, 2048, 64, 128, 4096, 1, True, False, marks=pytest.mark.full),
                 # Two batches, a partial last query block and key tile; the 65 blocks of eight
                 # queries fall short of any SM90 part's multiprocessors, so each block's keys
                 # split over several CTAs.
@@ -146,3 +152,49 @@ def test_indexer_empty_and_inverted_windows() -> None:
     ks[2::4], ke[2::4] = ke[2::4] + 7, ks[2::4]  # inverted
     ks[3::8] = 4096  # starts at the end of the keys
     test.check(FP8LightningIndexerFwdOp(), index_q, index_k, weights, ks, ke)
+
+
+@pytest.mark.sm90
+@pytest.mark.parametrize(
+    "queries, keys, heads, index_dim, groups",
+    [
+        pytest.param(8, 128, 64, 128, 1, marks=pytest.mark.smoke, id="warp-specialized"),
+        # Eight queries of 32 heads a block: one FFMA chain a head sum, where 64 heads take two.
+        pytest.param(64, 512, 32, 64, 1, marks=pytest.mark.full, id="eight-queries"),
+        pytest.param(8, 128, 64, 128, 2, marks=pytest.mark.full, id="two-groups"),
+        pytest.param(532, 32768, 64, 128, 1, marks=pytest.mark.full, id="partial-wave"),
+    ],
+)
+def test_indexer_signed_external_key_scales(queries, keys, heads, index_dim, groups) -> None:
+    """Random keys whose scales take random signs: each key row's scores take its own sign, in
+    both row halves of a thread's accumulators."""
+    test = FP8LightningIndexerTest(1, queries, heads, index_dim, keys, groups)
+    q, k, weights, starts, ends, scales = test.gen_weight_boundary_inputs()
+    q = torch.randn(q.shape, device=q.device).to(q.dtype)
+    k = torch.randn(k.shape, device=k.device).to(k.dtype)
+    weights = torch.randn(weights.shape, device=weights.device)
+    scales = torch.randn(scales.shape, device=scales.device) / 448.0
+    test.check(FP8LightningIndexerFwdOp(), q, k, weights, starts, ends, scales)
+
+
+@pytest.mark.in_tree_kernels
+@pytest.mark.sm90
+@pytest.mark.parametrize(
+    "groups",
+    [
+        pytest.param(1, marks=pytest.mark.smoke, id="single-group"),
+        pytest.param(2, marks=pytest.mark.full, id="two-groups"),
+    ],
+)
+def test_indexer_assumes_nonnegative_external_scales(groups) -> None:
+    from tileops.backend import BUILTIN
+
+    test = FP8LightningIndexerTest(1, 8, 64, 128, 128, groups)
+    q, k, weights, starts, ends, scales = test.gen_weight_boundary_inputs()
+    q.fill_(1)
+    k.fill_(1)
+    weights.fill_(1)
+    scales.fill_(0.5)
+    scales[:, 1::2] = 0
+    op = FP8LightningIndexerFwdOp(assume_nonnegative_scale=True, target=BUILTIN)
+    test.check(op, q, k, weights, starts, ends, scales)

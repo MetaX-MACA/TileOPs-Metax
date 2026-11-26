@@ -16,10 +16,6 @@ from tileops._ops.sequence_modeling.engram import EngramGateConvBwdOp, EngramGat
 from tileops._ops.sequence_modeling.engram_decode import EngramDecodeFwdOp
 from tileops._utils import is_maca
 
-# Autotuning is a bench-run policy, not a workload property; manifest
-# workloads do not carry it.
-_TUNE = True
-
 
 @pytest.mark.parametrize("case", bench.cases(EngramGateConvFwdOp), ids=lambda case: case.id)
 def test_engram_gate_conv_fwd_bench(case):
@@ -29,8 +25,7 @@ def test_engram_gate_conv_fwd_bench(case):
         bench.Runner(op, case).compare_torch()
         return
     op = EngramGateConvFwdOp(**case.arguments)
-    if _TUNE:
-        op.request_tune()
+    op.request_tune()
     bench.Runner(op, case).compare(
         {
             "torch-ref": case.reference,
@@ -47,8 +42,7 @@ def test_engram_gate_conv_bwd_bench(case):
         bench.Runner(op, case).compare_torch()
         return
     op = EngramGateConvBwdOp(**case.arguments)
-    if _TUNE:
-        op.request_tune()
+    op.request_tune()
     reference = case.reference
 
     @torch.enable_grad()
@@ -66,8 +60,7 @@ def test_engram_decode_bench(case):
         bench.Runner(op, case).compare_torch()
         return
     op = EngramDecodeFwdOp(**case.arguments)
-    if _TUNE:
-        op.request_tune()
+    op.request_tune()
     bench.Runner(op, case).compare(
         {
             "torch-ref": case.reference,

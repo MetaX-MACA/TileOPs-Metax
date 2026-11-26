@@ -1,7 +1,7 @@
 import functools
 import itertools
 import math
-from typing import Callable, Optional, Tuple
+from collections.abc import Callable
 
 import tilelang
 import tilelang.language as T
@@ -12,10 +12,9 @@ from tileops._kernels.attention.call_spec import (
     GQABwdInterface,
     GQAPreprocessBwdInterface,
 )
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.constants import LOG2E
 from tileops._kernels.kernel_base import CompiledProgram, Entry, Kernel
-from tileops._utils import get_shared_memory_optin, get_sm_count
 
 __all__ = ["GQABwdMMAKernel", "GQABwdPreprocessKernel", "GQABwdWGMMAPipelinedKernel"]
 
@@ -30,7 +29,7 @@ def _flashattn_bwd_preprocess_kernel(
     dtype: str,
     with_dq_accum: bool,
     launch_dependents: bool,
-    sm_scale: Optional[float] = None,
+    sm_scale: float | None = None,
 ) -> Callable:
     accum_dtype = "float"
     shape = (batch, seq_len, heads, dim)
@@ -139,8 +138,8 @@ class GQABwdPreprocessKernel(Kernel, GQAPreprocessBwdInterface):
         seq_len: int,
         dim: int,
         dtype: torch.dtype,
-        sm_scale: Optional[float] = None,
-        config: Optional[dict] = None,
+        sm_scale: float | None = None,
+        config: dict | None = None,
     ) -> None:
         super().__init__()
         self.batch = batch
@@ -159,7 +158,7 @@ class GQABwdPreprocessKernel(Kernel, GQAPreprocessBwdInterface):
         lse: torch.Tensor,
         with_dq_accum: bool = True,
         launch_dependents: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Return ``(delta, lse_log2, dq_accum)``: ``dq_accum`` zero-filled when
         ``with_dq_accum``, else ``None``.
 
@@ -235,7 +234,7 @@ def _gqa_bwd_wgmma_pipelined_kernel(
     dim: int,
     is_causal: bool,
     dtype: str = "float16",
-    sm_scale: Optional[float] = None,
+    sm_scale: float | None = None,
 ) -> Callable:
     sm_scale = (1.0 / dim) ** 0.5 if sm_scale is None else sm_scale
     scale = sm_scale * LOG2E
@@ -250,7 +249,7 @@ def _gqa_bwd_wgmma_pipelined_kernel(
         pass_configs={
             tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
         },
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
     )
     def _gqa_bwd_wgmma_pipelined_func(
         block_m: int, block_n: int, num_stages: int, threads: int
@@ -387,7 +386,7 @@ def _gqa_bwd_mma_kernel(
     dim: int,
     is_causal: bool,
     dtype: str = "float16",
-    sm_scale: Optional[float] = None,
+    sm_scale: float | None = None,
 ) -> Callable:
     sm_scale = (1.0 / dim) ** 0.5 if sm_scale is None else sm_scale
     scale = sm_scale * LOG2E
@@ -523,7 +522,7 @@ class GQABwdWGMMAPipelinedKernel(Kernel, GQABwdInterface):
             call.dtype,
             call.sm_scale,
         )
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         return (*args, index), lambda: cls(*args, device_index=index)
 
     def __init__(
@@ -535,10 +534,10 @@ class GQABwdWGMMAPipelinedKernel(Kernel, GQABwdInterface):
         dim: int,
         is_causal: bool,
         dtype: torch.dtype,
-        sm_scale: Optional[float] = None,
-        config: Optional[dict] = None,
+        sm_scale: float | None = None,
+        config: dict | None = None,
         *,
-        device_index: Optional[int] = None,
+        device_index: int | None = None,
     ) -> None:
         super().__init__(device_index=device_index)
         self.batch = batch
@@ -572,7 +571,7 @@ class GQABwdWGMMAPipelinedKernel(Kernel, GQABwdInterface):
     )
 
     @classmethod
-    def refusal(cls, call: AttentionCall) -> Optional[str]:
+    def refusal(cls, call: AttentionCall) -> str | None:
         """Require complete WGMMA contractions and shared memory for the narrowest default."""
         if call.softcap != 0.0:
             return "does not serve softcap"
@@ -594,7 +593,7 @@ class GQABwdWGMMAPipelinedKernel(Kernel, GQABwdInterface):
     @property
     def default_config(self) -> dict:
         return self._default_config_for(
-            get_shared_memory_optin(self.device_index),
+            self.build_target.smem_budget,
             self.dim,
             self.dtype.itemsize,
             self.heads != self.heads_kv,
@@ -624,16 +623,11 @@ class GQABwdWGMMAPipelinedKernel(Kernel, GQABwdInterface):
 
     @property
     def autotune_configs(self) -> list[dict]:
-        block_m = [64, 128]
-        block_n = [64, 128]
-        num_stages = [1, 2, 3]
-        threads = [128, 256]
-        _configs = list(itertools.product(block_m, block_n, num_stages, threads))
-        budget = get_shared_memory_optin(self.device_index)
+        budget = self.build_target.smem_budget
         grouped = self.heads != self.heads_kv
         configs = (
-            {"block_m": c[0], "block_n": c[1], "num_stages": c[2], "threads": c[3]}
-            for c in _configs
+            {"block_m": m, "block_n": n, "num_stages": s, "threads": t}
+            for m, n, s, t in itertools.product([64, 128], [64, 128], [1, 2, 3], [128, 256])
         )
         return [
             c for c in configs if self._builds(c, budget, self.dim, self.dtype.itemsize, grouped)
@@ -648,7 +642,7 @@ class GQABwdWGMMAPipelinedKernel(Kernel, GQABwdInterface):
         lse: torch.Tensor,
         delta: torch.Tensor,
         dq_accum: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return ``(dq, dk, dv)`` in the input dtype; ``dq_accum`` arrives zero-filled."""
         dq_accum = dq_accum.view(q.shape)
         grouped = self.heads_kv != self.heads
@@ -666,7 +660,7 @@ class GQABwdWGMMAPipelinedKernel(Kernel, GQABwdInterface):
         land_dq(dq_accum, dq)
         return dq, dk, dv
 
-    def _compile(self, cfg: dict) -> Tuple[CompiledProgram, CompiledProgram]:
+    def _compile(self, cfg: dict) -> tuple[CompiledProgram, CompiledProgram]:
         """The backward program for *cfg*, and the program that lands its f32 dQ."""
         land_dq = _flashattn_bwd_postprocess_kernel(
             self.batch, self.heads, self.seq_len, self.dim, self.dtype_str
@@ -685,7 +679,7 @@ class GQABwdMMAKernel(GQABwdWGMMAPipelinedKernel):
     _KEY_BLOCKS = ((128, 256), (64, 128))
 
     @classmethod
-    def refusal(cls, call: AttentionCall) -> Optional[str]:
+    def refusal(cls, call: AttentionCall) -> str | None:
         """Require complete MMA contractions and enough shared memory for the narrowest tile."""
         if call.softcap != 0.0:
             return "does not serve softcap"
@@ -708,13 +702,13 @@ class GQABwdMMAKernel(GQABwdWGMMAPipelinedKernel):
     @property
     def default_config(self) -> dict:
         return self._default_config_for(
-            get_shared_memory_optin(self.device_index),
+            self.build_target.smem_budget,
             self.dim,
             self.dtype.itemsize,
             self.heads != self.heads_kv,
             self.batch * self.heads,
             self.seq_len,
-            get_sm_count(self.device_index),
+            self.build_target.sm_count,
         )
 
     @classmethod
@@ -745,7 +739,7 @@ class GQABwdMMAKernel(GQABwdWGMMAPipelinedKernel):
 
     def tuning_candidates(self, configs, untuned=None) -> list[dict]:
         candidates = super().tuning_candidates(configs, untuned)
-        budget = get_shared_memory_optin(self.device_index)
+        budget = self.build_target.smem_budget
         return [
             config
             for config in candidates

@@ -3,7 +3,6 @@ interfaces their implementations inherit."""
 
 import dataclasses
 from abc import abstractmethod
-from typing import Optional, Tuple
 
 import torch
 
@@ -41,14 +40,14 @@ class AvgPoolCall(CallSpec):
 
     n: int = 0
     c_in: int = 0
-    size: Tuple[int, ...] = ()
-    window: Tuple[int, ...] = ()
-    stride: Tuple[int, ...] = ()
-    pad: Tuple[int, ...] = ()
+    size: tuple[int, ...] = ()
+    window: tuple[int, ...] = ()
+    stride: tuple[int, ...] = ()
+    pad: tuple[int, ...] = ()
     ceil_mode: bool = False
     count_include_pad: bool = True
-    divisor_override: Optional[int] = None
-    dtype: Optional[torch.dtype] = None
+    divisor_override: int | None = None
+    dtype: torch.dtype | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -61,13 +60,13 @@ class MaxPoolCall(CallSpec):
 
     n: int = 0
     c_in: int = 0
-    size: Tuple[int, ...] = ()
-    window: Tuple[int, ...] = ()
-    stride: Tuple[int, ...] = ()
-    pad: Tuple[int, ...] = ()
-    dilation: Tuple[int, ...] = ()
+    size: tuple[int, ...] = ()
+    window: tuple[int, ...] = ()
+    stride: tuple[int, ...] = ()
+    pad: tuple[int, ...] = ()
+    dilation: tuple[int, ...] = ()
     ceil_mode: bool = False
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -80,7 +79,7 @@ class AdaptivePool2dCall(CallSpec):
     w_in: int = 0
     out_h: int = 0
     out_w: int = 0
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -95,8 +94,8 @@ class MeanPoolingCall(CallSpec):
     chunks_per_batch: int = 0
     seq_num: int = 0
     use_offsets: bool = False
-    dtype: Optional[torch.dtype] = None
-    accum_dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
+    accum_dtype: torch.dtype | None = None
 
 
 class AvgPool1dFwdInterface(KernelInterface):
@@ -109,7 +108,7 @@ class AvgPool1dFwdInterface(KernelInterface):
         """Average each window of ``x``'s length axis; nothing is written in place.
 
         Padding is not read: a window overlapping it sums the input elements it covers.
-        Nothing is written in place, and the output aliases no input.
+        The output aliases no input.
 
         Args:
             x: The input, ``(call.n, call.c_in, call.size[0])`` in ``call.dtype``, on
@@ -136,7 +135,7 @@ class AvgPool2dFwdInterface(KernelInterface):
         """Average each window of ``x``'s spatial axes; nothing is written in place.
 
         Padding is not read: a window overlapping it sums the input elements it covers.
-        Nothing is written in place, and the output aliases no input.
+        The output aliases no input.
 
         Args:
             x: The input, ``(call.n, call.c_in, *call.size)`` in ``call.dtype``, on
@@ -164,7 +163,7 @@ class AvgPool3dFwdInterface(KernelInterface):
         """Average each window of ``x``'s spatial axes; nothing is written in place.
 
         Padding is not read: a window overlapping it sums the input elements it covers.
-        Nothing is written in place, and the output aliases no input.
+        The output aliases no input.
 
         Args:
             x: The input, ``(call.n, call.c_in, *call.size)`` in ``call.dtype``, on
@@ -192,8 +191,8 @@ class MaxPool1dFwdInterface(KernelInterface):
         """Take each window's maximum; nothing is written in place.
 
         A window's positions step by ``call.dilation``. The padded positions read as
-        negative infinity, so a window covering only padding yields it. Nothing is written
-        in place, and the output aliases no input.
+        negative infinity, so a window covering only padding yields it. The output aliases
+        no input.
 
         Args:
             x: The input, ``(call.n, call.c_in, call.size[0])`` in ``call.dtype``, on
@@ -204,7 +203,8 @@ class MaxPool1dFwdInterface(KernelInterface):
             A new contiguous ``(call.n, call.c_in, out_l)`` tensor in ``call.dtype`` on
             ``call.device``, with the output extents ``torch.nn.functional.max_pool1d``
             gives for ``call.window``, ``call.stride``, ``call.pad``, ``call.dilation``
-            and ``call.ceil_mode``. The comparison runs in float32 and the result is stored in ``call.dtype``.
+            and ``call.ceil_mode``. The comparison runs in float32 and the result is stored in
+            ``call.dtype``.
         """
 
 
@@ -218,8 +218,8 @@ class MaxPool2dFwdInterface(KernelInterface):
         """Take each window's maximum; nothing is written in place.
 
         A window's positions step by ``call.dilation``. The padded positions read as
-        negative infinity, so a window covering only padding yields it. Nothing is written
-        in place, and the output aliases no input.
+        negative infinity, so a window covering only padding yields it. The output aliases
+        no input.
 
         Args:
             x: The input, ``(call.n, call.c_in, *call.size)`` in ``call.dtype``, on
@@ -230,7 +230,8 @@ class MaxPool2dFwdInterface(KernelInterface):
             A new contiguous ``(call.n, call.c_in, out_h, out_w)`` tensor in ``call.dtype`` on
             ``call.device``, with the output extents ``torch.nn.functional.max_pool2d``
             gives for ``call.window``, ``call.stride``, ``call.pad``, ``call.dilation``
-            and ``call.ceil_mode``. The comparison runs in float32 and the result is stored in ``call.dtype``.
+            and ``call.ceil_mode``. The comparison runs in float32 and the result is stored in
+            ``call.dtype``.
         """
 
 
@@ -244,8 +245,8 @@ class MaxPool3dFwdInterface(KernelInterface):
         """Take each window's maximum; nothing is written in place.
 
         A window's positions step by ``call.dilation``. The padded positions read as
-        negative infinity, so a window covering only padding yields it. Nothing is written
-        in place, and the output aliases no input.
+        negative infinity, so a window covering only padding yields it. The output aliases
+        no input.
 
         Args:
             x: The input, ``(call.n, call.c_in, *call.size)`` in ``call.dtype``, on
@@ -256,7 +257,8 @@ class MaxPool3dFwdInterface(KernelInterface):
             A new contiguous ``(call.n, call.c_in, out_d, out_h, out_w)`` tensor in ``call.dtype`` on
             ``call.device``, with the output extents ``torch.nn.functional.max_pool3d``
             gives for ``call.window``, ``call.stride``, ``call.pad``, ``call.dilation``
-            and ``call.ceil_mode``. The comparison runs in float32 and the result is stored in ``call.dtype``.
+            and ``call.ceil_mode``. The comparison runs in float32 and the result is stored in
+            ``call.dtype``.
         """
 
 
@@ -266,11 +268,11 @@ class MaxPool1dIndicesFwdInterface(KernelInterface):
     request = MaxPoolCall
 
     @abstractmethod
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Take each window's maximum and where it sat; nothing is written in place.
 
         A window's positions step by ``call.dilation``. The padded positions read as
-        negative infinity. Nothing is written in place, and neither output aliases an input.
+        negative infinity. Neither output aliases an input.
 
         Args:
             x: The input, ``(call.n, call.c_in, call.size[0])`` in ``call.dtype``, on
@@ -292,11 +294,11 @@ class MaxPool2dIndicesFwdInterface(KernelInterface):
     request = MaxPoolCall
 
     @abstractmethod
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Take each window's maximum and where it sat; nothing is written in place.
 
         A window's positions step by ``call.dilation``. The padded positions read as
-        negative infinity. Nothing is written in place, and neither output aliases an input.
+        negative infinity. Neither output aliases an input.
 
         Args:
             x: The input, ``(call.n, call.c_in, *call.size)`` in ``call.dtype``, on
@@ -318,11 +320,11 @@ class MaxPool3dIndicesFwdInterface(KernelInterface):
     request = MaxPoolCall
 
     @abstractmethod
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Take each window's maximum and where it sat; nothing is written in place.
 
         A window's positions step by ``call.dilation``. The padded positions read as
-        negative infinity. Nothing is written in place, and neither output aliases an input.
+        negative infinity. Neither output aliases an input.
 
         Args:
             x: The input, ``(call.n, call.c_in, *call.size)`` in ``call.dtype``, on
@@ -351,7 +353,7 @@ class AdaptiveAvgPool2dFwdInterface(KernelInterface):
         ``ceil((i + 1) * h_in / out_h)`` and the columns given the same way, as
         ``torch.nn.functional.adaptive_avg_pool2d`` defines it. Windows may overlap, the
         divisor is the count of positions the window covers, and sums accumulate in
-        ``float32``. Nothing is written in place, and the output aliases no input.
+        ``float32``. The output aliases no input.
 
         Args:
             x: The input, ``(call.n, call.c_in, call.h_in, call.w_in)``, or
@@ -377,8 +379,8 @@ class AdaptiveMaxPool2dFwdInterface(KernelInterface):
         Output cell ``(i, j)`` takes the maximum over the input rows
         ``floor(i * h_in / out_h)`` up to ``ceil((i + 1) * h_in / out_h)`` and the columns
         given the same way, which is what ``torch.nn.functional.adaptive_max_pool2d`` uses.
-        Every window holds at least one position, so no fill value is read. Nothing is
-        written in place, and the output aliases no input.
+        Every window holds at least one position, so no fill value is read. The output
+        aliases no input.
 
         Args:
             x: The input, ``(call.n, call.c_in, call.h_in, call.w_in)``, or
@@ -398,14 +400,13 @@ class AdaptiveMaxPool2dIndicesFwdInterface(KernelInterface):
     request = AdaptivePool2dCall
 
     @abstractmethod
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Take each output cell's window maximum and where it sat; nothing is written in place.
 
         The windows are the ones ``torch.nn.functional.adaptive_max_pool2d`` uses: cell
         ``(i, j)`` covers the rows ``floor(i * h_in / out_h)`` up to
         ``ceil((i + 1) * h_in / out_h)`` and the columns given the same way. Every window
-        holds at least one position. Nothing is written in place, and neither output
-        aliases an input.
+        holds at least one position. Neither output aliases an input.
 
         Args:
             x: The input, ``(call.n, call.c_in, call.h_in, call.w_in)``, or

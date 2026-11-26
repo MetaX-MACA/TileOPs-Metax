@@ -21,9 +21,12 @@ class TopKSelectFixture(FixtureBase):
                 pytest.param(
                     4, 256, 1024, 1, 32, "float32", "int32", False, marks=pytest.mark.smoke
                 ),
+                pytest.param(8, 512, 2048, 1, 64, "float32", "int32", True, marks=pytest.mark.full),
+                # Enough rows to skip the register kernel, past 2048 keys: 512-thread blocks.
                 pytest.param(
-                    8, 512, 2048, 1, 64, "float32", "int32", False, marks=pytest.mark.full
+                    4, 128, 8192, 1, 512, "float32", "int32", False, marks=pytest.mark.full
                 ),
+                # 8 GiB and 16 GiB of scores.
                 pytest.param(
                     1,
                     32 * 1024,
@@ -33,8 +36,8 @@ class TopKSelectFixture(FixtureBase):
                     "float32",
                     "int32",
                     False,
-                    marks=pytest.mark.full,
-                ),
+                    marks=pytest.mark.nightly,
+                ),  # fmt: skip
                 pytest.param(
                     1,
                     32 * 1024,
@@ -44,8 +47,8 @@ class TopKSelectFixture(FixtureBase):
                     "float32",
                     "int32",
                     False,
-                    marks=pytest.mark.full,
-                ),
+                    marks=pytest.mark.nightly,
+                ),  # fmt: skip
             ],
         ),
     ]
@@ -73,27 +76,68 @@ def test_topk_select_op(
     test.check(op, *inputs)
 
 
-@pytest.mark.smoke
-@pytest.mark.parametrize("width", [0, 5, 32], ids=["empty", "short", "exactly-topk"])
-def test_topk_select_returns_a_short_window_whole(width: int) -> None:
-    """A window with at most ``topk`` keys selects all of them and pads with ``seq_len_kv``."""
+@pytest.mark.parametrize("fill_value", [None, -1], ids=["fill-default", "fill-minus-one"])
+@pytest.mark.parametrize(
+    "width",
+    [
+        pytest.param(0, marks=pytest.mark.smoke, id="empty"),
+        pytest.param(5, marks=pytest.mark.full, id="short"),
+        pytest.param(32, marks=pytest.mark.full, id="exactly-topk"),
+    ],
+)
+def test_topk_select_returns_a_short_window_whole(width: int, fill_value: int | None) -> None:
+    """A window with at most ``topk`` keys selects all of them and pads with ``fill_value``."""
     batch, seq_len, seq_len_kv, topk = 2, 16, 256, 32
     scores = torch.randn(batch, seq_len, seq_len_kv, 1, device=run_device())
     starts = torch.full((batch, seq_len), 7, dtype=torch.int32, device=run_device())
     ends = starts + width
-    out = TopKSelectFwdOp(top_k=topk)(scores, starts, ends)
-    expected = list(range(7, 7 + width)) + [seq_len_kv] * (topk - width)
+    out = TopKSelectFwdOp(top_k=topk, fill_value=fill_value)(scores, starts, ends)
+    fill = seq_len_kv if fill_value is None else fill_value
+    expected = sorted(list(range(7, 7 + width)) + [fill] * (topk - width))
     assert (out.sort(dim=-1).values == torch.tensor(expected, device=run_device())).all()
-    workload = TopKSelectWorkload(batch, seq_len, seq_len_kv, 1, topk, torch.float32, torch.int32)
+    workload = TopKSelectWorkload(
+        batch, seq_len, seq_len_kv, 1, topk, torch.float32, torch.int32, fill_value
+    )
     reference = workload.ref_program(scores, starts, ends)
     compare_outputs(out, reference, workload.verification(scores, starts, ends))
 
 
+@pytest.mark.parametrize("fill_value", [None, -1], ids=["fill-default", "fill-minus-one"])
+@pytest.mark.parametrize(
+    "seq_len_kv",
+    [pytest.param(0, marks=pytest.mark.smoke)]
+    + [pytest.param(n, marks=pytest.mark.full) for n in (1, 25, 511)],
+    ids=lambda n: f"keys{n}",
+)
+def test_topk_select_top_k_above_the_keys(seq_len_kv: int, fill_value: int | None) -> None:
+    """Fewer keys than ``top_k``: each row selects its whole window and fills the rest.
+
+    DeepSeek-V4-Flash's indexer takes the top 512 of a short context's compressed keys, none
+    for a context under four tokens; each query sees a prefix of them.
+    """
+    batch, seq_len, kv_group, topk = 2, 16, 2, 512
+    scores = torch.randn(batch, seq_len, seq_len_kv, kv_group, device=run_device())
+    ends = torch.linspace(0, seq_len_kv, seq_len, device=run_device()).to(torch.int32)
+    ends = ends.expand(batch, seq_len).contiguous()
+    starts = torch.zeros_like(ends)
+    starts[1] = ends[1] // 3
+    out = TopKSelectFwdOp(top_k=topk, fill_value=fill_value)(scores, starts, ends)
+    workload = TopKSelectWorkload(
+        batch, seq_len, seq_len_kv, kv_group, topk, torch.float32, torch.int32, fill_value
+    )
+    compare_outputs(
+        out, workload.ref_program(scores, starts, ends), workload.verification(scores, starts, ends)
+    )
+
+
 @pytest.mark.smoke
 def test_topk_select_threshold_bucket_past_staging() -> None:
-    """More keys share the topk-th score's bucket than the kernel stages; none is dropped."""
-    seq_len_kv, topk = 8192, 100
-    # Every score in [1, 1.03), one float16 bucket, and all distinct in float32.
+    """More keys share the topk-th score's bucket than the kernel stages; none is dropped.
+
+    A row past the register kernel's 16384 keys runs the staging kernel.
+    """
+    seq_len_kv, topk = 32768, 100
+    # Every score in [1, 1.125), one float16 bucket, and all distinct in float32.
     perm = torch.randperm(seq_len_kv, device=run_device()).float()
     scores = (1.0 + perm / (1 << 18)).reshape(1, 1, seq_len_kv, 1)
     starts = torch.zeros(1, 1, dtype=torch.int32, device=run_device())
@@ -126,3 +170,80 @@ def test_topk_select_window_past_the_bin_cache() -> None:
     compare_outputs(
         out, workload.ref_program(scores, starts, ends), workload.verification(scores, starts, ends)
     )
+
+
+def _registers_case(case: str):
+    """Scores and windows of a call of few rows, each of whose rows fits a block's registers."""
+    gen = torch.Generator(device=run_device()).manual_seed(0)
+    batch, seq_len, seq_len_kv, kv_group, topk = 2, 3, 8192, 1, 512
+    if case == "groups":
+        seq_len_kv, kv_group, topk = 1001, 2, 37
+    elif case == "radix-ties":
+        seq_len_kv, topk = 4096, 64
+    shape = (batch, seq_len, seq_len_kv, kv_group)
+    scores = torch.randn(shape, generator=gen, device=run_device())
+    starts = torch.zeros(batch, seq_len, dtype=torch.int32, device=run_device())
+    ends = torch.full_like(starts, seq_len_kv)
+    if case == "ranked-ties":
+        # About 128 keys a float16 bucket of [1, 2): the threshold bucket's keys rank each
+        # other.
+        scores = 1.0 + torch.rand(shape, generator=gen, device=run_device())
+    elif case == "exact-bucket":
+        # The top_k keys share one score, far above the rest: their bucket fills top_k.
+        scores = scores - 16.0
+        scores[:, :, 1000 : 1000 + topk] = 4.0
+    elif case == "radix-ties":
+        # 300 distinct keys in one float16 bucket, the top: more than rank each other, so
+        # radix rounds refine them, and their second key byte is 0xFF, the last bin. Keys at
+        # -8188 fill the 4096-bin histogram's bin 256, past the rounds' 256 bins; the rest
+        # stay below the bucket.
+        scores = scores * 0.1
+        scores[:, :, :300] = 1.9922 + torch.arange(300, device=run_device())[:, None] * 2e-5
+        scores[:, :, 300:1324] = -8188.0
+    elif case in ("windows", "groups"):
+        # Windows off every vector boundary; one row's holds fewer than top_k keys.
+        starts = torch.randint(
+            0, seq_len_kv // 3, (batch, seq_len), generator=gen, device=run_device()
+        ).to(torch.int32)
+        ends = (
+            starts
+            + topk
+            + 1
+            + torch.randint(
+                0, seq_len_kv // 2, (batch, seq_len), generator=gen, device=run_device()
+            )
+        ).to(torch.int32)
+        ends = ends.clamp(max=seq_len_kv)
+        ends[0, 0] = starts[0, 0] + topk // 2
+    return scores, starts, ends, topk
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param("ranked-ties", marks=pytest.mark.smoke),
+        *(
+            pytest.param(case, marks=pytest.mark.full)
+            for case in ("exact-bucket", "radix-ties", "windows", "groups")
+        ),
+    ],
+)
+@pytest.mark.in_tree_kernels
+def test_topk_select_few_rows_in_registers(case: str) -> None:
+    """A call of few short rows selects each row from its keys held in registers, at every
+    block size tuning may pick."""
+    scores, starts, ends, topk = _registers_case(case)
+    batch, seq_len, seq_len_kv, kv_group = scores.shape
+    op = TopKSelectFwdOp(top_k=topk)
+    workload = TopKSelectWorkload(
+        batch, seq_len, seq_len_kv, kv_group, topk, torch.float32, torch.int32
+    )
+    reference = workload.ref_program(scores, starts, ends)
+    compare_outputs(
+        op(scores, starts, ends), reference, workload.verification(scores, starts, ends)
+    )
+    (kernel,) = op.iter_kernels()
+    for config in kernel.autotune_configs:
+        kernel.config = {**kernel.config, **config}
+        out = op(scores, starts, ends)
+        compare_outputs(out, reference, workload.verification(scores, starts, ends))

@@ -1,4 +1,5 @@
-"""Sweep behaviour of the shared delta-rule forward autotune helper.
+"""Sweep behaviour of the shared delta-rule forward autotune helper, and the launch-width
+rule (``gemm_threads``) that narrows its candidates.
 
 The real sweep compiles fifteen kernels, so the selection logic is checked here
 against stub JIT builders: which candidates reach the autotuner, which sub-kernel
@@ -8,11 +9,13 @@ tuned. ``tests/ops/test_deltanet.py`` covers the same helper on the device.
 
 import inspect
 import sys
+from types import SimpleNamespace
 
 import pytest
 
 from tileops._kernels.linear_attention.deltanet import autotune as la
 from tileops._kernels.linear_attention.deltanet import chunk_fwd as deltanet_fwd
+from tileops._kernels.linear_attention.v_tile import fit_launches, gemm_threads
 
 pytestmark = pytest.mark.smoke
 
@@ -42,6 +45,7 @@ class _StubKernel:
         self.batch, self.head, self.seq_len = 2, 2, 128
         self.chunk_size, self.dim_k, self.dim_v = chunk_size, 64, dim_v
         self.dtype_str = "bfloat16"
+        self.wgmma = True
         self.sweeps: list[tuple[str, dict, tuple[dict, ...]]] = []
         #: ``(sub-kernel name, block_v) -> seed_config`` each sweep was handed.
         self.seeds: dict[tuple[str, int], dict] = {}
@@ -52,13 +56,13 @@ class _StubKernel:
     def default_config(self) -> dict:
         # h_block_v deliberately ignores dim_v divisibility, so a sweep that
         # took its fallback width from here would return an unbuildable one.
+        fused, output = la.chunk_gemm_configs(self.chunk_size, self.dim_v, self.dim_k, self.wgmma)
         return {
-            "fused_num_stages": 2,
-            "fused_threads": 256,
+            "fused_threads": max(config["threads"] for config in fused),
             "h_num_stages": 2,
             "h_threads": 256,
             "h_block_v": 32 if self.chunk_size >= 64 else 0,
-            "o_threads": 256,
+            "o_threads": max(config["threads"] for config in output),
         }
 
     def tune_jit_kernel(self, jit_kernel, configs, warmup, rep, seed_config, supply_prog):
@@ -84,7 +88,7 @@ def _run(kernel: _StubKernel) -> dict:
 def test_every_candidate_is_swept_and_the_winner_lands_in_its_key() -> None:
     kernel = _StubKernel()
     kernel.results = {
-        ("fused", 0): ({"num_stages": 1, "threads": 128}, 3.0),
+        ("fused", 0): ({"threads": 128}, 3.0),
         ("h", 0): ({"num_stages": 1, "threads": 256}, 2.0),
         ("h", 32): ({"num_stages": 2, "threads": 128}, 5.0),
         ("o", 0): ({"threads": 64}, 1.0),
@@ -95,19 +99,116 @@ def test_every_candidate_is_swept_and_the_winner_lands_in_its_key() -> None:
     swept = {
         (name, build["block_v"] if build else 0): configs for name, build, configs in kernel.sweeps
     }
-    assert swept[("fused", 0)] == la.PIPELINE_CONFIGS
+    assert swept[("fused", 0)] == ({"threads": 128}, {"threads": 256})
     assert swept[("h", 0)] == la.PIPELINE_CONFIGS
     assert swept[("h", 32)] == la.PIPELINE_CONFIGS
     assert swept[("o", 0)] == la.OUTPUT_CONFIGS
     assert config == {
-        "fused_num_stages": 1,
         "fused_threads": 128,
-        # block_v=0 measured 2.0 ms against 5.0 ms for block_v=32.
         "h_num_stages": 1,
         "h_threads": 256,
         "h_block_v": 0,
         "o_threads": 64,
     }
+
+
+@pytest.mark.parametrize(
+    ("threads", "wgmma", "outputs", "expected"),
+    [
+        # MMA: a 16 x 24 output splits over one warp only, three 8-column tiles over none.
+        (256, False, [(16, 24)], 32),
+        (256, False, [(16, 48)], 64),
+        (256, False, [(32, 24)], 32),
+        (256, False, [(64, 16)], 256),
+        # WGMMA: four warps split M by 64, the rest split N by 16 a warp group.
+        (256, True, [(64, 16)], 128),
+        (256, True, [(64, 32)], 256),
+        # M below 64 takes MMA's rule even where WGMMA is available.
+        (256, True, [(16, 64)], 256),
+        # The narrowest output bounds the launch.
+        (256, True, [(64, 64), (16, 24)], 32),
+    ],
+    ids=[
+        "mma-c16-v24",
+        "mma-c16-v48",
+        "mma-c32-v24",
+        "mma-m64-n16",
+        "wgmma-m64-n16",
+        "wgmma-m64-n32",
+        "wgmma-m16-mma",
+        "narrowest-output",
+    ],
+)
+def test_gemm_threads_fits_every_warp_on_every_output(threads, wgmma, outputs, expected) -> None:
+    assert gemm_threads(threads, wgmma, *outputs) == expected
+
+
+def test_fit_launches_narrows_each_config_and_drops_repeats() -> None:
+    configs = [
+        {"num_stages": 1, "threads": 256},
+        {"num_stages": 1, "threads": 128},
+        {"num_stages": 2, "threads": 256},
+    ]
+    assert fit_launches(configs, True, (64, 16)) == (
+        {"num_stages": 1, "threads": 128},
+        {"num_stages": 2, "threads": 128},
+    )
+
+
+@pytest.mark.parametrize("dim_v", [24, 48, 64])
+def test_chunk_16_sweep_and_default_stay_in_the_declared_candidates(monkeypatch, dim_v) -> None:
+    """At chunk16 the default config and the tuned one are declared candidates."""
+    kernel = _StubKernel(chunk_size=16, dim_v=dim_v)
+    default = deltanet_fwd.DeltaNetChunkFwdKernel._default_config_for(
+        99 * 1024, 16, 64, dim_v, 2, True
+    )
+    monkeypatch.setattr(_StubKernel, "default_config", property(lambda self: default))
+    declared = la.delta_rule_fwd_autotune_configs(
+        kernel.dim_v, kernel.chunk_size, kernel.dim_k, kernel.wgmma
+    )
+
+    assert default in declared
+    assert _run(kernel) in declared
+
+
+def test_small_walk_default_is_a_declared_candidate() -> None:
+    """A K16 walk's default config is one of its autotune candidates."""
+    kernel = object.__new__(deltanet_fwd.DeltaNetChunkFwdKernel)
+    kernel.batch, kernel.head, kernel.seq_len = 1, 2, 64
+    kernel.chunk_size, kernel.dim_k, kernel.dim_v = 16, 16, 64
+    kernel.dtype = "bfloat16"
+    kernel._walk = True
+    kernel.wgmma = True
+    kernel.build_target = SimpleNamespace(smem_budget=99 * 1024, sm_count=128)
+    kernel.config = kernel.default_config
+
+    assert kernel.config in kernel.autotune_configs
+
+
+def test_unmeasured_narrow_width_uses_its_own_thread_limit(monkeypatch) -> None:
+    kernel = _StubKernel(chunk_size=16)
+    default = deltanet_fwd.DeltaNetChunkFwdKernel._default_config_for(
+        99 * 1024, 16, 64, 64, 2, True
+    )
+    monkeypatch.setattr(_StubKernel, "default_config", property(lambda self: default))
+    original = kernel.tune_jit_kernel
+
+    def tune(jit, *args, **kwargs):
+        if jit.name == "h":
+            if jit.build_kwargs["block_v"] == 0:
+                raise RuntimeError("untiled state cannot build")
+            return _StubTuned(None, None)
+        return original(jit, *args, **kwargs)
+
+    monkeypatch.setattr(kernel, "tune_jit_kernel", tune)
+    with pytest.warns(UserWarning, match="untiled state cannot build"):
+        config = _run(kernel)
+
+    assert config["h_block_v"] == 32
+    assert config["h_threads"] == 128
+    assert config in la.delta_rule_fwd_autotune_configs(
+        kernel.dim_v, kernel.chunk_size, kernel.dim_k, kernel.wgmma
+    )
 
 
 def test_each_sweep_is_seeded_with_its_sub_kernel_untuned_launch() -> None:
@@ -122,7 +223,7 @@ def test_each_sweep_is_seeded_with_its_sub_kernel_untuned_launch() -> None:
 
     assert kernel.default_config["h_block_v"] == 32
     assert kernel.seeds == {
-        ("fused", 0): {"num_stages": 2, "threads": 256},
+        ("fused", 0): {"threads": 256},
         ("h", 0): dict(la.PIPELINE_CONFIGS[0]),
         ("h", 32): {"num_stages": 2, "threads": 256},
         ("o", 0): {"threads": 256},
@@ -186,7 +287,9 @@ def test_untunable_sub_kernel_falls_back_to_default_config() -> None:
 
 def test_selected_config_is_always_a_declared_candidate() -> None:
     kernel = _StubKernel()
-    declared = la.delta_rule_fwd_autotune_configs(kernel.dim_v)
+    declared = la.delta_rule_fwd_autotune_configs(
+        kernel.dim_v, kernel.chunk_size, kernel.dim_k, kernel.wgmma
+    )
 
     assert _run(kernel) in declared
     kernel.results = {
@@ -225,7 +328,9 @@ def test_untunable_fallback_width_is_buildable_when_dim_v_is_indivisible() -> No
 
     assert kernel.default_config["h_block_v"] == 32, "stub must diverge for this to bite"
     assert config["h_block_v"] == 0
-    assert config in la.delta_rule_fwd_autotune_configs(48)
+    assert config in la.delta_rule_fwd_autotune_configs(
+        48, kernel.chunk_size, kernel.dim_k, kernel.wgmma
+    )
 
 
 def test_a_shape_with_no_admissible_width_is_refused_by_both_entry_points() -> None:
@@ -238,13 +343,15 @@ def test_a_shape_with_no_admissible_width_is_refused_by_both_entry_points() -> N
     with pytest.raises(ValueError, match="no admissible"):
         la.default_h_block_v(8, 64)
     with pytest.raises(ValueError, match="no admissible"):
-        la.delta_rule_fwd_autotune_configs(8)
+        la.delta_rule_fwd_autotune_configs(8, 64, 64, True)
 
 
 def test_widths_resolving_to_one_tile_are_a_single_candidate() -> None:
     """At dim_v=32 both widths give a 32-column tile, so building both is waste."""
     assert la.h_block_v_candidates(32) == (0,)
-    assert {config["h_block_v"] for config in la.delta_rule_fwd_autotune_configs(32)} == {0}
+    assert {
+        config["h_block_v"] for config in la.delta_rule_fwd_autotune_configs(32, 64, 64, True)
+    } == {0}
 
 
 def test_a_width_that_fails_to_tune_does_not_sink_the_sweep() -> None:
@@ -267,7 +374,9 @@ def test_a_width_that_fails_to_tune_does_not_sink_the_sweep() -> None:
         config = _run(kernel)
 
     assert config["h_block_v"] == 0
-    assert config in la.delta_rule_fwd_autotune_configs(kernel.dim_v)
+    assert config in la.delta_rule_fwd_autotune_configs(
+        kernel.dim_v, kernel.chunk_size, kernel.dim_k, kernel.wgmma
+    )
     # When a width is dropped but the sweep survives, the warning is the only
     # diagnostic, so it is bounded the same way the raised error is.
     dropped = next(str(w.message) for w in warned if "unavailable" in str(w.message))
@@ -339,9 +448,7 @@ def test_the_raised_error_bounds_a_long_failure_text() -> None:
     widths = len(la.h_block_v_candidates(kernel.dim_v))
     assert "\n" not in message
     assert "header line" in message, "a padded preamble must not consume the summary"
-    # One bounded summary per width, plus a fixed prefix naming the shape, so
-    # the bound scales with the candidate set rather than with however many
-    # widths happen to be offered today.
+    # One bounded summary per width, plus a fixed prefix naming the shape.
     assert len(message) < 250 * widths + 100
     assert "x" * 300 not in message, "the log body must not survive whole"
     assert log in str(e.value.__cause__), "the chained cause keeps the whole text"
@@ -377,7 +484,9 @@ def test_default_h_block_v_prefers_a_tiled_width_and_stays_declared() -> None:
     assert la.default_h_block_v(48, 64) == 0  # 32 does not divide 48
     assert la.default_h_block_v(64, 32) == 0  # short chunk prefers no tiling
     for dim_v, chunk_size in ((64, 64), (96, 64), (48, 64), (64, 32)):
-        declared = {c["h_block_v"] for c in la.delta_rule_fwd_autotune_configs(dim_v)}
+        declared = {
+            c["h_block_v"] for c in la.delta_rule_fwd_autotune_configs(dim_v, chunk_size, 64, True)
+        }
         assert la.default_h_block_v(dim_v, chunk_size) in declared
 
 
@@ -426,7 +535,9 @@ def test_tune_true_reaches_the_sweep(monkeypatch) -> None:
     kernel.autotune()
 
     assert calls == [kernel_cls.__name__]
-    assert kernel.autotune_configs == la.delta_rule_fwd_autotune_configs(64)
+    assert kernel.autotune_configs == la.delta_rule_fwd_autotune_configs(
+        64, kernel.chunk_size, kernel.dim_k, kernel.wgmma
+    )
 
 
 @pytest.mark.cuda_only("cuda-kernel")

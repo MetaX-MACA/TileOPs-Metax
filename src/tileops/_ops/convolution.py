@@ -6,12 +6,14 @@ Provides:
   - Conv3dFwdOp: torch.nn.functional.conv3d
 """
 
-from typing import ClassVar, Mapping, Optional, Tuple
+from collections.abc import Mapping
+from typing import ClassVar
 
 import torch
 
 from tileops._kernels.convolution import (
     Conv1dCall,
+    Conv1dDirectKernel,
     Conv1dFwdInterface,
     Conv1dKernel,
     Conv1dPointwiseKernel,
@@ -27,11 +29,13 @@ from tileops._kernels.convolution import (
     Conv3dNdhwcKernel,
     DepthwiseConv1dKernel,
     DepthwiseConv2dKernel,
+    DepthwiseConv2dWarpKernel,
     GroupConv1dKernel,
     GroupConv2dKernel,
     GroupConv3dKernel,
 )
 from tileops._kernels.kernel_base import Kernel, KernelInterface
+from tileops._ops._spatial import per_axis_values
 from tileops._ops.op_base import Op
 from tileops._perf.profile import tensor_core_roof
 from tileops.backend import Target
@@ -43,16 +47,11 @@ __all__ = [
 ]
 
 
-def _axes(value: int | Tuple[int, ...], dims: int) -> Tuple[int, ...]:
-    """A per-axis parameter as one value per spatial axis."""
-    return (value,) * dims if isinstance(value, int) else tuple(value)
-
-
 def _padding(
-    padding: int | Tuple[int, ...] | str,
-    kernel: Tuple[int, ...],
-    dilation: Tuple[int, ...],
-) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+    padding: int | tuple[int, ...] | str,
+    kernel: tuple[int, ...],
+    dilation: tuple[int, ...],
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """The padding before and after every spatial axis.
 
     ``padding='same'`` with an odd total puts the extra element after, as torch does.
@@ -64,7 +63,7 @@ def _padding(
         total = tuple(d * (k - 1) for k, d in zip(kernel, dilation, strict=True))
         before = tuple(t // 2 for t in total)
         return before, tuple(t - b for t, b in zip(total, before, strict=True))
-    before = _axes(padding, len(kernel))
+    before = per_axis_values(padding, len(kernel))
     return before, before
 
 
@@ -73,10 +72,14 @@ def _out_dim(size: int, kernel: int, stride: int, before: int, after: int, dilat
 
 
 class Conv1dFwdOp(Op):
-    """1D convolution over an NCL input, as ``torch.nn.functional.conv1d``."""
+    """1D convolution over an NCL input, as ``torch.nn.functional.conv1d``.
+
+    Float32 operands multiply in TF32, as cuDNN does by default.
+    """
 
     kernel_types: ClassVar[Mapping[str, type[Kernel]]] = {
         "conv1d_pointwise": Conv1dPointwiseKernel,
+        "conv1d_direct": Conv1dDirectKernel,
         "conv1d": Conv1dKernel,
         "conv1d_unit_stride": Conv1dUnitStrideKernel,
         "depthwise_conv1d": DepthwiseConv1dKernel,
@@ -86,9 +89,9 @@ class Conv1dFwdOp(Op):
 
     def __init__(
         self,
-        stride: int | Tuple[int] = 1,
-        padding: int | Tuple[int] | str = 0,
-        dilation: int | Tuple[int] = 1,
+        stride: int | tuple[int] = 1,
+        padding: int | tuple[int] | str = 0,
+        dilation: int | tuple[int] = 1,
         groups: int = 1,
         *,
         target: Target = None,
@@ -113,7 +116,7 @@ class Conv1dFwdOp(Op):
         self,
         input: torch.Tensor,
         weight: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply the convolution.
 
@@ -127,15 +130,9 @@ class Conv1dFwdOp(Op):
         """
         n, c_in, l_in = input.shape
         c_out, c_in_g, kernel_l = weight.shape
-        (stride,) = _axes(self.stride, 1)
-        (dilation,) = _axes(self.dilation, 1)
-        if self.padding == "same":
-            total = dilation * (kernel_l - 1)
-            pad_left, pad_right, out_l = total // 2, total - total // 2, l_in
-        else:
-            (pad,) = (0,) if self.padding == "valid" else _axes(self.padding, 1)
-            pad_left = pad_right = pad
-            out_l = _out_dim(l_in, kernel_l, stride, pad, pad, dilation)
+        (stride,) = per_axis_values(self.stride, 1)
+        (dilation,) = per_axis_values(self.dilation, 1)
+        (pad_left,), (pad_right,) = _padding(self.padding, (kernel_l,), (dilation,))
         # A kernel is handed contiguous tensors, in the manifest's ``signature.inputs`` order;
         # a bias this call did not pass is ``None`` there.
         input = input.contiguous()
@@ -156,7 +153,7 @@ class Conv1dFwdOp(Op):
                 pad_right=pad_right,
                 dilation_l=dilation,
                 groups=self.groups,
-                out_l=out_l,
+                out_l=_out_dim(l_in, kernel_l, stride, pad_left, pad_right, dilation),
                 dtype=input.dtype,
                 has_bias=bias is not None,
                 device=input.device,
@@ -172,7 +169,7 @@ class Conv1dFwdOp(Op):
 class Conv2dFwdOp(Op):
     """2D convolution over an NCHW input, as ``torch.nn.functional.conv2d``.
 
-    They multiply float32 operands in TF32, as cuDNN does by default.
+    Float32 operands multiply in TF32, as cuDNN does by default.
     """
 
     kernel_types: ClassVar[Mapping[str, type[Kernel]]] = {
@@ -180,15 +177,16 @@ class Conv2dFwdOp(Op):
         "conv2d_symmetric": Conv2dSymmetricKernel,
         "conv2d": Conv2dKernel,
         "depthwise_conv2d": DepthwiseConv2dKernel,
+        "depthwise_conv2d_warp": DepthwiseConv2dWarpKernel,
         "group_conv2d": GroupConv2dKernel,
     }
     interfaces: ClassVar[Mapping[str, type[KernelInterface]]] = {"conv2d": Conv2dFwdInterface}
 
     def __init__(
         self,
-        stride: int | Tuple[int, int] = 1,
-        padding: int | Tuple[int, int] | str = 0,
-        dilation: int | Tuple[int, int] = 1,
+        stride: int | tuple[int, int] = 1,
+        padding: int | tuple[int, int] | str = 0,
+        dilation: int | tuple[int, int] = 1,
         groups: int = 1,
         *,
         target: Target = None,
@@ -213,7 +211,7 @@ class Conv2dFwdOp(Op):
         self,
         input: torch.Tensor,
         weight: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply the convolution.
 
@@ -227,8 +225,8 @@ class Conv2dFwdOp(Op):
         """
         n, c_in, h, w = input.shape
         c_out, c_in_g, kernel_h, kernel_w = weight.shape
-        stride = _axes(self.stride, 2)
-        dilation = _axes(self.dilation, 2)
+        stride = per_axis_values(self.stride, 2)
+        dilation = per_axis_values(self.dilation, 2)
         padding, padding_end = _padding(self.padding, (kernel_h, kernel_w), dilation)
         input = input.contiguous()
         weight = weight.contiguous()
@@ -267,7 +265,7 @@ class Conv2dFwdOp(Op):
 class Conv3dFwdOp(Op):
     """3D convolution over an NCDHW input, as ``torch.nn.functional.conv3d``.
 
-    They multiply float32 operands in TF32, as cuDNN does by default.
+    Float32 operands multiply in TF32, as cuDNN does by default.
     """
 
     kernel_types: ClassVar[Mapping[str, type[Kernel]]] = {
@@ -279,9 +277,9 @@ class Conv3dFwdOp(Op):
 
     def __init__(
         self,
-        stride: int | Tuple[int, int, int] = 1,
-        padding: int | Tuple[int, int, int] | str = 0,
-        dilation: int | Tuple[int, int, int] = 1,
+        stride: int | tuple[int, int, int] = 1,
+        padding: int | tuple[int, int, int] | str = 0,
+        dilation: int | tuple[int, int, int] = 1,
         groups: int = 1,
         *,
         target: Target = None,
@@ -306,7 +304,7 @@ class Conv3dFwdOp(Op):
         self,
         input: torch.Tensor,
         weight: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply the convolution.
 
@@ -323,8 +321,8 @@ class Conv3dFwdOp(Op):
         n, c_in, d, h, w = input.shape
         c_out, c_in_g, kernel_d, kernel_h, kernel_w = weight.shape
         kernel = (kernel_d, kernel_h, kernel_w)
-        stride = _axes(self.stride, 3)
-        dilation = _axes(self.dilation, 3)
+        stride = per_axis_values(self.stride, 3)
+        dilation = per_axis_values(self.dilation, 3)
         padding, padding_end = _padding(self.padding, kernel, dilation)
         out_d, out_h, out_w = (
             _out_dim(*axis)

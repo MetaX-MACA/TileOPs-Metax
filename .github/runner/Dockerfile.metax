@@ -1,21 +1,45 @@
 # syntax=docker/dockerfile:1.7
 # Multi-stage CI runner image for the self-hosted GPU runner.
-ARG BASE_IMAGE=cr.metax-tech.com/public-library/maca-pytorch:3.8.0.11-torch2.10-py312-ubuntu24.04-amd64
+ARG BASE_IMAGE=cr.metax-tech.com/public-library/maca-pytorch:3.9.1.2-torch2.10-py312-ubuntu24.04-amd64
 
 # ── runtime ──
 FROM ${BASE_IMAGE} AS runtime
+ENV PATH="/opt/conda/bin:${PATH}"
 ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 PIP_BREAK_SYSTEM_PACKAGES=1
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         git build-essential cmake ccache ninja-build unzip xz-utils sudo \
     && python -m pip install --upgrade pip
-# tilelang's build backend (scikit-build-core + patchelf, its [build-system].requires) and its
-# runtime deps, installed here so the tilelang stage can build with --no-build-isolation. cmake
-# from pip provides >=3.26.1 (tilelang's [tool.scikit-build] floor); jammy apt cmake is 3.22.
+# Install build tools and runtime dependencies before the isolated-dependency-free build.
 RUN python -m pip install \
-        setuptools wheel ninja scikit-build-core patchelf cmake \
-        triton apache-tvm-ffi cloudpickle ml_dtypes numpy psutil tqdm \
-        typing_extensions Cython z3-solver torch_c_dlpack_ext einops "PyYAML>=6.0"
+        setuptools wheel ninja scikit-build-core patchelf "cmake>=3.26.1" \
+        triton cloudpickle ml_dtypes numpy psutil tqdm \
+        typing_extensions "Cython>=3.1.0" "z3-solver>=4.13.0,<4.15.5" \
+        torch_c_dlpack_ext einops "PyYAML>=6.0"
+ARG MAX_JOBS=64
+ENV MAX_JOBS=${MAX_JOBS}
+RUN python -m pip install --no-cache-dir \
+    maca-python \
+    -i https://repos.metax-tech.com/r/maca-pypi/simple \
+    --trusted-host repos.metax-tech.com
+# USE_MACA must be set during the build, not only in the final image stage.
+RUN unset USE_CUDA USE_ROCM USE_METAL; \
+    git clone --branch 0.1.15 --recursive \
+      https://github.com/tile-ai/tilelang-metax.git /tmp/tilelang-metax-build \
+    && python -m pip install --no-deps --no-cache-dir --force-reinstall \
+      /tmp/tilelang-metax-build/3rdparty/tvm/3rdparty/tvm-ffi \
+    && USE_MACA=ON python -m pip install \
+      --no-build-isolation --no-deps --no-cache-dir --force-reinstall \
+      /tmp/tilelang-metax-build \
+    && rm -rf /tmp/tilelang-metax-build
+RUN python - <<'PY'
+from importlib.metadata import version
+import tilelang
+
+installed = version("tilelang")
+assert "+maca" in installed, f"Expected MACA TileLang, found {installed}"
+print(f"TileLang {installed}: {tilelang.__file__}")
+PY
 RUN python -m pip install --no-cache-dir \
     "transformers==4.45.2" \
     -i https://repos.metax-tech.com/r/maca-pypi/simple \
@@ -28,12 +52,8 @@ RUN python -m pip install --no-cache-dir --no-deps \
 RUN python - <<'PY'
 import transformers
 assert transformers.__version__ == "4.45.2", transformers.__version__
-from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
-assert mamba_chunk_scan_combined is not None
-print("mamba_ssm Triton baseline import OK")
+print("transformers version OK")
 PY
-ARG MAX_JOBS=64
-ENV MAX_JOBS=${MAX_JOBS}
 
 # ── final ──
 FROM runtime AS final

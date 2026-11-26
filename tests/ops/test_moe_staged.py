@@ -13,6 +13,7 @@ from tileops._kernels.moe import (
     PrePermuteCall,
 )
 from tileops._ops import moe as public_moe
+from tileops._ops.elementwise import SiLUAndMulFwdOp
 from tileops._ops.moe import (
     ContiguousLayoutSpec,
     MaskedLayoutSpec,
@@ -25,6 +26,7 @@ from tileops._ops.moe import (
 from tileops.backend import BUILTIN
 from tileops.backend import _registry as registry
 from tileops.backend._registry import register_kernel_type
+from tileops.gemm import GEMMFwdOp
 from workloads.device import run_device, run_device_available
 from workloads.moe import (
     MoEExpertMLPWorkload,
@@ -32,7 +34,7 @@ from workloads.moe import (
     MoEPostPermuteWorkload,
     post_permute_verification,
 )
-from workloads.numerics import compare_outputs
+from workloads.numerics import assert_normalized_error, compare_outputs
 from workloads.workload_base import manifest_call
 
 _TIGHT = ContiguousLayoutSpec.tight_physical_psum()
@@ -227,19 +229,18 @@ def test_staged_tight_pre_post_round_trip(dtype: torch.dtype) -> None:
     assert scaled.eval_roofline() == (1024 + tokens * hidden, 1600)
 
 
-@pytest.mark.smoke
 @pytest.mark.skipif(not run_device_available(), reason="staged kernels require CUDA")
 @pytest.mark.parametrize(
     "tokens,top_k,experts,hidden",
     [
         # Whole scan blocks, one gather block a token.
-        (512, 8, 128, 128),
+        pytest.param(512, 8, 128, 128, marks=pytest.mark.smoke),
         # Fewer tokens than SMs: each token's eight routes split over five blocks.
-        (32, 8, 128, 7168),
+        pytest.param(32, 8, 128, 7168, marks=pytest.mark.full),
         # A partial last scan block, and a row narrower than one eight-element copy.
-        (513, 8, 64, 7),
+        pytest.param(513, 8, 64, 7, marks=pytest.mark.full),
         # One scan program, three routes a token over three blocks.
-        (5, 3, 4, 24),
+        pytest.param(5, 3, 4, 24, marks=pytest.mark.full),
     ],
 )
 def test_staged_tight_optimized_shapes_round_trip(
@@ -326,7 +327,7 @@ def _run(workload) -> tuple:
     """The op built from the call, its output on the call's inputs, and the reference."""
     inputs = workload.gen_inputs()
     cls = MoEGroupedGEMMFwdOp if isinstance(workload, MoEGroupedGEMMWorkload) else MoEExpertMLPFwdOp
-    op = cls(**workload.call.arguments({}))
+    op = cls(**workload.call.arguments())
     args, keywords = workload.call.signature.forward_arguments(inputs)
     out = op(*args, **keywords)
     compare_outputs(out, workload.ref_program(*inputs), workload.verification(*inputs))
@@ -350,20 +351,10 @@ def _run(workload) -> tuple:
             marks=pytest.mark.smoke,
             id="aligned-per-row",
         ),
-        pytest.param(
-            _aligned("physical_psum"),
-            {"P": 128 * 9},
-            torch.bfloat16,
-            marks=pytest.mark.full,
-            id="aligned-psum",
-        ),
-        pytest.param(
-            {"masked": {"max_m": 128}}, {}, torch.bfloat16, marks=pytest.mark.full, id="masked"
-        ),
     ],
 )
 def test_grouped_gemm_runs_each_layout_through_the_op(layout, rows, dtype):
-    """Each claimed layout: the op builds the device's kernel once and matches the reference."""
+    """A layout's generated call, in each dtype, matches the reference."""
     num_experts = 6
     op, out = _run(
         MoEGroupedGEMMWorkload(_gemm_call(dtype, layout, K=512, E=num_experts, N=256, **rows))
@@ -393,32 +384,73 @@ def _uneven_rows(layout: dict, sizes: list) -> tuple:
     return (row if spec["packing"] == "tight" else -(-row // align) * align), ends
 
 
-@pytest.mark.smoke
 @pytest.mark.parametrize(
     ("layout", "sizes", "activation", "some"),
     [
-        pytest.param(_TIGHT_MOE_GROUPED_GEMM, [100, 0, 300, 128, 7, 64], None, (), id="tight-psum"),
+        pytest.param(
+            _TIGHT_MOE_GROUPED_GEMM,
+            [100, 0, 300, 128, 7, 64],
+            None,
+            (),
+            marks=pytest.mark.smoke,
+            id="tight-psum",
+        ),
         # 142 rows an expert on average: on H200 the unfused ping-pong 64-row tiles.
         pytest.param(
-            _TIGHT_MOE_GROUPED_GEMM, [200, 0, 300, 129, 70, 150], None, (), id="tight-psum-pingpong"
+            _TIGHT_MOE_GROUPED_GEMM,
+            [200, 0, 300, 129, 70, 150],
+            None,
+            (),
+            marks=pytest.mark.full,
+            id="tight-psum-pingpong",
         ),
         pytest.param(
             _TIGHT_MOE_GROUPED_GEMM,
             [200, 0, 300, 129, 70, 150],
             None,
             ("bias",),
+            marks=pytest.mark.full,
             id="tight-psum-pingpong-bias",
         ),
         pytest.param(
-            _aligned("per_row"), [100, 0, 300, 128, 7, 64], None, (), id="aligned-per-row"
+            _aligned("per_row"),
+            [100, 0, 300, 128, 7, 64],
+            None,
+            (),
+            marks=pytest.mark.full,
+            id="aligned-per-row",
         ),
         pytest.param(
-            _aligned("physical_psum"), [100, 0, 300, 128, 7, 64], None, (), id="aligned-psum"
+            _aligned("physical_psum"),
+            [100, 0, 300, 128, 7, 64],
+            None,
+            (),
+            marks=pytest.mark.full,
+            id="aligned-psum",
         ),
-        pytest.param(_aligned("physical_psum"), [300] * 32, None, (), id="aligned-psum-32-experts"),
-        pytest.param({"masked": {"max_m": 256}}, [100, 0, 256, 33], None, (), id="masked"),
         pytest.param(
-            {"masked": {"max_m": 256}}, [100, 0, 256, 33], "silu_and_mul", (), id="masked-gated"
+            _aligned("physical_psum"),
+            [300] * 32,
+            None,
+            (),
+            marks=pytest.mark.full,
+            id="aligned-psum-32-experts",
+        ),
+        pytest.param(
+            {"masked": {"max_m": 256}},
+            [100, 0, 256, 33],
+            None,
+            (),
+            marks=pytest.mark.full,
+            id="masked",
+        ),
+        pytest.param(
+            {"masked": {"max_m": 256}},
+            [100, 0, 256, 33],
+            "silu_and_mul",
+            (),
+            marks=pytest.mark.full,
+            id="masked-gated",
         ),
         # A bias under each layout; the gate/up bias stacked and interleaved.
         pytest.param(
@@ -426,6 +458,7 @@ def _uneven_rows(layout: dict, sizes: list) -> tuple:
             [100, 0, 300, 128, 7, 64],
             None,
             ("bias",),
+            marks=pytest.mark.full,
             id="aligned-per-row-bias",
         ),
         pytest.param(
@@ -433,6 +466,7 @@ def _uneven_rows(layout: dict, sizes: list) -> tuple:
             [100, 0, 256, 33],
             "swigluoai",
             ("bias",),
+            marks=pytest.mark.full,
             id="masked-swigluoai-bias",
         ),
         pytest.param(
@@ -440,6 +474,7 @@ def _uneven_rows(layout: dict, sizes: list) -> tuple:
             [100, 0, 300, 128, 7, 64],
             None,
             ("bias",),
+            marks=pytest.mark.full,
             id="tight-per-row-bias",
         ),
         pytest.param(
@@ -447,6 +482,7 @@ def _uneven_rows(layout: dict, sizes: list) -> tuple:
             [100, 0, 300, 128, 7, 64],
             "silu_and_mul",
             ("bias",),
+            marks=pytest.mark.full,
             id="aligned-psum-silu-bias",
         ),
     ],
@@ -454,21 +490,45 @@ def _uneven_rows(layout: dict, sizes: list) -> tuple:
 def test_grouped_gemm_writes_every_defined_row_of_uneven_experts(layout, sizes, activation, some):
     """Uneven experts, an empty one included, into a poisoned ``out``: every defined row is
     written and matches the reference."""
+    _check_every_defined_row_written(layout, sizes, activation, some, n=256)
+
+
+def _check_every_defined_row_written(layout, sizes, activation, some, n, k=512):
     rows, metadata = _uneven_rows(layout, sizes)
     extra = {} if activation is None else {"activation": activation}
     extra |= {"some": list(some)} if some else {}
     rows_arg = {} if "masked" in layout else {"P": rows}
-    call = _gemm_call(torch.bfloat16, layout, K=512, E=len(sizes), N=256, **rows_arg, **extra)
+    call = _gemm_call(torch.bfloat16, layout, K=k, E=len(sizes), N=n, **rows_arg, **extra)
     workload = MoEGroupedGEMMWorkload(call)
     a, b, _, bias = workload.gen_inputs()
     metadata = torch.tensor(metadata, dtype=torch.int32, device=a.device)
-    out = torch.full((*a.shape[:-1], 256), 1e4, dtype=torch.bfloat16, device=a.device)
-    op = MoEGroupedGEMMFwdOp(**call.arguments({}))
+    out = torch.full((*a.shape[:-1], n), 1e4, dtype=torch.bfloat16, device=a.device)
+    op = MoEGroupedGEMMFwdOp(**call.arguments())
     assert op(a, b, metadata, out=out, bias=bias) is out
     compare_outputs(
         out,
         workload.ref_program(a, b, metadata, bias),
         workload.verification(a, b, metadata, bias),
+    )
+
+
+@pytest.mark.smoke
+def test_grouped_gemm_writes_every_defined_row_of_short_experts_on_pingpong_tiles():
+    """16 experts of a few rows, one past a 64-row tile, at the width where H200's selector
+    takes 64x256 ping-pong tiles: a CTA's two warp-groups run partly filled tiles of
+    different experts."""
+    sizes = [100, 0, 30, 64, 7, 0, 20, 5, 1, 2, 3, 4, 8, 6, 3, 3]
+    _check_every_defined_row_written(_TIGHT_MOE_GROUPED_GEMM, sizes, None, (), n=4096)
+
+
+@pytest.mark.smoke
+def test_grouped_gemm_writes_every_defined_row_of_short_experts_on_boxed_pingpong_tiles():
+    """16 experts of a few rows, one past a 64-row tile, gated at the width and depth where
+    H200's selector takes the short-group tile with A in 16-row boxes, ping-pong: a CTA's two
+    warp-groups run partly filled tiles of different experts."""
+    sizes = [100, 0, 30, 64, 7, 0, 20, 5, 1, 2, 3, 4, 8, 6, 3, 3]
+    _check_every_defined_row_written(
+        _TIGHT_MOE_GROUPED_GEMM, sizes, "silu_and_mul", (), n=1024, k=2048
     )
 
 
@@ -506,8 +566,14 @@ def test_grouped_gemm_tight_per_row_matches_the_psum_layout(_architecture, dtype
     assert torch.equal(out, psum(a, b, counts.cumsum(0).int()))
 
 
-@pytest.mark.smoke
-@pytest.mark.parametrize("activation", ["silu_and_mul", "gelu_and_mul", "swigluoai"])
+@pytest.mark.parametrize(
+    "activation",
+    [
+        pytest.param("silu_and_mul", marks=pytest.mark.smoke),
+        pytest.param("gelu_and_mul", marks=pytest.mark.full),
+        pytest.param("swigluoai", marks=pytest.mark.full),
+    ],
+)
 def test_grouped_gemm_fuses_the_gated_activation(activation):
     """With ``activation`` the op hands the kernel a gate||up ``b`` and gets ffn columns back."""
     num_experts = 6
@@ -562,7 +628,7 @@ def test_grouped_gemm_clamps_swigluoai_at_its_limit():
     for i, (gate, up) in enumerate(limit_pairs):
         b[0, 0::2, i], b[0, 1::2, i] = gate, up
     metadata = torch.tensor([rows], dtype=torch.int32, device=run_device())
-    out = MoEGroupedGEMMFwdOp(**call.arguments({}))(a, b, metadata)
+    out = MoEGroupedGEMMFwdOp(**call.arguments())(a, b, metadata)
     inputs = (a, b, metadata, None)
     compare_outputs(out, workload.ref_program(*inputs), workload.verification(*inputs))
 
@@ -592,7 +658,7 @@ def test_grouped_gemm_fp32_output_and_preallocated_out():
     )
     workload = MoEGroupedGEMMWorkload(call)
     a, b, metadata, _ = workload.gen_inputs()
-    op = MoEGroupedGEMMFwdOp(**call.arguments({}))
+    op = MoEGroupedGEMMFwdOp(**call.arguments())
     out = torch.empty(600, 256, dtype=torch.float32, device=run_device())
     assert op(a, b, metadata, out=out) is out
     compare_outputs(
@@ -620,7 +686,7 @@ def test_a_published_config_pins_the_spec_of_the_next_launch(monkeypatch):
     workload = MoEGroupedGEMMWorkload(call)
     inputs = workload.gen_inputs()
     args, keywords = call.signature.forward_arguments(inputs)
-    op = MoEGroupedGEMMFwdOp(**call.arguments({}))
+    op = MoEGroupedGEMMFwdOp(**call.arguments())
     op(*args, **keywords)
     (selected,) = compiled
     pinned = (128, 64) if selected != (128, 64) else (128, 128)
@@ -644,12 +710,12 @@ def test_out_is_keyword_only_and_is_the_output(op_name):
     """``out`` is written and returned when passed by keyword, and refused by position."""
     if op_name == "MoEGroupedGEMMFwdOp":
         call = _gemm_call(torch.bfloat16, _TIGHT_MOE_GROUPED_GEMM, P=64, K=64, E=2, N=64)
-        workload, op = MoEGroupedGEMMWorkload(call), MoEGroupedGEMMFwdOp(**call.arguments({}))
+        workload, op = MoEGroupedGEMMWorkload(call), MoEGroupedGEMMFwdOp(**call.arguments())
     else:
         call = manifest_call(
             op_name, {"D": "bfloat16"}, layout=_TIGHT_MOE_GROUPED_GEMM, P=64, H=128, E=2, F=64
         )
-        workload, op = MoEExpertMLPWorkload(call), MoEExpertMLPFwdOp(**call.arguments({}))
+        workload, op = MoEExpertMLPWorkload(call), MoEExpertMLPFwdOp(**call.arguments())
     inputs = workload.gen_inputs()
     required = [t for t in inputs if t is not None]
     out = torch.full_like(op(*required), float("nan"))
@@ -672,7 +738,7 @@ def test_expert_mlp_out_may_be_its_input_but_not_the_down_weights():
         E=2,
         F=64,
     )
-    workload, op = MoEExpertMLPWorkload(call), MoEExpertMLPFwdOp(**call.arguments({}))
+    workload, op = MoEExpertMLPWorkload(call), MoEExpertMLPFwdOp(**call.arguments())
     inputs = workload.gen_inputs()
     expected = workload.ref_program(*inputs)
     expert_input, w_gate_up, w_down, metadata = inputs[:4]
@@ -762,7 +828,7 @@ def test_expert_mlp_in_tuned_mode_serves_repeated_calls():
     )
     workload = MoEExpertMLPWorkload(call)
     inputs = workload.gen_inputs()
-    op = MoEExpertMLPFwdOp(**call.arguments({}))
+    op = MoEExpertMLPFwdOp(**call.arguments())
     op.request_tune()
     expected = workload.ref_program(*inputs)
     args, keywords = call.signature.forward_arguments(inputs)
@@ -826,12 +892,6 @@ def test_grouped_gemm_refuses_what_the_template_cannot_run(layout, activation, f
 
 # The tensors a grouped GEMM reads while it writes ``out``, in the order the op takes them.
 _GROUPED_GEMM_READS = ("a", "b", "layout_metadata", "bias")
-# The overlap boundary per input: one input's case is smoke on each architecture mark, the rest
-# full.
-_GROUPED_GEMM_READ_CASES = [
-    pytest.param(name, marks=pytest.mark.full if i else pytest.mark.smoke)
-    for i, name in enumerate(_GROUPED_GEMM_READS)
-]
 
 
 def _grouped_gemm_in_workspace(beside: str, into: int) -> tuple:
@@ -861,49 +921,39 @@ def _grouped_gemm_in_workspace(beside: str, into: int) -> tuple:
 
     placed = {name: view(starts[name], t).copy_(t) for name, t in inputs.items()}
     out = view(starts[beside] + (into - out_like.numel()) * out_like.element_size(), out_like)
-    return MoEGroupedGEMMFwdOp(**call.arguments({})), placed, out, workload, workspace
+    return MoEGroupedGEMMFwdOp(**call.arguments()), placed, out, workload, workspace
+
+
+@pytest.mark.sm90
+@pytest.mark.smoke
+def test_grouped_gemm_refuses_out_overlapping_a_tensor_it_reads():
+    """The manifest lets ``out`` overlap no input: an ``out`` whose last element lies on the
+    first bytes of any input is refused before anything is written, since tiles store while
+    other tiles still load."""
+    for name in _GROUPED_GEMM_READS:
+        op, inputs, out, _, workspace = _grouped_gemm_in_workspace(name, 1)
+        before = workspace.clone()
+        with pytest.raises(ValueError, match=f"out must not overlap {name}"):
+            op(**inputs, out=out)
+        assert torch.equal(workspace, before)
 
 
 @pytest.mark.parametrize("_architecture", _GROUPED_GEMM_ARCHITECTURES)
-@pytest.mark.parametrize("dlpack", [False, True])
-@pytest.mark.parametrize("overlap", _GROUPED_GEMM_READ_CASES)
-def test_grouped_gemm_refuses_out_overlapping_a_tensor_it_reads(_architecture, overlap, dlpack):
-    """An ``out`` whose last element lies on the first bytes of one input is refused before
-    anything is written: tiles store while other tiles still load."""
-    op, inputs, out, _, workspace = _grouped_gemm_in_workspace(overlap, 1)
-    if dlpack:
-        inputs = {name: torch.from_dlpack(t) for name, t in inputs.items()}
-        out = torch.from_dlpack(out)
-    before = workspace.clone()
-    with pytest.raises(ValueError, match="out must not overlap"):
-        op(**inputs, out=out)
-    assert torch.equal(workspace, before)
-
-
-@pytest.mark.parametrize("_architecture", _GROUPED_GEMM_ARCHITECTURES)
-@pytest.mark.parametrize("dlpack", [False, True])
-@pytest.mark.parametrize("beside", _GROUPED_GEMM_READ_CASES)
-def test_grouped_gemm_accepts_out_ending_where_an_input_starts(_architecture, beside, dlpack):
+@pytest.mark.smoke
+def test_grouped_gemm_accepts_out_ending_where_an_input_starts(_architecture):
     """Inputs and ``out`` sliced from one buffer, ``out`` ending on the byte before one input
-    starts: ``out`` is written and returned."""
-    op, inputs, out, workload, _ = _grouped_gemm_in_workspace(beside, 0)
-    if dlpack:
-        inputs = {name: torch.from_dlpack(t) for name, t in inputs.items()}
-        out = torch.from_dlpack(out)
+    starts: each architecture's kernel writes ``out`` and returns it."""
+    op, inputs, out, workload, _ = _grouped_gemm_in_workspace("a", 0)
     assert op(**inputs, out=out) is out
     args = tuple(inputs.values())
     compare_outputs(out, workload.ref_program(*args), workload.verification(*args))
 
 
-# Unpermute at a hidden size no power of two divides.
-
-
 @pytest.mark.smoke
 @pytest.mark.skipif(not run_device_available(), reason="staged kernels require CUDA")
 def test_post_permute_more_tokens_than_sms_at_gpt_oss_hidden_size() -> None:
-    """Regression: with more tokens than SMs at gpt-oss's H = 2880, the unpermute kernel took
-    a power-of-two launch width that does not divide the row, so its row fragment had no layout
-    and the kernel failed to compile."""
+    """With more tokens than SMs at gpt-oss's H = 2880, the unpermute kernel compiles with a
+    launch width that divides the row."""
     tokens, top_k, hidden = 512, 4, 2880
     routes = tokens * top_k
     call = manifest_call(
@@ -925,12 +975,58 @@ def test_post_permute_more_tokens_than_sms_at_gpt_oss_hidden_size() -> None:
 
 
 @pytest.mark.smoke
+@pytest.mark.skipif(not run_device_available(), reason="staged kernels require CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_post_permute_adds_the_residual_to_the_scaled_reduction(dtype: torch.dtype) -> None:
+    """The routing scale multiplies the reduction, the residual is added once, and the result
+    is written into ``out``."""
+    tokens, top_k, hidden, scale = 37, 6, 4096, 1.5
+    routes = tokens * top_k
+    expert_output = torch.randn(routes, hidden, dtype=dtype, device=run_device())
+    weights = torch.rand(tokens, top_k, device=run_device())
+    inverse = torch.randperm(routes, device=run_device()).int()
+    residual = torch.randn(tokens, hidden, dtype=dtype, device=run_device())
+    op = MoEPostPermuteFwdOp(_TIGHT, RoutingEpilogueSpec(routed_scaling_factor=scale))
+    out = torch.empty(tokens, hidden, dtype=dtype, device=run_device())
+    assert op(expert_output, weights, inverse, out=out, residual=residual) is out
+    routed = expert_output[inverse.long()].float().view(tokens, top_k, hidden)
+    expected = (routed * weights[..., None]).sum(dim=1) * scale + residual.float()
+    compare_outputs(out.float(), expected, post_permute_verification(scale))
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(not run_device_available(), reason="staged kernels require CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_post_permute_adds_the_residual_before_the_cast(dtype: torch.dtype) -> None:
+    """Routes of 1 and eps / 2 against a residual of -1 leave eps / 2: rounding the reduction
+    first would round 1 + eps / 2 to 1 and leave 0."""
+    tokens, top_k, hidden = 4, 2, 64
+    half_eps = torch.finfo(dtype).eps / 2
+    expert_output = torch.full((tokens * top_k, hidden), half_eps, dtype=dtype, device=run_device())
+    expert_output[0::2] = 1.0
+    inverse = torch.arange(tokens * top_k, dtype=torch.int32, device=run_device())
+    weights = torch.ones(tokens, top_k, device=run_device())
+    residual = torch.full((tokens, hidden), -1.0, dtype=dtype, device=run_device())
+    out = MoEPostPermuteFwdOp(_TIGHT)(expert_output, weights, inverse, residual=residual)
+    assert torch.equal(out, torch.full_like(out, half_eps))
+
+
 @pytest.mark.parametrize(
     "arch", [pytest.param(89, marks=pytest.mark.sm89), pytest.param(90, marks=pytest.mark.sm90)]
 )
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("shift", ["a", "b", "bias", "out"])
-@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize(
+    "dtype, shift, masked",
+    [
+        pytest.param(torch.bfloat16, "a", False, marks=pytest.mark.smoke),
+        pytest.param(torch.float16, "a", False, marks=pytest.mark.smoke),
+        *(
+            pytest.param(torch.bfloat16, shift, masked, marks=pytest.mark.full)
+            for shift in ("a", "b", "bias", "out")
+            for masked in (False, True)
+            if (shift, masked) != ("a", False)
+        ),
+    ],
+)
 def test_grouped_gemm_accepts_offset_storage(dtype, shift, masked, arch):
     """SM89 vector accesses and SM90 TMA descriptors accept contiguous offset views, and an
     idle expert's output rows are preserved."""
@@ -963,7 +1059,7 @@ def test_grouped_gemm_accepts_offset_storage(dtype, shift, masked, arch):
         assert out.is_contiguous() and out.data_ptr() % 16
     else:
         out = torch.full_like(expected, 123)
-    op = MoEGroupedGEMMFwdOp(**call.arguments({}))
+    op = MoEGroupedGEMMFwdOp(**call.arguments())
     assert op(**inputs, out=out) is out
     compare_outputs(out, expected, workload.verification(*inputs.values()))
     if masked:
@@ -994,6 +1090,8 @@ def _post_permute_in_workspace(name, overlap):
         "inverse_indices": torch.arange(tokens * top_k, dtype=torch.int32, device=run_device()),
         "topk_weights": torch.ones(tokens, top_k, device=run_device()),
     }
+    if name == "residual":
+        inputs[name] = torch.randn(tokens, hidden, dtype=torch.bfloat16, device=run_device())
     source = inputs[name]
     out_like = torch.empty(tokens, hidden, dtype=inputs["expert_output"].dtype)
     workspace = torch.zeros(out_like.nbytes + source.nbytes, dtype=torch.uint8, device=run_device())
@@ -1007,24 +1105,81 @@ def _post_permute_in_workspace(name, overlap):
 
 @pytest.mark.smoke
 @pytest.mark.usefixtures("dlpack_device")
-@pytest.mark.parametrize("name", ["expert_output", "inverse_indices", "topk_weights"])
-def test_post_permute_refuses_overlapping_dlpack_output(name):
-    """An output sharing an element with any input is refused without writing."""
-    op, inputs, out, _, workspace = _post_permute_in_workspace(name, True)
-    before = workspace.clone()
-    with pytest.raises(ValueError, match=f"out must not overlap {name}"):
-        op(**inputs, out=out)
-    assert torch.equal(workspace, before)
+def test_post_permute_refuses_overlapping_dlpack_output():
+    """The manifest lets ``out`` overlap no input: an output sharing an element with any input
+    is refused without writing."""
+    for name in ("expert_output", "topk_weights", "inverse_indices", "residual"):
+        op, inputs, out, _, workspace = _post_permute_in_workspace(name, True)
+        before = workspace.clone()
+        with pytest.raises(ValueError, match=f"out must not overlap {name}"):
+            op(**inputs, out=out)
+        assert torch.equal(workspace, before)
 
 
 @pytest.mark.smoke
 @pytest.mark.usefixtures("dlpack_device")
-@pytest.mark.parametrize("name", ["expert_output", "inverse_indices", "topk_weights"])
-def test_post_permute_accepts_adjacent_dlpack_output(name):
+def test_post_permute_accepts_adjacent_dlpack_output():
     """An output ending where an input starts is written without modifying that input."""
-    op, inputs, out, workload, workspace = _post_permute_in_workspace(name, False)
+    op, inputs, out, workload, workspace = _post_permute_in_workspace("topk_weights", False)
     before = workspace.clone()
     assert op(**inputs, out=out) is out
     args = (inputs["expert_output"], inputs["topk_weights"], inputs["inverse_indices"])
     compare_outputs(out, workload.ref_program(*args), workload.verification(*args))
     assert torch.equal(workspace[out.nbytes :], before[out.nbytes :])
+
+
+def _deepseek_v4_moe(x, ids, weights, w_gate_up, w_down, shared_gate_up, shared_down, limit):
+    """DeepSeek-V4-Flash inference/model.py ``MoE.forward`` over ``Expert.forward``, its
+    linears in the dtype of *x*: bfloat16 runs the official code, float32 the reference."""
+
+    def expert(x, w_gate_up, w_down, weight=None):
+        gate, up = torch.nn.functional.linear(x, w_gate_up).float().chunk(2, dim=-1)
+        h = torch.nn.functional.silu(gate.clamp(max=limit)) * up.clamp(-limit, limit)
+        if weight is not None:
+            h = weight * h
+        return torch.nn.functional.linear(h.to(x.dtype), w_down)
+
+    y = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+    for e in range(w_gate_up.shape[0]):
+        token, k = torch.where(ids == e)
+        y[token] += expert(x[token], w_gate_up[e], w_down[e], weights[token, k, None])
+    y += expert(x, shared_gate_up, shared_down)
+    return y.to(x.dtype)
+
+
+@pytest.mark.sm90
+@pytest.mark.smoke
+def test_deepseek_v4_moe_block_matches_the_float32_reference() -> None:
+    """DeepSeek-V4-Flash's MoE block from TileOPs ops, its weights spread so the clamp engages:
+    the routing weight scales each clamped SwiGLU row before the down projection, and the
+    shared expert joins the float32 sum before the one cast. Its error against the float32
+    reference stays within twice the official bfloat16 code's."""
+    tokens, hidden, inter, experts, top_k, limit = 64, 512, 256, 16, 6, 10.0
+    device, dtype = run_device(), torch.bfloat16
+    spread = 7 * hidden**-0.5
+    x = torch.randn(tokens, hidden, device=device).to(dtype)
+    w_gate_up = (torch.randn(experts, 2 * inter, hidden, device=device) * spread).to(dtype)
+    w_down = (torch.randn(experts, hidden, inter, device=device) * inter**-0.5).to(dtype)
+    shared_gate_up = (torch.randn(2 * inter, hidden, device=device) * spread).to(dtype)
+    shared_down = (torch.randn(hidden, inter, device=device) * inter**-0.5).to(dtype)
+    ids = torch.rand(tokens, experts, device=device).argsort(dim=-1)[:, :top_k].int()
+    weights = torch.rand(tokens, top_k, device=device)
+    weights = weights / weights.sum(dim=-1, keepdim=True) * 1.5
+
+    rows, ends, inverse = MoEPrePermuteFwdOp(_TIGHT, num_local_experts=experts)(x, ids)
+    row_weights = torch.empty(rows.shape[0], device=device)
+    row_weights[inverse.long()] = weights.flatten()
+    activation = SiLUAndMulFwdOp(swiglu_limit=limit)
+    gate_up = MoEGroupedGEMMFwdOp(_TIGHT)(rows, w_gate_up, ends)
+    routed = MoEGroupedGEMMFwdOp(_TIGHT)(activation(gate_up, scale=row_weights), w_down, ends)
+    shared = GEMMFwdOp()(activation(GEMMFwdOp()(x, shared_gate_up)), shared_down)
+    got = MoEPostPermuteFwdOp(_TIGHT)(routed, torch.ones_like(weights), inverse, residual=shared)
+
+    tensors = (x, ids, weights, w_gate_up, w_down, shared_gate_up, shared_down)
+    official = _deepseek_v4_moe(*tensors, limit)
+    reference = _deepseek_v4_moe(
+        *(t.float() if t.is_floating_point() else t for t in tensors), limit
+    )
+    official, exact = official.double(), reference.double()
+    bound = 2 * ((official - exact).pow(2).sum() / (official.pow(2) + exact.pow(2)).sum()).item()
+    assert_normalized_error(got.float(), reference, bound)

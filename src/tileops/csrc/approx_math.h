@@ -26,4 +26,16 @@ __device__ __forceinline__ float approx_tanh(float x) {
 #endif
 }
 
+// One MUFU.RCP. Not ``asm volatile`` as TileLang's ``fast_rcp`` is, so nvcc
+// hoists a loop-invariant reciprocal and merges repeated ones.
+__device__ __forceinline__ float approx_rcp(float x) {
+#if defined(__MACA_ARCH__)
+  return 1.0f / x;
+#else
+  float r;
+  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
+  return r;
+#endif
+}
+
 }  // namespace tileops

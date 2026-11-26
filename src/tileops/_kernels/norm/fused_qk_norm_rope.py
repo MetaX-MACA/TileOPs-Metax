@@ -3,24 +3,32 @@
 ``qkv`` is ``[N, (H + 2 Hk) D]``: H q heads, Hk k heads, Hk v heads, D values each. For token
 ``n`` and q or k head ``h``, over the head's values ``x``::
 
-    y = x * rsqrt(mean(x^2) + eps) * w            (w = q_weight or k_weight)
+    y = x * rsqrt(mean(x^2) + eps) * w            (w = q_weight or k_weight; 1 + w zero-centered)
     c, s = cos_sin_cache[positions[n], :R/2], cos_sin_cache[positions[n], R/2:]
     neox:        (y[i], y[i + R/2]) <- (y[i] c[i] - y[i + R/2] s[i], y[i + R/2] c[i] + y[i] s[i])
     interleaved: (y[2i], y[2i + 1]) <- (y[2i] c[i] - y[2i + 1] s[i], y[2i + 1] c[i] + y[2i] s[i])
+
+With interleaved multimodal sections, ``positions`` is ``[3, N]`` and frequency ``i`` takes
+``c[i]``, ``s[i]`` from the row of ``positions[1, n]`` where ``i % 3 == 1 and i < 3 * sections[1]``,
+of ``positions[2, n]`` where ``i % 3 == 2 and i < 3 * sections[2]``, else of ``positions[0, n]``.
 
 Values past R pass through normalized; the v heads are not touched. The arithmetic is float32
 and each value rounds once to the qkv dtype.
 """
 
-from typing import Optional
+import operator
 
 import tilelang
 import tilelang.language as T
 import torch
 
 from tileops._kernels.build_target import target_cache
+from tileops._kernels.constants import VECTOR_ACCESS_BYTES
 from tileops._kernels.kernel_base import Entry, Kernel
+from tileops._kernels.norm._config import rms_scale
 from tileops._kernels.norm.call_spec import FusedQKNormRoPECall, FusedQKNormRoPEFwdInterface
+from tileops._kernels.warp_reduce import warp_reduce
+from tileops._utils import WARP_LANES
 
 __all__ = ["FusedQKNormRoPEKernel"]
 
@@ -28,7 +36,7 @@ __all__ = ["FusedQKNormRoPEKernel"]
 def _vector(dim: int, rot: int, dtype: torch.dtype) -> int:
     """Values a lane moves per access: the widest of one 16-byte vector, 4, 2 or 1 whose pairs
     tile both the rotated and the passed-through values. Needs an even ``dim``."""
-    widest = 16 // torch.empty((), dtype=dtype).element_size()
+    widest = VECTOR_ACCESS_BYTES // dtype.itemsize
     return next(v for v in (widest, 4, 2, 1) if dim % (2 * v) == 0 and rot % (2 * v) == 0)
 
 
@@ -43,7 +51,13 @@ def _fused_qk_norm_rope_kernel(
     dtype: str,
     cache_dtype: str,
     vec: int,
+    zero_centered: bool,
+    mrope: bool,
+    height_end: int,
+    width_end: int,
 ):
+    """``mrope`` reads ``[3, N]`` positions of interleaved multimodal sections, whose height and
+    width frequencies end at ``height_end = 3 * sections[1]`` and ``width_end = 3 * sections[2]``."""
     qk = heads + kv_heads
     width = (heads + 2 * kv_heads) * dim
     half = rot // 2
@@ -58,10 +72,15 @@ def _fused_qk_norm_rope_kernel(
     rot_lanes = half // vec
     rest = (dim - rot) // 2
 
-    @tilelang.jit(out_idx=[])
+    # A multimodal row picks each value's cache row with selects the bounds check would branch
+    # around; the op's contract keeps positions in [0, P), so that program carries none.
+    unchecked = {tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True}
+
+    @tilelang.jit(out_idx=[], pass_configs=unchecked if mrope else None)
     def _func(threads: int):
         tokens = T.dynamic("tokens")
         positions_max = T.dynamic("positions_max")
+        position_shape = (3, tokens) if mrope else (tokens,)
         rows = threads // group
         blocks = -(-qk // rows)
 
@@ -72,25 +91,13 @@ def _fused_qk_norm_rope_kernel(
             x[i] = a * c - x[j] * s
             x[j] = x[j] * c + a * s
 
-        @T.macro
-        def add_lanes(ss, mask):
-            ss[0] = ss[0] + T.shfl_xor(ss[0], mask)
-
-        def reduce_group(ss):
-            """Sum ss over the row's group of lanes. A plain function: the builder would turn a
-            loop inside the prim_func into a TIR loop."""
-            mask = group // 2
-            while mask:
-                add_lanes(ss, mask)
-                mask //= 2
-
         @T.prim_func
         def main(
             qkv: T.Tensor((tokens, width), dtype),
             q_weight: T.Tensor((dim,), dtype),
             k_weight: T.Tensor((dim,), dtype),
             cos_sin_cache: T.Tensor((positions_max, rot), cache_dtype),
-            positions: T.Tensor((tokens,), "int64"),
+            positions: T.Tensor(position_shape, "int64"),
         ):
             # A CTA is `rows` consecutive q/k heads of one token, `group` lanes a head. CTAs
             # are numbered token-major, so the CTAs resident at once read one stretch of qkv.
@@ -120,14 +127,21 @@ def _fused_qk_norm_rope_kernel(
                 sr = T.alloc_local((vec,), cache_dtype)
                 x = T.alloc_local((2 * vec,), "float32")
                 ss = T.alloc_local((1,), "float32")
-                pos = T.alloc_local((1,), "int64")
+                pos = T.alloc_local((3 if mrope else 1,), "int64")
+                if mrope:
+                    phase_row = T.alloc_local((3,), "int64")
+                    phase_end = T.alloc_local((3,), "int32")
                 for v in T.unroll(vec):
                     va[v] = T.cast(0, dtype)
                     vb[v] = T.cast(0, dtype)
                 # Every load is issued before the first one is waited on: the position first,
                 # whose cos/sin row is the one dependent load, then the weights and the row.
                 if rotates:
-                    pos[0] = positions[n]
+                    if mrope:
+                        for a in T.unroll(3):
+                            pos[a] = positions[a, n]
+                    else:
+                        pos[0] = positions[n]
                 if live:
                     if h < heads:
                         for v in T.vectorized(vec):
@@ -144,20 +158,46 @@ def _fused_qk_norm_rope_kernel(
                     for v in T.vectorized(vec):
                         vb[v] = qkv[n, h * dim + o2 + v]
                 if rotates:
-                    for v in T.vectorized(vec):
-                        cr[v] = cos_sin_cache[pos[0], cbase + v]
-                    for v in T.vectorized(vec):
-                        sr[v] = cos_sin_cache[pos[0], half + cbase + v]
+                    if mrope:
+                        # The lane's first frequency fixes v's residue, so the row and section
+                        # end are picked once a residue (k = v % 3); each value reads its row.
+                        first = cbase % 3
+                        temporal = pos[0]
+                        for k in T.unroll(3):
+                            residue = (first + k) % 3
+                            phase_row[k] = T.if_then_else(
+                                residue == 1,
+                                pos[1],
+                                T.if_then_else(residue == 2, pos[2], temporal),
+                            )
+                            phase_end[k] = T.if_then_else(
+                                residue == 1,
+                                height_end,
+                                T.if_then_else(residue == 2, width_end, half),
+                            )
+                        for v in T.unroll(vec):
+                            row = T.if_then_else(
+                                cbase + v < phase_end[v % 3], phase_row[v % 3], temporal
+                            )
+                            cr[v] = cos_sin_cache[row, cbase + v]
+                            sr[v] = cos_sin_cache[row, half + cbase + v]
+                    else:
+                        for v in T.vectorized(vec):
+                            cr[v] = cos_sin_cache[pos[0], cbase + v]
+                        for v in T.vectorized(vec):
+                            sr[v] = cos_sin_cache[pos[0], half + cbase + v]
                 ss[0] = T.float32(0)
                 for v in T.unroll(vec):
                     x[v] = T.cast(va[v], "float32")
                     x[vec + v] = T.cast(vb[v], "float32")
                     ss[0] += x[v] * x[v] + x[vec + v] * x[vec + v]
-                reduce_group(ss)
+                warp_reduce(ss, operator.add, lanes=group)
                 scale = T.rsqrt(ss[0] / T.float32(dim) + T.float32(eps))
                 for v in T.unroll(vec):
-                    x[v] = x[v] * scale * T.cast(wa[v], "float32")
-                    x[vec + v] = x[vec + v] * scale * T.cast(wb[v], "float32")
+                    x[v] = x[v] * scale * rms_scale(T.cast(wa[v], "float32"), zero_centered)
+                    x[vec + v] = (
+                        x[vec + v] * scale * rms_scale(T.cast(wb[v], "float32"), zero_centered)
+                    )
                 if rotates:
                     for u in T.unroll(vec):
                         c = T.cast(cr[u], "float32")
@@ -195,16 +235,24 @@ class FusedQKNormRoPEKernel(Kernel, FusedQKNormRoPEFwdInterface):
         cache_dtype: float16, bfloat16 or float32, of the cos/sin cache.
         config: Optional ``{"threads"}`` override.
         device_index: The device the kernel runs on.
+        zero_centered: Whether to scale by ``1 + weight``, formed in float32.
+        mrope_ends: ``(3 * sections[1], 3 * sections[2])`` of interleaved multimodal sections,
+            whose ``positions`` are ``[3, N]``; ``None`` for one position a token.
     """
 
     supported_archs: list[int] = [80, 86, 89, 90]
 
     @classmethod
-    def refusal(cls, call: FusedQKNormRoPECall) -> Optional[str]:
+    def refusal(cls, call: FusedQKNormRoPECall) -> str | None:
+        if call.mrope_section is not None and not call.mrope_interleaved:
+            return (
+                "the kernel assigns the three positions' frequencies interleaved; "
+                "consecutive sections (mrope_interleaved=False) are not served"
+            )
         if call.dim % 2:
             return f"a lane holds pairs of values, so the head dim must be even, not {call.dim}"
         lanes = call.dim // (2 * _vector(call.dim, call.rot, call.dtype))
-        if lanes > 32:
+        if lanes > WARP_LANES:
             return (
                 f"a head of {call.dim} values with {call.rot} rotated needs {lanes} lanes; "
                 "its sum of squares is reduced inside one warp of 32"
@@ -223,8 +271,14 @@ class FusedQKNormRoPEKernel(Kernel, FusedQKNormRoPEFwdInterface):
             call.dtype,
             call.cache_dtype,
         )
-        index = call.device.index if call.device is not None else None
-        return (*args, index), lambda: cls(*args, device_index=index)
+        sections = call.mrope_section
+        options = {
+            "zero_centered": call.zero_centered,
+            "mrope_ends": None if sections is None else (3 * sections[1], 3 * sections[2]),
+        }
+        index = call.device_index
+        key = (*args, *options.values(), index)
+        return key, lambda: cls(*args, **options, device_index=index)
 
     def __init__(
         self,
@@ -236,8 +290,11 @@ class FusedQKNormRoPEKernel(Kernel, FusedQKNormRoPEFwdInterface):
         eps: float,
         dtype: torch.dtype,
         cache_dtype: torch.dtype,
-        config: Optional[dict] = None,
-        device_index: Optional[int] = None,
+        config: dict | None = None,
+        device_index: int | None = None,
+        *,
+        zero_centered: bool = False,
+        mrope_ends: tuple[int, int] | None = None,
     ) -> None:
         super().__init__(device_index=device_index)
         self.dtype = dtype
@@ -252,6 +309,9 @@ class FusedQKNormRoPEKernel(Kernel, FusedQKNormRoPEFwdInterface):
             self.dtype_str,
             str(cache_dtype).removeprefix("torch."),
             self.vec,
+            zero_centered,
+            mrope_ends is not None,
+            *(mrope_ends or (0, 0)),
         )
         self.init_config(config)
 

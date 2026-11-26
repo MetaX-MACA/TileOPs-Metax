@@ -20,7 +20,7 @@ from workloads.reduction import ArgreduceCase, reduction_verification
 def _call(op, x: torch.Tensor) -> torch.Tensor:
     """Invoke a single-output argreduce op and narrow the return to ``Tensor``.
 
-    The shared ``OpBase.__call__`` is typed as ``Union[Tensor, tuple]`` to
+    The shared ``Op.__call__`` is typed as ``Tensor | tuple[Tensor, ...]`` to
     accommodate ops with multiple outputs.  Argreduce ops always return a
     single ``Tensor``; this helper keeps the call sites well-typed without
     sprinkling ``cast(...)`` everywhere.
@@ -36,7 +36,7 @@ class ArgreduceBasicFixture(FixtureBase):
                 pytest.param(128, 512, torch.float32, marks=pytest.mark.smoke),
                 pytest.param(128, 512, torch.float16, marks=pytest.mark.smoke),
                 pytest.param(128, 512, torch.bfloat16, marks=pytest.mark.smoke),
-                pytest.param(2048, 4096, torch.bfloat16, marks=pytest.mark.smoke),
+                pytest.param(2048, 4096, torch.bfloat16, marks=pytest.mark.full),
                 pytest.param(256, 4096, torch.float16, marks=pytest.mark.full),
                 pytest.param(256, 4096, torch.bfloat16, marks=pytest.mark.full),
                 # Non-aligned N (non-pow2 last dim)
@@ -569,9 +569,15 @@ def test_argreduce_first_index_and_nan_semantics(op_kind: str) -> None:
     compare_outputs(y, ref, reduction_verification((ref).dtype))
 
 
-@pytest.mark.smoke
 @pytest.mark.parametrize("op_kind", ["argmax", "argmin"])
-@pytest.mark.parametrize("n", [8, 4096, 40960])
+@pytest.mark.parametrize(
+    "n",
+    [
+        pytest.param(8, marks=pytest.mark.smoke),
+        pytest.param(4096, marks=pytest.mark.full),
+        pytest.param(40960, marks=pytest.mark.full),
+    ],
+)
 def test_argreduce_ties_between_two_nans(op_kind: str, n: int) -> None:
     """Two NaNs tie, so the lower index wins — on every reduction layout.
 

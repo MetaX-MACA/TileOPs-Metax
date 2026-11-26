@@ -72,7 +72,7 @@ def _check(workload, op):
             FP16,
             FP8,
             [63, 0],
-            marks=pytest.mark.smoke,
+            marks=pytest.mark.full,
             id="fp8-fp16-page-boundary",
         ),
         # 20 + 6 columns are off the 8-element vector, so the columns move narrower.
@@ -88,6 +88,21 @@ def _check(workload, op):
             marks=pytest.mark.full,
             id="bf16-columns-off-the-vector",
         ),
+        # Two 4104-wide latent rows are 1026 vectors, past a block's 1024 threads: the latent
+        # takes a second round, and k_pe's 1024 vectors start on the threads it leaves idle in
+        # that round and run into a third.
+        pytest.param(
+            3,
+            4104,
+            4096,
+            7,
+            3,
+            BF16,
+            BF16,
+            [20, 0, 6],
+            marks=pytest.mark.full,
+            id="bf16-latent-past-the-block",
+        ),
         # No latent columns: the latent copy writes nothing and is never built.
         pytest.param(
             3,
@@ -100,6 +115,20 @@ def _check(workload, op):
             [1, -1, 20],
             marks=pytest.mark.full,
             id="no-latent-columns",
+        ),
+        # No k_pe columns, GLM-5.3-Flash's latent-only row: the 16-bit program copies the
+        # latent alone and never builds the k_pe copy.
+        pytest.param(
+            5,
+            512,
+            0,
+            64,
+            2,
+            BF16,
+            BF16,
+            [70, -1, 0, 127, 64],
+            marks=pytest.mark.full,
+            id="bf16-no-rope-columns",
         ),
         # An odd token count leaves the last block with one token.
         pytest.param(
@@ -178,7 +207,7 @@ def test_mla_kv_cache_write_copies_the_named_rows(
             FP16,
             [9, 2, -1],
             False,
-            marks=pytest.mark.smoke,
+            marks=pytest.mark.full,
             id="neox-fp8",
         ),
         # Half of a 6-wide k_pe is odd: a neox thread holds one element of each half.

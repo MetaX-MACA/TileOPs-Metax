@@ -1,6 +1,6 @@
 """INT8 dequantize kernels."""
 
-from typing import ClassVar, Optional
+from typing import ClassVar
 
 import tilelang
 import tilelang.language as T
@@ -20,7 +20,6 @@ from tileops._kernels.quantization.call_spec import (
     INT8DequantPerChannelFwdInterface,
     INT8DequantPerTensorFwdInterface,
 )
-from tileops._utils import get_sm_version
 
 __all__ = [
     "INT8DequantPerBlockFwdKernel",
@@ -30,11 +29,13 @@ __all__ = [
     "INT8DequantPerTensorSmallFwdKernel",
 ]
 
-# The float32 bit pattern of 2^23 + 128. Adding an int8 code c to it gives the pattern of
-# 2^23 + 128 + c exactly, so subtracting 2^23 + 128 recovers float(c) with an integer add
-# and an FADD instead of I2F, which issues 16 results per clock per SM against FADD's 128.
-_CODE_BIAS_BITS = 0x4B000080
-_CODE_BIAS = 8388736.0
+
+def _code_to_float(code):
+    """The float32 value of an int8 *code*, by an integer add and an FADD instead of I2F,
+    which issues 16 results per clock per SM against FADD's 128."""
+    # 0x4B000080 is the float32 bit pattern of 2^23 + 128. Adding c to it gives the pattern
+    # of 2^23 + 128 + c exactly, and subtracting 2^23 + 128 leaves float(c).
+    return T.reinterpret(T.Cast(T.int32, code) + 0x4B000080, T.float32) - 8388736.0
 
 
 @target_cache(maxsize=32)
@@ -118,13 +119,12 @@ class INT8DequantPerChannelFwdKernel(Kernel, INT8DequantPerChannelFwdInterface):
     # ``q`` is data: random codes run the same instructions as real ones.
     autotune_accepts_random_int_inputs: bool = True
 
-    # H200 launch configs by output element width; two steps overlap two loads per thread.
+    # Launch configs by output element width; two steps overlap two loads per thread.
     _CONFIGS: ClassVar[dict[int, dict]] = {
         2: {"threads": 128, "steps": 2},
         4: {"threads": 512, "steps": 2},
     }
-    # Below _SMALL_N codes, blocks of 1024 codes measured fastest: the matrix spreads
-    # over more SMs.
+    # Below _SMALL_N codes, blocks of 1024 codes spread the matrix over more SMs.
     _SMALL_CONFIGS: ClassVar[dict[int, dict]] = {
         2: {"threads": 128, "steps": 1},
         4: {"threads": 128, "steps": 2},
@@ -134,7 +134,7 @@ class INT8DequantPerChannelFwdKernel(Kernel, INT8DequantPerChannelFwdInterface):
     _TUNE_STEPS: ClassVar[tuple[int, ...]] = (1, 2, 4)
 
     @classmethod
-    def refusal(cls, call: DequantizeCall) -> Optional[str]:
+    def refusal(cls, call: DequantizeCall) -> str | None:
         reason = super().refusal(call)
         # The last block's indices run up to one block past M * K; the widest block holds
         # 16-bit codes, VECTOR_ACCESS_BYTES // 2 per thread per step.
@@ -145,7 +145,7 @@ class INT8DequantPerChannelFwdKernel(Kernel, INT8DequantPerChannelFwdInterface):
 
     @classmethod
     def entry_for(cls, call: DequantizeCall) -> Entry:
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         identity = (call.m, call.k, call.out_dtype, index)
         return identity, lambda: cls(*identity[:3], device_index=index)
 
@@ -154,8 +154,8 @@ class INT8DequantPerChannelFwdKernel(Kernel, INT8DequantPerChannelFwdInterface):
         m: int,
         k: int,
         out_dtype: torch.dtype,
-        config: Optional[dict] = None,
-        device_index: "int | None" = None,
+        config: dict | None = None,
+        device_index: int | None = None,
     ):
         super().__init__(device_index=device_index)
         self.m = m
@@ -194,9 +194,10 @@ def _int8_dequant_per_tensor_kernel(
         chunk = threads * vec
         block = chunk * steps
         full_blocks = n // block
-
-        def code_to_float(code):
-            return T.reinterpret(T.Cast(T.int32, code) + _CODE_BIAS_BITS, T.float32) - _CODE_BIAS
+        # Keep bulk stores aligned to 16 bytes; handle the remainder separately.
+        whole = n // vec * vec
+        tail_whole = whole - full_blocks * block
+        rest = n - whole
 
         @T.prim_func
         def _int8_dequant_per_tensor_main(
@@ -215,53 +216,46 @@ def _int8_dequant_per_tensor_kernel(
                 s = T.alloc_var(T.float32)
                 # Every block reads the one scale: kept in L1, later blocks on an SM hit it.
                 s = T.call_extern(T.float32, "tileops::load_f32_evict_last", T.address_of(scale[0]))
-                if bx < full_blocks:
-                    # Every load of the block issues before the first conversion.
+                # Clamp excess loads to the last vector; only valid lanes are stored below.
+                if whole > 0:
                     for r in T.unroll(steps):
                         for j in T.vectorized(vec):
-                            q_local[r * vec + j] = q[bx * block + r * chunk + tx * vec + j]
-                    if staged:
-                        for r in T.unroll(steps):
-                            for j in T.unroll(vec):
+                            q_local[r * vec + j] = q[
+                                T.min(bx * block + r * chunk + tx * vec, whole - vec) + j
+                            ]
+                    for r in T.unroll(steps):
+                        for j in T.unroll(vec):
+                            if staged:
                                 x_shared[r * chunk + tx * vec + j] = T.Cast(
-                                    out_dtype, code_to_float(q_local[r * vec + j]) * s
+                                    out_dtype, _code_to_float(q_local[r * vec + j]) * s
                                 )
+                            else:
+                                x_local[r * vec + j] = T.Cast(
+                                    out_dtype, _code_to_float(q_local[r * vec + j]) * s
+                                )
+                if bx < full_blocks:
+                    if staged:
                         # One bulk store of the block's output.
                         T.copy(x_shared, x[bx * block : (bx + 1) * block])
                     else:
                         for r in T.unroll(steps):
-                            for j in T.unroll(vec):
-                                x_local[r * vec + j] = T.Cast(
-                                    out_dtype, code_to_float(q_local[r * vec + j]) * s
-                                )
-                        for r in T.unroll(steps):
                             for j in T.vectorized(vec):
                                 x[bx * block + r * chunk + tx * vec + j] = x_local[r * vec + j]
                 else:
-                    # The last block moves whole vectors where they fit, and code by code,
-                    # with loads clamped to the last code, where the run ends.
-                    for r in T.unroll(steps):
-                        base = bx * block + r * chunk + tx * vec
-                        if base + vec <= n:
-                            for j in T.vectorized(vec):
-                                q_local[r * vec + j] = q[base + j]
-                        else:
-                            for j in T.unroll(vec):
-                                q_local[r * vec + j] = q[T.min(base + j, n - 1)]
-                    for r in T.unroll(steps):
-                        for j in T.unroll(vec):
-                            x_local[r * vec + j] = T.Cast(
-                                out_dtype, code_to_float(q_local[r * vec + j]) * s
+                    if tail_whole > 0:
+                        if staged:
+                            T.copy(
+                                x_shared[0:tail_whole],
+                                x[full_blocks * block : full_blocks * block + tail_whole],
                             )
-                    for r in T.unroll(steps):
-                        base = bx * block + r * chunk + tx * vec
-                        if base + vec <= n:
-                            for j in T.vectorized(vec):
-                                x[base + j] = x_local[r * vec + j]
                         else:
-                            for j in T.unroll(vec):
-                                if base + j < n:
-                                    x[base + j] = x_local[r * vec + j]
+                            for r in T.unroll(steps):
+                                base = full_blocks * block + r * chunk + tx * vec
+                                if base < whole:
+                                    for j in T.vectorized(vec):
+                                        x[base + j] = x_local[r * vec + j]
+                    if rest > 0 and tx < rest:
+                        x[whole + tx] = T.Cast(out_dtype, _code_to_float(q[whole + tx]) * s)
 
         return _int8_dequant_per_tensor_main
 
@@ -274,7 +268,8 @@ class INT8DequantPerTensorFwdKernel(Kernel, INT8DequantPerTensorFwdInterface):
     The matrix is read as one flat run of ``n`` codes. A thread converts one 16-byte
     vector of ``x`` per step, ``steps`` steps per block with every load issued first, and
     the block stages its output in shared memory and writes it with one bulk copy. The
-    last block converts code by code against ``n``.
+    last block stores only its whole vectors that way and converts the ``n % vec`` codes
+    after them one a thread.
 
     Args:
         n: Codes in ``q``, ``M * K``.
@@ -301,7 +296,7 @@ class INT8DequantPerTensorFwdKernel(Kernel, INT8DequantPerTensorFwdInterface):
     _TUNE_STEPS: ClassVar[tuple[int, ...]] = (2, 4, 8)
 
     @classmethod
-    def refusal(cls, call: DequantizeCall) -> Optional[str]:
+    def refusal(cls, call: DequantizeCall) -> str | None:
         reason = super().refusal(call)
         # The last block's indices run up to one block past M * K; the widest block holds
         # 16-bit codes, VECTOR_ACCESS_BYTES // 2 per thread per step.
@@ -312,7 +307,7 @@ class INT8DequantPerTensorFwdKernel(Kernel, INT8DequantPerTensorFwdInterface):
 
     @classmethod
     def entry_for(cls, call: DequantizeCall) -> Entry:
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         identity = (call.m * call.k, call.out_dtype, index)
         return identity, lambda: cls(*identity[:2], device_index=index)
 
@@ -320,17 +315,15 @@ class INT8DequantPerTensorFwdKernel(Kernel, INT8DequantPerTensorFwdInterface):
         self,
         n: int,
         out_dtype: torch.dtype,
-        config: Optional[dict] = None,
-        device_index: "int | None" = None,
+        config: dict | None = None,
+        device_index: int | None = None,
     ):
         super().__init__(device_index=device_index)
-        self.n = n
         self.dtype = out_dtype
         # Codes per thread per step: one 16-byte vector of ``x``.
         vec = VECTOR_ACCESS_BYTES // out_dtype.itemsize
-        device = torch.device("cuda", device_index) if device_index is not None else None
-        resident_threads = torch.cuda.get_device_properties(device).max_threads_per_multi_processor
-        resident_blocks = SM_RESIDENT_BLOCKS[get_sm_version(device_index)]
+        resident_threads = self.build_target.threads_per_sm
+        resident_blocks = SM_RESIDENT_BLOCKS[self.build_target.arch]
         self.kernel = _int8_dequant_per_tensor_kernel(
             n, self.dtype_str, vec, self._STAGED, resident_threads, resident_blocks
         )
@@ -373,7 +366,7 @@ class INT8DequantPerTensorSmallFwdKernel(INT8DequantPerTensorFwdKernel):
     _SMALL_N: ClassVar[int] = 1 << 19
 
     @classmethod
-    def refusal(cls, call: DequantizeCall) -> "str | None":
+    def refusal(cls, call: DequantizeCall) -> str | None:
         if call.m * call.k >= cls._SMALL_N:
             return f"serves fewer than {cls._SMALL_N} elements, got {call.m * call.k}"
         return super().refusal(call)
@@ -410,9 +403,6 @@ def _int8_dequant_per_block_kernel(
         # and at every row start.
         block_scales = block // QUANT_SCALE_BLOCK + block // k + 3
 
-        def code_to_float(code):
-            return T.reinterpret(T.Cast(T.int32, code) + _CODE_BIAS_BITS, T.float32) - _CODE_BIAS
-
         def scaled(q_local, s_local, cross, r, j):
             # The scale of code j of step r's vector: the lanes before each boundary take
             # the earlier scale.
@@ -427,7 +417,7 @@ def _int8_dequant_per_block_kernel(
                 )
             elif straddles:
                 s = T.if_then_else(j < cross[r * 2], s, s_local[r * spans + 1])
-            return T.Cast(out_dtype, code_to_float(q_local[r * vec + j]) * s)
+            return T.Cast(out_dtype, _code_to_float(q_local[r * vec + j]) * s)
 
         @T.macro
         def load_scales(src, first, last, s_local, cross, r, base):
@@ -503,7 +493,7 @@ def _int8_dequant_per_block_kernel(
                             if idx < n:
                                 x[idx] = T.Cast(
                                     out_dtype,
-                                    code_to_float(q[idx])
+                                    _code_to_float(q[idx])
                                     * scale[idx // k * per_row + idx % k // QUANT_SCALE_BLOCK],
                                 )
                 elif bx < full_blocks:
@@ -594,7 +584,7 @@ class INT8DequantPerBlockFwdKernel(Kernel, INT8DequantPerBlockFwdInterface):
     _TUNE_STEPS: ClassVar[tuple[int, ...]] = (2, 4, 8)
 
     @classmethod
-    def refusal(cls, call: DequantizeCall) -> Optional[str]:
+    def refusal(cls, call: DequantizeCall) -> str | None:
         reason = super().refusal(call)
         # The last block's indices run up to one block past M * K; the widest block holds
         # 16-bit codes, VECTOR_ACCESS_BYTES // 2 per thread per step.
@@ -605,7 +595,7 @@ class INT8DequantPerBlockFwdKernel(Kernel, INT8DequantPerBlockFwdInterface):
 
     @classmethod
     def entry_for(cls, call: DequantizeCall) -> Entry:
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         identity = (call.m, call.k, call.out_dtype, index)
         return identity, lambda: cls(*identity[:3], device_index=index)
 
@@ -614,18 +604,15 @@ class INT8DequantPerBlockFwdKernel(Kernel, INT8DequantPerBlockFwdInterface):
         m: int,
         k: int,
         out_dtype: torch.dtype,
-        config: Optional[dict] = None,
-        device_index: "int | None" = None,
+        config: dict | None = None,
+        device_index: int | None = None,
     ):
         super().__init__(device_index=device_index)
-        self.m = m
-        self.k = k
         self.dtype = out_dtype
         # Codes per thread per step: one 16-byte vector of ``x``.
         vec = VECTOR_ACCESS_BYTES // out_dtype.itemsize
-        device = torch.device("cuda", device_index) if device_index is not None else None
-        resident_threads = torch.cuda.get_device_properties(device).max_threads_per_multi_processor
-        resident_blocks = SM_RESIDENT_BLOCKS[get_sm_version(device_index)]
+        resident_threads = self.build_target.threads_per_sm
+        resident_blocks = SM_RESIDENT_BLOCKS[self.build_target.arch]
         self.kernel = _int8_dequant_per_block_kernel(
             m, k, self.dtype_str, vec, self._STAGED, resident_threads, resident_blocks
         )
@@ -668,7 +655,7 @@ class INT8DequantPerBlockSmallFwdKernel(INT8DequantPerBlockFwdKernel):
     _SMALL_N: ClassVar[int] = 1 << 19
 
     @classmethod
-    def refusal(cls, call: DequantizeCall) -> "str | None":
+    def refusal(cls, call: DequantizeCall) -> str | None:
         if call.m * call.k >= cls._SMALL_N:
             return f"serves fewer than {cls._SMALL_N} elements, got {call.m * call.k}"
         return super().refusal(call)

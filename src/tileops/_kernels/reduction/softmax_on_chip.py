@@ -6,26 +6,29 @@ across a thread-block cluster; the CTAs of a cluster exchange their partial ``(m
 through each other's shared memory.
 
 A handful of long rows, which a CTA a row leaves most SMs idle for, takes the widest cluster
-a row instead, each CTA's share held in registers; see :class:`SoftmaxClusterSplitKernel`.
+a row instead, each CTA's share held in registers; so do many 16-bit rows of whole shares
+of eight vectors a thread, on a portable cluster. See :class:`SoftmaxClusterSplitKernel`.
 """
 
-from typing import Optional
+import operator
 
 import tilelang
 import tilelang.language as T
-import torch
 from tvm import DataType
 
 from tileops._csrc import csrc_include
 from tileops._kernels.build_target import target_cache
-from tileops._kernels.constants import LOG2E, VECTOR_ACCESS_BYTES
+from tileops._kernels.constants import LOG2E, MAX_PORTABLE_CLUSTER_BLOCKS, VECTOR_ACCESS_BYTES
 from tileops._kernels.reduction._primitives import (
-    exp_shifted,
-    restore_same_shape,
+    AUTOTUNE_THREADS,
+    FRAGMENT_ELEMS_PER_THREAD,
+    fold_max_sum,
+    fold_max_sum_into,
 )
 from tileops._kernels.reduction.call_spec import SoftmaxCall
-from tileops._kernels.reduction.softmax import _SoftmaxKernelBase
+from tileops._kernels.reduction.softmax import _PlannedSoftmaxKernel
 from tileops._kernels.streaming_load import load16
+from tileops._kernels.warp_reduce import warp_reduce
 from tileops._utils import WARP_LANES, WARP_SHUFFLE_STAGES
 
 __all__ = ["SoftmaxClusterSplitKernel", "SoftmaxOnChipKernel"]
@@ -55,18 +58,17 @@ def _softmax_on_chip_kernel(
     # The output's exponent is raised by this many before the exp2 and the result scaled
     # back by a multiply, which keeps a subnormal probability.
     exp_bias = 64
+    # A 16-bit row takes its warp's maximum before its terms, so the warp's sums add without
+    # a rescaling, which runs faster on SM90 for every 16-bit plan. An fp32 row folds the
+    # warp's (max, sum) pairs after its terms: the maximum taken first runs slower for two
+    # of its plans.
+    max_first = DataType(dtype).bits == 16
 
     @tilelang.jit(
         out_idx=[1],
         compile_flags=csrc_include("cluster_partials.h", "approx_math.h", "streaming_load.h"),
     )
     def build():
-        def fold(peak, total, other_peak, other_total):
-            """The ``(max, sum)`` of two partial pairs; two empty ones stay empty."""
-            top = T.max(peak, other_peak)
-            both = total * exp_shifted(peak, top) + other_total * exp_shifted(other_peak, top)
-            return top, T.if_then_else(top == neg_inf, T.cast(0, "float32"), both)
-
         def term(value, peak):
             """``exp(value - peak)`` of one element for the sum, which is at least one: a
             subnormal term reads as zero."""
@@ -151,6 +153,8 @@ def _softmax_on_chip_kernel(
                 stat[0] = T.cast(peaks[0], "float32")
                 for i in T.unroll(1, vec):
                     stat[0] = T.max(stat[0], T.cast(peaks[i], "float32"))
+                if max_first:
+                    warp_reduce(stat, T.max)
                 stat[1] = T.cast(0, "float32")
                 if stat[0] != neg_inf:
                     for j in T.unroll(held_vectors * vec):
@@ -160,10 +164,10 @@ def _softmax_on_chip_kernel(
                             piece[i] = tile[0, (v * threads + tx) * vec + i]
                         for i in T.unroll(vec):
                             stat[1] += term(piece[i], stat[0])
-                for step in T.unroll(WARP_LANES.bit_length() - 1):
-                    peer[0] = T.shfl_xor(stat[0], T.shift_left(1, step))
-                    peer[1] = T.shfl_xor(stat[1], T.shift_left(1, step))
-                    stat[0], stat[1] = fold(stat[0], stat[1], peer[0], peer[1])
+                if max_first:
+                    warp_reduce(stat, operator.add, first=1)
+                else:
+                    warp_reduce(stat, fold_max_sum_into, 2, peer=peer)
                 if tx % WARP_LANES == 0:
                     sums[2 * (tx // WARP_LANES)] = stat[0]
                     sums[2 * (tx // WARP_LANES) + 1] = stat[1]
@@ -171,7 +175,7 @@ def _softmax_on_chip_kernel(
                 stat[0] = T.cast(neg_inf, "float32")
                 stat[1] = T.cast(0, "float32")
                 for w in T.unroll(warps):
-                    stat[0], stat[1] = fold(stat[0], stat[1], sums[2 * w], sums[2 * w + 1])
+                    stat[0], stat[1] = fold_max_sum(stat[0], stat[1], sums[2 * w], sums[2 * w + 1])
 
                 # Every peer's barrier is initialized past this wait.
                 T.cluster_wait()
@@ -190,7 +194,7 @@ def _softmax_on_chip_kernel(
                 T.mbarrier_wait_parity(received[0], 0)
                 for p in T.unroll(cluster):
                     if p != rank:
-                        stat[0], stat[1] = fold(
+                        stat[0], stat[1] = fold_max_sum(
                             stat[0],
                             stat[1],
                             sums[own + slot * p],
@@ -219,7 +223,7 @@ def _softmax_on_chip_kernel(
     return build
 
 
-class SoftmaxOnChipKernel(_SoftmaxKernelBase):
+class SoftmaxOnChipKernel(_PlannedSoftmaxKernel):
     """Softmax / log-softmax reading each row once from registers and shared memory.
 
     A row is split across the smallest power-of-two cluster of two to eight CTAs whose
@@ -233,7 +237,7 @@ class SoftmaxOnChipKernel(_SoftmaxKernelBase):
     preferred_over = frozenset({"softmax_streaming"})
 
     @classmethod
-    def _plan(cls, call: SoftmaxCall) -> Optional[tuple]:
+    def _plan(cls, call: SoftmaxCall) -> tuple | None:
         """``(cluster, threads, held_vectors, ctas_per_sm)`` for *call*'s rows, or ``None``."""
         elem = call.dtype.itemsize
         # A 16384-element fp32 row runs faster on SoftmaxKernel.
@@ -271,9 +275,7 @@ class SoftmaxOnChipKernel(_SoftmaxKernelBase):
         return super().refusal(call)
 
     def __init__(self, call: SoftmaxCall):
-        super().__init__(device_index=call.device.index)
-        self.call = call
-        self.dtype = call.dtype
+        super().__init__(call)
         self.cluster, threads, held_vectors, ctas_per_sm = self._plan(call)
         self.kernel = _softmax_on_chip_kernel(
             call.m,
@@ -288,29 +290,9 @@ class SoftmaxOnChipKernel(_SoftmaxKernelBase):
         )
         self.init_config(None)
 
-    @property
-    def default_config(self) -> dict:
-        return {}
-
-    @property
-    def autotune_configs(self) -> list[dict]:
-        return [self.default_config]
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Normalize ``call.axis`` of the contiguous input *x*."""
-        rows = self._rows(x)
-        m = rows.shape[0]
-        chunk = self.call.n // self.cluster
-        y = self.program(self._compile)(rows.reshape(m * self.cluster, chunk))
-        return restore_same_shape(y.reshape(m, self.call.n), self.call.shape, (self.call.axis,))
-
-    def _compile(self, cfg: dict):
-        """The program."""
-        return self.kernel()
-
 
 @target_cache(maxsize=32)
-def _softmax_cluster_split_kernel(M, N, dtype, out_dtype, cluster, threads):
+def _softmax_cluster_split_kernel(M, N, dtype, out_dtype, cluster, threads, min_blocks):
     """Build the softmax of ``(M, N)`` rows, each split across ``cluster`` CTAs in registers.
 
     A CTA holds ``N // cluster`` columns, vector ``v * threads + tx`` in thread ``tx``. The
@@ -318,6 +300,8 @@ def _softmax_cluster_split_kernel(M, N, dtype, out_dtype, cluster, threads):
     CTAs -- and each takes the maximum first, so the exponential of a pair is taken once at
     each fold rather than at every step of a pairwise chain. Each element's exponential is
     taken once, against its warp's maximum, and kept until the output scales it.
+
+    ``min_blocks`` is the CTAs each SM must keep resident, or 0 for no bound.
     """
     vec = VECTOR_ACCESS_BYTES // (DataType(dtype).bits // 8)
     chunk = N // cluster
@@ -330,6 +314,14 @@ def _softmax_cluster_split_kernel(M, N, dtype, out_dtype, cluster, threads):
     # Exponentials are taken this many octaves up and the output scaled back by a multiply,
     # so a probability below the smallest normal float stays subnormal rather than zero.
     exp_bias = 64
+    # A float16 maximum times log2(e) is finite in fp32, so a float16 term is shifted by
+    # max * log2(e) inside one FFMA; a wider type's maximum can overflow that product, and
+    # its terms subtract the maximum first.
+    fold = dtype == "float16"
+    # The load index of a view of 2**31 elements or more folds into one iterator over the
+    # whole view, whose extent overflows TileLang's int32 constant; such a view loads at an
+    # int64 access_ptr offset instead.
+    by_offset = M * N >= 2**31
 
     @tilelang.jit(
         out_idx=[1],
@@ -374,15 +366,20 @@ def _softmax_cluster_split_kernel(M, N, dtype, out_dtype, cluster, threads):
             y: T.Tensor[(M * cluster, chunk), out_dtype],
         ):
             with T.ClusterKernel(M * cluster, threads=threads, cluster_dims=cluster) as cta:
+                if min_blocks > 0:
+                    T.annotate_min_blocks_per_sm(min_blocks)
                 tx = T.get_thread_binding()
                 lane = tx % WARP_LANES
                 rank = cta % cluster
                 raw = T.alloc_local([held], dtype)
                 vals = T.alloc_local([held], "float32")
                 out = T.alloc_local([vec], out_dtype)
+                peaks = T.alloc_local([vec], dtype)
                 # The warp's (max, sum), then the CTA's, then the row's.
                 stat = T.alloc_local([6], "float32")
                 pair = T.alloc_local([2], "float32")
+                # The warp's shift of the exponents.
+                shift = T.alloc_local([1], "float32")
                 # One buffer for the warp pairs and the peers' pairs: a peer writes its pair
                 # while this CTA still folds its warps, so no slot may share their storage.
                 pairs = T.alloc_shared([2 * (warps + cluster)], "float32")
@@ -398,7 +395,18 @@ def _softmax_cluster_split_kernel(M, N, dtype, out_dtype, cluster, threads):
 
                 for v in T.unroll(vectors):
                     if whole or v * threads + tx < chunk_vectors:
-                        load16(raw, v * vec, x, (cta, (v * threads + tx) * vec))
+                        if by_offset:
+                            T.call_extern(
+                                "handle",
+                                "tileops::load16",
+                                T.address_of(raw[v * vec]),
+                                x.access_ptr(
+                                    "r",
+                                    offset=T.cast(cta, "int64") * chunk + (v * threads + tx) * vec,
+                                ),
+                            )
+                        else:
+                            load16(raw, v * vec, x, (cta, (v * threads + tx) * vec))
                 for v in T.unroll(vectors):
                     for i in T.unroll(vec):
                         vals[v * vec + i] = T.if_then_else(
@@ -406,18 +414,34 @@ def _softmax_cluster_split_kernel(M, N, dtype, out_dtype, cluster, threads):
                             T.cast(raw[v * vec + i], "float32"),
                             neg_inf,
                         )
-                stat[0] = vals[0]
-                for i in T.unroll(1, held):
-                    stat[0] = T.max(stat[0], vals[i])
+                # The maximum is one of the values: taken in their own type, two 16-bit
+                # elements a lane-wide instruction.
+                for i in T.vectorized(vec):
+                    peaks[i] = T.cast(neg_inf, dtype)
+                for v in T.unroll(vectors):
+                    if whole or v * threads + tx < chunk_vectors:
+                        for i in T.vectorized(vec):
+                            peaks[i] = T.max(peaks[i], raw[v * vec + i])
+                stat[0] = T.cast(peaks[0], "float32")
+                for i in T.unroll(1, vec):
+                    stat[0] = T.max(stat[0], T.cast(peaks[i], "float32"))
                 stat[0] = warp_max(stat[0])
                 # A warp of only -inf shifts by zero: its terms are exp(-inf) = 0, not NaN.
                 pair[0] = T.if_then_else(stat[0] == neg_inf, T.cast(0, "float32"), stat[0])
+                if fold:
+                    # The shift rounds max * log2(e) - bias, below 2**17 for a float16
+                    # maximum, by at most 2**-8; a warp's terms and its share of the sum
+                    # carry that rounding alike, so between warps it scales a probability
+                    # by a factor within 2**(2**-7) of one.
+                    shift[0] = T.ieee_fmaf(pair[0], LOG2E, -float(exp_bias))
                 stat[1] = T.cast(0, "float32")
                 for i in T.unroll(held):
                     vals[i] = T.call_extern(
                         "float32",
                         "tileops::approx_exp2",
-                        (vals[i] - pair[0]) * LOG2E + float(exp_bias),
+                        T.ieee_fmaf(vals[i], LOG2E, -shift[0])
+                        if fold
+                        else (vals[i] - pair[0]) * LOG2E + float(exp_bias),
                     )
                     stat[1] = stat[1] + vals[i]
                 stat[1] = warp_sum(stat[1])
@@ -473,56 +497,94 @@ def _softmax_cluster_split_kernel(M, N, dtype, out_dtype, cluster, threads):
     return build
 
 
-class SoftmaxClusterSplitKernel(_SoftmaxKernelBase):
-    """Softmax of a handful of long rows, each split across a 16-CTA cluster in registers.
+class SoftmaxClusterSplitKernel(_PlannedSoftmaxKernel):
+    """Softmax of long rows, each split across a thread-block cluster in registers.
 
-    Serves the softmax calls :class:`SoftmaxSplitKernel` would split, on SM90, whose output
-    keeps the input's dtype and whose rows divide into whole 16-byte vectors per CTA of at
-    most 48 KB read and written. Where the split exchanges segment statistics
-    through global memory across a grid barrier, a cluster exchanges one ``(max, sum)`` pair
-    per CTA through its peers' shared memory, and every fold of pairs is a shuffle tree.
+    Serves same-dtype softmax calls on SM90 under two plans. A handful of long rows, the
+    calls :class:`SoftmaxSplitKernel` would split, take a 16-CTA cluster a row whose CTAs
+    each read and write at most 48 KB of whole 16-byte vectors. Where the split exchanges
+    segment statistics through global memory across a grid barrier, a cluster exchanges one
+    ``(max, sum)`` pair per CTA through its peers' shared memory, and every fold of pairs is
+    a shuffle tree. Many 16-bit rows take a cluster of 16 or 32 KB shares, one a CTA, each
+    held whole; see :meth:`_plan`.
     """
 
     supported_archs = [90]
-    preferred_over = frozenset({"softmax_split"})
+    preferred_over = frozenset({"softmax_split", "softmax_on_chip"})
 
     @classmethod
-    def _plan(cls, call: SoftmaxCall) -> Optional[tuple]:
-        """``(cluster, threads)`` for *call*'s rows, or ``None``."""
-        # The widest cluster SM90 launches, which a kernel opts into past the portable 8.
-        cluster = 16
-        # Vectors a thread holds: the fewest threads that keep a thread's exponentials
-        # within 40 fp32 registers for a 16-bit row and 20 for an fp32 one.
-        vectors_per_thread = 5
-        # Bytes a CTA reads and writes at most. A cluster moves a row through 16 SMs where
-        # the split spreads it over the device, so a CTA's share bounds the cluster's time;
-        # on H200 past this share an fp32 row of one or two rows ran slower than the split.
-        max_cta_bytes = 48 * 1024
-        vec = VECTOR_ACCESS_BYTES // call.dtype.itemsize
-        if call.op_kind != "softmax" or cls.split_seg_n(call) <= 0:
+    def _plan(cls, call: SoftmaxCall) -> tuple | None:
+        """``(cluster, threads, min_blocks)`` for *call*'s rows, or ``None``."""
+        if call.op_kind != "softmax":
             return None
-        # A widened output writes each 16-byte input vector as two; on H200 that ran slower
-        # than the split at every measured shape.
+        # A widened output writes each 16-byte input vector as two, which runs slower than
+        # the split: it moves six bytes an element instead of four.
         if call.out_dtype != call.dtype:
             return None
-        if call.n % (cluster * vec) or 2 * call.n * call.dtype.itemsize > cluster * max_cta_bytes:
+        if cls.split_seg_n(call) > 0:
+            # The widest cluster SM90 launches, which a kernel opts into past the portable 8.
+            cluster = 16
+            # Vectors a thread holds: the fewest threads that keep a thread's exponentials
+            # within 40 fp32 registers for a 16-bit row and 20 for an fp32 one.
+            vectors_per_thread = 5
+            # Bytes a CTA reads and writes at most. A cluster moves a row through 16 SMs where
+            # the split spreads it over the device, so a CTA's share bounds the cluster's
+            # time; past this share the split is faster.
+            max_cta_bytes = 48 * 1024
+            vec = VECTOR_ACCESS_BYTES // call.dtype.itemsize
+            if (
+                call.n % (cluster * vec)
+                or 2 * call.n * call.dtype.itemsize > cluster * max_cta_bytes
+            ):
+                return None
+            chunk_vectors = call.n // (cluster * vec)
+            threads = -(-chunk_vectors // vectors_per_thread)
+            return cluster, -(-threads // WARP_LANES) * WARP_LANES, 0
+        # Many rows hold each share in registers and keep every element's fp32 term, so
+        # an element is exponentiated once. A 16-bit row at the DRAM rate asks for an
+        # exponential every two bytes, twice an fp32 row's rate, which is where a second
+        # exponential an element costs the most.
+        if call.dtype.itemsize != 2:
             return None
-        chunk_vectors = call.n // (cluster * vec)
-        threads = -(-chunk_vectors // vectors_per_thread)
-        threads = -(-threads // WARP_LANES) * WARP_LANES
-        return cluster, threads
+        # A shorter row fits one CTA's registers whole, its fragment budget a thread across
+        # the widest CTA the row kernels plan, and needs no cluster.
+        if call.n < FRAGMENT_ELEMS_PER_THREAD * max(AUTOTUNE_THREADS):
+            return None
+        # Eight 16-byte vectors a thread, so each SM keeps that many loads in flight for every
+        # resident thread. A row of two shares of ``wide`` threads takes a cluster of
+        # two: SM90 places clusters of two CTAs in every CTA slot, where wider clusters leave
+        # some slots idle; ``wide`` threads keep as many threads an SM resident as 128-thread
+        # CTAs do. A wider row takes 128-thread CTAs, so the CTAs of a cluster take an SM in
+        # the smallest steps its register file allows.
+        vectors, wide = 8, 256
+        row_bytes = call.n * call.dtype.itemsize
+        threads = wide if row_bytes == 2 * wide * vectors * VECTOR_ACCESS_BYTES else 128
+        share = threads * vectors * VECTOR_ACCESS_BYTES
+        if row_bytes % share or row_bytes // share > MAX_PORTABLE_CLUSTER_BLOCKS:
+            return None
+        # A thread holds an fp32 term for each element it holds; ptxas gives the program 16
+        # registers more, for the row statistics and addresses. That sets the CTAs an SM
+        # keeps resident.
+        terms = vectors * VECTOR_ACCESS_BYTES // call.dtype.itemsize
+        resident = call.regs_per_sm // (threads * (terms + 16))
+        # A partial last wave leaves up to one wave of SMs idle: a grid of 100 waves or more
+        # keeps that under 1% of the kernel's time.
+        if call.m * (row_bytes // share) < 100 * resident * call.sm_count:
+            return None
+        return row_bytes // share, threads, resident
 
     @classmethod
     def refusal(cls, call: SoftmaxCall) -> "str | None":
         if cls._plan(call) is None:
-            return "not a same-dtype softmax split of whole vectors and at most 48 KB a CTA"
+            return (
+                "not a same-dtype softmax split of whole vectors and at most 48 KB a CTA, "
+                "nor many 16-bit rows of whole 16 or 32 KB shares on a portable cluster"
+            )
         return super().refusal(call)
 
     def __init__(self, call: SoftmaxCall):
-        super().__init__(device_index=call.device.index)
-        self.call = call
-        self.dtype = call.dtype
-        self.cluster, threads = self._plan(call)
+        super().__init__(call)
+        self.cluster, threads, min_blocks = self._plan(call)
         self.kernel = _softmax_cluster_split_kernel(
             call.m,
             call.n,
@@ -530,25 +592,6 @@ class SoftmaxClusterSplitKernel(_SoftmaxKernelBase):
             self.dtype_to_str(call.out_dtype),
             self.cluster,
             threads,
+            min_blocks,
         )
         self.init_config(None)
-
-    @property
-    def default_config(self) -> dict:
-        return {}
-
-    @property
-    def autotune_configs(self) -> list[dict]:
-        return [self.default_config]
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Normalize ``call.axis`` of the contiguous input *x*."""
-        rows = self._rows(x)
-        m = rows.shape[0]
-        chunk = self.call.n // self.cluster
-        y = self.program(self._compile)(rows.reshape(m * self.cluster, chunk))
-        return restore_same_shape(y.reshape(m, self.call.n), self.call.shape, (self.call.axis,))
-
-    def _compile(self, cfg: dict):
-        """The program."""
-        return self.kernel()

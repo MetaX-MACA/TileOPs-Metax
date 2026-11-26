@@ -57,8 +57,9 @@ A workload is defined once. A test and a benchmark each use it, and never each o
 - An op contract test asserts nothing about the in-tree implementation — the kernel class, strategy or config chosen, or how a cache key folds a shape.
 - A test that depends on the in-tree implementations — a coverage gap, a registered stand-in implementation, a kernel path it pins `target=BUILTIN` to reach — carries `in_tree_kernels`, which deselects it off the builtin target.
 - The full `tests/ops` suite on a device other than CUDA runs under a `--tileops-target` naming a backend that serves the device; `cpu` with the builtin target is not a configuration of that suite.
-- Preflight runs the `tests/ops` smoke tier on `tileops_test` under the `tileops_test` target. Its kernel for every op is that op's reference: the `ref_program` of the op's call workload (`workloads.calls`), on the manifest call the kernel's tensors and params state. A call the reference does not compute, or whose inputs it does not read in their call form, is not served.
-- A call the `tileops_test` target refuses raises `tests.conftest.UnservedError`, and the test is reported unvalidated: neither a failure nor evidence. Any other error, an op-layer refusal included, fails the test.
+- A run of `tests/ops` on the `tileops_test` device uses the `tileops_test` target. Its kernel for every op is that op's reference: the `ref_program` of the op's call workload (`workloads.calls`), on the manifest call the kernel's tensors and params state. A call the reference does not compute, or whose inputs it does not read in their call form, is not served.
+- A call the `tileops_test` target refuses raises `tests.conftest.UnservedError`, and the test is reported unvalidated: neither a failure nor evidence.
+- A test of an op the run's target does not serve is reported unvalidated, so a backend can run the suite before it serves every op. Any other error, an op-layer refusal included, fails the test.
 
 **Device:**
 
@@ -143,6 +144,12 @@ No performance exploration, autotune sweep or duplicate code path.
 ### Infrastructure rules
 
 - A change to shared test infrastructure (`tests/workload_test_base.py`, common fixtures, the shared verifier) keeps default semantics unless every affected test migrates with it.
+
+### Model tests
+
+- Tests under [`tests/models/`](../../tests/models/) run nightly, all of them, not in a pull request's gate.
+- A model test runs on random weights; it reads no real checkpoint and needs no network.
+- A model test's reference is a package the runner image installs or an unmodified, revision-pinned copy under [`third_party/`](../../third_party/). A missing reference fails the test.
 
 ## Benchmarks
 

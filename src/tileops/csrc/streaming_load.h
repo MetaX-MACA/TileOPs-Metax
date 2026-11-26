@@ -43,7 +43,7 @@ __device__ __forceinline__ T load_evict_first(const T* src) {
 }
 
 // Loads one element of global memory, evict-last in L1 and L2. T is 4 or 2
-// bytes wide. Each reader states its measurement.
+// bytes wide.
 template <typename T>
 __device__ __forceinline__ T load_evict_last(const T* src) {
   static_assert(sizeof(T) == 4 || sizeof(T) == 2, "a 4- or 2-byte element");
@@ -103,9 +103,27 @@ __device__ __forceinline__ void load16(void* dst, const void* src) {
   __builtin_memcpy(dst, &v, 16);
 }
 
+// Copies the 16 bytes at src to dst, both 16-byte aligned, in any state space,
+// as one 16-byte load and one 16-byte store.
+__device__ __forceinline__ void copy16(void* dst, const void* src) {
+  *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+}
+
 // Starts bringing the line holding src into L2 without waiting for it.
 __device__ __forceinline__ void prefetch_l2(const void* src) {
   asm volatile("prefetch.global.L2 [%0];" ::"l"(src));
+}
+
+// Loads one 2-byte element as fp32 with a coherent load, which ptxas keeps
+// ahead of the next barrier; it sinks a read-only (.nc) load to its first use.
+template <typename T>
+__device__ __forceinline__ float load_before_barrier_f32(const T* src) {
+  static_assert(sizeof(T) == 2, "a 2-byte element");
+  uint16_t bits;
+  asm volatile("ld.global.b16 %0, [%1];" : "=h"(bits) : "l"(src));
+  T v;
+  __builtin_memcpy(&v, &bits, 2);
+  return static_cast<float>(v);
 }
 
 }  // namespace tileops

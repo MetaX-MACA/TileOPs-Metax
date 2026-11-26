@@ -1,5 +1,3 @@
-# convolution.yaml -- manifest entries for the 'convolution' family.
-#
 # padding takes a per-axis value or a mode; 'same' pads so the output keeps the input length,
 # splitting an odd total the way torch does (the extra element on the right).
 
@@ -18,7 +16,7 @@ Conv1dFwdOp:
     inputs:
       input: {dtype: T, shape: "[N, C_in, L_in]"}
       weight: {dtype: T, shape: "[C_out, C_in_g, kW]"}
-      bias: {dtype: T, shape: "[C_out]", optional: true}
+      bias: {dtype: T, shape: "[C_out]", type: "Tensor | None", default: null}
     outputs:
       output: {dtype: T, shape: "[N, C_out, L_out]"}
     let:
@@ -33,23 +31,14 @@ Conv1dFwdOp:
     - "padding != 'same' or sW == 1"
     - "L_out > 0"
 
-  # Workloads selected from three dominant Conv1d model families:
-  #   Whisper (OpenAI ASR)  — https://huggingface.co/openai/whisper-large-v3
-  #     src: transformers/models/whisper/modeling_whisper.py WhisperEncoder (nn.Conv1d)
-  #   Wav2Vec2 (Meta ASR)   — https://huggingface.co/facebook/wav2vec2-base
-  #     src: transformers/models/wav2vec2/modeling_wav2vec2.py Wav2Vec2NoLayerNormConvLayer (nn.Conv1d)
-  #   EnCodec (Meta codec)  — https://huggingface.co/facebook/encodec_24khz
-  #     src: transformers/models/encodec/modeling_encodec.py EncodecEncoder (EncodecConv1d → nn.Conv1d)
-  # Selection criteria: cover small/large kernel, narrow/wide channels,
-  #   short/long sequences, and different pipeline stages (entry vs deep layer).
   workloads:
-  # Whisper-large encoder conv1: mel spectrogram → hidden (most common ASR entry point)
+  # Whisper-large-v3 encoder conv1: mel spectrogram to hidden.
   - {N: 1, C_in: 80, L_in: 3000, C_out: 1280, kW: 3, dtype_cases: [{T: float16}, {T: bfloat16}], label: whisper-conv1}
-  # Wav2Vec2 feature extractor layer1: raw 1s waveform, large kernel + stride downsampling
+  # Wav2Vec2-base feature extractor layer 1: a 1 s waveform, large kernel with stride.
   - {N: 1, C_in: 1, L_in: 16000, C_out: 512, kW: 10, stride: 5, dtype_cases: [{T: float16}, {T: bfloat16}], label: wav2vec2-layer1}
-  # EnCodec SEANet encoder init: raw 1s audio @24kHz, narrow channels
+  # EnCodec-24kHz SEANet encoder input conv: 1 s of audio, narrow channels.
   - {N: 1, C_in: 1, L_in: 24000, C_out: 32, kW: 7, dtype_cases: [{T: float16}, {T: bfloat16}], label: encodec-init}
-  # EnCodec SEANet deep block: short sequence, wide channels, large kernel
+  # EnCodec SEANet deep block: short sequence, wide channels, large kernel.
   - {N: 1, C_in: 128, L_in: 600, C_out: 256, kW: 10, dtype_cases: [{T: float16}, {T: bfloat16}], label: encodec-deep}
   - {N: 1, C_in: 80, L_in: 3000, C_out: 1280, kW: 3, some: [bias], dtype_cases: [{T: float16}, {T: bfloat16}], label: whisper-conv1-bias}
   - {N: 1, C_in: 1, L_in: 16000, C_out: 512, kW: 10, stride: 5, some: [bias], dtype_cases: [{T: float16}, {T: bfloat16}], label: wav2vec2-layer1-bias}
@@ -74,7 +63,7 @@ Conv2dFwdOp:
     inputs:
       input: {dtype: T, shape: "[N, C_in, H, W]"}
       weight: {dtype: T, shape: "[C_out, C_in_g, kH, kW]"}
-      bias: {dtype: T, shape: "[C_out]", optional: true}
+      bias: {dtype: T, shape: "[C_out]", type: "Tensor | None", default: null}
     outputs:
       output: {dtype: T, shape: "[N, C_out, out_H, out_W]"}
     let:
@@ -140,7 +129,7 @@ Conv3dFwdOp:
     inputs:
       input: {dtype: T, shape: "[N, C_in, D, H, W]"}
       weight: {dtype: T, shape: "[C_out, C_in_g, kD, kH, kW]"}
-      bias: {dtype: T, shape: "[C_out]", optional: true}
+      bias: {dtype: T, shape: "[C_out]", type: "Tensor | None", default: null}
     outputs:
       output: {dtype: T, shape: "[N, C_out, out_D, out_H, out_W]"}
     let:

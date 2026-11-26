@@ -2,7 +2,7 @@
 
 import collections
 import math
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 import tilelang
 import torch
@@ -37,30 +37,27 @@ from tileops._kernels.linear_attention.gdn.prefill_prepare import (
     prefill_solve_warpgroup_tl,
     warmup_chunks_program,
 )
-from tileops._utils import get_sm_count
 
 __all__ = ["GDNDensePrefillFwdKernel"]
 
 
 class GDNDensePrefillFwdKernel(Kernel, GDNFwdInterface):
-    """SM90 equal-length BTHD inference prefill.
-
-    This is the inference owner of the retained partitioned prefill pipeline.
-    The Op layer admits only the currently supported region; the kernel keeps
-    the unified public call signature so no layout or ABI adapter is needed.
-    """
+    """SM90 BTHD inference prefill: the one-kernel prefill, or the block solve and the
+    partitioned walk."""
 
     supported_archs = [90]
 
     @classmethod
-    def refusal(cls, call: GDNCall) -> Optional[str]:
+    def refusal(cls, call: GDNCall) -> str | None:
         """Why this kernel does not serve *call*, or ``None`` when it does.
 
         Prefill in chunks of 64 tokens over a 64- or 128-wide square state, equal-length or
         packed, with a row that is not a whole chunk, with grouped value heads, with the
-        state key-major or value-major, and with the Q/K normalization, the gate and the
-        beta transform taken in kernel.
+        state key-major or value-major, in batch order or in the slots of a state pool, and
+        with the Q/K normalization, the gate and the beta transform taken in kernel.
         """
+        if call.rollback:
+            return "keeps one state a sequence; num_accepted_tokens is not served"
         heads = head_count_refusal(call.heads, call.value_heads)
         if heads is not None:
             return heads
@@ -68,11 +65,11 @@ class GDNDensePrefillFwdKernel(Kernel, GDNFwdInterface):
             return "does not support K and V other than matching 64 or 128"
         if call.seq_len < 1 or (call.seq_len == 1 and not call.varlen):
             return "serves prefill, which is more than one token per sequence"
-        return None
+        return super().refusal(call)
 
     @classmethod
     def entry_for(cls, call: GDNCall) -> Entry:
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         arguments = dict(
             batch=call.batch,
             heads=call.heads,
@@ -88,6 +85,7 @@ class GDNDensePrefillFwdKernel(Kernel, GDNFwdInterface):
             gate_in_kernel=call.gate_in_kernel,
             beta_sigmoid=call.beta_sigmoid,
             allow_neg_eigval=call.allow_neg_eigval,
+            pooled=call.pooled,
             device_index=index,
         )
         return tuple(sorted(arguments.items(), key=lambda item: item[0])), lambda: cls(**arguments)
@@ -108,6 +106,7 @@ class GDNDensePrefillFwdKernel(Kernel, GDNFwdInterface):
         gate_in_kernel: bool = False,
         beta_sigmoid: bool = False,
         allow_neg_eigval: bool = False,
+        pooled: bool = False,
         *,
         device_index: int | None = None,
     ) -> None:
@@ -132,12 +131,14 @@ class GDNDensePrefillFwdKernel(Kernel, GDNFwdInterface):
         self.gate_in_kernel = gate_in_kernel
         self.beta_sigmoid = beta_sigmoid
         self.allow_neg_eigval = allow_neg_eigval
+        # A pool is read and written through each sequence's slot, which every pass that
+        # touches a state is built for.
+        self.pooled = pooled
 
     @staticmethod
     @target_cache(maxsize=32)
     def _partition_metadata(
         raw_sequence_lengths: tuple[int, ...],
-        num_heads: int,
         chunk_size: int,
         max_local_chunks: int,
         use_partition: bool,
@@ -191,7 +192,7 @@ class GDNDensePrefillFwdKernel(Kernel, GDNFwdInterface):
         num_heads: int,
         dim: int,
         state_v_first: bool,
-        device_index: int | None,
+        sm_count: int,
     ) -> int:
         """The partition width, in chunks, that minimizes the modeled time of a split call.
 
@@ -199,7 +200,6 @@ class GDNDensePrefillFwdKernel(Kernel, GDNFwdInterface):
         tile costing two thirds of one; each piece of the longest sequence adds half a step for
         its correction link and passes. The widest of equal costs wins, for the fewest passes.
         """
-        sm_count = get_sm_count(device_index)
         longest = max(chunks)
         counts = collections.Counter(chunks)
         best_cost, best_width = math.inf, longest
@@ -208,7 +208,7 @@ class GDNDensePrefillFwdKernel(Kernel, GDNFwdInterface):
             if 2 * width > 3 * best_cost:
                 break
             grid = num_heads * sum(n * -(-c // width) for c, n in counts.items())
-            tile = forward_value_tile(grid, dim, state_v_first, device_index)
+            tile = forward_value_tile(grid, dim, state_v_first, sm_count)
             waves = -(-grid * (dim // tile) // sm_count)
             step = 1.0 if tile == dim else 2 / 3
             cost = waves * width * step + 0.5 * -(-longest // width)
@@ -232,23 +232,20 @@ class GDNDensePrefillFwdKernel(Kernel, GDNFwdInterface):
         sequence_lengths: tuple[int, ...],
         num_heads: int,
         chunk_size: int,
-        device_index: int | None,
+        sm_count: int,
     ) -> bool:
         """Whether splitting the sequences shortens the recurrence enough to repay its passes.
 
-        One CTA walks one (sequence, value head) and holds an SM for the walk, so an
-        unsplit call lasts about as long as its long walks: those over half the longest.
-        Splitting helps only by spreading the long walks over SMs they leave idle, and
-        it adds warmup and correction passes. When the long walks already hold more than
-        half the SMs, or more than a quarter over walks of at most 32 chunks, those passes
-        cost more than the spread saves and the sequences stay whole.
+        An unsplit call lasts about as long as its long walks, those over half the longest,
+        one CTA a (sequence, value head). Splitting spreads them over idle SMs but adds warmup
+        and correction passes, so the sequences stay whole when the long walks already hold
+        more than half the SMs, or more than a quarter over walks of at most 32 chunks.
         """
-        sm_count = get_sm_count(device_index)
         chunks = [tilelang.cdiv(length, chunk_size) for length in sequence_lengths]
         longest = max(chunks)
         long_walks = num_heads * sum(1 for count in chunks if 2 * count > longest)
         # Walks this short gain too little from spreading to repay the passes at a quarter
-        # of the SMs busy; measured on H200 rows of 16 to 1024 chunks.
+        # of the SMs busy.
         short_walk_chunks = 32
         if 2 * long_walks > sm_count:
             return False
@@ -259,19 +256,17 @@ class GDNDensePrefillFwdKernel(Kernel, GDNFwdInterface):
         num_tokens: int,
         num_heads: int,
         sequence_lengths: tuple[int, ...] | None,
-        device_index: int | None,
     ) -> bool:
         """Whether the one-kernel prefill outruns the solve pass and the partitioned walk.
 
         The one-kernel prefill forms each chunk's inverse on the SM that walks the chunk, so
         it needs walks for most SMs. It serves the call when the walks of more than half the
         longest length hold more than half the SMs and the sequences stay whole, or when all
-        walks together hold more than three quarters of the SMs, where it also beats
-        splitting the long walks (measured on H200 rows of 64 to 128 walks).
+        walks together hold more than three quarters of the SMs.
         """
         if not sequence_lengths or any(length <= 0 for length in sequence_lengths):
             return False
-        sm_count = get_sm_count(device_index)
+        sm_count = self.build_target.sm_count
         longest = max(sequence_lengths)
         long_walks = num_heads * sum(1 for length in sequence_lengths if 2 * length > longest)
         walks = num_heads * len(sequence_lengths)
@@ -279,7 +274,7 @@ class GDNDensePrefillFwdKernel(Kernel, GDNFwdInterface):
             return True
         return (
             2 * long_walks > sm_count
-            and self._width(num_tokens, num_heads, sequence_lengths, device_index) is None
+            and self._width(num_tokens, num_heads, sequence_lengths) is None
         )
 
     def _width(
@@ -287,7 +282,6 @@ class GDNDensePrefillFwdKernel(Kernel, GDNFwdInterface):
         num_tokens: int,
         num_heads: int,
         sequence_lengths: tuple[int, ...] | None,
-        device_index: int | None,
     ) -> int | None:
         """The partition width in chunks, or ``None`` when the sequences are walked whole."""
         chunk_size = 64
@@ -296,11 +290,15 @@ class GDNDensePrefillFwdKernel(Kernel, GDNFwdInterface):
         num_chunks = tilelang.cdiv(num_tokens, chunk_size)
         if not (
             (num_heads <= 40 or (num_heads <= 64 and num_chunks >= 128))
-            and self._partition_pays(sequence_lengths, num_heads, chunk_size, device_index)
+            and self._partition_pays(
+                sequence_lengths, num_heads, chunk_size, self.build_target.sm_count
+            )
         ):
             return None
         chunks = tuple(tilelang.cdiv(length, chunk_size) for length in sequence_lengths)
-        width = self._local_chunks(chunks, num_heads, self.dim, self.state_v_first, device_index)
+        width = self._local_chunks(
+            chunks, num_heads, self.dim, self.state_v_first, self.build_target.sm_count
+        )
         return width if max(chunks) > width else None
 
     def _split(
@@ -312,19 +310,14 @@ class GDNDensePrefillFwdKernel(Kernel, GDNFwdInterface):
     ) -> tuple[torch.Tensor, ...] | None:
         """Where the sequences split, or ``None`` when they are walked whole.
 
-        Partitioning splits a long sequence at a chunk boundary and replays each piece from
-        a corrected state, which asks for every length on the host. A packed call that
-        passes no host copy of the offsets keeps its sequences whole instead.
-
-        A sequence that is not a whole number of chunks still partitions: every split lands
-        on a chunk boundary by construction, so only a sequence's last partition is short,
-        and the warmup pass that floors a partition's chunk count is the one pass that
-        skips a last partition.
+        Splitting needs every length on the host, so a packed call without a host copy of the
+        offsets keeps its sequences whole. Splits land on chunk boundaries, so only a
+        sequence's last partition is short, and the warmup pass skips it.
         """
-        width = self._width(num_tokens, num_heads, sequence_lengths, device_index)
+        width = self._width(num_tokens, num_heads, sequence_lengths)
         if width is None:
             return None
-        return self._partition_metadata(sequence_lengths, num_heads, 64, width, True, device_index)
+        return self._partition_metadata(sequence_lengths, 64, width, True, device_index)
 
     def _partitioned_initial_state(
         self,
@@ -337,6 +330,7 @@ class GDNDensePrefillFwdKernel(Kernel, GDNFwdInterface):
         k_rnorm: torch.Tensor | None,
         initial_state: torch.Tensor | None,
         split: tuple[torch.Tensor, ...],
+        state_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """The state each partition starts from, and the offsets the recurrence walks."""
         _, _, warmup_program, states_program, correct_program, _ = programs
@@ -374,12 +368,13 @@ class GDNDensePrefillFwdKernel(Kernel, GDNFwdInterface):
             fallback_mask=fallback_mask,
             seq_map_r2c=seq_map_r2c_t,
             state_v_first=self.state_v_first,
+            state_indices=state_indices,
         )
         return cp_h0, cp_cu_seqlens_t, seq_map_c2r_t, raw_cu_seqlens
 
     def _programs(
         self,
-        cfg: Dict[str, Any],
+        cfg: dict[str, Any],
         offsets_dtype: torch.dtype,
         beta_dtype: torch.dtype,
         state_dtype: torch.dtype | None,
@@ -426,6 +421,7 @@ class GDNDensePrefillFwdKernel(Kernel, GDNFwdInterface):
                 state_v_first=self.state_v_first,
                 beta_sigmoid=self.beta_sigmoid,
                 allow_neg_eigval=self.allow_neg_eigval,
+                pooled=self.pooled,
             )
             return CompiledProgram(cumsum), CompiledProgram(prefill), None, None, None, None
         if solve == "warpgroup":
@@ -489,6 +485,7 @@ class GDNDensePrefillFwdKernel(Kernel, GDNFwdInterface):
                     torch.bool,
                     state_dtype is not None,
                     self.state_v_first,
+                    pooled=self.pooled,
                 )
             )
         forward = fused_gdr_fwd_program(
@@ -508,7 +505,8 @@ class GDNDensePrefillFwdKernel(Kernel, GDNFwdInterface):
             l2norm=self.l2norm,
             beta_sigmoid=self.beta_sigmoid,
             allow_neg_eigval=self.allow_neg_eigval,
-            device_index=device_index,
+            pooled=self.pooled,
+            sm_count=self.build_target.sm_count,
         )
         return (
             CompiledProgram(cumsum),
@@ -531,7 +529,10 @@ class GDNDensePrefillFwdKernel(Kernel, GDNFwdInterface):
         cu_seqlens_cpu: torch.Tensor | None = None,
         A_log: torch.Tensor | None = None,
         dt_bias: torch.Tensor | None = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        state_indices: torch.Tensor | None = None,
+        num_accepted_tokens: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del num_accepted_tokens
         self._require_devices(q=q, k=k, v=v, g=g, beta=beta)
         chunk_size = 64
         batch, seq_len = q.shape[:2]
@@ -555,7 +556,7 @@ class GDNDensePrefillFwdKernel(Kernel, GDNFwdInterface):
         if (
             dim_v == FUSED_PREFILL_DIM
             and not self.l2norm
-            and self._fused_serves(batch * seq_len, value_heads, lengths, device_index)
+            and self._fused_serves(batch * seq_len, value_heads, lengths)
         ):
             # Whole sequences of 128-wide heads that keep most SMs busy: one kernel forms
             # each chunk's inverse beside the walk instead of a separate solve pass.
@@ -565,14 +566,13 @@ class GDNDensePrefillFwdKernel(Kernel, GDNFwdInterface):
             # An SM holds about seven warp-group solves at once; below about one such wave
             # of (chunk, head) pairs each pair's step chain decides and the one-warp solve
             # is as fast.
-            warp_group_pairs = 8 * get_sm_count(device_index)
+            warp_group_pairs = 8 * self.build_target.sm_count
             pairs = (
                 len(lengths) * tilelang.cdiv(uniform, chunk_size) * value_heads if uniform else 0
             )
-            # The warp-group solve beats the one-warp solve on bfloat16 rows of one length,
-            # whose chunks it addresses by arithmetic; in float16 the one-warp solve is the
-            # faster (measured on H200), and a normalized key takes it for the norms the
-            # later passes read.
+            # The warp-group solve serves bfloat16 rows of one length, whose chunks it
+            # addresses by arithmetic; a normalized key takes the one-warp solve for the norms
+            # the later passes read.
             warp_group = (
                 pairs >= warp_group_pairs and not self.l2norm and self.dtype == torch.bfloat16
             )
@@ -600,6 +600,7 @@ class GDNDensePrefillFwdKernel(Kernel, GDNFwdInterface):
                 beta,
                 cu_seqlens,
                 initial_state=initial_state,
+                state_indices=state_indices,
             )
             return o.reshape(batch, seq_len, value_heads, dim_v), final_state
         if solve == "warpgroup":
@@ -618,7 +619,7 @@ class GDNDensePrefillFwdKernel(Kernel, GDNFwdInterface):
             )
         else:
             initial, offsets, cp_seq_map, raw_offsets = self._partitioned_initial_state(
-                programs, k, v, inverse, g, beta, k_rnorm, initial_state, split
+                programs, k, v, inverse, g, beta, k_rnorm, initial_state, split, state_indices
             )
         o, final_state = fused_gdr_fwd(
             programs[-1],
@@ -634,5 +635,7 @@ class GDNDensePrefillFwdKernel(Kernel, GDNFwdInterface):
             raw_cu_seqlens=raw_offsets,
             state_v_first=self.state_v_first,
             k_rnorm=k_rnorm,
+            state_indices=state_indices,
+            pool=initial_state if self.pooled else None,
         )
         return o.reshape(batch, seq_len, value_heads, dim_v), final_state

@@ -1,5 +1,6 @@
-"""The dtype registry: every dtype name a manifest may write, with its bits per element and
-its category.
+"""The dtype registry: every dtype name a manifest may write.
+
+Each name maps to its bits per element and its category.
 
 This package depends on nothing beyond the standard library and PyYAML, so dtypes are names.
 """
@@ -27,6 +28,8 @@ _DTYPES: dict[str, tuple[int, str]] = {
     "float8_e4m3": (8, "float"),
     "float8_e5m2fnuz": (8, "float"),
     "float8_e4m3fnuz": (8, "float"),
+    # Power-of-two scales: an 8-bit exponent, no sign, no mantissa.
+    "float8_e8m0fnu": (8, "float"),
 }
 
 DTYPE_BITS: dict[str, int] = {name: bits for name, (bits, _) in _DTYPES.items()}

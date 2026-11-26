@@ -8,10 +8,9 @@ from tileops._kernels.attention.call_spec import (
     MergeAttentionStatesCall,
     MergeAttentionStatesFwdInterface,
 )
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.constants import VECTOR_ACCESS_BYTES
 from tileops._kernels.kernel_base import Entry, Kernel
-from tileops._utils import get_sm_count
 
 __all__ = ["MergeAttentionStatesKernel"]
 
@@ -22,7 +21,7 @@ def _merge_states_kernel(dim, dtype, cols, run, tail, base2):
     # count ahead of every load, which delays the loads of a single-wave launch.
     @tilelang.jit(
         out_idx=[4, 5],
-        compile_flags=["--use_fast_math"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "--use_fast_math"],
         pass_configs={tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True},
     )
     def _func(block_rows, threads):
@@ -113,7 +112,7 @@ class MergeAttentionStatesKernel(Kernel, MergeAttentionStatesFwdInterface):
 
     @classmethod
     def entry_for(cls, call: MergeAttentionStatesCall) -> Entry:
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         return (call.dim, call.dtype, call.lse_base, index), lambda: cls(
             call.dim, call.dtype, call.lse_base, device_index=index
         )
@@ -127,7 +126,7 @@ class MergeAttentionStatesKernel(Kernel, MergeAttentionStatesFwdInterface):
         lanes = VECTOR_ACCESS_BYTES // dtype.itemsize
         self._vector = lanes if dim and dim % lanes == 0 else 1
         self._cols = tilelang.next_power_of_2(max(1, dim))
-        self._sm_count = get_sm_count(device_index)
+        self._sm_count = self.build_target.sm_count
         self.init_config(config)
 
     @property

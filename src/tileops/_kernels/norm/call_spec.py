@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import dataclasses
 from abc import abstractmethod
-from typing import Optional
 
 import torch
 
@@ -30,8 +29,13 @@ __all__ = [
     "InstanceNormTrainFwdInterface",
     "LayerNormCall",
     "LayerNormFwdInterface",
+    "RMSNormCall",
     "RMSNormFwdInterface",
+    "RMSNormGatedCall",
+    "RMSNormGatedFwdInterface",
     "RMSNormQuantCall",
+    "whole_row_refusal",
+    "whole_row_scale_refusal",
 ]
 
 
@@ -80,6 +84,35 @@ class LayerNormCall(CallSpec):
 
 
 @dataclasses.dataclass(frozen=True)
+class RMSNormCall(LayerNormCall):
+    """The facts that select an RMS normalization implementation and build it.
+
+    RMS and fused-add RMS normalization take it. ``zero_centered`` scales by ``1 + weight``
+    instead of ``weight``; ``group_size`` is the run of elements each root mean square
+    covers, ``None`` for the whole row.
+    """
+
+    zero_centered: bool = False
+    group_size: int | None = None
+
+
+def whole_row_refusal(call: RMSNormCall) -> str | None:
+    """Why a kernel normalizing each whole row does not serve *call*, or ``None`` when it
+    does."""
+    if call.group_size not in (None, call.n):
+        return "the kernel normalizes each whole row; group_size is not served"
+    return None
+
+
+def whole_row_scale_refusal(call: RMSNormCall) -> str | None:
+    """Why a kernel normalizing each whole row and scaling it by ``weight`` does not serve
+    *call*, or ``None`` when it does."""
+    if call.zero_centered:
+        return "the kernel scales by the weight itself; zero_centered is not served"
+    return whole_row_refusal(call)
+
+
+@dataclasses.dataclass(frozen=True)
 class RMSNormQuantCall(CallSpec):
     """The facts that select an implementation normalizing and quantizing trailing rows.
 
@@ -93,7 +126,28 @@ class RMSNormQuantCall(CallSpec):
     eps: float = 1e-6
     dtype: torch.dtype = torch.bfloat16
     quant_dtype: torch.dtype = torch.float8_e4m3fn
-    scale_ub: Optional[float] = None
+    scale_ub: float | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class RMSNormGatedCall(CallSpec):
+    """The facts that select a gated RMS normalization implementation and build it.
+
+    ``n`` is the row's element count and ``group`` the element count each norm runs over,
+    which divides ``n``. ``eps``, ``norm_before_gate`` and ``activation`` are the op's
+    construction parameters, which the programs compile in. ``bias_dtype`` and ``z_dtype``
+    are ``None`` where the call passes no ``bias`` or no ``z``.
+    """
+
+    n: int = 0
+    group: int = 0
+    eps: float = 1e-6
+    norm_before_gate: bool = True
+    activation: str = "silu"
+    dtype: torch.dtype = torch.bfloat16
+    weight_dtype: torch.dtype = torch.bfloat16
+    bias_dtype: torch.dtype | None = None
+    z_dtype: torch.dtype | None = None
 
 
 class BatchNormTrainFwdInterface(KernelInterface):
@@ -105,10 +159,10 @@ class BatchNormTrainFwdInterface(KernelInterface):
     def forward(
         self,
         x: torch.Tensor,
-        running_mean: Optional[torch.Tensor],
-        running_var: Optional[torch.Tensor],
-        weight: Optional[torch.Tensor],
-        bias: Optional[torch.Tensor],
+        running_mean: torch.Tensor | None,
+        running_var: torch.Tensor | None,
+        weight: torch.Tensor | None,
+        bias: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Normalize *x* per channel by its batch statistics.
 
@@ -143,8 +197,8 @@ class BatchNormInferFwdInterface(KernelInterface):
         x: torch.Tensor,
         running_mean: torch.Tensor,
         running_var: torch.Tensor,
-        weight: Optional[torch.Tensor],
-        bias: Optional[torch.Tensor],
+        weight: torch.Tensor | None,
+        bias: torch.Tensor | None,
     ) -> torch.Tensor:
         """Normalize *x* per channel by the running statistics; nothing is written in place.
 
@@ -202,10 +256,10 @@ class InstanceNormFwdInterface(KernelInterface):
     def forward(
         self,
         x: torch.Tensor,
-        running_mean: Optional[torch.Tensor] = None,
-        running_var: Optional[torch.Tensor] = None,
-        weight: Optional[torch.Tensor] = None,
-        bias: Optional[torch.Tensor] = None,
+        running_mean: torch.Tensor | None = None,
+        running_var: torch.Tensor | None = None,
+        weight: torch.Tensor | None = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Normalize each row of *x* by its own statistics; nothing is written in place.
 
@@ -235,8 +289,8 @@ class InstanceNormTrainFwdInterface(KernelInterface):
         x: torch.Tensor,
         running_mean: torch.Tensor,
         running_var: torch.Tensor,
-        weight: Optional[torch.Tensor] = None,
-        bias: Optional[torch.Tensor] = None,
+        weight: torch.Tensor | None = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Normalize *x* per instance and update the running statistics in place.
 
@@ -266,8 +320,8 @@ class InstanceNormInferFwdInterface(KernelInterface):
         x: torch.Tensor,
         running_mean: torch.Tensor,
         running_var: torch.Tensor,
-        weight: Optional[torch.Tensor],
-        bias: Optional[torch.Tensor],
+        weight: torch.Tensor | None,
+        bias: torch.Tensor | None,
     ) -> torch.Tensor:
         """Normalize *x* per channel by the running statistics; nothing is written in place.
 
@@ -309,7 +363,7 @@ class LayerNormFwdInterface(KernelInterface):
 
     @abstractmethod
     def forward(
-        self, x: torch.Tensor, weight: Optional[torch.Tensor], bias: Optional[torch.Tensor]
+        self, x: torch.Tensor, weight: torch.Tensor | None, bias: torch.Tensor | None
     ) -> torch.Tensor:
         """Normalize each run of ``call.n`` trailing elements; nothing is written in place.
 
@@ -328,10 +382,10 @@ class LayerNormFwdInterface(KernelInterface):
 class RMSNormFwdInterface(KernelInterface):
     """Root mean square normalization over the trailing ``call.n`` elements."""
 
-    request = LayerNormCall
+    request = RMSNormCall
 
     @abstractmethod
-    def forward(self, x: torch.Tensor, weight: Optional[torch.Tensor]) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, weight: torch.Tensor | None) -> torch.Tensor:
         """Normalize each run of ``call.n`` trailing elements; nothing is written in place.
 
         Every tensor is contiguous on ``call.device``.
@@ -339,6 +393,36 @@ class RMSNormFwdInterface(KernelInterface):
         Args:
             x: Any shape whose trailing axes hold ``call.n`` elements, in ``call.dtype``.
             weight: ``call.n`` elements of scale in ``call.dtype``, or ``None`` for one.
+
+        Returns:
+            A new output shaped like *x*, in ``call.dtype``.
+        """
+
+
+class RMSNormGatedFwdInterface(KernelInterface):
+    """RMS normalization of each group of ``call.group`` trailing elements, gated by
+    ``act(z)``."""
+
+    request = RMSNormGatedCall
+
+    @abstractmethod
+    def forward(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        z: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Normalize, scale, shift and gate each row; nothing is written in place.
+
+        Every tensor is contiguous on ``call.device``. A tensor is passed exactly where
+        ``call`` names its dtype.
+
+        Args:
+            x: ``(*leading, call.n)`` in ``call.dtype``.
+            weight: ``(call.n,)`` scale in ``call.weight_dtype``.
+            bias: ``(call.n,)`` shift in ``call.bias_dtype``, or ``None``.
+            z: Shaped like *x*, in ``call.z_dtype``, or ``None`` for no gate.
 
         Returns:
             A new output shaped like *x*, in ``call.dtype``.
@@ -372,7 +456,7 @@ class FusedAddLayerNormFwdInterface(KernelInterface):
 class FusedAddRMSNormFwdInterface(KernelInterface):
     """A residual add, then RMS normalization of the sum over the last ``call.n`` elements."""
 
-    request = LayerNormCall
+    request = RMSNormCall
 
     @abstractmethod
     def forward(
@@ -458,8 +542,8 @@ class GroupNormFwdInterface(KernelInterface):
     def forward(
         self,
         x: torch.Tensor,
-        weight: Optional[torch.Tensor] = None,
-        bias: Optional[torch.Tensor] = None,
+        weight: torch.Tensor | None = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Normalize each group of *x* by its own statistics; nothing is written in place.
 
@@ -478,7 +562,12 @@ class GroupNormFwdInterface(KernelInterface):
 @dataclasses.dataclass(frozen=True)
 class FusedQKNormRoPECall(CallSpec):
     """One in-place q/k normalization and rotation; the token and position counts are runtime
-    data."""
+    data.
+
+    ``zero_centered`` scales by ``1 + weight``. ``mrope_section`` is the op's multimodal
+    rotary sections, ``None`` for one position a token, and ``mrope_interleaved`` its
+    interleaved assignment.
+    """
 
     heads: int = 0
     kv_heads: int = 0
@@ -486,8 +575,11 @@ class FusedQKNormRoPECall(CallSpec):
     rot: int = 0
     interleaved: bool = False
     eps: float = 1e-6
-    dtype: Optional[torch.dtype] = None
-    cache_dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
+    cache_dtype: torch.dtype | None = None
+    zero_centered: bool = False
+    mrope_section: tuple[int, ...] | None = None
+    mrope_interleaved: bool = False
 
 
 class FusedQKNormRoPEFwdInterface(KernelInterface):
@@ -514,5 +606,6 @@ class FusedQKNormRoPEFwdInterface(KernelInterface):
             q_weight: ``(call.dim,)`` in ``call.dtype``.
             k_weight: ``(call.dim,)`` in ``call.dtype``.
             cos_sin_cache: ``(positions, call.rot)`` in ``call.cache_dtype``, cosines then sines.
-            positions: ``int64`` ``(tokens,)``, each a row of *cos_sin_cache*.
+            positions: ``int64`` ``(tokens,)``, each a row of *cos_sin_cache*; ``(3, tokens)``,
+                the temporal, height and width rows, with ``call.mrope_section``.
         """

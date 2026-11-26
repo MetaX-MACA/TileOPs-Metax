@@ -5,7 +5,8 @@ to normalize and write it, the second time from the far end: the tiles it read l
 the likeliest still in L2.
 """
 
-from typing import Optional
+import math
+import operator
 
 import tilelang
 import tilelang.language as T
@@ -15,9 +16,15 @@ from tvm import DataType
 from tileops._kernels.build_target import target_cache
 from tileops._kernels.constants import VECTOR_ACCESS_BYTES
 from tileops._kernels.kernel_base import Entry, Kernel
-from tileops._kernels.norm.call_spec import LayerNormCall, RMSNormFwdInterface
+from tileops._kernels.norm.call_spec import (
+    LayerNormCall,
+    RMSNormCall,
+    RMSNormFwdInterface,
+    whole_row_scale_refusal,
+)
 from tileops._kernels.tiling import ALIGNMENT, align_up
-from tileops._utils import WARP_LANES, get_sm_count
+from tileops._kernels.warp_reduce import warp_reduce
+from tileops._utils import WARP_LANES
 
 __all__ = ["RMSNormStreamingKernel"]
 
@@ -25,9 +32,7 @@ __all__ = ["RMSNormStreamingKernel"]
 @target_cache(maxsize=32)
 def _rms_norm_streaming_kernel(M, N, eps, dtype, has_weight, ctas):
     # The widest access that divides the row, so every row starts on one.
-    vec = VECTOR_ACCESS_BYTES // (DataType(dtype).bits // 8)
-    while N % vec:
-        vec //= 2
+    vec = math.gcd(N, VECTOR_ACCESS_BYTES // (DataType(dtype).bits // 8))
 
     @tilelang.jit(out_idx=[2])
     def build(threads, accesses):
@@ -70,8 +75,7 @@ def _rms_norm_streaming_kernel(M, N, eps, dtype, has_weight, ctas):
                         for j in T.unroll(accesses * vec):
                             v = T.cast(held[j], "float32")
                             acc[0] += v * v
-                    for k in T.unroll(WARP_LANES.bit_length() - 1):
-                        acc[0] += T.shfl_xor(acc[0], T.shift_left(1, k))
+                    warp_reduce(acc, operator.add)
                     if tx % WARP_LANES == 0:
                         warp_sums[step % 2, tx // WARP_LANES] = acc[0]
                     T.sync_threads()
@@ -109,9 +113,11 @@ class RMSNormStreamingKernel(Kernel, RMSNormFwdInterface):
     preferred_over = frozenset({"rms_norm", "rms_norm_two_pass"})
 
     @classmethod
-    def refusal(cls, call: LayerNormCall) -> "str | None":
+    def refusal(cls, call: RMSNormCall) -> "str | None":
+        if (reason := whole_row_scale_refusal(call)) is not None:
+            return reason
         element_bytes = call.dtype.itemsize
-        budget = torch.cuda.get_device_properties(call.device).shared_memory_per_block_optin
+        budget = call.smem_budget
         if align_up(call.n, ALIGNMENT) * element_bytes <= budget:
             return f"a row of {call.n} elements fits the {budget}-byte shared memory of a block"
         return super().refusal(call)
@@ -134,7 +140,8 @@ class RMSNormStreamingKernel(Kernel, RMSNormFwdInterface):
     def autotune_configs(self) -> list[dict]:
         return [self.default_config]
 
-    def forward(self, x: torch.Tensor, weight: Optional[torch.Tensor]) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, weight: torch.Tensor | None) -> torch.Tensor:
+        self._require_devices(x=x, weight=weight)
         rows = x.reshape(-1, self.n)
         has_weight = weight is not None
         weight = weight.reshape(self.n) if has_weight else rows.new_empty(1)
@@ -145,7 +152,7 @@ class RMSNormStreamingKernel(Kernel, RMSNormFwdInterface):
     def _compile(self, cfg: dict, m: int, has_weight: bool, device_index: int):
         """The program for *m* rows, with or without a weight, on device *device_index*."""
         # Two CTAs an SM, each walking its share of the rows.
-        ctas = min(m, 2 * get_sm_count(device_index))
+        ctas = min(m, 2 * self.build_target.sm_count)
         self.kernel = kernel = _rms_norm_streaming_kernel(
             m, self.n, self.eps, self.dtype_str, has_weight, ctas
         )

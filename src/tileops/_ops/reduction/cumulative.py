@@ -1,6 +1,7 @@
 """Cumulative scan operators (cumsum, cumprod)."""
 
-from typing import ClassVar, Mapping, Optional
+from collections.abc import Mapping
+from typing import ClassVar
 
 import torch
 
@@ -11,6 +12,7 @@ from tileops._kernels.reduction.call_spec import (
     CumulativeCall,
 )
 from tileops._kernels.reduction.cumulative import (
+    CumsumClusterScanKernel,
     CumulativeKernel,
     CumulativeParallelScanKernel,
     CumulativeRowScanKernel,
@@ -36,7 +38,7 @@ class CumulativeOp(Op):
         self,
         dim: int,
         *,
-        dtype: Optional[torch.dtype] = None,
+        dtype: torch.dtype | None = None,
         target: Target = None,
     ) -> None:
         """Build the op. Shapes and dtype are taken from the first call.
@@ -106,6 +108,7 @@ class CumsumFwdOp(CumulativeOp):
 
     _op_kind = "sum"
     kernel_types: ClassVar[Mapping[str, type[Kernel]]] = {
+        "cumsum_cluster_scan": CumsumClusterScanKernel,
         "cumulative_row_scan": CumulativeRowScanKernel,
         "cumulative_parallel_scan": CumulativeParallelScanKernel,
         "cumulative_fwd": CumulativeKernel,

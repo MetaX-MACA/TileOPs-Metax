@@ -8,11 +8,7 @@ import pytest
 import torch
 
 from tests.workload_test_base import _check_result
-from tests.xfail_whitelist import (
-    MACA_XFAIL_NO_RUN,
-    MACA_XFAIL_PREFIXES,
-    MACA_XFAILS,
-)
+from tests.xfail_whitelist import MACA_XFAIL_NO_RUN, MACA_XFAIL_PREFIXES, MACA_XFAILS
 from tileops._utils import is_maca
 from tileops._utils.device import (
     accelerator_memory_reserved,
@@ -20,13 +16,27 @@ from tileops._utils.device import (
     empty_accelerator_cache,
     on_current_index,
 )
-from tileops.backend import BUILTIN, OpNotAvailableError, default_target
+from tileops.backend import (
+    BUILTIN,
+    OpNotAvailableError,
+    OpNotServedError,
+    _registry,
+    default_target,
+)
 from workloads.device import (
     run_device,
     run_device_available,
     run_device_is_cuda,
     torch_compile_unavailable,
 )
+from workloads.gemm import fp32_matmul_reduction
+
+
+@pytest.fixture
+def fp32_gemm_reduction():
+    """Use full FP32 reduction in the cuBLAS reference and restore its prior settings."""
+    with fp32_matmul_reduction():
+        yield
 
 
 def _normalized_test_nodeid(item: pytest.Item) -> str:
@@ -103,22 +113,27 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
 
 
+@pytest.hookimpl(trylast=True)
 def pytest_configure(config: pytest.Config) -> None:
     """Flip the in-process trace switch on when ``--trace-kernel`` is passed.
 
     Runs once at startup, before any kernel is built, so the traced build is the
     one that gets cached. No environment variable is involved — the switch lives
-    in this pytest process only.
+    in this pytest process only. Runs after the root conftest pins the target, and
+    records it as the run's target.
     """
     if config.getoption("--trace-kernel"):
         from tileops.trace import trace
 
         trace.enable()  # dumps to debug/ (gitignored)
-    global _cuda_only_must_fail
+    global _cuda_only_must_fail, _run_target
     _cuda_only_must_fail = config.getoption("--tileops-cuda-only-must-fail")
+    _run_target = default_target()
 
 
 _cuda_only_must_fail = False
+# The target ``--tileops-target`` pinned; a default a test or fixture sets later does not change it.
+_run_target = None
 
 
 @pytest.fixture(autouse=True)
@@ -304,10 +319,18 @@ class UnservedError(OpNotAvailableError):
 
 
 def _unserved(exc: BaseException | None) -> bool:
-    """Whether *exc* is, or was re-raised from, a test target's refusal."""
+    """Whether *exc* is, or was re-raised from, a test target's refusal or the run's target
+    not serving the op. A target a test names itself does not count."""
+    run_target = _run_target
     # The shared verifier re-raises a request's error under the op's name, from the original.
     while exc is not None:
         if isinstance(exc, UnservedError):
+            return True
+        if (
+            isinstance(exc, OpNotServedError)
+            and run_target is not None
+            and exc.target == run_target
+        ):
             return True
         exc = exc.__cause__
     return False
@@ -317,8 +340,9 @@ def _unserved(exc: BaseException | None) -> bool:
 def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo) -> None:
     """Carry the test's architecture markers on its report, which xdist ships to the controller.
 
-    A test whose op call a test target refuses is unvalidated: a skip that is neither a
-    failure nor evidence of the test's own outcome.
+    A test whose op call a test target refuses, or whose op the run's target (the one
+    ``--tileops-target`` names) does not serve, is unvalidated: a skip that is neither a failure
+    nor evidence of the test's own outcome.
     """
     outcome = yield
     report = outcome.get_result()
@@ -416,6 +440,10 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             marker_errors.append(
                 f"{item.nodeid}: expected exactly one tier marker, found {tiers or 'none'}"
             )
+        elif "tests/models/" in str(item.path) and tiers != ["nightly"]:
+            # A model test builds whole decoder layers and runs the authors' reference beside
+            # them; that cost belongs to the nightly run, not to a pull request's gate.
+            marker_errors.append(f"{item.nodeid}: a test under tests/models is nightly")
 
     ops_groups: dict[tuple[str, str], list[pytest.Item]] = defaultdict(list)
     for item in items:
@@ -428,14 +456,25 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     for (_path, _test_name), group in ops_groups.items():
         non_xfail_items = [item for item in group if item.get_closest_marker("xfail") is None]
         smoke_items = [item for item in group if item.get_closest_marker("smoke") is not None]
+        auto_xfail_smoke = any(
+            item.get_closest_marker("xfail") is not None
+            and item.__dict__.get("_tileops_maca_xfail", False)
+            for item in smoke_items
+        )
+        for item in smoke_items:
+            if (
+                item.get_closest_marker("xfail") is not None
+                and not item.__dict__.get("_tileops_maca_xfail", False)
+            ):
+                marker_errors.append(f"{item.nodeid}: smoke cases must not be xfail")
 
-        # Xfailed smoke cases still document the intended smoke coverage for
-        # their dtype, even when this backend cannot execute them successfully.
-        valid_smoke_items = smoke_items
+        valid_smoke_items = [
+            item for item in smoke_items if item.get_closest_marker("xfail") is None
+        ]
 
-        # Backend xfails may include former smoke parameters. In that case
-        # smoke ordering/coverage cannot be enforced for the group.
-        if non_xfail_items and not any(item.get_closest_marker("xfail") for item in group):
+        # MACA allowlist marks are applied at collection time; they may cover a smoke
+        # case whose backend failure is already known. Keep those out of ordering checks.
+        if non_xfail_items and not auto_xfail_smoke:
             if len(valid_smoke_items) < 1:
                 marker_errors.append(
                     f"{non_xfail_items[0].nodeid}: each test must have at least one smoke case"
@@ -601,3 +640,16 @@ def pytest_runtest_call(item):
         _check_result.op_name = None
         _check_result.op_module = None
         _check_result.max_abs_err = None
+
+
+@pytest.fixture
+def isolated_registry():
+    """An empty kernel registry for the test, restored afterwards."""
+    state = _registry.snapshot()
+    _registry.DETECTORS.clear()
+    _registry.BUILDERS.clear()
+    _registry.LOAD_FAILURES.clear()
+    _registry.default_target = None
+    _registry._loaded = True
+    yield
+    _registry.restore(state)

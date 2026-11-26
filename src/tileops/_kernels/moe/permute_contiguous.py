@@ -1,23 +1,27 @@
 """Layout-specialized contiguous materialization for staged MoE PrePermute."""
 
 import math
-from typing import Optional
 
 import tilelang
 import tilelang.language as T
 import torch
 
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS
+from tileops._kernels.constants import VECTOR_ACCESS_BYTES
 from tileops._kernels.kernel_base import CompiledProgram, Kernel
 from tileops._kernels.moe.call_spec import PrePermuteCall, PrePermuteFwdInterface
-from tileops._utils import get_sm_count
+from tileops._kernels.moe.layout import row_threads
 
 __all__ = ["MoEPrePermuteContiguousKernel"]
+
+# Elements of a 16-bit row one vector access copies; both gathers copy rows this wide.
+_ROW_VECTOR = VECTOR_ACCESS_BYTES // 2
 
 
 def _make_tight_scan(numel: int, num_experts: int):
     """Count assignments and produce tight physical-PSUM metadata."""
 
-    @tilelang.jit(out_idx=[], compile_flags=["-O3"])
+    @tilelang.jit(out_idx=[], compile_flags=[*CUDA_COMPILE_FLAGS])
     def _scan(threads: int):
         @T.prim_func
         def _scan_main(
@@ -78,7 +82,7 @@ def _make_parallel_tight_scan(
     blocks = (numel + routes_per_block - 1) // routes_per_block
     prefix_threads = min(1024, 1 << max(0, (num_experts - 1).bit_length()))
 
-    @tilelang.jit(out_idx=[], compile_flags=["-O3"])
+    @tilelang.jit(out_idx=[], compile_flags=[*CUDA_COMPILE_FLAGS])
     def _count():
         @T.prim_func
         def _count_main(
@@ -108,7 +112,7 @@ def _make_parallel_tight_scan(
 
         return _count_main
 
-    @tilelang.jit(out_idx=[], compile_flags=["-O3"])
+    @tilelang.jit(out_idx=[], compile_flags=[*CUDA_COMPILE_FLAGS])
     def _prefix():
         @T.prim_func
         def _prefix_main(
@@ -150,7 +154,7 @@ def _make_parallel_tight_scan(
 
         return _prefix_main
 
-    @tilelang.jit(out_idx=[], compile_flags=["-O3"])
+    @tilelang.jit(out_idx=[], compile_flags=[*CUDA_COMPILE_FLAGS])
     def _scatter():
         @T.prim_func
         def _scatter_main(
@@ -192,7 +196,7 @@ def _make_aligned_per_row_scan(
     """Produce aligned slots, per-row expert IDs, and inverse indices."""
     owner_search_steps = max(1, num_experts.bit_length())
 
-    @tilelang.jit(out_idx=[], compile_flags=["-O3"])
+    @tilelang.jit(out_idx=[], compile_flags=[*CUDA_COMPILE_FLAGS])
     def _scan(threads: int):
         @T.prim_func
         def _scan_main(
@@ -272,14 +276,6 @@ def _make_aligned_per_row_scan(
     return _scan
 
 
-def _row_threads(hidden_size: int) -> int:
-    """Threads that copy one row eight elements each: the most, up to 1024, dividing it."""
-    threads = min(1024, hidden_size // 8)
-    while threads > 0 and hidden_size % threads != 0:
-        threads -= 1
-    return max(threads, 1)
-
-
 def _make_aligned_gather(
     num_tokens: int,
     physical_rows: int,
@@ -289,10 +285,10 @@ def _make_aligned_gather(
     rows_per_block: int,
 ):
     """Gather real rows and zero-fill padding and capacity rows."""
-    threads = _row_threads(hidden_size)
+    threads = row_threads(hidden_size, _ROW_VECTOR)
     grid = (physical_rows + rows_per_block - 1) // rows_per_block
 
-    @tilelang.jit(out_idx=[], compile_flags=["-O3", "-DENABLE_BF16"])
+    @tilelang.jit(out_idx=[], compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"])
     def _gather():
         @T.prim_func
         def _gather_main(
@@ -328,10 +324,10 @@ def _make_token_gather(num_tokens: int, top_k: int, hidden_size: int, dtype: str
     Block ``split`` handles routes ``split + i * splits``. Reusing the row avoids
     repeated DRAM reads when the hidden states exceed L2.
     """
-    threads = _row_threads(hidden_size)
+    threads = row_threads(hidden_size, _ROW_VECTOR)
     per_block = (top_k + splits - 1) // splits
 
-    @tilelang.jit(out_idx=[], compile_flags=["-O3", "-DENABLE_BF16"])
+    @tilelang.jit(out_idx=[], compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"])
     def _gather():
         @T.prim_func
         def _token_gather_main(
@@ -367,8 +363,8 @@ class MoEPrePermuteContiguousKernel(Kernel, PrePermuteFwdInterface):
             return f"requires float16 or bfloat16, got {call.input_dtype}"
         return super().refusal(call)
 
-    def __init__(self, call: PrePermuteCall, config: Optional[dict] = None) -> None:
-        super().__init__(device_index=call.device.index if call.device is not None else None)
+    def __init__(self, call: PrePermuteCall, config: dict | None = None) -> None:
+        super().__init__(device_index=call.device_index)
         layout = call.layout
         self.layout_key = getattr(layout, "selection_key", "")
         self.num_tokens = call.num_tokens
@@ -465,7 +461,7 @@ class MoEPrePermuteContiguousKernel(Kernel, PrePermuteFwdInterface):
             )
             return CompiledProgram(scan), CompiledProgram(gather()), None
         # Fewer tokens than SMs split each token's routes so the grid still covers them.
-        splits = min(self.top_k, -(-get_sm_count(self.device_index) // self.num_tokens))
+        splits = min(self.top_k, -(-self.build_target.sm_count // self.num_tokens))
         gather = CompiledProgram(
             _make_token_gather(
                 self.num_tokens, self.top_k, self.hidden_size, self.dtype_str, splits

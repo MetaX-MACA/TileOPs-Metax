@@ -1,6 +1,7 @@
 """Seeded categorical draw: one inverse-CDF search per row, over one read of the row."""
 
-from typing import ClassVar, Optional
+import operator
+from typing import ClassVar
 
 import tilelang
 import tilelang.language as T
@@ -14,9 +15,16 @@ from tileops._kernels.constants import (
 )
 from tileops._kernels.kernel_base import Kernel
 from tileops._kernels.sampling.call_spec import SamplingCall, SamplingFromProbsFwdInterface
-from tileops._kernels.sampling.philox import UNIFORM_BITS, mix
-from tileops._kernels.sampling.row_tiles import load_vector, row_split, vector_width
-from tileops._utils import WARP_LANES, WARP_SHUFFLE_STAGES, is_maca
+from tileops._kernels.sampling.philox import draw, uniform_of
+from tileops._kernels.sampling.row_tiles import (
+    gather_part_totals,
+    load_vector,
+    pick_entry,
+    row_split,
+    vector_width,
+)
+from tileops._kernels.warp_reduce import warp_reduce
+from tileops._utils import WARP_LANES, is_maca
 
 __all__ = ["SamplingFromProbsFwdKernel"]
 
@@ -126,12 +134,7 @@ def _sampling_from_probs_kernel(
                         if src[tx * span + i] > T.cast(0, "float64"):
                             idx[1] = tx * span + i
                         acc[0] = acc[0] + src[tx * span + i]
-                for stage in T.unroll(WARP_SHUFFLE_STAGES):
-                    reach = T.int32(WARP_LANES // 2) >> stage
-                    idx[0] = T.min(idx[0], T.shfl_xor(idx[0], reach, width=WARP_LANES))
-                    idx[1] = T.max(idx[1], T.shfl_xor(idx[1], reach, width=WARP_LANES))
-                if tx == 0:
-                    pick[0] = T.if_then_else(idx[0] < n, idx[0], T.max(idx[1], 0))
+                pick_entry(idx, pick, n)
             T.sync_threads()
             if tx == 0:
                 acc[1] = frac * edge[0] + base
@@ -187,55 +190,26 @@ def _sampling_from_probs_kernel(
                     for j in T.unroll(pace):
                         if r * pace + j < chunk:
                             fold(warp, cur, j)
-                            for stage in T.unroll(WARP_SHUFFLE_STAGES):
-                                reach = T.int32(WARP_LANES // 2) >> stage
-                                warp[0] = warp[0] + T.shfl_xor(warp[0], reach, width=WARP_LANES)
+                            warp_reduce(warp, operator.add, high_first=True)
                             if tx % WARP_LANES == 0:
                                 seg[(r * pace + j) * warps + tx // WARP_LANES] = T.cast(
                                     warp[0], "float64"
                                 )
                 T.sync_threads()
 
-                # The row's uniform: Philox4x32-10 keyed by the seed and counted by the row
-                # alone, so it is the same value however the launch splits the row.
-                key[0] = T.cast(seed[0] & T.int64(0xFFFFFFFF), "uint32")
-                key[1] = T.cast((seed[0] >> T.int64(32)) & T.int64(0xFFFFFFFF), "uint32")
-                counter[0] = T.uint32(0)
-                counter[1] = T.cast(line, "uint32")
-                counter[2] = T.cast(offset[0] & T.int64(0xFFFFFFFF), "uint32")
-                counter[3] = T.cast((offset[0] >> T.int64(32)) & T.int64(0xFFFFFFFF), "uint32")
-                mix(counter, key, bump)
-                aim[1] = T.cast(
-                    T.cast(counter[0] >> T.uint32(32 - UNIFORM_BITS), "float32")
-                    * T.float32(2.0**-UNIFORM_BITS),
-                    "float64",
-                )
+                # The row's uniform, counted by the row alone, so it is the same value however
+                # the launch splits the row.
+                draw(counter, key, bump, seed, offset, T.uint32(0), line)
+                aim[1] = T.cast(uniform_of(counter[0]), "float64")
 
                 if parts == 1:
                     if tx == 0:
                         owner[0] = 0
                     aim[0] = T.cast(0, "float64")
                 else:
-                    # The chunk total, summed exactly as ``locate`` sums the same entries,
-                    # so the prefix a block takes from the barrier and the prefix it then
-                    # descends agree entry for entry.
-                    if tx < WARP_LANES:
-                        acc[0] = T.cast(0, "float64")
-                        for i in T.serial(leaf_span):
-                            if tx * leaf_span + i < leaves:
-                                acc[0] = acc[0] + seg[tx * leaf_span + i]
-                        lane[tx] = acc[0]
-                    T.sync_threads()
-                    if tx == 0:
-                        acc[0] = T.cast(0, "float64")
-                        for l in T.serial(WARP_LANES):
-                            acc[0] = acc[0] + lane[l]
-                        partial[bx] = acc[0]
-                    T.sync_grid()
-                    for i in T.serial(-(-parts // threads)):
-                        if i * threads + tx < parts:
-                            chunks[i * threads + tx] = partial[line * parts + i * threads + tx]
-                    T.sync_threads()
+                    gather_part_totals(
+                        seg, lane, partial, chunks, acc, bx, line, leaves, leaf_span, parts, threads
+                    )
                     locate(
                         chunks,
                         parts,
@@ -345,7 +319,7 @@ class SamplingFromProbsFwdKernel(Kernel, SamplingFromProbsFwdInterface):
         return vec, parts, -(-row_tiles // parts) * (cls._THREADS // WARP_LANES)
 
     @classmethod
-    def refusal(cls, call: SamplingCall) -> Optional[str]:
+    def refusal(cls, call: SamplingCall) -> str | None:
         reason = super().refusal(call)
         if reason is not None:
             return reason
@@ -368,15 +342,15 @@ class SamplingFromProbsFwdKernel(Kernel, SamplingFromProbsFwdInterface):
             )
         return None
 
-    def __init__(self, call: SamplingCall, config: Optional[dict] = None) -> None:
-        super().__init__(device_index=call.device.index if call.device is not None else None)
+    def __init__(self, call: SamplingCall, config: dict | None = None) -> None:
+        super().__init__(device_index=call.device_index)
         self.call = call
         self.dtype = call.dtype
-        self._vec, self._parts, _leaves = self._plan(
+        vec, self._parts, _leaves = self._plan(
             call.vocab, call.dtype.itemsize, call.batch, call.sm_count
         )
         self.kernel = _sampling_from_probs_kernel(
-            call.batch, call.vocab, self._vec, self._THREADS, self._parts, self._PACE
+            call.batch, call.vocab, vec, self._THREADS, self._parts, self._PACE
         )
         self.init_config(config)
 

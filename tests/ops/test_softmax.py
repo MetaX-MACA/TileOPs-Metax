@@ -14,20 +14,22 @@ All operators use the spec-conformant interface:
 """
 
 import math
+import re
 
 import pytest
 import torch
 import torch.nn.functional as F
+from tilelang.jit.kernel import JITKernel
 
 from tests.workload_test_base import FixtureBase, TestBase
+from tileops._kernels.kernel_base import CompiledProgram
+from tileops._kernels.reduction.call_spec import SoftmaxCall
+from tileops._kernels.reduction.softmax_on_chip import SoftmaxClusterSplitKernel
 from tileops._kernels.tiling import ALIGNMENT
 from tileops._ops.reduction.softmax import LogSoftmaxFwdOp, LogSumExpFwdOp, SoftmaxFwdOp
 from tileops._utils import get_shared_memory_optin, get_sm_count
 from workloads.device import run_device, run_device_available
 from workloads.numerics import compare_outputs
-
-# Tolerances (from docs/design/testing.md)
-# Softmax — spec-conformant interface (shape, dim, dtype)
 from workloads.reduction import (
     LogSoftmaxCase,
     LogSumExpCase,
@@ -57,7 +59,7 @@ class SoftmaxFixture(FixtureBase):
                 pytest.param((4, 512), -1, torch.float32, False, marks=pytest.mark.smoke),
                 # A 2 KB row on a warp, tail-M: the last CTA's warps past M store nothing.
                 pytest.param((5, 512), -1, torch.float32, False, marks=pytest.mark.full),
-                # request_tune() regression: kernel must be built before autotune runs
+                # request_tune(): the kernel is built before autotune runs
                 pytest.param((32, 256), -1, torch.float16, True, marks=pytest.mark.full),
                 # dim=-1 (default path): dtypes x pow2/non-pow2
                 pytest.param((32, 300), -1, torch.float32, False, marks=pytest.mark.full),
@@ -191,7 +193,7 @@ class LogSoftmaxFixture(FixtureBase):
                 ),
                 pytest.param((32, 256), -1, torch.float16, False, marks=pytest.mark.smoke),
                 pytest.param((32, 256), -1, torch.bfloat16, False, marks=pytest.mark.smoke),
-                # request_tune() regression: kernel must be built before autotune runs
+                # request_tune(): the kernel is built before autotune runs
                 pytest.param((32, 256), -1, torch.float16, True, marks=pytest.mark.full),
                 # dim=-1 (default path): dtypes x pow2/non-pow2
                 pytest.param((32, 300), -1, torch.float32, False, marks=pytest.mark.full),
@@ -327,7 +329,7 @@ class LogSumExpFixture(FixtureBase):
                 ),
                 pytest.param((32, 256), -1, torch.float16, False, marks=pytest.mark.smoke),
                 pytest.param((32, 256), -1, torch.bfloat16, False, marks=pytest.mark.smoke),
-                # request_tune() regression: kernel must be built before autotune runs
+                # request_tune(): the kernel is built before autotune runs
                 pytest.param((32, 256), -1, torch.float16, True, marks=pytest.mark.full),
                 # dim=-1: dtypes x pow2/non-pow2
                 pytest.param((32, 300), -1, torch.float32, False, marks=pytest.mark.full),
@@ -417,15 +419,14 @@ def test_logsumexp_keepdim(shape: tuple, dim: int, dtype: torch.dtype) -> None:
     compare_outputs(y, y_ref, softmax_verification(x.dtype, logarithmic=True))
 
 
-@pytest.mark.smoke
 @pytest.mark.parametrize(
     "shape, dim, dtype",
     [
-        pytest.param((256, 16384), -1, torch.bfloat16, id="streaming"),
-        pytest.param((64, 4096), -1, torch.float16, id="single-tile"),
-        pytest.param((300, 100000), -1, torch.float32, id="tiled"),
-        pytest.param((8, 102400), -1, torch.float32, id="split"),
-        pytest.param((4, 128, 4096), [0, 2], torch.float16, id="edge-axes"),
+        pytest.param((256, 16384), -1, torch.bfloat16, id="streaming", marks=pytest.mark.smoke),
+        pytest.param((64, 4096), -1, torch.float16, id="single-tile", marks=pytest.mark.smoke),
+        pytest.param((300, 100000), -1, torch.float32, id="tiled", marks=pytest.mark.smoke),
+        pytest.param((8, 102400), -1, torch.float32, id="split", marks=pytest.mark.full),
+        pytest.param((4, 128, 4096), [0, 2], torch.float16, id="edge-axes", marks=pytest.mark.full),
     ],
 )
 def test_logsumexp_special_values(shape: tuple, dim, dtype: torch.dtype) -> None:
@@ -715,8 +716,7 @@ def test_log_softmax_dim_none_reused_across_ranks() -> None:
     compare_outputs(y3, y3_ref, softmax_verification(y3.dtype, logarithmic=True))
 
 
-# Roofline regression: LogSoftmax FLOPs must equal 5 * M * N (not 6 * M * N).
-# Direct construction — no manifest-string indirection.
+# LogSoftmax FLOPs equal 5 * M * N.
 
 
 @pytest.mark.smoke
@@ -857,7 +857,6 @@ def test_large_row_shifts_its_maximum_to_exactly_one() -> None:
     )
 
 
-@pytest.mark.smoke
 @pytest.mark.parametrize(
     "op, reference",
     [
@@ -866,17 +865,20 @@ def test_large_row_shifts_its_maximum_to_exactly_one() -> None:
     ],
 )
 @pytest.mark.parametrize(
-    "width, prefix",
+    "width, prefix, dtype",
     [
         # 16384-element tiles on the streaming kernel: the first tile and most of the
         # second are the -inf prefix.
-        pytest.param(40000, 28672, id="streaming"),
+        pytest.param(40000, 28672, torch.float32, id="streaming", marks=pytest.mark.smoke),
+        # Two CTAs a row on the on-chip kernel, whose 16-bit rows take the warp maximum
+        # before their terms: the first CTA's share is the prefix.
+        pytest.param(65536, 32768, torch.float16, id="on-chip-fp16", marks=pytest.mark.smoke),
         # Eight CTAs a row on the on-chip kernel: the first CTA's share is the prefix.
-        pytest.param(40960, 5120, id="on-chip"),
+        pytest.param(40960, 5120, torch.float32, id="on-chip", marks=pytest.mark.full),
     ],
 )
 def test_leading_tiles_of_only_neg_inf_do_not_poison_a_row(
-    op: type, reference, width: int, prefix: int
+    op: type, reference, width: int, prefix: int, dtype: torch.dtype
 ) -> None:
     """A row whose leading part holds only ``-inf`` still reduces its finite tail.
 
@@ -889,7 +891,7 @@ def test_leading_tiles_of_only_neg_inf_do_not_poison_a_row(
     device = run_device()
     torch.manual_seed(1235)
     # Too few rows dispatch to the split kernel instead.
-    x = torch.randn((264, width), dtype=torch.float32, device=device)
+    x = torch.randn((264, width), dtype=dtype, device=device)
     x[0, :prefix] = float("-inf")
     x[1, :] = float("-inf")
 
@@ -923,6 +925,26 @@ def test_rows_read_once_across_a_cluster(op, reference, shape: tuple, dtype) -> 
     )
 
 
+def _scaled_rows(shape: tuple, dtype) -> torch.Tensor:
+    """Standard normal rows times four, from a fixed seed."""
+    torch.manual_seed(1235)
+    return torch.randn(shape, dtype=dtype, device=run_device()) * 4
+
+
+def _special_value_rows(shape: tuple, dtype) -> torch.Tensor:
+    """``_scaled_rows`` with special values in the first four rows.
+
+    The first eighth of row 0 is ``-inf``, row 1 is only ``-inf``, row 2 holds a ``+inf``
+    and row 3 a NaN.
+    """
+    x = _scaled_rows(shape, dtype)
+    x[0, : shape[1] // 8] = float("-inf")
+    x[1, :] = float("-inf")
+    x[2, shape[1] // 2] = float("inf")
+    x[3, shape[1] // 3] = float("nan")
+    return x
+
+
 @pytest.mark.smoke
 @pytest.mark.sm90
 @pytest.mark.in_tree_kernels
@@ -943,33 +965,104 @@ def test_few_long_rows_across_a_cluster(shape: tuple, dtype, special: bool) -> N
 
     SM90 is the first architecture with thread-block clusters and the 16-CTA cluster size
     the kernel launches.
-    In the special-value case the first two CTAs of row 0 hold only ``-inf``, so whole
-    warps and whole CTAs fold a ``-inf`` maximum and contribute nothing instead of the NaN
-    of ``exp(-inf - -inf)``. Row 1 is only ``-inf``, row 2 holds a ``+inf`` and row 3 a
-    NaN; each comes back NaN throughout, as torch returns it.
+    In the special-value case (``_special_value_rows``) the first two CTAs of row 0 hold
+    only ``-inf``, so whole warps and whole CTAs fold a ``-inf`` maximum and contribute
+    nothing instead of the NaN of ``exp(-inf - -inf)``; rows 1 to 3 come back NaN
+    throughout, as torch returns them.
     """
-    torch.manual_seed(1235)
-    x = torch.randn(shape, dtype=dtype, device=run_device()) * 4
-    if special:
-        x[0, : shape[1] // 8] = float("-inf")
-        x[1, :] = float("-inf")
-        x[2, shape[1] // 2] = float("inf")
-        x[3, shape[1] // 3] = float("nan")
+    x = _special_value_rows(shape, dtype) if special else _scaled_rows(shape, dtype)
     op = SoftmaxFwdOp(dim=-1)
     compare_outputs(op(x), F.softmax(x, dim=-1), softmax_verification(dtype, logarithmic=False))
     served = {type(kernel).__name__ for kernel in op._entries_built("softmax").values()}
     assert served == {"SoftmaxClusterSplitKernel"}, served
 
 
+@pytest.mark.sm90
+@pytest.mark.in_tree_kernels
+@pytest.mark.parametrize(
+    "shape, dtype, cluster",
+    [
+        # Two 32 KB shares a row, on a grid of over 100 waves of resident CTAs.
+        pytest.param((20480, 32768), torch.bfloat16, 2, id="two-shares", marks=pytest.mark.smoke),
+        # Eight 16 KB shares a row.
+        pytest.param((10240, 65536), torch.float16, 8, id="eight-shares", marks=pytest.mark.smoke),
+        # Six 16 KB shares, a cluster whose width is not a power of two.
+        pytest.param((13312, 49152), torch.float16, 6, id="six-shares", marks=pytest.mark.full),
+        # 2**31 elements: the loads take an int64 offset.
+        pytest.param(
+            (32768, 65536), torch.bfloat16, 8, id="two-to-the-31", marks=pytest.mark.nightly
+        ),
+    ],
+)
+def test_long_rows_held_whole_across_a_cluster(shape: tuple, dtype, cluster: int) -> None:
+    """Many 16-bit rows match torch, held whole in registers across a cluster.
+
+    SM90 is the first architecture with thread-block clusters, which the kernel launches.
+    The input takes ``_special_value_rows``: the first eighth of row 0 is ``-inf``, so where
+    that is a CTA's share its warps fold a ``-inf`` maximum and contribute nothing; rows 1
+    to 3 come back NaN throughout, as torch returns them. Row 4 lies wholly below -900, so
+    only its own maximum keeps its terms from flushing to zero. Row 5 lies near the type's
+    largest finite value; for bfloat16 its maximum times log2(e) is past the largest fp32.
+    Row 6 is one zero among ``-inf``: its sum is a single term, which the bias must raise.
+    """
+    x = _special_value_rows(shape, dtype)
+    x[4] -= 1000
+    x[5] += 0.9 * torch.finfo(dtype).max
+    x[6] = float("-inf")
+    x[6, 7] = 0
+    normalize = SoftmaxFwdOp(dim=-1)
+    compare_outputs(normalize(x), F.softmax(x, dim=-1), softmax_verification(dtype))
+    (kernel,) = normalize.iter_kernels()
+    assert isinstance(kernel, SoftmaxClusterSplitKernel), type(kernel).__name__
+    assert kernel.cluster == cluster, kernel.cluster
+
+
+@pytest.mark.sm90
 @pytest.mark.smoke
+@pytest.mark.parametrize(
+    "op_kind, shape, dtype, out_dtype",
+    [
+        pytest.param("softmax", (20480, 32768), torch.float32, torch.float32, id="float32"),
+        pytest.param("softmax", (1024, 32768), torch.bfloat16, torch.bfloat16, id="few-waves"),
+        # A row of four and a half shares.
+        pytest.param("softmax", (20480, 36864), torch.bfloat16, torch.bfloat16, id="part-share"),
+        # Sixteen shares, past the portable cluster.
+        pytest.param("softmax", (10240, 131072), torch.float16, torch.float16, id="sixteen-shares"),
+        pytest.param("softmax", (20480, 32768), torch.bfloat16, torch.float32, id="widened"),
+        pytest.param(
+            "log_softmax", (20480, 32768), torch.bfloat16, torch.bfloat16, id="log-softmax"
+        ),
+        # A row of 16384 elements fits one CTA's registers whole.
+        pytest.param("softmax", (40960, 16384), torch.bfloat16, torch.bfloat16, id="two-shares"),
+    ],
+)
+def test_cluster_split_refuses_rows_it_does_not_hold(op_kind, shape, dtype, out_dtype) -> None:
+    """SoftmaxClusterSplitKernel refuses calls outside both of its plans."""
+    call = SoftmaxCall(
+        device=run_device(),
+        shape=shape,
+        axis=1,
+        op_kind=op_kind,
+        dtype=dtype,
+        out_dtype=out_dtype,
+    )
+    assert SoftmaxClusterSplitKernel.refusal(call) is not None
+
+
 @pytest.mark.parametrize(
     "dtype, low, shape",
     [
-        pytest.param(torch.float32, -100.0, (264, 65536), id="float32"),
-        pytest.param(torch.bfloat16, -88.0, (264, 65536), id="bfloat16"),
+        pytest.param(torch.float32, -100.0, (264, 65536), id="float32", marks=pytest.mark.smoke),
+        pytest.param(torch.bfloat16, -88.0, (264, 65536), id="bfloat16", marks=pytest.mark.smoke),
         # Four rows split across a cluster each: every warp but the first holds only
         # ``low``, and its factor against the row maximum is subnormal on its own.
-        pytest.param(torch.bfloat16, -88.0, (4, 102400), id="cluster-split"),
+        pytest.param(
+            torch.bfloat16, -88.0, (4, 102400), id="cluster-split", marks=pytest.mark.smoke
+        ),
+        # Rows a group of a warp's lanes holds, and rows one CTA holds in registers: both
+        # exponentiate with an exp2 that flushes a subnormal result to zero.
+        pytest.param(torch.float32, -100.0, (1, 512), id="warp-rows", marks=pytest.mark.full),
+        pytest.param(torch.bfloat16, -88.0, (1, 2048), id="held-row", marks=pytest.mark.full),
     ],
 )
 def test_subnormal_probabilities_survive(dtype, low: float, shape: tuple) -> None:
@@ -987,4 +1080,94 @@ def test_subnormal_probabilities_survive(dtype, low: float, shape: tuple) -> Non
     torch.testing.assert_close(y, expected, rtol=1e-2, atol=0)
 
 
-_H200 = {"arch": 90, "sm_count": 132, "smem_budget": 232448}
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "shape, dtype",
+    [
+        # Rows a group of a warp's lanes holds.
+        pytest.param((4, 512), torch.float32, id="warp-rows"),
+        # Rows one CTA holds in registers.
+        pytest.param((8, 2048), torch.float16, id="held-row"),
+    ],
+)
+def test_register_held_rows_special_values(shape: tuple, dtype) -> None:
+    """Rows held in registers return torch's result around special values.
+
+    The ``-inf`` part of row 0 comes back zero; rows 1 to 3 come back NaN throughout, as
+    torch returns them.
+    """
+    x = _special_value_rows(shape, dtype)
+    compare_outputs(
+        SoftmaxFwdOp(dim=-1)(x),
+        F.softmax(x, dim=-1),
+        softmax_verification(dtype, logarithmic=False),
+    )
+
+
+# The L2 policy of Softmax's input-row loads (``keeps_input_rows``): evict-last where a kernel
+# reads each input row once into one CTA's registers and writes an output row for it, on an
+# input past L2; the default load on an input within L2. The inputs past L2 take 128 MB, past
+# the L2 of any supported device.
+
+
+def _launched_sources(monkeypatch) -> list:
+    """The CUDA source of every program launched or built from here on."""
+    sources = []
+    call, build = JITKernel.__call__, CompiledProgram.__init__
+
+    def launched(self, *args, **kwargs):
+        sources.append(self.get_kernel_source())
+        return call(self, *args, **kwargs)
+
+    def built(self, jit):
+        sources.append(jit.get_kernel_source())
+        build(self, jit)
+
+    monkeypatch.setattr(JITKernel, "__call__", launched)
+    monkeypatch.setattr(CompiledProgram, "__init__", built)
+    return sources
+
+
+def _run_and_capture(monkeypatch, shape, dtype, kernel) -> list:
+    """The CUDA sources of the programs Softmax runs on *shape*, which must be *kernel*'s;
+    the output is checked against the reference."""
+    sources = _launched_sources(monkeypatch)
+    test = SoftmaxTest(shape, dtype)
+    op = SoftmaxFwdOp(dim=-1)
+    test.check(op, *test.gen_inputs())
+    assert [type(k).__name__ for k in op.iter_kernels()] == [kernel]
+    assert sources
+    return sources
+
+
+@pytest.mark.smoke
+@pytest.mark.in_tree_kernels
+@pytest.mark.parametrize(
+    "shape, dtype, kernel",
+    [
+        pytest.param((131072, 512), torch.float16, "SoftmaxWarpRowsKernel", id="warp-rows"),
+        pytest.param((32768, 2048), torch.bfloat16, "SoftmaxKernel", id="held-row"),
+    ],
+)
+def test_softmax_rows_past_l2_load_evict_last(monkeypatch, shape, dtype, kernel) -> None:
+    """Every 16-byte input-row load, on an input past L2, is evict-last in L2."""
+    for source in _run_and_capture(monkeypatch, shape, dtype, kernel):
+        reads = [line for line in source.splitlines() if re.search(r"\bx\[|\(x \+ ", line)]
+        assert reads
+        assert all("tileops::load16_evict_last(" in line for line in reads)
+
+
+@pytest.mark.smoke
+@pytest.mark.in_tree_kernels
+@pytest.mark.parametrize(
+    "shape, dtype, kernel",
+    [
+        pytest.param((1024, 512), torch.float16, "SoftmaxWarpRowsKernel", id="warp-rows"),
+        pytest.param((1024, 2048), torch.bfloat16, "SoftmaxKernel", id="held-row"),
+    ],
+)
+def test_softmax_rows_within_l2_keep_the_default_load(monkeypatch, shape, dtype, kernel) -> None:
+    """On an input within L2, the input rows load without an L2 eviction hint."""
+    assert not any(
+        "evict_last" in source for source in _run_and_capture(monkeypatch, shape, dtype, kernel)
+    )

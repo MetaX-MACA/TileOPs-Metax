@@ -7,7 +7,7 @@ clamped to zero from above for numerical safety.
 """
 
 import itertools
-from typing import Callable, Optional
+from collections.abc import Callable
 
 import tilelang
 import tilelang.language as T
@@ -157,6 +157,63 @@ def _ssd_chunk_state_fwd_kernel(
     return kernel_func
 
 
+@target_cache(maxsize=32)
+@tilelang.jit(out_idx=[5], pass_configs={"tl.enable_aggressive_shared_memory_merge": True})
+def _ssd_chunk_state_tma_kernel(batch, chunks, heads, has_seq_idx, dtype):
+    """Use 128-token TMA panels and a contiguous FP32 state write on Hopper, for one B group."""
+    chunk, d_head, d_state, panel = 256, 64, 128, 128
+    seq = chunks * chunk
+
+    @T.prim_func
+    def main(
+        x: T.Tensor((batch, seq, heads, d_head), dtype),
+        b: T.Tensor((batch, seq, 1, d_state), dtype),
+        dt: T.Tensor((batch, heads, chunks, chunk), "float32"),
+        da: T.Tensor((batch, heads, chunks, chunk), "float32"),
+        seq_idx: T.Tensor((batch, seq), "int32"),
+        out: T.Tensor((batch, chunks, heads, d_head, d_state), "float32"),
+    ):
+        with T.Kernel(heads, chunks, batch, threads=128) as (h, c, z):
+            b_tile = T.alloc_shared((panel, d_state), dtype)
+            x_tile = T.alloc_shared((panel, d_head), dtype)
+            weights = T.alloc_shared((chunk,), "float32")
+            acc = T.alloc_fragment((d_head, d_state), "float32")
+            ready = T.alloc_barrier([128, 128])
+            start = c * chunk
+            T.tma_copy(b[z, start : start + panel, 0, :], b_tile, barrier=ready[0])
+            T.tma_copy(x[z, start : start + panel, h, :], x_tile, barrier=ready[0])
+            T.barrier_arrive(ready[0])
+            for k in T.Parallel(chunk):
+                weight = T.exp(T.min(da[z, h, c, chunk - 1] - da[z, h, c, k], 0.0)) * dt[z, h, c, k]
+                if has_seq_idx:
+                    last = seq_idx[z, start + chunk - 1]
+                    weights[k] = T.if_then_else(
+                        last >= 0 and seq_idx[z, start + k] == last, weight, 0.0
+                    )
+                else:
+                    weights[k] = weight
+            T.sync_threads()
+            for tile in T.unroll(2):
+                if tile == 1:
+                    T.tma_copy(b[z, start + panel : start + chunk, 0, :], b_tile, barrier=ready[1])
+                    T.tma_copy(x[z, start + panel : start + chunk, h, :], x_tile, barrier=ready[1])
+                    T.barrier_arrive(ready[1])
+                T.barrier_wait(ready[tile], 0)
+                for k, p in T.Parallel(panel, d_head):
+                    x_tile[k, p] = T.cast(
+                        weights[tile * panel + k] * T.cast(x_tile[k, p], "float32"), dtype
+                    )
+                T.gemm(x_tile, b_tile, acc, transpose_A=True, clear_accum=tile == 0)
+                T.sync_threads()
+            staging = T.alloc_shared((d_head, d_state), "float32")
+            T.annotate_layout({staging: tilelang.layout.make_swizzled_layout(staging)})
+            T.copy(acc, staging)
+            T.tma_copy(staging, out[z, c, h, :, :])
+            T.tma_store_wait()
+
+    return main
+
+
 class SSDChunkStateFwdKernel(Kernel, SSDChunkStateFwdInterface):
     """Mamba-2 SSD chunk state forward kernel.
 
@@ -169,18 +226,6 @@ class SSDChunkStateFwdKernel(Kernel, SSDChunkStateFwdInterface):
               * exp(dA_cumsum[b,h,c,Q-1] - dA_cumsum[b,h,c,l])
               * dt[b, h, c, l]
               * (1 if not has_seq_idx else (seq_idx[b,c*Q+Q-1] >= 0 and seq_idx[b,c*Q+l] == seq_idx[b,c*Q+Q-1]))
-
-    Inputs:
-        x:         (batch, seqlen, n_heads, d_head)           dtype
-        Bmat:      (batch, seqlen, n_groups, d_state)         dtype
-        dt:        (batch, n_heads, num_chunks, chunk_len)    dtype — accepts target dtype,
-                   will be cast to fp32 internally for accumulation
-        dA_cumsum: (batch, n_heads, num_chunks, chunk_len)    float32
-        seq_idx:   (batch, seqlen)                            int32 (optional)
-
-    Output:
-        out:       (batch, num_chunks, n_heads, d_head, d_state) float32
-
     """
 
     supported_archs: list[int] = [80, 86, 89, 90]
@@ -215,8 +260,8 @@ class SSDChunkStateFwdKernel(Kernel, SSDChunkStateFwdInterface):
         n_groups: int,
         dtype: torch.dtype,
         has_seq_idx: bool = False,
-        config: Optional[dict] = None,
-        dt_dtype: Optional[torch.dtype] = None,
+        config: dict | None = None,
+        dt_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         self.batch = batch
@@ -243,10 +288,18 @@ class SSDChunkStateFwdKernel(Kernel, SSDChunkStateFwdInterface):
         )
         self.init_config(config)
 
+    def _uses_tma_panels(self) -> bool:
+        return (
+            self.build_target.arch == 90
+            and (self.chunk_len, self.d_head, self.d_state) == (256, 64, 128)
+            and self.dtype in (torch.float16, torch.bfloat16)
+            and self.dt_dtype == torch.float32
+            and self.n_groups == 1
+            and self.batch * self.num_chunks * self.n_heads >= 768
+        )
+
     @property
     def default_config(self) -> dict:
-        # threads=128 (4 warps) reduces register pressure and improves occupancy over 256.
-        # The primary Mamba geometry benefits from fewer reduction-loop syncs.
         # Small grids split N for more CTAs; saturated grids avoid reloading X.
         grid_size = self.batch * self.num_chunks * self.n_heads
         primary_mamba_geometry = self.chunk_len == 256 and self.d_head == 64 and self.d_state == 128
@@ -290,14 +343,7 @@ class SSDChunkStateFwdKernel(Kernel, SSDChunkStateFwdInterface):
 
     @property
     def autotune_configs(self) -> list[dict]:
-        # Grid rationale:
-        #   block_n in {64, 128}: 128 covers the full d_state=128 in one tile
-        #     and is the default; 64 is retained for d_state<128 shapes.
-        #   block_p in {16, 32, 64}: 16 is the minimum MMA M-atom.
-        #   block_l in {32, 64, 128}: larger K improves GEMM arithmetic
-        #     intensity; 32 keeps shared-memory pressure low for small d_head.
-        #   threads in {128, 256}: 128 warps = 4, 256 warps = 8; higher thread
-        #     count hides latency but increases register/shared pressure.
+        # block_p 16 is the minimum MMA M-atom.
         block_n = [64, 128]
         block_p = [16, 32, 64]
         block_l = [32, 64, 128]
@@ -322,29 +368,18 @@ class SSDChunkStateFwdKernel(Kernel, SSDChunkStateFwdInterface):
         dA_cumsum: torch.Tensor,
         seq_idx: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute chunk-end SSM states.
-
-        Args:
-            x: (batch, seqlen, n_heads, d_head) dtype
-            Bmat: (batch, seqlen, n_groups, d_state) dtype
-            dt: (batch, n_heads, num_chunks, chunk_len) float32 or dtype
-            dA_cumsum: (batch, n_heads, num_chunks, chunk_len) float32
-            seq_idx: (batch, seqlen) int32
-
-        Returns:
-            out: (batch, num_chunks, n_heads, d_head, d_state) float32
-
-        The compiled kernel reads dt in its input dtype and converts values to
-        float32 during accumulation.
-        """
         return self.program(self._compile)(x, Bmat, dt, dA_cumsum, seq_idx)
 
     def _compile(self, cfg: dict):
         """The program ``forward`` launches, compiled from *cfg*."""
+        if self._uses_tma_panels() and cfg == self.default_config:
+            return _ssd_chunk_state_tma_kernel(
+                self.batch, self.num_chunks, self.n_heads, self.has_seq_idx, self.dtype_str
+            )
         return self.kernel(
             cfg["block_n"],
             cfg["block_p"],
             cfg["block_l"],
             cfg["threads"],
-            cfg.get("num_stages", 2),
+            cfg["num_stages"],
         )

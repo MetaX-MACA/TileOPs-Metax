@@ -29,6 +29,7 @@ from tileops._kernels.gemm.persistent.heuristics import (
     spec_from_config,
 )
 from tileops._kernels.gemm.persistent.template import GEMMTemplate
+from tileops._utils import calibration_key
 from workloads.device import run_device
 from workloads.gemm import BMMWorkload
 from workloads.moe import MoEGroupedGEMMWorkload
@@ -140,30 +141,25 @@ def test_selector_short_group_h200_band():
         num_groups=160,
         activation="silu_and_mul",
     )
-    short = get_best_config(_desc(4096, 3072, 5120, device_name="NVIDIA H200", **grouped))
+    short = get_best_config(_desc(4096, 3072, 5120, calibration="h200", **grouped))
     assert (short.block_m, short.block_n, short.block_k, short.a_box_rows) == (64, 128, 128, 16)
+    assert short.pingpong and short.num_math_warpgroups == 2
     swiglu = get_best_config(
         _desc(
             256,
             5760,
             2880,
-            device_name="NVIDIA H200",
+            calibration="h200",
             **{**grouped, "num_groups": 128, "activation": "swigluoai"},
         )
     )
     assert (swiglu.block_m, swiglu.block_n, swiglu.block_k, swiglu.a_box_rows) == (64, 128, 128, 16)
-    wide = get_best_config(_desc(16384, 3072, 5120, device_name="NVIDIA H200", **grouped))
+    wide = get_best_config(_desc(16384, 3072, 5120, calibration="h200", **grouped))
     assert (wide.block_k, wide.a_box_rows) == (64, 0)
-    assert (
-        get_best_config(_desc(4096, 3072, 5120, device_name="NVIDIA H100", **grouped)).block_k == 64
-    )
+    assert get_best_config(_desc(4096, 3072, 5120, calibration=None, **grouped)).block_k == 64
     plain = {**grouped, "activation": "none"}
-    assert (
-        get_best_config(_desc(4096, 5120, 1536, device_name="NVIDIA H200", **plain)).block_k == 128
-    )
-    assert (
-        get_best_config(_desc(4096, 7168, 2048, device_name="NVIDIA H200", **plain)).block_k == 64
-    )
+    assert get_best_config(_desc(4096, 5120, 1536, calibration="h200", **plain)).block_k == 128
+    assert get_best_config(_desc(4096, 7168, 2048, calibration="h200", **plain)).block_k == 64
 
 
 @pytest.mark.smoke
@@ -176,11 +172,15 @@ def test_selector_pingpong_group_h200_band():
         gemm_type=GEMMType.M_GROUPED_TIGHT_PSUM,
         num_groups=256,
         activation="silu_and_mul",
-        device_name="NVIDIA H200",
+        calibration="h200",
     )
     fused = get_best_config(_desc(32768, 4096, 7168, **grouped))
     assert (fused.block_m, fused.block_n, fused.block_k) == (64, 256, 64)
     assert fused.pingpong and fused.num_math_warpgroups == 2
+    # A fused epilogue writes its whole tile: over 1300 groups, whose row ends take the
+    # shared memory of a fifth stage, it stays whole although a staged box would free one.
+    many = get_best_config(_desc(1300 * 112, 4096, 7168, **{**grouped, "num_groups": 1300}))
+    assert (many.pingpong, many.epilogue_stage_n, many.num_stages) == (True, 0, 4)
     swiglu = get_best_config(
         _desc(16384, 5760, 2880, **{**grouped, "num_groups": 128, "activation": "swigluoai"})
     )
@@ -202,17 +202,77 @@ def test_selector_pingpong_group_h200_band():
     assert not mn_major.pingpong
     stated = get_best_config(_desc(32768, 4096, 7168, expected_m=512, **grouped))
     assert not stated.pingpong
-    h100 = get_best_config(_desc(32768, 4096, 7168, **{**grouped, "device_name": "NVIDIA H100"}))
+    h100 = get_best_config(_desc(32768, 4096, 7168, **{**grouped, "calibration": None}))
     assert (h100.block_m, h100.block_n, h100.pingpong) == (128, 256, False)
+
+
+@pytest.mark.smoke
+def test_selector_runs_its_own_pingpong_tile_on_two_math_warp_groups():
+    """Below the bands, a tight GEMM whose own tile has the ping-pong tile's 64 rows runs it
+    ping-pong; the same tile given a two-buffer staged epilogue or a stated group size, or the
+    short-group tile's half width, keeps one math warp-group."""
+    tight = dict(gemm_type=GEMMType.M_GROUPED_TIGHT_PSUM, num_groups=256, calibration="h200")
+    # 16 rows a group at N 7168 K 2048: the cost model's tile is 64x256x64.
+    down = get_best_config(_desc(4096, 7168, 2048, **tight))
+    assert (down.block_m, down.block_n, down.block_k) == (64, 256, 64)
+    assert down.pingpong and down.num_math_warpgroups == 2
+    # 16 rows a group at N 1536 K 2048: the short-group tile's half width, for waves the wide
+    # tiles underfill, keeps one warp-group.
+    half = get_best_config(_desc(257, 1536, 2048, **{**tight, "num_groups": 16}))
+    assert (half.block_m, half.block_n, half.pingpong) == (64, 64, False)
+    # 64 rows a group at K 512: the same tile, staged in two 64-wide buffers for a fifth stage.
+    staged = get_best_config(_desc(512, 7168, 512, **{**tight, "num_groups": 8}))
+    assert (staged.block_m, staged.block_n, staged.epilogue_buffers) == (64, 256, 2)
+    assert not staged.pingpong
+    stated = get_best_config(_desc(4096, 7168, 2048, expected_m=16, **tight))
+    assert not stated.pingpong
+    # 2 rows a group, gated, at K 512: the cost model's tile is 64x256; a fused call runs it
+    # ping-pong too.
+    fused = get_best_config(
+        _desc(16, 4096, 512, activation="silu_and_mul", **{**tight, "num_groups": 8})
+    )
+    assert (fused.block_m, fused.block_n, fused.pingpong) == (64, 256, True)
+
+
+@pytest.mark.smoke
+def test_selector_pingpong_past_the_unfused_band_where_its_slots_hold_more_rows():
+    """Past 192 rows a group, an unfused tight GEMM takes the ping-pong tile only where its
+    slot share beats the 128x256 tile's by ``pingpong_slot_share_ratio``; an unbiased tile is
+    192 wide where that width's slot share is larger than 256's."""
+    tight = dict(gemm_type=GEMMType.M_GROUPED_TIGHT_PSUM, num_groups=16, calibration="h200")
+    # 428 rows a group at N 2048: slot shares 0.926 (64x256), 0.864 (64x192), 0.810 (128x256).
+    skew_down = get_best_config(_desc(6843, 2048, 768, **tight))
+    assert (skew_down.block_m, skew_down.block_n, skew_down.pingpong) == (64, 256, True)
+    # Staging one 64-column TMA store box rather than the 32 KiB tile frees a fifth 40 KiB stage.
+    assert (skew_down.epilogue_stage_n, skew_down.num_stages) == (64, 5)
+    # At N 1536: 0.926 (64x192) against 0.810 for both 256-wide tiles.
+    skew_up = get_best_config(_desc(6843, 1536, 2048, **tight))
+    assert (skew_up.block_m, skew_up.block_n, skew_up.pingpong) == (64, 192, True)
+    # Six 32 KiB stages fit beside the whole 24 KiB tile as beside one box: it stays whole.
+    assert (skew_up.epilogue_stage_n, skew_up.num_stages) == (0, 6)
+    # At N 1040 the last column tile of either width is partly empty: 0.731 (64x192) against
+    # 0.658 (64x256); counted by rows and waves alone the two widths tie at 0.810.
+    tail = get_best_config(_desc(6843, 1040, 768, **tight))
+    assert (tail.block_m, tail.block_n, tail.pingpong) == (64, 192, True)
+    # A bias keeps the 256-wide tiles: the native-width WGMMA does not serve a biased tile.
+    biased = get_best_config(_desc(6843, 1536, 2048, has_bias=True, **tight))
+    assert biased.block_n == 256
+    # 256 rows a group at N 1536: 0.970 for both widths, so the wider tile stands.
+    even = get_best_config(_desc(4096, 1536, 2048, **tight))
+    assert (even.block_m, even.block_n, even.pingpong) == (64, 256, True)
+    # 640 rows a group at N 1536: 0.970 (64x192) against 0.909 (128x256), short of the ratio.
+    tall = get_best_config(_desc(10240, 1536, 2048, **tight))
+    assert (tall.block_m, tall.block_n, tall.pingpong) == (128, 256, False)
 
 
 @pytest.mark.smoke
 def test_selector_fills_the_sms_on_tight_unfused_groups():
     """A tight unfused grid that leaves SMs idle takes the half-width tile; a short group
     takes it only where its busy tiles fill their waves better."""
-    tight = dict(gemm_type=GEMMType.M_GROUPED_TIGHT_PSUM, num_groups=16, device_name="NVIDIA H200")
-    # 64 rows a group: 64x256 runs 96 CTAs on 132 SMs, 64x128 runs 192.
-    routed = get_best_config(_desc(1024, 1536, 2048, **tight))
+    tight = dict(gemm_type=GEMMType.M_GROUPED_TIGHT_PSUM, num_groups=16, calibration="h200")
+    # 64 rows a group at K 512, below the short-group band: 64x256 runs 96 CTAs on 132 SMs,
+    # 64x128 runs 192.
+    routed = get_best_config(_desc(1024, 1536, 512, **tight))
     assert (routed.block_m, routed.block_n) == (64, 128)
     # 16 rows a group: 192 busy tiles fill 73% of two waves, 384 fill 97% of three.
     ragged = get_best_config(_desc(257, 1536, 2048, **tight))
@@ -237,7 +297,7 @@ def test_selector_keeps_the_tile_where_half_width_does_not_apply():
     """A grid that leaves SMs idle keeps its tile where half its width is not a legal tile,
     the layout is not tight, or a gated activation is fused. ``k`` sits below the short
     group band, so the cost model's tile is the one each rule receives."""
-    kw = dict(num_groups=16, device_name="NVIDIA H200")
+    kw = dict(num_groups=16, calibration="h200")
     tight = dict(gemm_type=GEMMType.M_GROUPED_TIGHT_PSUM, **kw)
     # 64 CTAs of 64x64; a 32-wide tile is off the 64-column step.
     narrow = get_best_config(_desc(257, 256, 512, **tight))
@@ -255,18 +315,17 @@ def test_selector_keeps_the_tile_where_half_width_does_not_apply():
 @pytest.mark.smoke
 def test_selector_stages_h200_batched_epilogue():
     """H200 batched 128x256 tiles trade half-width stores for a fourth K stage."""
-    h200 = get_best_config(_desc(1024, 1024, 1024, num_groups=8, device_name="NVIDIA H200"))
+    h200 = get_best_config(_desc(1024, 1024, 1024, num_groups=8, calibration="h200"))
     assert (h200.block_m, h200.block_n, h200.num_stages, h200.epilogue_stage_n) == (
         128,
         256,
         4,
         128,
     )
-    h100 = get_best_config(_desc(1024, 1024, 1024, num_groups=8, device_name="NVIDIA H100"))
+    h100 = get_best_config(_desc(1024, 1024, 1024, num_groups=8, calibration=None))
     assert h100.epilogue_stage_n == 0
     # The band is fitted on the board, not on the exact name CUDA reports for it.
-    nvl = get_best_config(_desc(1024, 1024, 1024, num_groups=8, device_name="NVIDIA H200 NVL"))
-    assert nvl.epilogue_stage_n == 128
+    assert calibration_key("NVIDIA H200 NVL") == "h200"
 
 
 @pytest.mark.smoke
@@ -279,7 +338,7 @@ def test_grouped_selector_calibration_preserves_dense_and_k_grouped_choices():
             7168,
             gemm_type=GEMMType.DENSE,
             activation="silu_and_mul",
-            device_name="NVIDIA H200",
+            calibration="h200",
         )
     )
     assert (dense.block_m, dense.block_n, dense.num_stages) == (128, 192, 4)
@@ -293,7 +352,7 @@ def test_grouped_selector_calibration_preserves_dense_and_k_grouped_choices():
             num_groups=16,
             major_a=Major.MN,
             major_b=Major.MN,
-            device_name="NVIDIA H200",
+            calibration="h200",
         )
     )
     assert (k_grouped.block_m, k_grouped.block_n, k_grouped.num_stages) == (128, 256, 4)
@@ -308,7 +367,7 @@ def test_grouped_selector_calibration_stays_on_physical_psum_layouts():
         2048,
         gemm_type=GEMMType.M_GROUPED_TIGHT_PSUM,
         num_groups=16,
-        device_name="NVIDIA H200",
+        calibration="h200",
     )
     assert all(layout.block_n != 192 for layout in layout_candidates(tight))
 
@@ -319,7 +378,7 @@ def test_grouped_selector_calibration_stays_on_physical_psum_layouts():
         gemm_type=GEMMType.M_GROUPED_ALIGNED_PSUM,
         num_groups=16,
         m_alignment=128,
-        device_name="NVIDIA H200",
+        calibration="h200",
     )
     assert all(layout.block_n != 192 for layout in layout_candidates(padded))
     assert get_best_config(padded).epilogue_stage_n == 64
@@ -346,7 +405,7 @@ _GOLDEN_SPECS = {
         (128, 192, 64, 4, 0),
     ),
     "dense-h100": (
-        dict(gemm_type=GEMMType.DENSE, m=4096, n=4096, k=4096, device_name="NVIDIA H100"),
+        dict(gemm_type=GEMMType.DENSE, m=4096, n=4096, k=4096, calibration=None),
         (128, 256, 64, 3, 0),
     ),
     "batched": (dict(m=1024, n=1024, k=1024, num_groups=8), (128, 256, 64, 4, 128)),
@@ -411,7 +470,7 @@ _GOLDEN_SPECS = {
 @pytest.mark.full
 @pytest.mark.parametrize("fields,expected", _GOLDEN_SPECS.values(), ids=_GOLDEN_SPECS)
 def test_selector_golden_specs(fields, expected):
-    spec = get_best_config(_desc(**{"device_name": "NVIDIA H200", **fields}))
+    spec = get_best_config(_desc(**{"calibration": "h200", **fields}))
     got = (spec.block_m, spec.block_n, spec.block_k, spec.num_stages, spec.epilogue_stage_n)
     assert got == expected
 
@@ -424,12 +483,11 @@ def test_selector_golden_specs(fields, expected):
         # one row past a tile is a whole extra tile per group, and which tile the
         # model then prefers is what these pin.
         (32, (64, 128, 128, 4, 0)),
-        (33, (64, 256, 64, 4, 0)),
-        (64, (64, 256, 64, 5, 64)),
+        (64, (64, 128, 128, 4, 0)),
         (65, (128, 256, 64, 3, 0)),
         (127, (128, 256, 64, 3, 0)),
         (128, (128, 256, 64, 4, 64)),
-        (129, (64, 256, 64, 4, 0)),
+        (129, (64, 256, 64, 5, 64)),
     ],
 )
 def test_selector_golden_rows_per_group_boundaries(rows_per_group, expected):
@@ -440,7 +498,7 @@ def test_selector_golden_rows_per_group_boundaries(rows_per_group, expected):
             7168,
             gemm_type=GEMMType.M_GROUPED_TIGHT_PSUM,
             num_groups=16,
-            device_name="NVIDIA H200",
+            calibration="h200",
         )
     )
     got = (spec.block_m, spec.block_n, spec.block_k, spec.num_stages, spec.epilogue_stage_n)
@@ -469,6 +527,8 @@ def test_spec_rejects_inconsistent_template_parameters():
     GroupedGEMMSpec(**fields)
     with pytest.raises(ValueError, match="num_math_threads"):
         GroupedGEMMSpec(**{**fields, "block_m": 64})
+    with pytest.raises(ValueError, match="group starts"):
+        GroupedGEMMSpec(**{**fields, "group_starts": True})
     with pytest.raises(ValueError, match="both exceed 128"):
         GroupedGEMMSpec(**{**fields, "block_m": 256, "block_n": 256})
     with pytest.raises(ValueError, match="two epilogue buffers"):
@@ -500,16 +560,15 @@ def test_spec_rejects_inconsistent_template_parameters():
             }
         )
     m_grouped = {**fields, "gemm_type": GEMMType.M_GROUPED_TIGHT_PSUM, "num_groups": 4}
-    # A boxes split a tight warp-group's 64 rows into positive multiples of 8 dividing them.
+    # A boxes split a tight warp-group's 64 rows into positive multiples of 8 dividing them; a
+    # ping-pong warp-group owns its tile's 64 rows whole.
+    pingpong = {**m_grouped, "pingpong": True, "block_m": 64}
     GroupedGEMMSpec(**{**m_grouped, "a_box_rows": 16})
-    for box in (-16, 24):
+    GroupedGEMMSpec(**{**pingpong, "a_box_rows": 64})
+    for mode, box in ((m_grouped, -16), (m_grouped, 24), (pingpong, 24)):
         with pytest.raises(ValueError, match="a_box_rows"):
-            GroupedGEMMSpec(**{**m_grouped, "a_box_rows": box})
-    for mode in (
-        fields,
-        {**m_grouped, "gemm_type": GEMMType.M_GROUPED_TIGHT_PER_ROW},
-        {**m_grouped, "pingpong": True, "block_m": 64},
-    ):
+            GroupedGEMMSpec(**{**mode, "a_box_rows": box})
+    for mode in (fields, {**m_grouped, "gemm_type": GEMMType.M_GROUPED_TIGHT_PER_ROW}):
         with pytest.raises(ValueError, match="a_box_rows"):
             GroupedGEMMSpec(**{**mode, "a_box_rows": 16})
     # A fused tile takes block_n a multiple of 16, and refuses an odd multiple of 8.
@@ -533,6 +592,15 @@ def test_spec_rejects_inconsistent_template_parameters():
         spec_from_config(_desc(4096, 2880, 2880, has_bias=True, **tight), tile)
     pingpong = {**m_grouped, "block_m": 64, "block_n": 256, "pingpong": True}
     GroupedGEMMSpec(**pingpong)
+    with pytest.raises(ValueError, match="multiple of 8 columns"):
+        GroupedGEMMSpec(**{**pingpong, "epilogue_stage_n": 4})
+    # A 192-wide ping-pong tile issues the native-width WGMMA: no bias, no fused activation,
+    # a 16-bit output.
+    narrow = {**pingpong, "block_n": 192}
+    assert GroupedGEMMSpec(**narrow).native_wgmma
+    for bad in (dict(has_bias=True), dict(activation="silu_and_mul"), dict(cd_dtype="float32")):
+        with pytest.raises(ValueError, match="native-width WGMMA"):
+            GroupedGEMMSpec(**{**narrow, **bad})
     for bad in (
         dict(num_math_threads=128),
         dict(block_m=128),

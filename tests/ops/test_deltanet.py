@@ -4,7 +4,9 @@ import pytest
 import torch
 
 from tests.workload_test_base import FixtureBase, TestBase
-from tileops.backend import BUILTIN, TensorSpec
+from tileops._kernels.kernel_base import Kernel
+from tileops._kernels.linear_attention import DeltaNetChunkCall
+from tileops.backend import BUILTIN, OpNotAvailableError, TensorSpec
 from tileops.backend import _registry as registry
 from tileops.linear_attention import (
     DeltaNetChunkBwdOp,
@@ -54,13 +56,61 @@ class DeltaNetChunkFwdFixture(FixtureBase):
                 ),
                 pytest.param(2, 64, 2, 64, 64, 32, torch.float16, False, marks=pytest.mark.smoke),
                 pytest.param(2, 64, 2, 64, 64, 32, torch.bfloat16, False, marks=pytest.mark.smoke),
-                pytest.param(1, 128, 4, 64, 64, 32, torch.float32, False, marks=pytest.mark.full),
-                pytest.param(1, 128, 4, 64, 64, 32, torch.float16, False, marks=pytest.mark.full),
-                pytest.param(1, 128, 4, 64, 64, 32, torch.bfloat16, False, marks=pytest.mark.full),
+                # dim_k 128 at chunk 128: SM89's 99 KB of shared memory per block holds the
+                # recurrence but not the state walk.
+                pytest.param(
+                    1,
+                    256,
+                    4,
+                    128,
+                    128,
+                    128,
+                    torch.bfloat16,
+                    False,
+                    marks=(pytest.mark.smoke, pytest.mark.sm89),
+                ),
+                *[
+                    pytest.param(
+                        1,
+                        seq_len,
+                        2,
+                        dim_k,
+                        dim_v,
+                        chunk,
+                        dtype,
+                        False,
+                        marks=pytest.mark.full,
+                        id=name,
+                    )
+                    for name, seq_len, dim_k, dim_v, chunk, dtype in (
+                        ("chunk16-fp16", 64, 64, 64, 16, torch.float16),
+                        # An odd count of 8-column tiles: no column split above one warp divides it.
+                        ("chunk16-v24-fp32", 64, 64, 24, 16, torch.float32),
+                        ("chunk16-v24-fp16", 64, 64, 24, 16, torch.float16),
+                        ("chunk16-v48", 64, 64, 48, 16, torch.float16),
+                        ("chunk16-walk", 64, 16, 64, 16, torch.bfloat16),
+                        # 2 by 3 warp tiles, which TileLang's square split divides only at one warp.
+                        ("chunk32-v24", 64, 64, 24, 32, torch.bfloat16),
+                        # One 16-row tile in the walk operands' products.
+                        ("chunk64-k16", 128, 16, 64, 64, torch.float16),
+                    )
+                ],
                 pytest.param(2, 8192, 4, 64, 64, 64, torch.float16, False, marks=pytest.mark.full),
                 pytest.param(2, 16384, 4, 64, 64, 64, torch.float16, False, marks=pytest.mark.full),
                 # State walk with dim_v > dim_k: the late-load branches.
-                pytest.param(1, 256, 2, 64, 128, 128, torch.float32, False, marks=pytest.mark.full),
+                # This float32 forward at chunk 128, head dims 64 / 128, fits only SM90's
+                # shared memory.
+                pytest.param(
+                    1,
+                    256,
+                    2,
+                    64,
+                    128,
+                    128,
+                    torch.float32,
+                    False,
+                    marks=(pytest.mark.full, pytest.mark.sm90),
+                ),
                 # chunk_size=64 is where the untuned default takes a tiled width, so
                 # the tuned run has to beat a tiled baseline rather than no tiling.
                 pytest.param(
@@ -75,6 +125,17 @@ class DeltaNetChunkFwdFixture(FixtureBase):
                     marks=pytest.mark.full,
                     id="full-bf16-tuned",
                 ),
+                *[
+                    pytest.param(
+                        1, 64, 2, dim_k, dim_v, 16, dtype, True, marks=pytest.mark.nightly, id=name
+                    )
+                    for name, dim_k, dim_v, dtype in (
+                        ("chunk16-tuned", 64, 64, torch.bfloat16),
+                        ("chunk16-tuned-v24", 64, 24, torch.float16),
+                        ("chunk16-tuned-v96", 64, 96, torch.float16),
+                        ("chunk16-walk-tuned", 16, 64, torch.bfloat16),
+                    )
+                ],
             ],
         ),
     ]
@@ -99,6 +160,56 @@ def test_deltanet_fwd(
     test.check(op, *test.gen_inputs())
 
 
+@pytest.mark.smoke
+@pytest.mark.in_tree_kernels
+def test_deltanet_chunk_accepts_strided_inputs() -> None:
+    """Chunk kernels accept transpose-backed inputs and saved forward tensors."""
+    torch.manual_seed(42)
+    workload = DeltaNetChunkwiseTest(2, 2, 64, 64, 64, 32, torch.float16)
+    inputs = workload.gen_inputs()
+    fwd = DeltaNetChunkFwdOp(chunk_size=32, target=BUILTIN)
+    bwd = DeltaNetChunkBwdOp(chunk_size=32, target=BUILTIN)
+
+    def as_view(tensor: torch.Tensor) -> torch.Tensor:
+        view = tensor.transpose(1, 2).contiguous().transpose(1, 2)
+        assert not view.is_contiguous()
+        return view
+
+    outputs = fwd(*inputs)
+    torch.testing.assert_close(
+        fwd(*(as_view(tensor) for tensor in inputs)), outputs, atol=0, rtol=0
+    )
+
+    grad_inputs = (outputs[0], *inputs, *outputs[1:])
+    gradients = bwd(*grad_inputs)
+    torch.testing.assert_close(
+        bwd(*(as_view(tensor) for tensor in grad_inputs)), gradients, atol=0, rtol=0
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.in_tree_kernels
+def test_deltanet_fwd_serves_chunk_128_in_sm89_shared_memory() -> None:
+    """Dispatch on SM89's device facts serves dim_k 128 at chunk 128: where the state walk
+    does not fit a block's shared memory, the recurrence does."""
+    (in_tree,) = Kernel.devices
+    call = DeltaNetChunkCall(
+        arch=89,
+        sm_count=142,
+        smem_budget=101376,
+        batch=1,
+        heads=4,
+        seq_len=256,
+        chunk_size=128,
+        dim_k=128,
+        dim_v=128,
+        dtype=torch.bfloat16,
+        device=torch.device(in_tree),
+    )
+    op = DeltaNetChunkFwdOp(chunk_size=128)
+    assert op.key_for("deltanet_chunk_fwd", call) == "deltanet_chunk_fwd"
+
+
 class DeltaNetChunkBwdFixture(FixtureBase):
     PARAMS = [
         (
@@ -107,6 +218,32 @@ class DeltaNetChunkBwdFixture(FixtureBase):
                 pytest.param(2, 64, 2, 64, 64, 32, torch.float32, False, marks=pytest.mark.smoke),
                 pytest.param(2, 64, 2, 64, 64, 32, torch.float16, False, marks=pytest.mark.smoke),
                 pytest.param(2, 64, 2, 64, 64, 32, torch.bfloat16, False, marks=pytest.mark.smoke),
+                # SM89's 99 KB of shared memory per block holds the w/u program at head dims
+                # 128 / 128 only with its storage reused.
+                pytest.param(
+                    1,
+                    256,
+                    4,
+                    128,
+                    128,
+                    64,
+                    torch.bfloat16,
+                    False,
+                    marks=(pytest.mark.smoke, pytest.mark.sm89),
+                ),
+                # dim_k 16 gives the per-chunk gradients and the dh walk one 16-row warp tile.
+                pytest.param(
+                    1,
+                    128,
+                    2,
+                    16,
+                    64,
+                    64,
+                    torch.float16,
+                    False,
+                    marks=pytest.mark.full,
+                    id="chunk64-k16",
+                ),
                 pytest.param(
                     1,
                     256,
@@ -129,9 +266,45 @@ class DeltaNetChunkBwdFixture(FixtureBase):
                     False,
                     marks=pytest.mark.full,
                 ),
-                pytest.param(1, 128, 4, 64, 64, 32, torch.float32, False, marks=pytest.mark.full),
-                pytest.param(1, 128, 4, 64, 64, 32, torch.float16, False, marks=pytest.mark.full),
-                pytest.param(1, 128, 4, 64, 64, 32, torch.bfloat16, False, marks=pytest.mark.full),
+                # 128 heads fill a wave with the walk's widest value tile, which at head dims
+                # 128 / 128 SM89's shared memory cannot hold.
+                pytest.param(
+                    8,
+                    256,
+                    16,
+                    128,
+                    128,
+                    64,
+                    torch.bfloat16,
+                    False,
+                    marks=(pytest.mark.full, pytest.mark.sm89),
+                ),
+                # SM89's 99 KB of shared memory per block holds the w/u program's float32 bound
+                # at head dims 64 / 64 only with its storage reused.
+                pytest.param(
+                    1,
+                    256,
+                    4,
+                    64,
+                    64,
+                    64,
+                    torch.float32,
+                    False,
+                    marks=(pytest.mark.full, pytest.mark.sm89),
+                ),
+                # SM90's shared memory holds the w/u program at head dims 256 / 256 only with
+                # its storage reused.
+                pytest.param(
+                    1,
+                    256,
+                    4,
+                    256,
+                    256,
+                    32,
+                    torch.bfloat16,
+                    False,
+                    marks=(pytest.mark.full, pytest.mark.sm90),
+                ),
                 # Backward from the state walk's saved S, w and u.
                 pytest.param(1, 256, 2, 64, 64, 64, torch.bfloat16, False, marks=pytest.mark.full),
                 pytest.param(
@@ -169,18 +342,13 @@ def test_deltanet_bwd(
     v = torch.randn(B, H, S, DV, device=run_device(), dtype=dtype) * 0.1
     beta = torch.rand(B, H, S, device=run_device(), dtype=dtype) * 0.5
 
-    # Forward to get S for backward kernel
-    from tileops.linear_attention import DeltaNetChunkFwdOp
-
     fwd_op = DeltaNetChunkFwdOp(chunk_size=BC)
     _o, S_fwd, Aw, Au, w_fwd, u_fwd = fwd_op(q, k, v, beta)
     do = torch.randn(B, H, S, DV, device=run_device(), dtype=dtype) * 0.1
 
-    # Reference via autograd
     ref_dq, ref_dk, ref_dv, ref_dbeta = deltanet_autograd_bwd_torch(do, q, k, v, beta, BC)
     ref_outputs = (ref_dq, ref_dk, ref_dv, ref_dbeta)
 
-    # Kernel
     op = DeltaNetChunkBwdOp(chunk_size=BC)
     if tune:
         op.request_tune()
@@ -193,20 +361,103 @@ def test_deltanet_bwd(
     )
 
 
+@pytest.mark.smoke
+@pytest.mark.in_tree_kernels
+@pytest.mark.parametrize(
+    "chunk_size, dim_k, dim_v, dtype",
+    [(64, 64, 64, torch.float32), (64, 128, 128, torch.bfloat16)],
+)
+def test_deltanet_bwd_serves_in_sm89_shared_memory(
+    chunk_size: int, dim_k: int, dim_v: int, dtype: torch.dtype
+) -> None:
+    """Dispatch on SM89's device facts serves these calls: with the w/u program's storage
+    reused, its shared memory as written fits a block's."""
+    (in_tree,) = Kernel.devices
+    call = DeltaNetChunkCall(
+        arch=89,
+        sm_count=142,
+        smem_budget=101376,
+        batch=1,
+        heads=4,
+        seq_len=256,
+        chunk_size=chunk_size,
+        dim_k=dim_k,
+        dim_v=dim_v,
+        dtype=dtype,
+        device=torch.device(in_tree),
+    )
+    assert DeltaNetChunkBwdOp().key_for("deltanet_chunk_bwd", call) == "deltanet_chunk_bwd"
+
+
+@pytest.mark.smoke
+@pytest.mark.in_tree_kernels
+@pytest.mark.parametrize(
+    "chunk_size, dim_k, dim_v, dtype",
+    [
+        (64, 256, 256, torch.bfloat16),
+        (128, 32, 256, torch.bfloat16),
+        (64, 32, 256, torch.float32),
+    ],
+)
+def test_deltanet_bwd_refused_beyond_sm90_shared_memory(
+    chunk_size: int, dim_k: int, dim_v: int, dtype: torch.dtype
+) -> None:
+    """Dispatch on SM90's device facts refuses these calls: where the gradient program of each
+    chunk forms the partial du it still holds the chunk's attention tile, and what it holds
+    there exceeds a block's shared memory."""
+    (in_tree,) = Kernel.devices
+    call = DeltaNetChunkCall(
+        arch=90,
+        sm_count=132,
+        smem_budget=232448,
+        batch=1,
+        heads=4,
+        seq_len=256,
+        chunk_size=chunk_size,
+        dim_k=dim_k,
+        dim_v=dim_v,
+        dtype=dtype,
+        device=torch.device(in_tree),
+    )
+    with pytest.raises(OpNotAvailableError, match="needs at least"):
+        DeltaNetChunkBwdOp().key_for("deltanet_chunk_bwd", call)
+
+
+@pytest.mark.smoke
+@pytest.mark.in_tree_kernels
+@pytest.mark.parametrize(
+    "op_cls, name, chunk_size, dim_k, dim_v",
+    [
+        (DeltaNetChunkFwdOp, "deltanet_chunk_fwd", 40, 64, 64),
+        (DeltaNetChunkFwdOp, "deltanet_chunk_fwd", 64, 24, 64),
+        (DeltaNetChunkBwdOp, "deltanet_chunk_bwd", 64, 64, 24),
+    ],
+)
+def test_deltanet_chunk_refuses_extents_no_matmul_tiles(
+    op_cls, name, chunk_size, dim_k, dim_v
+) -> None:
+    """No launch builds a chunk_size or dim_k off the 16-row matmul tile, nor a backward that
+    reduces a 16-bit dim_v off the 16-wide matmul step, so dispatch refuses them."""
+    (in_tree,) = Kernel.devices
+    call = DeltaNetChunkCall(
+        arch=90,
+        sm_count=132,
+        smem_budget=232448,
+        batch=1,
+        heads=2,
+        seq_len=128,
+        chunk_size=chunk_size,
+        dim_k=dim_k,
+        dim_v=dim_v,
+        dtype=torch.bfloat16,
+        device=torch.device(in_tree),
+    )
+    with pytest.raises(OpNotAvailableError, match="multiple of 16"):
+        op_cls().key_for(name, call)
+
+
 class DeltaNetFwdTest(DeltaNetFwdWorkload, TestBase):
     pass
-
-
-@pytest.fixture
-def isolated_registry():
-    state = registry.snapshot()
-    registry.DETECTORS.clear()
-    registry.BUILDERS.clear()
-    registry.LOAD_FAILURES.clear()
-    registry.default_target = None
-    registry._loaded = True
-    yield
-    registry.restore(state)
 
 
 @pytest.mark.smoke
@@ -277,12 +528,8 @@ def test_deltanet_dense_prefill_matches_fla(_architecture: int, dtype: torch.dty
     test = DeltaNetFwdTest(2, 128, 4, 64, dtype)
     inputs = test.gen_inputs()
     op = DeltaNetFwdOp()
-    if dtype == torch.float16:
-        test.check(op, *inputs)
-        test.check(op, *inputs[:4])
-    else:
-        test.check(op, *inputs)
-        test.check(op, *inputs[:4])
+    test.check(op, *inputs)
+    test.check(op, *inputs[:4])
 
 
 @pytest.mark.smoke
@@ -333,7 +580,7 @@ def test_deltanet_decode_matches_fla(dtype: torch.dtype) -> None:
     test = DeltaNetFwdTest(2, 1, 4, 128, dtype)
     inputs = test.gen_inputs()
     op = DeltaNetFwdOp()
-    # The workload preserves the single-step 4e-8 bound (measured error 4e-9).
+    # The workload keeps the single-step 4e-8 bound.
     test.check(op, *inputs)
     test.check(op, *inputs[:4])
 
@@ -363,21 +610,18 @@ class DeltaNetDecodeTest(DeltaNetDecodeWorkload, TestBase):
 class DeltaNetDecodeFixture(FixtureBase):
     PARAMS = [
         (
-            "batch, heads, dim_k, dim_v, dtype, tune",
+            "batch, heads, dim_k, dim_v, dtype",
             [
-                pytest.param(1, 4, 64, 64, torch.float32, False, marks=pytest.mark.smoke),
-                pytest.param(1, 4, 64, 64, torch.float16, False, marks=pytest.mark.smoke),
-                pytest.param(1, 4, 64, 64, torch.bfloat16, False, marks=pytest.mark.smoke),
-                pytest.param(2, 8, 64, 64, torch.float32, False, marks=pytest.mark.full),
-                pytest.param(2, 4, 128, 128, torch.float32, False, marks=pytest.mark.full),
-                pytest.param(2, 4, 128, 128, torch.float16, False, marks=pytest.mark.full),
-                pytest.param(2, 4, 128, 128, torch.bfloat16, False, marks=pytest.mark.full),
-                pytest.param(2, 8, 64, 64, torch.float16, False, marks=pytest.mark.full),
-                pytest.param(2, 8, 64, 64, torch.bfloat16, False, marks=pytest.mark.full),
+                pytest.param(1, 4, 64, 64, torch.float32, marks=pytest.mark.smoke),
+                pytest.param(1, 4, 64, 64, torch.float16, marks=pytest.mark.smoke),
+                pytest.param(1, 4, 64, 64, torch.bfloat16, marks=pytest.mark.smoke),
+                pytest.param(2, 4, 128, 128, torch.float32, marks=pytest.mark.full),
+                pytest.param(2, 4, 128, 128, torch.float16, marks=pytest.mark.full),
+                pytest.param(2, 4, 128, 128, torch.bfloat16, marks=pytest.mark.full),
                 # A key dim the default key tile covers in one tile, whose state load hung
                 # on SM90 when lowered to a TMA bulk copy.
-                pytest.param(1, 4, 16, 64, torch.float32, False, marks=pytest.mark.full),
-                pytest.param(1, 4, 16, 64, torch.float16, False, marks=pytest.mark.full),
+                pytest.param(1, 4, 16, 64, torch.float32, marks=pytest.mark.full),
+                pytest.param(1, 4, 16, 64, torch.float16, marks=pytest.mark.full),
             ],
         ),
     ]
@@ -385,42 +629,40 @@ class DeltaNetDecodeFixture(FixtureBase):
 
 @DeltaNetDecodeFixture
 def test_deltanet_decode(
-    batch: int, heads: int, dim_k: int, dim_v: int, dtype: torch.dtype, tune: bool
+    batch: int, heads: int, dim_k: int, dim_v: int, dtype: torch.dtype
 ) -> None:
     torch.manual_seed(42)
     test = DeltaNetDecodeTest(batch, heads, dim_k, dim_v, dtype)
-    op = DeltaNetRecurrentFwdOp()
-    if tune:
-        op.request_tune()
-    test.check(op, *test.gen_inputs())
+    test.check(DeltaNetRecurrentFwdOp(), *test.gen_inputs())
 
 
-@DeltaNetDecodeFixture
-def test_deltanet_decode_multi_step(
-    batch: int,
-    heads: int,
-    dim_k: int,
-    dim_v: int,
-    dtype: torch.dtype,
-    tune: bool,
-) -> None:
-    """Test multiple sequential decode steps to verify state propagation."""
+@pytest.mark.in_tree_kernels
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    ("width", "dtype"),
+    [(64, torch.float16), (64, torch.float32), (128, torch.bfloat16)],
+)
+def test_deltanet_decode_accepts_strided_inputs(width: int, dtype: torch.dtype) -> None:
     torch.manual_seed(42)
-    num_steps = 8
-    B, H, DK, DV = batch, heads, dim_k, dim_v
+    inputs = DeltaNetDecodeTest(2, 2, width, width, dtype).gen_inputs()
+    views = tuple(t.transpose(0, 1).contiguous().transpose(0, 1) for t in inputs)
+    assert all(not view.is_contiguous() for view in views)
+    op = DeltaNetRecurrentFwdOp(target=BUILTIN)
+    torch.testing.assert_close(op(*views), op(*inputs), atol=0, rtol=0)
 
-    op = DeltaNetRecurrentFwdOp()
-    if tune:
-        op.request_tune()
 
-    state_op = torch.zeros(B, H, DK, DV, device=run_device(), dtype=dtype)
-    state_ref = torch.zeros(B, H, DK, DV, device=run_device(), dtype=dtype)
-
-    for _ in range(num_steps):
-        q = torch.randn(B, H, DK, device=run_device(), dtype=dtype) * 0.1
-        k = torch.randn(B, H, DK, device=run_device(), dtype=dtype) * 0.1
-        v = torch.randn(B, H, DV, device=run_device(), dtype=dtype) * 0.1
-        beta = torch.rand(B, H, device=run_device(), dtype=dtype) * 0.5
+def _check_decode_steps(op, batch: int, heads: int, dim_k: int, dim_v: int, dtype) -> None:
+    """Eight decode steps from a zero state, each output and state checked against the
+    reference."""
+    torch.manual_seed(42)
+    device = run_device()
+    state_op = torch.zeros(batch, heads, dim_k, dim_v, device=device, dtype=dtype)
+    state_ref = torch.zeros(batch, heads, dim_k, dim_v, device=device, dtype=dtype)
+    for _ in range(8):
+        q = torch.randn(batch, heads, dim_k, device=device, dtype=dtype) * 0.1
+        k = torch.randn(batch, heads, dim_k, device=device, dtype=dtype) * 0.1
+        v = torch.randn(batch, heads, dim_v, device=device, dtype=dtype) * 0.1
+        beta = torch.rand(batch, heads, device=device, dtype=dtype) * 0.5
 
         o_ref, state_ref = deltanet_decode_torch(q, k, v, beta, state_ref)
         o_ref = o_ref.to(dtype)
@@ -431,6 +673,13 @@ def test_deltanet_decode_multi_step(
 
         compare_outputs(o_op, o_ref, decode_verification(dtype))
         compare_outputs(state_op, state_ref, decode_verification(dtype))
+
+
+@DeltaNetDecodeFixture
+def test_deltanet_decode_multi_step(
+    batch: int, heads: int, dim_k: int, dim_v: int, dtype: torch.dtype
+) -> None:
+    _check_decode_steps(DeltaNetRecurrentFwdOp(), batch, heads, dim_k, dim_v, dtype)
 
 
 @pytest.mark.in_tree_kernels
@@ -452,31 +701,6 @@ def test_deltanet_decode_warp_real_128x128_smoke(dtype: torch.dtype) -> None:
 @pytest.mark.sm90
 @pytest.mark.smoke
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_deltanet_decode_warp_real_128x128_multi_step_smoke(
-    dtype: torch.dtype,
-) -> None:
+def test_deltanet_decode_warp_real_128x128_multi_step_smoke(dtype: torch.dtype) -> None:
     """PR smoke must exercise raw CUDA state propagation across decode steps."""
-
-    torch.manual_seed(42)
-    num_steps = 8
-    B, H, DK, DV = 2, 4, 128, 128
-    op = DeltaNetRecurrentFwdOp(target=BUILTIN)
-
-    state_op = torch.zeros(B, H, DK, DV, device="cuda", dtype=dtype)
-    state_ref = torch.zeros(B, H, DK, DV, device="cuda", dtype=dtype)
-
-    for _ in range(num_steps):
-        q = torch.randn(B, H, DK, device="cuda", dtype=dtype) * 0.1
-        k = torch.randn(B, H, DK, device="cuda", dtype=dtype) * 0.1
-        v = torch.randn(B, H, DV, device="cuda", dtype=dtype) * 0.1
-        beta = torch.rand(B, H, device="cuda", dtype=dtype) * 0.5
-
-        o_ref, state_ref = deltanet_decode_torch(q, k, v, beta, state_ref)
-        o_ref = o_ref.to(dtype)
-        state_ref = state_ref.to(dtype)
-
-        with torch.no_grad():
-            o_op, state_op = op(q, k, v, beta, state_op)
-
-        compare_outputs(o_op, o_ref, decode_verification(dtype))
-        compare_outputs(state_op, state_ref, decode_verification(dtype))
+    _check_decode_steps(DeltaNetRecurrentFwdOp(target=BUILTIN), 2, 4, 128, 128, dtype)

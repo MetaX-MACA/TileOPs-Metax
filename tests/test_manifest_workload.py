@@ -8,10 +8,18 @@ import pytest
 import torch
 import yaml
 
+from tileops.manifest import load_adts, load_manifest
 from tileops.manifest._plan import entry_plan
 from tileops.manifest._values import ADTValue
-from tileops.manifest._workload import RowError, check_workloads, instantiate
-from tileops.manifest.primitives import GENERATORS, PREDICATES
+from tileops.manifest._workload import (
+    RowError,
+    TensorSpec,
+    bench_calls,
+    call_from_tensors,
+    check_workloads,
+    instantiate,
+)
+from tileops.manifest.primitives import GENERATOR_SHAPES, GENERATORS, PREDICATES
 
 pytestmark = pytest.mark.smoke
 
@@ -64,7 +72,11 @@ def test_shape_descriptions_match_calls_without_generating_metadata(name, monkey
                 described = instantiate(plan, row, case, metadata=False)
             assert described.case_id == call.case_id
             assert described.specs == {
-                n: None if spec is None else replace(spec, values=None)
+                n: None
+                if spec is None
+                else tuple(replace(e, values=None) for e in spec)
+                if isinstance(spec, tuple)
+                else replace(spec, values=None)
                 for n, spec in call.specs.items()
             }
             for actual, expected in (
@@ -116,20 +128,25 @@ def test_arguments_are_constructor_values():
     from tileops._ops.moe.contracts import ContiguousLayoutSpec, ContiguousPacking
 
     pooling = _first_call("MeanPoolingFwdOp")
-    assert pooling.arguments(pooling.materialize("cpu"))["accum_dtype"] is torch.float32
+    assert pooling.arguments()["accum_dtype"] is torch.float32
     moe = _first_call("MoEPrePermuteFwdOp")
-    layout = moe.arguments(moe.materialize("cpu"))["layout"]
+    layout = moe.arguments()["layout"]
     assert isinstance(layout, ContiguousLayoutSpec) and layout.packing is ContiguousPacking.TIGHT
     entry = _with_param(
         _varlen(L=[1], q={"masked": {"max_m": 4}}),
         q={"type": "MGroupedLayout | None"},
-        w={"dtype": "float16", "shape": "[2]"},
     )
     sig = entry_plan("Varlen", entry, _ADTS)
     call = instantiate(sig, entry["workloads"][0], entry["workloads"][0]["dtype_cases"][0])
-    tensors = call.materialize("cpu")
-    arguments = call.arguments(tensors)
-    assert arguments["q"].max_m == 4 and arguments["w"] is tensors["w"]
+    assert call.arguments()["q"].max_m == 4
+    entry = _with_param(
+        _varlen(L=[1], q=[[{"masked": {"max_m": 4}}], None]),
+        q={"type": "list[list[MGroupedLayout] | None]"},
+    )
+    sig = entry_plan("Varlen", entry, _ADTS)
+    call = instantiate(sig, entry["workloads"][0], entry["workloads"][0]["dtype_cases"][0])
+    ((layout,), absent) = call.arguments()["q"]
+    assert layout.max_m == 4 and absent is None
 
 
 def test_materialize_draws_every_dtype_category():
@@ -165,6 +182,35 @@ def test_packed_positions_restart_at_each_sequence():
     for lengths in ([], [2, 0]):
         with pytest.raises(ValueError, match="non-empty positive list"):
             GENERATORS["packed_positions"](lengths)
+
+
+def test_stacked_positions_repeat_the_packed_positions_over_the_leading_shape():
+    assert GENERATORS["stacked_positions"]((), [2, 1]) == [0, 1, 0]
+    assert GENERATORS["stacked_positions"]((3,), [2, 1]) == [[0, 1, 0]] * 3
+    assert GENERATOR_SHAPES["stacked_positions"]((3,), [2, 1]) == (3, 3)
+    # A 2 x 3 image opens each sequence; the text after it continues from 3 on every axis.
+    assert GENERATORS["stacked_positions"]((3,), [8, 2], (2, 3)) == [
+        [0, 0, 0, 0, 0, 0, 3, 4, 0, 0],
+        [0, 0, 0, 1, 1, 1, 3, 4, 0, 0],
+        [0, 1, 2, 0, 1, 2, 3, 4, 0, 1],
+    ]
+    with pytest.raises(ValueError, match="image"):
+        GENERATORS["stacked_positions"]((), [2], (2, 3))
+    with pytest.raises(ValueError, match="non-negative"):
+        GENERATORS["stacked_positions"]((-1,), [2])
+
+
+def test_distinct_ids_fill_their_shape_with_distinct_values_in_range():
+    import random
+
+    ids = GENERATORS["distinct_ids"](random.Random(0), (3, 4), 12)
+    flat = [v for row in ids for v in row]
+    assert len(ids) == 3 and all(len(row) == 4 for row in ids)
+    assert sorted(flat) == list(range(12))
+    assert GENERATOR_SHAPES["distinct_ids"]((3, 4), 12) == (3, 4)
+    assert len(GENERATORS["distinct_ids"](random.Random(0), (5,), 7)) == 5
+    with pytest.raises(ValueError, match="0 <= n <= hi"):
+        GENERATORS["distinct_ids"](random.Random(0), (3, 4), 11)
 
 
 def test_causal_topk_indices_draw_distinct_visible_keys_and_pad():
@@ -271,8 +317,17 @@ def _varlen_cross_requires():
     entry = _varlen(L=[2, 3], some=["a", "b"])
     inputs = entry["signature"]["inputs"]
     for name in ("a", "b"):
-        inputs[name] = {**inputs["offsets"], "optional": True}
+        inputs[name] = {**inputs["offsets"], "type": "Tensor | None", "default": None}
     inputs["a"]["requires"] = ["attn.paged_fits(b, 8)"]
+    return entry
+
+
+def _varlen_discriminated():
+    """A chunk size and a segment bound chosen by which member ``x`` holds."""
+    entry = _varlen(L=[2, 3])
+    inputs = entry["signature"]["inputs"]
+    inputs["chunks"]["values"] = "chunk_indices(L, 4 if member(x) == 'Tensor' else 2)"
+    inputs["offsets"]["requires"] = ["prefix_offsets(5)", "max_segment(9 if present(x) else 8)"]
     return entry
 
 
@@ -301,7 +356,8 @@ def _varlen_generated(dtype="int32", requires=(), some=()):
         "dtype": dtype,
         "shape": "[N, 2]",
         "values": "chunk_indices(L, 4)",
-        "optional": True,
+        "type": "Tensor | None",
+        "default": None,
         **({"requires": list(requires)} if requires else {}),
     }
     return entry
@@ -405,9 +461,9 @@ _ENTRY_ERRORS = [
         "repeats",
     ),
     (
-        "ClampTensorFwdOp",
+        "ClampFwdOp",
         _entry(
-            "ClampTensorFwdOp",
+            "ClampFwdOp",
             status="implemented",
             workloads=[
                 {
@@ -420,16 +476,33 @@ _ENTRY_ERRORS = [
                 }
             ],
         ),
-        "no row omits optional tensor 'max'",
+        "no row passes member 'None' of 'max'",
     ),
     (
-        "ClampTensorFwdOp",
+        "ClampFwdOp",
         _entry(
-            "ClampTensorFwdOp",
+            "ClampFwdOp",
             status="implemented",
             workloads=[{"A": [4], "dtype_cases": [{"T": "float16"}], "label": "x"}],
         ),
-        "no row passes optional tensor 'max'",
+        "no row passes member 'Tensor' of 'max'",
+    ),
+    (
+        "ClampFwdOp",
+        _entry(
+            "ClampFwdOp",
+            workloads=[
+                {
+                    "A": [4],
+                    "L": [4],
+                    "min": None,
+                    "some": ["min"],
+                    "dtype_cases": [{"T": "float16"}],
+                    "label": "x",
+                }
+            ],
+        ),
+        "min is in `some`, which passes its tensor, and has a value",
     ),
     (
         "GEMMFwdOp",
@@ -460,6 +533,17 @@ _ENTRY_ERRORS = [
         "is not declared",
     ),
     ("Varlen", _varlen_chained(), None),
+    # A generator or predicate argument reads which member an argument holds, not its value.
+    (
+        "Varlen",
+        _varlen_discriminated(),
+        None,
+    ),
+    (
+        "Varlen",
+        _varlen_with(requires=["max_segment(9 if present(q) else 8)"]),
+        "'q' is no argument",
+    ),
     ("Varlen", _varlen_empty_chunks(), None),
     ("Varlen", _varlen_with(values="bogus(L)"), "is not a call of a built-in"),
     ("Varlen", _varlen_divided(K=0), "refinement fails: K > 0"),
@@ -479,6 +563,11 @@ _ENTRY_ERRORS = [
     ),
     ("Varlen", _varlen_generated(requires=["max_segment(9)"]), "reads rank 1"),
     ("Varlen", _varlen_cross_requires(), "reads 'b' where it is absent"),
+    (
+        "Varlen",
+        _varlen_with(requires=["max_segment(9)"]),
+        "max_segment needs prefix_offsets on the same tensor",
+    ),
     ("Varlen", _varlen_spliced_requires(), "needs a fixed-rank tensor"),
     (
         "Varlen",
@@ -491,9 +580,11 @@ _ENTRY_ERRORS = [
     ("Varlen", _varlen(L="prefix_sum([1])"), "not a call of a Seq[Int] primitive"),
     (
         "Varlen",
-        _varlen_with(values="prefix_sum(L)", requires=["max_segment(1)"]),
+        _varlen_with(values="prefix_sum(L)", requires=["prefix_offsets(5)", "max_segment(1)"]),
         "requires max_segment(1) fails",
     ),
+    ("Varlen", _varlen(nightly="never"), "`nightly` must be one of"),
+    ("Varlen", _varlen(nightly="skip"), "every row is `nightly: skip`"),
 ]
 
 
@@ -506,3 +597,192 @@ def test_check_workloads(name, entry, message):
         assert errors == []
     else:
         assert any(message in e for e in errors), errors
+
+
+def test_the_nightly_sweep_keeps_one_dtype_where_a_bfloat16_sibling_times_the_same_kernels():
+    signature = {
+        "forall": {"M": "Dim", "L": "Seq[Int]", "T": "DType[float16 | bfloat16 | float32]"},
+        "params": {
+            "out": {"type": "float16 | bfloat16 | None", "default": None},
+            "mode": {"type": "'float16' | 'other'", "default": "other"},
+        },
+        "inputs": {
+            "x": {"dtype": "T", "shape": "[M]"},
+            "o": {"dtype": "int32", "shape": "[B]", "values": "prefix_sum(L)"},
+        },
+        "outputs": {"y": {"dtype": "T", "shape": "[M]"}},
+    }
+    both = [{"T": "float16"}, {"T": "bfloat16"}]
+    rows = [
+        {"M": 1, "L": [1], "dtype_cases": both, "label": "pair"},
+        {"M": 2, "L": [1], "dtype_cases": [{"T": "float16"}], "label": "alone"},
+        {"M": 1, "L": [1], "dtype_cases": both, "label": "kept", "nightly": "every-dtype"},
+        {"M": 1, "L": [1], "dtype_cases": both, "label": "skipped", "nightly": "skip"},
+        # One row per dtype, a default and a sequence spelled differently: still siblings.
+        {
+            "M": 3,
+            "L": "repeat(2, 2)",
+            "mode": "other",
+            "dtype_cases": [{"T": "float16"}],
+            "label": "split",
+        },
+        {"M": 3, "L": [2, 2], "dtype_cases": [{"T": "bfloat16"}], "label": "split"},
+        # Siblings by a dtype parameter.
+        *(
+            {"M": 4, "L": [1], "out": t, "dtype_cases": [{"T": "float32"}], "label": "param"}
+            for t in ("float16", "bfloat16")
+        ),
+        # A string parameter and a label that read float16 are no dtypes.
+        {"M": 5, "L": [1], "mode": "float16", "dtype_cases": both, "label": "mode"},
+        *(
+            {"M": 6, "L": [1], "dtype_cases": [{"T": "float32"}], "label": t}
+            for t in ("float16", "bfloat16")
+        ),
+    ]
+    plan = entry_plan("Probe", {"signature": signature, "workloads": rows}, _ADTS)
+    kept = [
+        (row["label"], case["T"], row.get("out")) for row, case in bench_calls(plan, rows, True)
+    ]
+    assert kept == [
+        ("pair", "bfloat16", None),
+        ("alone", "float16", None),
+        ("kept", "float16", None),
+        ("kept", "bfloat16", None),
+        ("split", "bfloat16", None),
+        ("param", "float32", "bfloat16"),
+        ("mode", "bfloat16", None),
+        ("float16", "float32", None),
+        ("bfloat16", "float32", None),
+    ]
+    # A call mixing float16 and bfloat16 is no float16 sibling of the all-bfloat16 one.
+    mixed = {
+        "forall": {"M": "Dim", "T": "DType[float16 | bfloat16]", "U": "DType[float16 | bfloat16]"},
+        "inputs": {"a": {"dtype": "T", "shape": "[M]"}, "b": {"dtype": "U", "shape": "[M]"}},
+        "outputs": {"y": {"dtype": "T", "shape": "[M]"}},
+    }
+    cases = [
+        {"T": t, "U": u}
+        for t, u in [("bfloat16", "float16"), ("bfloat16", "bfloat16"), ("float16", "float16")]
+    ]
+    rows = [{"M": 1, "dtype_cases": cases, "label": "mixed"}]
+    plan = entry_plan("Mixed", {"signature": mixed, "workloads": rows}, _ADTS)
+    assert [case for _, case in bench_calls(plan, rows, True)] == cases[:2]
+
+
+def _gemm_from(a: tuple, b: tuple):
+    plan = entry_plan("GEMMFwdOp", _ENTRIES["GEMMFwdOp"], _ADTS)
+    known = {"trans_a": False, "trans_b": True}
+    return call_from_tensors(
+        plan, known, {"a": TensorSpec(a, "float16"), "b": TensorSpec(b, "float16")}
+    )
+
+
+def test_a_call_from_tensors_solves_its_indices_and_outputs():
+    """``d = a @ b.T`` on a 4x8 ``a`` and a 16x8 ``b``: M 4, N 16, K 8, and a 4x16 ``d``."""
+    call = _gemm_from((4, 8), (16, 8))
+    assert {n: call.indices[n] for n in ("M", "N", "K", "T")} == {
+        "M": 4,
+        "N": 16,
+        "K": 8,
+        "T": "float16",
+    }
+    assert call.specs["d"] == TensorSpec((4, 16), "float16")
+    assert call.written == frozenset()
+
+
+def test_a_call_from_tensors_refuses_inputs_that_disagree():
+    with pytest.raises(RowError, match="not K"):
+        _gemm_from((4, 8), (16, 4))
+
+
+@pytest.mark.parametrize("inplace", [False, True])
+def test_a_call_from_tensors_writes_an_input_where_its_condition_holds(inplace):
+    plan = entry_plan("ReLUFwdOp", load_manifest()["ReLUFwdOp"], load_adts())
+    x = TensorSpec((2, 3), "bfloat16")
+    call = call_from_tensors(plan, {"inplace": inplace}, {"input": x})
+    assert call.specs["output"] == x
+    assert call.written == (frozenset({"input"}) if inplace else frozenset())
+
+
+# ---------------------------------------------------------------- tensor sequences
+
+
+def _concat_rows(label):
+    plan = entry_plan("ConcatRowsFwdOp", _ENTRIES["ConcatRowsFwdOp"], _ADTS)
+    row = next(r for r in _ENTRIES["ConcatRowsFwdOp"]["workloads"] if r["label"] == label)
+    row = {k: v for k, v in row.items() if k != "expect_fail"}
+    return plan, row, row["dtype_cases"][0]
+
+
+def test_a_tensor_sequence_instantiates_one_spec_per_element():
+    plan, row, case = _concat_rows("three")
+    call = instantiate(plan, row, case)
+    assert [e.shape for e in call.specs["parts"]] == [(2, 4, 2), (0, 4, 2), (5, 4, 2)]
+    assert call.tensors["output"] == ((7, 4, 2), "float16")
+    assert call.bytes("parts") == 7 * 8 * 2
+    parts = call.materialize("cpu")["parts"]
+    assert isinstance(parts, list) and [tuple(p.shape) for p in parts] == [
+        (2, 4, 2),
+        (0, 4, 2),
+        (5, 4, 2),
+    ]
+    assert len({p.untyped_storage().data_ptr() for p in parts if p.numel()}) == 2
+
+
+def test_an_empty_sequence_takes_its_shared_names_from_another_tensor():
+    plan, row, case = _concat_rows("none")
+    call = instantiate(plan, row, case)
+    assert call.specs["parts"] == () and call.indices["N"] == ()
+    assert call.tensors["output"] == ((0, 4), "float32")
+
+
+def test_element_wise_indices_of_one_sequence_have_one_length():
+    entry = copy.deepcopy(_ENTRIES["ConcatRowsFwdOp"])
+    entry["signature"]["forall"]["M"] = "Seq[Dim]"
+    entry["signature"]["inputs"]["parts"]["shape"] = "[N, M, *A]"
+    entry["signature"]["outputs"]["output"]["shape"] = "[sum(N), *A]"
+    plan = entry_plan("ConcatRowsFwdOp", entry, _ADTS)
+    row = {"A": [4], "N": [2, 3], "M": [1], "label": "x"}
+    with pytest.raises(RowError, match="differ in length"):
+        instantiate(plan, row, {"T": "float16"})
+
+
+def _two_sequences(dtype="T"):
+    forall = {"N": "Dim", "A": "Seq[Shape]", "B": "Seq[Shape]", "T": "DType[float16 | float32]"}
+    if dtype != "T":
+        forall["D"] = "Seq[DType[float16 | float32]]"
+    signature = {
+        "forall": forall,
+        "inputs": {
+            "xs": {"type": "list[Tensor]", "dtype": dtype, "shape": "[N, *A]"},
+            "ys": {"type": "list[Tensor]", "dtype": dtype, "shape": "[N, *B]"},
+        },
+        "outputs": {"n": {"dtype": "float32", "shape": "[N]"}},
+    }
+    return entry_plan("TwoSequencesFwdOp", {"signature": signature}, _ADTS)
+
+
+def test_two_empty_sequences_leave_their_shared_name_unsolved():
+    with pytest.raises(RowError, match="xs and ys empty: no element 0 solves"):
+        call_from_tensors(_two_sequences(), {}, {"xs": (), "ys": ()})
+
+
+def test_a_call_from_tensors_refuses_sequences_disagreeing_on_an_element_dtype():
+    xs = (TensorSpec((2, 3), "float16"), TensorSpec((2, 3), "float32"))
+    ys = (TensorSpec((2, 3), "float16"), TensorSpec((2, 3), "float16"))
+    with pytest.raises(RowError, match="the elements of ys differ in dtype from D"):
+        call_from_tensors(_two_sequences("D"), {}, {"xs": xs, "ys": ys})
+
+
+@pytest.mark.parametrize(
+    ("row", "message"),
+    [
+        ({}, "argument 'value' has no value"),
+        ({"value": "x"}, "value = 'x' is not a non-tensor member of 'Number | bool | Tensor'"),
+    ],
+)
+def test_a_row_passes_a_member_of_a_union_argument(row, message):
+    plan = entry_plan("MaskedFillFwdOp", load_manifest()["MaskedFillFwdOp"], load_adts())
+    row = {"A": [4], "M": [4], "label": "x", **row}
+    with pytest.raises(RowError, match=message):
+        instantiate(plan, row, {"T": "float16"})

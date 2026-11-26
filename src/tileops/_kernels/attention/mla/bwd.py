@@ -14,7 +14,7 @@ A fixed-length call is the packed one with every request ``seqlen`` long; only t
 of ``lse`` and ``delta`` differs, batch-major ``(B, H, S)`` against head-major ``(H, T)``.
 """
 
-from typing import Callable, Optional
+from collections.abc import Callable
 
 import tilelang
 import tilelang.language as T
@@ -26,7 +26,7 @@ from tileops._kernels.attention.call_spec import (
     MLADenseBwdInterface,
     MLAVarlenBwdInterface,
 )
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.constants import LOG2E
 from tileops._kernels.grouped_tiling import GroupTiling
 from tileops._kernels.kernel_base import CompiledProgram, Entry, Kernel
@@ -42,7 +42,7 @@ def _delta_kernel(batch: int, heads: int, dim_v: int, dense_seqlen: int, dtype: 
     @tilelang.jit(
         out_idx=[2],
         pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
     )
     def _delta_func() -> Callable:
         total = T.dynamic("total_q")
@@ -84,7 +84,7 @@ def _dq_land_kernel(heads: int, dim_qk: int, scale: float, dtype: str) -> Callab
     @tilelang.jit(
         out_idx=[1],
         pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
     )
     def _dq_land_func() -> Callable:
         total = T.dynamic("total_q")
@@ -125,7 +125,7 @@ def _bwd_kernel(
 
     @tilelang.jit(
         pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
     )
     def _bwd_func(block_n: int, block_m: int, num_stages: int, threads: int) -> Callable:
         total_q = T.dynamic("total_q")
@@ -271,7 +271,7 @@ class _MLABwdKernelBase(Kernel):
     general: bool = True
 
     @classmethod
-    def refusal(cls, call: MLABwdCall) -> Optional[str]:
+    def refusal(cls, call: MLABwdCall) -> str | None:
         if call.dtype not in ATTENTION_DTYPES:
             return f"runs float16 and bfloat16, got {call.dtype}"
         if call.dim_qk % 16 != 0 or call.dim_v % 16 != 0:
@@ -292,7 +292,7 @@ class _MLABwdKernelBase(Kernel):
             is_causal=call.is_causal,
             sm_scale=call.sm_scale,
             dtype=call.dtype,
-            device_index=call.device.index if call.device is not None else None,
+            device_index=call.device_index,
         )
         return tuple(args.items()), lambda: cls(**args)
 
@@ -306,10 +306,10 @@ class _MLABwdKernelBase(Kernel):
         seqlen_kv: int,
         is_causal: bool,
         dtype: torch.dtype,
-        sm_scale: Optional[float] = None,
-        config: Optional[dict] = None,
+        sm_scale: float | None = None,
+        config: dict | None = None,
         *,
-        device_index: Optional[int] = None,
+        device_index: int | None = None,
     ) -> None:
         super().__init__(device_index=device_index)
         self.batch, self.heads = batch, heads

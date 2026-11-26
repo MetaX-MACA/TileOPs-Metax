@@ -14,15 +14,16 @@ the op's contract rather than a kernel's.
 
 import functools
 import itertools
+from collections.abc import Callable
 from dataclasses import dataclass
 from math import prod
-from typing import Callable
 
 import tilelang
 import tilelang.language as T
 import torch
 
 from tileops._csrc import csrc_include
+from tileops._kernels.autotune import candidate_busy_ms
 from tileops._kernels.build_target import target_cache
 from tileops._kernels.constants import (
     LOG2E,
@@ -32,11 +33,12 @@ from tileops._kernels.constants import (
 from tileops._kernels.kernel_base import CompiledProgram
 from tileops._kernels.streaming_load import load16
 from tileops._kernels.tiling import ALIGNMENT, align_up
+from tileops._kernels.warp_reduce import warp_reduce
 from tileops._utils import WARP_LANES
+from tileops.manifest.primitives import ceil_div
 
 __all__ = [
     "AUTOTUNE_THREADS",
-    "DEFAULT_ALIGNMENT",
     "DEFAULT_THREADS",
     "FP32_EXACT_INT_LIMIT",
     "FRAGMENT_ELEMS_PER_THREAD",
@@ -44,22 +46,24 @@ __all__ = [
     "BlockConfigPlanner",
     "RowTiledAutotuneMixin",
     "block_fold",
-    "ceildiv_int",
     "compute_tile_n",
     "device_smem_budget",
     "down_rows_launcher",
     "down_rows_splits",
     "edge_axis_split",
     "exp_shifted",
+    "exp_shifted_scaled",
     "extrema_combine",
+    "fold_max_sum",
+    "fold_max_sum_into",
     "fold_rows_kernel",
     "identity_for",
+    "keeps_input_rows",
     "reduced_shape",
     "restore_reduced",
     "restore_same_shape",
     "row_layout",
     "rows_for_axes",
-    "torch_dtype_nbytes",
     "tune_by_forward",
 ]
 
@@ -89,6 +93,16 @@ def device_smem_budget(device_index: int | None = None) -> int:
 # 256-element alignment (512 bytes for fp16/bf16) required by T.copy()
 # shared memory instructions.  Sub-categories may override this default.
 DEFAULT_ALIGNMENT: int = ALIGNMENT
+def keeps_input_rows(call) -> bool:
+    """Whether a kernel that reads each input row once into one CTA's registers and writes
+    an output row for it (softmax, log-softmax) loads the rows evict-last in L2: where the
+    input exceeds L2, so its lines compete for it.
+
+    Every other reduction kernel keeps the default load: one folding each row to one value,
+    one splitting a row across a CTA cluster, and one reading a row twice.
+    """
+    return call.m * call.n * call.dtype.itemsize > call.l2_bytes
+
 
 # Widest single fragment/shared-memory tile the reduction kernels plan; shared memory
 # and the register file are checked separately.
@@ -125,14 +139,33 @@ def exp_shifted(value, shift):
     return T.exp2((value - shift) * LOG2E)
 
 
+def exp_shifted_scaled(value, shift):
+    """``exp(value - shift) * 2**24`` through ``tileops::approx_exp2``.
+
+    ``approx_exp2`` flushes results below ``2**-126`` to zero. The ``2**24`` factor keeps
+    every term whose probability is a nonzero float32 (``2**-150`` and up) above that, and
+    dividing by the row sum cancels it. A shift of ``-inf`` yields ``NaN`` for a ``-inf``
+    value, as ``exp_shifted`` does. The caller includes ``approx_math.h``.
+    """
+    return T.call_extern("float32", "tileops::approx_exp2", (value - shift) * LOG2E + 24.0)
+
+
+def fold_max_sum(peak, total, other_peak, other_total):
+    """The ``(max, sum)`` of two partial softmax pairs; two empty ones stay empty."""
+    top = T.max(peak, other_peak)
+    both = total * exp_shifted(peak, top) + other_total * exp_shifted(other_peak, top)
+    return top, T.if_then_else(top == float("-inf"), T.cast(0, "float32"), both)
+
+
+@T.macro
+def fold_max_sum_into(stat, other):
+    """Fold the ``(max, sum)`` pair in ``other[0:2]`` into the one in ``stat[0:2]``."""
+    stat[0], stat[1] = fold_max_sum(stat[0], stat[1], other[0], other[1])
+
+
 # Largest integer count fp32 carries exactly; a statistic folded through
 # fp32 counts or weights is trusted only below it.
 FP32_EXACT_INT_LIMIT = 1 << 24
-
-
-def ceildiv_int(x: int, y: int) -> int:
-    """Return ``ceil(x / y)`` for positive integer dimensions."""
-    return -(-x // y)
 
 
 def identity_for(op_kind: str) -> float:
@@ -172,14 +205,6 @@ def block_fold(
     group_warps = lanes // WARP_LANES
 
     @T.macro
-    def shuffle(total, span):
-        # Folds the first *span* lanes of each warp, a power of two, into its lane 0.
-        for stage in T.serial(span.bit_length() - 1):
-            total[0] = combine(
-                total[0], T.shfl_xor(total[0], T.int32(span // 2) >> stage, width=WARP_LANES)
-            )
-
-    @T.macro
     def store(total, tx, out, index):
         if rows:
             if T.And(tx % lanes == 0, index < rows):
@@ -189,7 +214,7 @@ def block_fold(
 
     @T.macro
     def fold(total, warp_total, tx, out, index):
-        shuffle(total, WARP_LANES)
+        warp_reduce(total, combine, high_first=True, serial=True)
         if group_warps == 1:
             store(total, tx, out, index)
         else:
@@ -205,17 +230,16 @@ def block_fold(
                     identity,
                 )
                 # Lanes past the group's warps hold the identity, so the span rounds up.
-                shuffle(total, 1 << (group_warps - 1).bit_length())
+                warp_reduce(
+                    total,
+                    combine,
+                    lanes=1 << (group_warps - 1).bit_length(),
+                    high_first=True,
+                    serial=True,
+                )
                 store(total, tx, out, index)
 
     return fold
-
-
-def torch_dtype_nbytes(dtype: torch.dtype | str) -> int:
-    """Return element size for a torch dtype object or dtype-name string."""
-    if isinstance(dtype, str):
-        dtype = getattr(torch, dtype)
-    return torch.empty(0, dtype=dtype).element_size()
 
 
 class BlockConfigPlanner:
@@ -284,7 +308,7 @@ class BlockConfigPlanner:
 
     def frag_elems(self, block_m: int, cols: int, threads: int) -> int:
         """Tile elements one thread holds across every live fragment."""
-        return ceildiv_int(block_m * cols, threads) * self.frag_slots
+        return ceil_div(block_m * cols, threads) * self.frag_slots
 
     def frag_fits(self, block_m: int, cols: int, threads: int) -> bool:
         """Whether a ``(block_m, cols)`` tile stays in registers for this pair."""
@@ -313,7 +337,7 @@ class BlockConfigPlanner:
         still has to divide across the block, which is what ``layout_ok`` measures.
         """
         if block_m == 1:
-            return max(DEFAULT_ALIGNMENT, threads)
+            return max(ALIGNMENT, threads)
         return self.reduce_column_alignment(self.elem_bytes, threads)
 
     def tile_n_for(self, block_m: int, threads: int) -> int:
@@ -397,20 +421,13 @@ class BlockConfigPlanner:
         flattens that loop, the thread owning column *j* of row *i* is
         ``(i * cols + j) / vec % threads``, and the map repeats from row to row
         only when ``cols`` is a whole number of passes or divides one evenly.
-        Measured 44 of 44 over fp16/fp32 x {128, 256} threads x cols in
-        [256, 4096].
 
-        The kernels serialise the row loop, so the map does not depend on the row
-        and nearly every width builds.  One narrow residue survives --
-        softmax, log_softmax and logsumexp fail layout inference at
-        ``block_m=4, cols=768`` -- and this envelope still excludes it, so it
-        stays as the guard.  Everything it admits builds; some of what it
-        rejects would now build too.
+        The kernels serialise the row loop, so most widths it rejects build too; it
+        stays as the guard because softmax, log_softmax and logsumexp fail layout
+        inference at ``block_m=4, cols=768``, which it excludes.
 
-        ``block_m == 1`` has no row-to-row shift, but the columns still have to divide
-        across the block: layout inference finds no layout otherwise. Exact over 72 of
-        72 combinations of nine widths, four thread counts and fp16/fp32 -- a
-        ``(1, cols)`` fragment builds if and only if ``threads`` divides ``cols``.
+        ``block_m == 1`` has no row-to-row shift, but a ``(1, cols)`` fragment builds
+        if and only if ``threads`` divides ``cols``.
         """
         if block_m == 1:
             return cols % threads == 0
@@ -419,10 +436,10 @@ class BlockConfigPlanner:
 
     def reject_tile_n(self, block_m: int, tile_n: int, threads: int) -> str:
         """Return why a caller-supplied ``tile_n`` is unusable, or ""."""
-        if tile_n <= 0 or tile_n % DEFAULT_ALIGNMENT:
+        if tile_n <= 0 or tile_n % ALIGNMENT:
             return (
                 f"tile_n={tile_n} must be positive and a multiple of "
-                f"{DEFAULT_ALIGNMENT} (the T.copy shared-memory alignment)"
+                f"{ALIGNMENT} (the T.copy shared-memory alignment)"
             )
         if tile_n > MAX_SINGLE_TILE_COLS:
             return f"tile_n={tile_n} exceeds the {MAX_SINGLE_TILE_COLS} column cap"
@@ -515,7 +532,7 @@ def compute_tile_n(
     block_m: int,
     elem_bytes: int,
     N_padded: int,
-    alignment: int = DEFAULT_ALIGNMENT,
+    alignment: int = ALIGNMENT,
     budget: int = STATIC_SHARED_BYTES,
     num_buffers: int = 1,
 ) -> int:
@@ -526,11 +543,7 @@ def compute_tile_n(
     ``num_buffers * block_m * tile_n_max * elem_bytes <= budget``.
     The return value may be a smaller divisor of *N_padded* when that
     divisor does not increase the number of N-tiles, because an exact
-    division eliminates the nearly-empty remainder tile and reduces
-    wasted memory traffic.  For example, N_padded=32768 with
-    tile_n_max=32512 gives 2 tiles where tile 2 has only 256 valid
-    columns (99.2% waste), while divisor=16384 also gives 2 tiles with
-    zero waste.
+    division eliminates the nearly-empty remainder tile.
 
     When every divisor requires strictly more tiles, the full
     budget-derived cap is returned and the tiled kernel handles the
@@ -543,7 +556,7 @@ def compute_tile_n(
         block_m: Number of rows per thread block.
         elem_bytes: Bytes per element (e.g. 2 for fp16/bf16, 4 for fp32).
         N_padded: Padded hidden dimension (already aligned to *alignment*).
-        alignment: Column alignment boundary (default DEFAULT_ALIGNMENT).
+        alignment: Column alignment boundary (default ALIGNMENT).
         budget: Shared memory budget in bytes (default 48 KiB).
         num_buffers: Number of shared memory buffers of shape
             ``(block_m, tile_n)`` that must fit simultaneously (default 1).
@@ -580,17 +593,8 @@ def compute_tile_n(
             best_dividing = candidate
             break
 
-    # Accept the divisor when it does not increase the number of
-    # N-tiles.  Each tile incurs a global-memory pass in both passes of
-    # the 2-pass softmax, so fewer tiles is always cheaper.  When the
-    # divisor gives the same tile count as tile_n_max, prefer the
-    # divisor because it eliminates the nearly-empty remainder tile
-    # (e.g. N_padded=32768, tile_n_max=32512 → 2 tiles with a 256-col
-    # remainder vs divisor=16384 → 2 even tiles with zero waste).
-    #
-    # When the divisor requires strictly more tiles (e.g. smaller
-    # divisors of N_padded), stick with tile_n_max and handle the
-    # single remainder tile via masked loads.
+    # Each tile costs a global-memory pass in both passes of the 2-pass
+    # softmax, so a divisor that adds tiles loses to tile_n_max.
     if best_dividing > 0:
         div_tiles = N_padded // best_dividing  # exact division
         max_tiles = (N_padded + tile_n_max - 1) // tile_n_max
@@ -606,11 +610,11 @@ def tune_by_forward(
     rep: int = 10,
     forward=None,
 ) -> None:
-    """Select the fastest candidate config by timing one call per candidate.
+    """Select the candidate config with the lowest :func:`candidate_busy_ms` reading.
 
     The tiled reduction paths have no single ``self.kernel`` object for
     TileLang's autotuner to decorate — they dispatch through wrapped helper
-    functions — so each candidate is timed through a call instead.
+    functions — so each candidate is read through calls instead.
     Leaves ``kernel.config`` set to the winner, or to ``default_config`` when
     the kernel declares no candidates.
 
@@ -635,18 +639,7 @@ def tune_by_forward(
     best_config, best_time = configs[0], float("inf")
     for cfg in configs:
         with kernel._trying(cfg):
-            for _ in range(warmup):
-                call(*probe_inputs)
-            torch.cuda.synchronize()
-
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            for _ in range(rep):
-                call(*probe_inputs)
-            end.record()
-            torch.cuda.synchronize()
-        elapsed = start.elapsed_time(end) / rep
+            elapsed = candidate_busy_ms(lambda: call(*probe_inputs), warmup, rep)
 
         if elapsed < best_time:
             best_time, best_config = elapsed, cfg
@@ -748,16 +741,13 @@ class RowTiledAutotuneMixin:
         Includes the heuristic tile_n (from block_m=1) plus alternative
         tile_n values derived from ``_tile_n_for_block_m(2)`` and
         ``_tile_n_for_block_m(4)``, with a half-step fallback aligned to
-        ``DEFAULT_ALIGNMENT`` when block_m exploration yields no
+        ``ALIGNMENT`` when block_m exploration yields no
         alternatives.  tile_n=0 means single-tile (no tiling).  All
         candidates are de-duplicated and sorted descending for
         deterministic ordering.
 
-        Each distinct tile_n value requires a full kernel recompilation,
-        which is expensive for large-N workloads (compilations can take
-        minutes each).  To keep autotuner wall time practical we cap
-        the total number of tile_n candidates at ``_MAX_TILE_N_CANDIDATES``
-        (currently 3).
+        Each distinct tile_n value requires a full kernel recompilation, so the
+        candidates are capped at ``_MAX_TILE_N_CANDIDATES``.
 
         - When the heuristic default tile_n is 0 (single-tile / small N),
           return ``[0]`` -- the autotuner varies only block_m and threads. A
@@ -784,13 +774,11 @@ class RowTiledAutotuneMixin:
         # Also try half of the default tile_n (rounded to alignment) as a
         # search point when block_m exploration didn't yield alternatives.
         if len(candidates) < 2:
-            half_tn = (default_tn // 2 // DEFAULT_ALIGNMENT) * DEFAULT_ALIGNMENT
+            half_tn = (default_tn // 2 // ALIGNMENT) * ALIGNMENT
             if half_tn > 0 and half_tn != default_tn:
                 candidates.add(half_tn)
 
-        # Cap to avoid excessive compilation time.
-        sorted_candidates = sorted(candidates, reverse=True)
-        return sorted_candidates[: self._MAX_TILE_N_CANDIDATES]
+        return sorted(candidates, reverse=True)[: self._MAX_TILE_N_CANDIDATES]
 
     def autotune(self, warmup: int = 10, rep: int = 10) -> None:
         """Sweep the candidates, rebuilding per tile_n."""
@@ -840,10 +828,7 @@ class RowTiledAutotuneMixin:
         rebuilds the kernel for each tile_n value.  Configs include
         ``tile_n`` alongside ``block_m`` and ``threads``.
         """
-        budget = self._smem_budget
-        smem_per_row = self.N_padded * self._elem_bytes
-        max_block_m_no_tile = budget // smem_per_row if smem_per_row > 0 else 16
-        threads_list = list(AUTOTUNE_THREADS)
+        max_block_m_no_tile = self._smem_budget // (self.N_padded * self._elem_bytes)
 
         configs = []
         for tile_n in self._tile_n_candidates():
@@ -859,7 +844,7 @@ class RowTiledAutotuneMixin:
                         continue
                     if bm > max_block_m_no_tile:
                         continue
-                    for t in threads_list:
+                    for t in AUTOTUNE_THREADS:
                         if not self._planner.layout_ok(bm, self.N_padded, t):
                             continue
                         configs.append({"block_m": bm, "threads": t, "tile_n": 0})
@@ -867,11 +852,11 @@ class RowTiledAutotuneMixin:
                 # Tiled regime: block_m=1 with each tile_n candidate. Each
                 # distinct tile_n triggers a kernel recompilation, so only
                 # threads vary within a tile_n regime.
-                for t in threads_list:
+                for t in AUTOTUNE_THREADS:
                     configs.append({"block_m": 1, "threads": t, "tile_n": tile_n})
 
         if not configs:
-            configs = [{"block_m": 1, "threads": 256, "tile_n": self._tile_n}]
+            configs = [{"block_m": 1, "threads": DEFAULT_THREADS, "tile_n": self._tile_n}]
 
         return configs
 
@@ -933,12 +918,7 @@ def _down_rows_ops(op_kind: str, divisor: float, out_dtype: str, epilogue: str):
 
     @T.macro
     def init(acc):
-        if op_kind in ("amax", "amin"):
-            T.fill(acc, identity_for(op_kind))
-        elif op_kind == "prod":
-            T.fill(acc, 1.0)
-        else:
-            T.fill(acc, 0.0)
+        T.fill(acc, identity_for(op_kind))
 
     @T.macro
     def combine(acc, slot, value):
@@ -949,16 +929,13 @@ def _down_rows_ops(op_kind: str, divisor: float, out_dtype: str, epilogue: str):
         else:
             acc[slot] = acc[slot] + value
 
+    def finished(accumulated):
+        value = accumulated / divisor if divisor else accumulated
+        return T.sqrt(value) if epilogue == "sqrt" else value
+
     @T.macro
     def finish(out_local, slot, accumulated):
-        if divisor and epilogue == "sqrt":
-            out_local[slot] = T.cast(T.sqrt(accumulated / divisor), out_dtype)
-        elif divisor:
-            out_local[slot] = T.cast(accumulated / divisor, out_dtype)
-        elif epilogue == "sqrt":
-            out_local[slot] = T.cast(T.sqrt(accumulated), out_dtype)
-        else:
-            out_local[slot] = T.cast(accumulated, out_dtype)
+        out_local[slot] = T.cast(finished(accumulated), out_dtype)
 
     return init, combine, finish
 
@@ -1002,7 +979,7 @@ def _down_rows_kernel(
             caller whose outer pass finishes a sum-of-squares; ``""`` for none.
     """
     block_b = threads * _LEADING_POLICY.cols_per_thread
-    rows_per_split = ceildiv_int(A, splits)
+    rows_per_split = ceil_div(A, splits)
     exact = B % block_b == 0
     rows_exact = rows_per_split * splits == A
     init_acc, combine, finish = _down_rows_ops(op_kind, divisor, out_dtype, epilogue)
@@ -1012,7 +989,9 @@ def _down_rows_kernel(
     # the depth it gives a plain max, too few rows' loads in flight; the walk is unrolled
     # explicitly to a plain max's depth: 64 rows of 4-byte elements, 32 of narrower ones.
     walk = (
-        functools.partial(T.unroll, unroll_factor=64 if torch_dtype_nbytes(in_dtype) == 4 else 32)
+        functools.partial(
+            T.unroll, unroll_factor=64 if getattr(torch, in_dtype).itemsize == 4 else 32
+        )
         if extrema
         else T.serial
     )
@@ -1090,7 +1069,7 @@ def _down_rows_kernel(
 def _vector_tiles(kept: int, in_dtype: str) -> bool:
     """Whether *kept* columns split into at least ``min_vector_blocks`` whole tiles of one
     16-byte vector a thread on ``vector_threads`` threads."""
-    tile = _LEADING_POLICY.vector_threads * VECTOR_ACCESS_BYTES // torch_dtype_nbytes(in_dtype)
+    tile = _LEADING_POLICY.vector_threads * VECTOR_ACCESS_BYTES // getattr(torch, in_dtype).itemsize
     return kept % tile == 0 and kept // tile >= _LEADING_POLICY.min_vector_blocks
 
 
@@ -1105,7 +1084,7 @@ def _down_rows_vector_kernel(
     16-byte boundary.
     """
     threads = _LEADING_POLICY.vector_threads
-    vec = VECTOR_ACCESS_BYTES // torch_dtype_nbytes(in_dtype)
+    vec = VECTOR_ACCESS_BYTES // getattr(torch, in_dtype).itemsize
     init_acc, combine, finish = _down_rows_ops(op_kind, divisor, out_dtype, epilogue)
 
     @tilelang.jit(out_idx=[1], compile_flags=csrc_include("streaming_load.h", "nan_extrema.h"))
@@ -1144,8 +1123,8 @@ def down_rows_splits(reduced: int, kept: int) -> int:
     )
     if reduced * kept <= grid_work:
         return 1
-    column_blocks = ceildiv_int(kept, _LEADING_POLICY.threads * _LEADING_POLICY.cols_per_thread)
-    return max(1, min(reduced, ceildiv_int(_LEADING_POLICY.target_blocks, column_blocks)))
+    column_blocks = ceil_div(kept, _LEADING_POLICY.threads * _LEADING_POLICY.cols_per_thread)
+    return max(1, min(reduced, ceil_div(_LEADING_POLICY.target_blocks, column_blocks)))
 
 
 def down_rows_launcher(
@@ -1229,10 +1208,9 @@ def fold_rows_kernel(
         unroll: Vector loads each thread keeps in flight.
         lead: Segments each row reduces, strided ``m * n`` elements apart.
     """
-    vec = VECTOR_ACCESS_BYTES // torch_dtype_nbytes(dtype)
+    vec = VECTOR_ACCESS_BYTES // getattr(torch, dtype).itemsize
     slot_dtype = "int32" if op_kind == "inf" else "float32"
     identity = identity_for(op_kind)
-    load = "tileops::load16"
 
     @tilelang.jit(out_idx=[1], compile_flags=csrc_include("streaming_load.h", "nan_extrema.h"))
     def _func(threads: int):
@@ -1268,27 +1246,17 @@ def fold_rows_kernel(
                 return T.cast(T.reinterpret(total, "float32"), out_dtype)
             return T.cast(total, out_dtype)
 
-        def at(x, seg, row, j):
-            return x[row, j] if lead == 1 else x[seg, row, j]
+        def at(seg, row, j):
+            return (row, j) if lead == 1 else (seg, row, j)
 
         @T.macro
         def fold(x, seg, row, tx, held, tail, slots):
             # The row holds whole vectors, so the tail is guarded per vector. Its load issues
             # first, so the threads holding a tail wait one memory latency, not two.
             if steps * step + tx * vec < n:
-                T.call_extern(
-                    "handle",
-                    load,
-                    T.address_of(tail[0]),
-                    T.address_of(at(x, seg, row, steps * step + tx * vec)),
-                )
+                load16(tail, 0, x, at(seg, row, steps * step + tx * vec))
             for k in T.unroll(steps, unroll_factor=unroll):
-                T.call_extern(
-                    "handle",
-                    load,
-                    T.address_of(held[0]),
-                    T.address_of(at(x, seg, row, (k * threads + tx) * vec)),
-                )
+                load16(held, 0, x, at(seg, row, (k * threads + tx) * vec))
                 for c in T.serial(vec):
                     slots[c] = combine(slots[c], prepared(held[c]))
             if steps * step + tx * vec < n:

@@ -6,7 +6,7 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.gemm.call_spec import GEMMCall
 from tileops._kernels.gemm.dense import GEMMCpAsyncKernel, GEMMTMAKernel
 from tileops._kernels.gemm.heuristics import small_m_splitk_config
@@ -14,7 +14,6 @@ from tileops._kernels.gemm.persistent.heuristics import GEMMType
 from tileops._kernels.gemm.persistent.template import GEMMTemplate
 from tileops._kernels.kernel_base import Entry, Kernel
 from tileops._kernels.moe.call_spec import SharedExpertMLPCall, SharedExpertMLPFwdInterface
-from tileops._utils import get_sm_count, get_sm_version
 
 __all__ = ["SharedExpertMLPKernel"]
 
@@ -27,7 +26,7 @@ def _silu_mul_fused_kernel(M: int, N: int, dtype_str: str):
     @tilelang.jit(
         out_idx=[1],
         pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
     )
     def _func(block_m, block_n, threads):
         gate_up_shape = (M, N * 2)
@@ -115,7 +114,7 @@ class SharedExpertMLPKernel(Kernel, SharedExpertMLPFwdInterface):
     @classmethod
     def entry_for(cls, call: SharedExpertMLPCall) -> Entry:
         """One build per token count, width, expert width, dtype and device."""
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         identity = (call.num_tokens, call.hidden_size, call.ffn_size, call.dtype, index)
         return identity, lambda: cls(
             num_tokens=call.num_tokens,
@@ -154,8 +153,8 @@ class SharedExpertMLPKernel(Kernel, SharedExpertMLPFwdInterface):
         num_tokens, hidden_size, ffn_size = self.num_tokens, self.hidden_size, self.ffn_size
         dtype, device_index = self.dtype, self.device_index
         pinned = self._configured or dict(cfg) != self.default_config
-        sm_version = get_sm_version(device_index)
-        sm_count = get_sm_count(device_index)
+        target = self.build_target
+        sm_version, sm_count = target.arch, target.sm_count
         device = torch.device("cuda", device_index) if device_index is not None else None
         fused, activated = None, False
         # Each GEMM runs on the dense kernel whose region holds its shape.
@@ -172,7 +171,7 @@ class SharedExpertMLPKernel(Kernel, SharedExpertMLPFwdInterface):
             )
             for n, k in ((ffn_size * 2, hidden_size), (hidden_size, ffn_size))
         )
-        # The defaults above are the SM90 template's tiles: a dense kernel picks its own
+        # The default config holds the SM90 template's tiles: a dense kernel picks its own
         # unless the caller set one.
         gemm_config = dict(cfg) if pinned else None
         # The template's fused epilogue stores S columns a row, which TMA takes in whole
@@ -250,7 +249,7 @@ class SharedExpertMLPKernel(Kernel, SharedExpertMLPFwdInterface):
                     hidden_size,
                     ffn_size,
                     sm_count,
-                    torch.cuda.get_device_name(device_index),
+                    target.calibration,
                 )
                 if dtype is torch.bfloat16 and not pinned
                 else None

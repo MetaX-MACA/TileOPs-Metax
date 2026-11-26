@@ -1,10 +1,12 @@
-from typing import ClassVar, Mapping, Optional, Tuple
+from collections.abc import Mapping
+from typing import ClassVar
 
 import torch
 
 from tileops._kernels.attention import (
     NSACompressedFwdVarlenKernel,
     NSACompressedFwdVarlenTMAKernel,
+    NSAFwdVarlenGatherKernel,
     NSAFwdVarlenKernel,
     NSAFwdVarlenTMAKernel,
     NSATopKVarlenKernel,
@@ -54,7 +56,7 @@ class NSATopKVarlenFwdOp(Op):
         *,
         selected_block_num: int,
         block_size: int,
-        sm_scale: Optional[float] = None,
+        sm_scale: float | None = None,
         validate_inputs: bool = False,
         target: Target = None,
     ) -> None:
@@ -136,12 +138,20 @@ class NSAVarlenFwdOp(Op):
 
     A causal token sees the keys of its selected blocks up to its own position, a
     non-causal one up to the end of its sequence; a block starting past that bound
-    contributes nothing, and a token no block gives a key outputs zeros.
+    contributes nothing, and a token no block gives a key outputs zeros. With
+    ``cu_seqlens_k`` each request's queries are the last of its keys, as in FLA's
+    ``parallel_nsa_fwd``. A token's slots may come in any order; a slot past its
+    ``block_counts``, or naming a block that starts past its last visible key (as a padding
+    id does), selects nothing. The kernels compute in float32, flush subnormals to zero, and
+    land the softmax weights in the input dtype before they multiply the values, as
+    FlashAttention does: inputs whose QK products, scaled scores or value sums pass
+    float32's range are not supported.
     """
 
     kernel_types: ClassVar[Mapping[str, type[Kernel]]] = {
         "nsa_fwd_varlen_kernel": NSAFwdVarlenKernel,
         "nsa_fwd_varlen_tma_kernel": NSAFwdVarlenTMAKernel,
+        "nsa_fwd_varlen_gather_kernel": NSAFwdVarlenGatherKernel,
     }
     interfaces: ClassVar[Mapping[str, type[KernelInterface]]] = {
         "nsa_fwd_varlen_kernel": NSAFwdInterface
@@ -151,7 +161,7 @@ class NSAVarlenFwdOp(Op):
         self,
         *,
         block_size: int,
-        sm_scale: Optional[float] = None,
+        sm_scale: float | None = None,
         is_causal: bool = True,
         validate_inputs: bool = False,
         target: Target = None,
@@ -164,8 +174,9 @@ class NSAVarlenFwdOp(Op):
                 ``D ** -0.5``.
             is_causal: Whether a token sees keys only up to its own position. Default
                 ``True``, as FLA's ``parallel_nsa``, which has no switch.
-            validate_inputs: Check on the CPU that ``cu_seqlens`` starts at 0, never
-                decreases and ends at the token count.
+            validate_inputs: Check on the CPU that ``cu_seqlens`` and ``cu_seqlens_k`` start
+                at 0, never decrease and end at the query and key counts, and that
+                ``block_indices`` and ``block_counts`` lie in their manifest ranges.
             target: Which set of kernels serves this op — a target name, ``BUILTIN``
                 for the in-tree kernels, or ``None`` to decide from the input device.
         """
@@ -177,11 +188,19 @@ class NSAVarlenFwdOp(Op):
         super().__init__(target=target)
 
     def roofline_data_terms(self) -> "dict[str, int]":
-        """The key rows this call's selection scores and the distinct rows it reads."""
+        """The key rows this call's selection scores and the distinct rows it reads, the
+        (token, KV head) query groups that score a key, and the selection slots
+        ``block_counts`` names."""
         from tileops._perf.formulas import nsa_selected_rows
 
-        scored, distinct = nsa_selected_rows(self.last_call)
-        return {"scored_rows": scored, "distinct_rows": distinct}
+        call = self.last_call
+        scored, distinct, groups = nsa_selected_rows(call)
+        return {
+            "scored_rows": scored,
+            "distinct_rows": distinct,
+            "active_q_groups": groups,
+            "consulted_slots": sum(sum(row) for row in call.metadata_values("block_counts")),
+        }
 
     def forward(
         self,
@@ -192,22 +211,30 @@ class NSAVarlenFwdOp(Op):
         block_counts: torch.Tensor,
         cu_seqlens: torch.Tensor,
         token_indices: torch.Tensor,
+        *,
+        cu_seqlens_k: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Attend each token to its selected blocks.
 
         Args:
             q: Queries, packed over the batch [c_seq_len, heads, dim].
-            k: Keys [c_seq_len, head_kv, dim].
-            v: Values [c_seq_len, head_kv, dim].
+            k: Keys [c_seq_len, head_kv, dim], or one row per key with ``cu_seqlens_k``.
+            v: Values, shaped as ``k``.
             block_indices: Selected block ids [c_seq_len, head_kv, selected_blocks].
             block_counts: Valid block count per token and KV head [c_seq_len, head_kv].
             cu_seqlens: Request boundaries into the packed sequence [batch + 1].
             token_indices: Request id and in-request position per token [c_seq_len, 2].
+            cu_seqlens_k: Key boundaries [batch + 1]; ``None`` means ``cu_seqlens``.
 
         Returns:
             Attention output [c_seq_len, heads, dim].
         """
-        tensors = (q, k, v, block_indices, block_counts, cu_seqlens, token_indices)
+        # The kernels address packed tensors; a strided view, such as one selection
+        # expanded over the KV heads, is copied first.
+        tensors = tuple(
+            None if t is None else t.contiguous()
+            for t in (q, k, v, block_indices, block_counts, cu_seqlens, token_indices, cu_seqlens_k)
+        )
         c_seq_len, heads, dim = q.shape
         return self.kernel_for(
             "nsa_fwd_varlen_kernel",
@@ -222,6 +249,7 @@ class NSAVarlenFwdOp(Op):
                 scale=dim**-0.5 if self.sm_scale is None else self.sm_scale,
                 is_causal=self.is_causal,
                 dtype=q.dtype,
+                separate_keys=cu_seqlens_k is not None,
                 device=q.device,
             ),
         )(*tensors)
@@ -256,7 +284,7 @@ class NSACompressedVarlenFwdOp(Op):
         self,
         *,
         block_size: int,
-        sm_scale: Optional[float] = None,
+        sm_scale: float | None = None,
         validate_inputs: bool = False,
         target: Target = None,
     ) -> None:
@@ -291,7 +319,7 @@ class NSACompressedVarlenFwdOp(Op):
         cu_seqlens: torch.Tensor,
         chunk_offsets: torch.Tensor,
         token_indices: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Attend each token to its request's compressed chunks.
 
         Args:

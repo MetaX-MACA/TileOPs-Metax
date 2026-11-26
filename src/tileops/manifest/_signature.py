@@ -11,7 +11,11 @@ import ast
 import copy
 import functools
 import itertools
+import re
+import sys
+from collections.abc import Iterable
 from dataclasses import dataclass, field
+from typing import Any
 
 from tileops.manifest._dtype_rules import DTYPE_BITS
 from tileops.manifest._expr import (
@@ -23,9 +27,11 @@ from tileops.manifest._expr import (
     callee,
     fold,
     infer_kinds,
+    member_kind,
     names,
     parse,
     value_at,
+    value_names,
 )
 from tileops.manifest._kinds import (
     BOOL,
@@ -37,11 +43,17 @@ from tileops.manifest._kinds import (
     fits,
     parse_spec,
     parse_type,
+    split_union,
     union,
 )
-from tileops.manifest.primitives import PRIMITIVE_KINDS, PRIMITIVES
+from tileops.manifest.primitives import DETERMINING_PREDICATES, PRIMITIVE_KINDS, PRIMITIVES
 
 __all__ = [
+    "ITEM",
+    "MEMBERS",
+    "REQUIRED",
+    "SLOT_TYPES",
+    "TENSOR_MEMBERS",
     "Signature",
     "SignatureBranch",
     "SignatureError",
@@ -49,14 +61,22 @@ __all__ = [
     "Tensor",
     "adt_fields",
     "branch",
+    "call_scalar_lets",
     "complete_point",
+    "components",
     "discriminant_axes",
     "discriminant_groups",
     "dtype_kind",
+    "elementwise",
     "expand",
     "field_kind",
     "holds",
+    "items",
     "kind_env",
+    "localized",
+    "member_at",
+    "member_of",
+    "members",
     "output_emitted",
     "param_kind",
     "parse_signature",
@@ -69,15 +89,69 @@ __all__ = [
 ]
 
 
+# The members an argument type may hold, as `member(x)` names them.
+MEMBERS = ("Tensor", "list[Tensor]", "int", "float", "Number", "bool", "None")
+# The members that hold tensors: an argument holding one takes part in tensor inference.
+TENSOR_MEMBERS = frozenset({"Tensor", "list[Tensor]"})
+# A declaration without `default`: the argument must be passed.
+REQUIRED = object()
+# The operator-schema type of each member's slot, and its slot-name suffix.
+SLOT_TYPES = {
+    "Tensor": ("Tensor", ""),
+    "list[Tensor]": ("Tensor[]", ""),
+    "int": ("SymInt", "__int"),
+    "float": ("float", "__float"),
+    "Number": ("Scalar", "__number"),
+    "bool": ("bool", "__bool"),
+}
+
+
+def members(type_text: object) -> tuple[str, ...]:
+    """The members of an argument `type`, in declared order; `SignatureError` outside `MEMBERS`."""
+    found = tuple(m.replace(" ", "") for m in split_union(str(type_text).strip()))
+    bad = [m for m in found if m not in MEMBERS]
+    if bad or len(set(found)) != len(found):
+        raise SignatureError(f"type {type_text!r} is not a union of distinct members of {MEMBERS}")
+    if "Number" in found and {"int", "float"} & set(found):
+        raise SignatureError(f"type {type_text!r}: Number already holds int and float")
+    return found
+
+
+def member_of(value: object, members: tuple[str, ...]) -> str | None:
+    """The member of `members` that holds `value`; None when none does.
+
+    A symbolic `torch.SymBool`, `SymInt` or `SymFloat` is held as the scalar it stands for.
+    """
+    torch = sys.modules.get("torch")
+    symbolic = (torch.SymBool, torch.SymInt, torch.SymFloat) if torch is not None else ()
+    if value is None:
+        found = ["None"]
+    elif isinstance(value, (list, tuple)):
+        found = ["list[Tensor]"]
+    elif torch is not None and isinstance(value, torch.Tensor):
+        found = ["Tensor"]
+    elif isinstance(value, (bool, *symbolic[:1])):
+        found = ["bool"]
+    elif isinstance(value, (int, *symbolic[1:2])):
+        # A `float` member takes an int, as Python's `float` annotation and the `float` slot do.
+        found = ["int", "Number", "float"]
+    elif isinstance(value, (float, *symbolic[2:])):
+        found = ["float", "Number"]
+    else:
+        found = []
+    return next((m for m in found if m in members), None)
+
+
 @dataclass
 class Tensor:
     name: str
     dtype: str
     shape: str
-    optional: "bool | str" = False
+    # The argument type; `Tensor` stands for this declaration's `Tensor[dtype, shape]`.
+    type: str = "Tensor"
     nullable: str | None = None
     buffer: bool = False
-    mutated: "bool | str" = False
+    mutated: bool | str = False
     values: str | None = None
     requires: tuple[str, ...] = ()
     cpu: bool = False
@@ -86,35 +160,76 @@ class Tensor:
     contiguous: bool = False
     kw_only: bool = False
     overlaps: tuple[str, ...] = ()
+    default: object = REQUIRED
+
+    @property
+    def members(self) -> tuple[str, ...]:
+        return members(self.type)
+
+    @property
+    def sequence(self) -> bool:
+        """Whether the argument is a tensor sequence, `list[Tensor]`."""
+        return "list[Tensor]" in self.members
+
+    @property
+    def slots(self) -> list[tuple[str, str, str]]:
+        """The operator-schema slots, each `(type, name, member)`.
+
+        One member takes one slot as it is; several members take a nullable slot per member
+        that is not None.
+        """
+        nullable = len(self.members) > 1
+        return [
+            (f"{SLOT_TYPES[m][0]}{'?' if nullable else ''}", f"{self.name}{SLOT_TYPES[m][1]}", m)
+            for m in self.members
+            if m != "None"
+        ]
+
+    @property
+    def scalars(self) -> tuple[str, ...]:
+        """The members that are neither a tensor nor None."""
+        return tuple(m for m in self.members if m not in TENSOR_MEMBERS and m != "None")
 
     @property
     def derived(self) -> bool:
         """Whether a determining predicate fixes this tensor's contents from other tensors."""
-        from tileops.manifest.primitives import DETERMINING_PREDICATES
-
         return any(r.split("(", 1)[0].strip() in DETERMINING_PREDICATES for r in self.requires)
 
 
 @dataclass
 class Signature:
+    """An entry's parsed `signature`: its indices, parameters, tensors, `let`s and rules."""
+
     name: str
     forall: dict[str, str]
-    params: dict[str, dict]
-    ctor_tensors: dict[str, Tensor]
+    params: dict[str, dict[str, Any]]
     inputs: dict[str, Tensor]
     outputs: dict[str, Tensor]
-    types: dict[str, dict]
+    types: dict[str, dict[str, Any]]
     let: dict[str, str]
     rules: list[str]
-    adts: dict[str, dict] = field(default_factory=dict)
-    dtype_combos: list[dict] = field(default_factory=list)
+    adts: dict[str, dict[str, Any]] = field(default_factory=dict)
+    dtype_combos: list[dict[str, Any]] = field(default_factory=list)
 
     @property
-    def call_tensors(self) -> dict[str, Tensor]:
-        """Tensors unification reads: construction-time tensors, then call-time inputs."""
-        return {**self.ctor_tensors, **self.inputs}
+    def scalar_inputs(self) -> set[str]:
+        """The call-time inputs with a scalar member."""
+        return {t for t, d in self.inputs.items() if d.scalars}
 
-    def forward_arguments(self, inputs) -> tuple[tuple, dict]:
+    def written(self, point: dict[str, object], present: set[str]) -> frozenset[str]:
+        """The inputs a call at `point` writes: `mutated` where its condition holds, `write_only`."""
+        return frozenset(
+            t.name
+            for t in self.inputs.values()
+            if t.name in present
+            and (
+                t.write_only
+                or t.mutated is True
+                or (isinstance(t.mutated, str) and value_at(parse(t.mutated), point) is True)
+            )
+        )
+
+    def forward_arguments[T](self, inputs: Iterable[T]) -> tuple[tuple[T, ...], dict[str, T]]:
         """*inputs*, call-time inputs in `inputs` order, as `forward` takes them.
 
         Returns the positional ones in order, and each `kw_only` one by name. *inputs* may stop
@@ -134,6 +249,7 @@ class Signature:
         )
 
     def kind(self, name: str) -> Kind | None:
+        """The kind of index or parameter `name`; None for any other name."""
         if name in self.forall:
             return _spec(self.forall[name])
         if name in self.params:
@@ -170,6 +286,34 @@ def field_kind(decl: object) -> Kind | None:
     return kind
 
 
+# The prefix of the name an element's item takes in that element's unification.
+ITEM = "_item_"
+
+
+def elementwise(sig: Signature) -> frozenset:
+    """The indices a `list[Tensor]` declaration reads per element.
+
+    These are the indices of a `Seq` kind other than a generator's value list.
+    """
+    return frozenset(n for n, k in sig.forall.items() if k.startswith("Seq[") and k != "Seq[Int]")
+
+
+def items(node: ast.expr, each: frozenset) -> list[str]:
+    """The element-wise indices `node` reads, in order of first reading."""
+    found = []
+    for n in ast.walk(node):
+        if isinstance(n, ast.Name) and n.id in each and n.id not in found:
+            found.append(n.id)
+    return found
+
+
+def localized(node: ast.expr, each) -> ast.expr:
+    """An element type with each element-wise index `X` read as the element's item `_item_X`."""
+    return ast.fix_missing_locations(
+        Substitute({x: ast.Name(f"{ITEM}{x}", ast.Load()) for x in each}).visit(copy.deepcopy(node))
+    )
+
+
 def _identifier(name: object) -> bool:
     return isinstance(name, str) and name.isidentifier()
 
@@ -181,11 +325,15 @@ def _tensor(name: str, decl: object) -> Tensor:
         or not isinstance(decl.get("shape"), str)
     ):
         raise SignatureError(f"tensor {name!r} needs string `dtype` and `shape`")
+    try:
+        members(decl.get("type", "Tensor"))
+    except SignatureError as exc:
+        raise SignatureError(f"tensor {name!r}: {exc}") from None
     return Tensor(
         name,
         decl["dtype"],
         decl["shape"],
-        decl.get("optional", False),
+        decl.get("type", "Tensor"),
         decl.get("nullable"),
         decl.get("buffer") == "out",
         decl.get("mutated", False),
@@ -197,6 +345,7 @@ def _tensor(name: str, decl: object) -> Tensor:
         decl.get("contiguous") is True,
         decl.get("kw_only") is True,
         tuple(decl.get("overlaps") or ()),
+        decl.get("default", REQUIRED),
     )
 
 
@@ -224,34 +373,35 @@ def read_signature(name: str, entry: dict, adts: dict) -> tuple[Signature, list[
     forall = {}
     for index, kind in sections["forall"].items():
         dtype = _spec_or_none(str(kind))
-        if kind in ("Dim", "Shape", "Seq[Int]") or (
-            dtype is not None and dtype.tag == "DType" and dtype.values
+        elem = _spec_or_none(str(kind)[4:-1]) if str(kind).startswith("Seq[DType[") else None
+        if kind in ("Dim", "Shape", "Seq[Int]", "Seq[Dim]", "Seq[Shape]") or any(
+            d is not None and d.tag == "DType" and d.values for d in (dtype, elem)
         ):
             forall[index] = kind
         else:
             problems.append(f"forall index {index!r} has unknown kind {kind!r}")
-    params, ctor_tensors, tensors = {}, {}, {"inputs": {}, "outputs": {}}
+    params, tensors = {}, {"inputs": {}, "outputs": {}}
     for p, decl in sections["params"].items():
-        if isinstance(decl, dict) and "shape" in decl:
-            tensors.setdefault("params", {})[p] = decl
+        if isinstance(decl, dict) and (
+            "shape" in decl or re.search(r"\bTensor\b", str(decl.get("type", "")))
+        ):
+            problems.append(f"parameter {p!r} declares a tensor: a tensor is a call-time input")
         elif isinstance(decl, dict) and "type" in decl:
             params[p] = decl
         else:
             problems.append(f"parameter {p!r} needs a `type`")
-    for group in ("params", "inputs", "outputs"):
-        source = tensors.get("params", {}) if group == "params" else sections[group]
-        for n, decl in source.items():
+    for group in ("inputs", "outputs"):
+        for n, decl in sections[group].items():
             try:
                 tensor = _tensor(n, decl)
             except SignatureError as exc:
                 problems.append(str(exc))
                 continue
-            (ctor_tensors if group == "params" else tensors[group])[n] = tensor
+            tensors[group][n] = tensor
     return Signature(
         name,
         forall,
         params,
-        ctor_tensors,
         tensors["inputs"],
         tensors["outputs"],
         dict(sections["types"]),
@@ -268,6 +418,21 @@ def parse_signature(name: str, entry: dict, adts: dict) -> Signature:
     if problems:
         raise SignatureError(problems[0])
     return sig
+
+
+def call_scalar_lets(sig: Signature) -> set[str]:
+    """The `let`s that read a call-time scalar member, directly or through another `let`."""
+    scalars = sig.scalar_inputs
+    reads = {}
+    for n, e in sig.let.items():
+        try:
+            reads[n] = value_names(parse(e))
+        except SignatureError:
+            reads[n] = set()
+    found: set[str] = set()
+    while more := {n for n, r in reads.items() if n not in found and r & (scalars | found)}:
+        found |= more
+    return found
 
 
 # ---------------------------------------------------------------- kinds
@@ -287,18 +452,23 @@ def adt_fields(adts: dict) -> dict:
 def kind_env(
     sig: Signature, lets: dict[str, ast.expr], kinds: dict | None = None
 ) -> tuple[KindEnv, list[str]]:
-    """The `KindEnv` of `sig`: every index, parameter and `let`, lets in dependency order, and
-    the misuse inferring the lets finds. `kinds` overrides what the declarations give."""
-    base = {n: sig.kind(n) for n in (*sig.forall, *sig.params)} | (kinds or {})
+    """The `KindEnv` of `sig`, and the misuse inferring its lets finds.
+
+    The env holds every index, parameter and `let`, lets in dependency order. `kinds`
+    overrides what the declarations give.
+    """
+    tags = {t.name: t.members for t in sig.inputs.values()}
+    # A call-time argument with a scalar member is a value where narrowed to that member.
+    arguments = {t: member_kind(m) for t, m in tags.items() if sig.inputs[t].scalars}
+    base = {n: sig.kind(n) for n in (*sig.forall, *sig.params)} | arguments | (kinds or {})
     env = KindEnv(
         base,
         adt_fields(sig.adts),
         frozenset(sig.types),
-        frozenset({*sig.call_tensors, *sig.outputs})
+        frozenset({*sig.inputs, *sig.outputs})
         | ({"out"} if any(t.buffer for t in sig.outputs.values()) else set()),
-        frozenset(
-            p for p in sig.params if param_kind(sig.params[p].get("type"), sig.adts).tag == "Maybe"
-        ),
+        frozenset(p for p in sig.params if sig.kind(p).tag == "Maybe"),
+        tags=tags,
     )
     errors: list[str] = []
     pending = list(lets)
@@ -312,14 +482,25 @@ def kind_env(
     return env, errors
 
 
-def dtype_kind(sig: Signature, node: ast.expr, errors: list[str]) -> Kind | None:
-    """The kind of a dtype expression; misuse goes to `errors`."""
+def dtype_kind(
+    sig: Signature, node: ast.expr, errors: list[str], each: frozenset = frozenset(), top=True
+) -> Kind | None:
+    """The kind of a dtype expression; misuse goes to `errors`.
+
+    An element-wise index in `each` is its item, a `list[Tensor]` element's dtype; any other
+    `Seq[DType]` index is a list of dtypes, which only a primitive argument takes.
+    """
     if isinstance(node, ast.Constant) and node.value is None:
         return NONE
     if isinstance(node, ast.Name):
         if node.id in DTYPE_BITS and node.id not in {*sig.forall, *sig.params}:
             return dtypes([node.id])
         kind = sig.kind(node.id)
+        if kind is not None and kind.tag == "Seq" and kind.item is not None:
+            if node.id in each:
+                return kind.item
+            if not top:
+                return kind
         if kind is not None and kind.payload().tag == "DType":
             return kind
         errors.append(f"{node.id!r} is not a DType index, dtype parameter or registered dtype")
@@ -334,21 +515,40 @@ def dtype_kind(sig: Signature, node: ast.expr, errors: list[str]) -> Kind | None
         return DTYPE
     domains = []
     for arg, wanted in zip(node.args, formal, strict=True):
-        kind = dtype_kind(sig, arg, errors)
+        kind = dtype_kind(sig, arg, errors, each, top=False)
         if kind is not None and not fits(kind, _spec(wanted)):
             errors.append(f"argument {ast.unparse(arg)} has kind {kind}, expected {wanted}")
         domains.append(_dtype_values(kind))
     if any(d is None for d in domains):
         return DTYPE
-    # Every argument has finite dtypes, so the result's are the primitive over their product.
-    values = {PRIMITIVES[name](*combo) for combo in itertools.product(*domains)}
+    # Every argument has finite dtypes, so the result's are the primitive over their product;
+    # a combination outside the primitive's domain yields nothing, and raises at the call.
+    values = set()
+    for combo in itertools.product(*domains):
+        try:
+            values.add(PRIMITIVES[name](*combo))
+        except ValueError:
+            continue
+    if not values:
+        errors.append(f"{ast.unparse(node)} has no value over its arguments' dtypes")
+        return DTYPE
     return union(*(NONE if v is None else dtypes([v]) for v in values))
 
 
 def _dtype_values(kind: Kind | None) -> set | None:
-    """The values of a dtype expression's kind, None among them; None when unbounded."""
+    """The values of a dtype expression's kind, None among them; None when unbounded.
+
+    A list of dtypes takes every non-empty subset of its item's, in sorted order: the
+    primitives taking one are symmetric.
+    """
     if kind is None:
         return None
+    if kind.tag == "Seq":
+        item = _dtype_values(kind.item)
+        if item is None or None in item:
+            return None
+        pool = sorted(item)
+        return {combo for n in range(1, len(pool) + 1) for combo in itertools.combinations(pool, n)}
     if kind.tag == "None":
         return {None}
     payload = kind.payload()
@@ -367,7 +567,7 @@ def _finite_axis(p: str, kind: Kind, adts: dict) -> tuple[str | None, list] | No
     if kind.tag == "Str" and kind.values:
         return (p, sorted(kind.values))
     if kind.tag == "Maybe":
-        payload = _finite_axis(f"{p}.value", kind.item, adts) if kind.item.tag == "ADT" else None
+        payload = _finite_axis(p, kind.item, adts) if kind.item.tag == "ADT" else None
         if payload is None:
             return (f"present({p})", [False, True])
         return (
@@ -401,13 +601,12 @@ def discriminant_axes(sig: Signature) -> dict[str, tuple[str | None, list]]:
     A key of None marks an ADT axis whose values are partial points.
     """
     axes: dict[str, tuple[str | None, list]] = {}
-    for p, decl in sig.params.items():
-        kind = param_kind(decl.get("type"), sig.adts)
-        if (axis := _finite_axis(p, kind, sig.adts)) is not None:
+    for p in sig.params:
+        if (axis := _finite_axis(p, sig.kind(p), sig.adts)) is not None:
             axes[p] = axis
-    for t in sig.call_tensors.values():
-        if t.optional is True:
-            axes[t.name] = (f"present({t.name})", [False, True])
+    for t in sig.inputs.values():
+        if len(t.members) > 1:
+            axes[t.name] = (f"member({t.name})", list(t.members))
     if any(t.buffer for t in sig.outputs.values()):
         axes["out"] = ("present(out)", [False, True])
     return axes
@@ -431,9 +630,9 @@ def discriminant_groups(sig: Signature) -> list[list[tuple[str | None, list]]]:
         for n in rest:
             group[root(n)] = root(first)
 
-    for t in (*sig.call_tensors.values(), *sig.outputs.values()):
+    for t in (*sig.inputs.values(), *sig.outputs.values()):
         reads = {t.name} | ({"out"} if t.buffer else set())
-        for text in (t.shape, t.dtype, t.optional, t.nullable, t.mutated):
+        for text in (t.shape, t.dtype, t.nullable, t.mutated):
             if isinstance(text, str):
                 reads |= names(parse(text))
         link(reads)
@@ -469,22 +668,28 @@ def _inlined(sig: Signature, node: ast.expr) -> ast.expr:
 
 
 def _invariant_fails(adts: dict, p: str, kind: Kind, point: dict) -> str | None:
-    """The invariant of the constructor ADT-valued *p* holds at `point`, when it is false there;
-    a `Maybe[ADT]` payload's, where it is present."""
+    """The invariant of the constructor ADT-valued *p* holds at `point`, when it is false there.
+
+    For a `Maybe[ADT]` it is the payload's, where it is present.
+    """
     if kind.tag == "Maybe" and kind.item.tag == "ADT":
         if point.get(f"present({p})") is not True:
             return None
-        p, kind = f"{p}.value", kind.item
+        kind = kind.item
     ctor = point.get(f"{p}.kind")
     declared = adts.get(kind.name, {}) if kind.tag == "ADT" else {}
     invariant = declared.get("sum", {}).get(ctor, {}).get("invariant")
     if invariant is None:
         return None
     fields = {k[len(p) + 1 :]: v for k, v in point.items() if k.startswith(f"{p}.")}
-    node = parse(invariant)
-    if not names(bind(node, fields)) and value_at(node, fields, f"{p} invariant") is False:
+    if _closed_value(parse(invariant), fields, f"{p} invariant") is False:
         return f"{p}: {invariant}"
     return None
+
+
+def _closed_value(node: ast.expr, point: dict, where: str):
+    """The value of `node` at `point`, or `OPEN` when it reads a name `point` does not fix."""
+    return OPEN if names(bind(node, point)) else value_at(node, point, where)
 
 
 def rejecting_rule(sig: Signature, point: dict) -> str | None:
@@ -493,38 +698,43 @@ def rejecting_rule(sig: Signature, point: dict) -> str | None:
     What a refinement reads is judged with the `let`s it reads inlined.
     """
     for i, text in enumerate(sig.rules):
-        rule = _inlined(sig, parse(text))
-        if not names(bind(rule, point)) and value_at(rule, point, f"shape_rules[{i}]") is False:
+        if _closed_value(_inlined(sig, parse(text)), point, f"shape_rules[{i}]") is False:
             return text
-    for p, decl in sig.params.items():
-        failed = _invariant_fails(sig.adts, p, param_kind(decl.get("type"), sig.adts), point)
+    for p in sig.params:
+        failed = _invariant_fails(sig.adts, p, sig.kind(p), point)
         if failed is not None:
             return failed
     return None
 
 
-def holds(expr: "bool | str | None", point: dict) -> bool:
+def holds(expr: bool | str | None, point: dict) -> bool:
     """A presence or effect condition at `point`; it must read only discriminants."""
     if expr is None or isinstance(expr, bool):
         return expr is not False
-    node = parse(expr)
-    value = OPEN if names(bind(node, point)) else value_at(node, point, repr(expr))
+    value = _closed_value(parse(expr), point, repr(expr))
     if value is OPEN:
         raise SignatureError(f"{expr!r} reads more than discriminants")
     return bool(value)
 
 
 def complete_point(sig: Signature, point: dict, strict: bool = True) -> dict:
-    """`point` with `present(t)` for every tensor, from its `optional` or `nullable` condition.
+    """`point` with `present(t)` for every tensor.
 
-    A required input and an output that is not nullable are present; an `optional: true`
-    tensor's presence is its own axis. With `strict=False` a presence `point` does not settle
-    is left unsettled instead of raising.
+    An input's comes from its member, `member(t)` being an axis of its own when its type has
+    several; an output's comes from its `nullable` condition.
+
+    With `strict=False` a presence `point` does not settle is left unsettled instead of raising.
     """
     point = dict(point)
+    for t in sig.inputs.values():
+        if len(t.members) == 1:
+            point.setdefault(f"member({t.name})", t.members[0])
+        tag = point.get(f"member({t.name})")
+        if tag is not None:
+            point.setdefault(f"present({t.name})", tag != "None")
     pending = {
-        t.name: t.nullable if t.name in sig.outputs else t.optional
-        for t in (*sig.call_tensors.values(), *sig.outputs.values())
+        t.name: t.nullable if t.name in sig.outputs else True
+        for t in (*sig.inputs.values(), *sig.outputs.values())
         if f"present({t.name})" not in point
     }
     lets = {}
@@ -541,15 +751,14 @@ def complete_point(sig: Signature, point: dict, strict: bool = True) -> dict:
                 settled[name] = value
                 del lets[name]
         for name, cond in pending.items():
-            node = _inlined(sig, parse(cond)) if isinstance(cond, str) else None
             if cond is True:
                 value = OPEN  # its own discriminant axis, which `point` lacks
-            elif node is None:
+            elif not isinstance(cond, str):
                 value = True
-            elif names(bind(node, point)):
-                value = OPEN
             else:
-                value = value_at(node, point, f"tensor {name!r} presence")
+                value = _closed_value(
+                    _inlined(sig, parse(cond)), point, f"tensor {name!r} presence"
+                )
             if value is not OPEN:
                 settled[f"present({name})"] = bool(value)
         if not settled and not pending:
@@ -563,11 +772,15 @@ def complete_point(sig: Signature, point: dict, strict: bool = True) -> dict:
     return point
 
 
+def member_at(tensor: Tensor, point: dict) -> str | None:
+    """The member a call-time input holds at `point`; None when unsettled."""
+    members_ = tensor.members
+    return members_[0] if len(members_) == 1 else point.get(f"member({tensor.name})")
+
+
 def tensor_passed(tensor: Tensor, point: dict) -> bool:
-    """Whether a call at `point` passes an input or construction-time tensor."""
-    if tensor.optional is True:
-        return point.get(f"present({tensor.name})", False)
-    return holds(tensor.optional or None, point)
+    """Whether a call at `point` passes this declaration's tensor or tensor sequence."""
+    return member_at(tensor, point) in TENSOR_MEMBERS
 
 
 def output_emitted(tensor: Tensor, point: dict) -> bool:
@@ -576,6 +789,11 @@ def output_emitted(tensor: Tensor, point: dict) -> bool:
 
 
 # ---------------------------------------------------------------- type families
+
+
+def components(value: object) -> list:
+    """A family's `match` or a case's `when` as its list of components."""
+    return value if isinstance(value, list) else [value]
 
 
 def _matches(pattern, value) -> bool:
@@ -607,22 +825,16 @@ def _discriminant(node: ast.expr, point: dict):
 
 def _case(fam: str, family: dict, sub: dict, point: dict) -> str:
     """The `is` of the one case of *family* whose pattern matches its `match` at *point*."""
-    keys = family["match"] if isinstance(family["match"], list) else [family["match"]]
     got = []
-    for k in keys:
+    for k in components(family["match"]):
         node = Substitute(sub).visit(parse(k))
-        absent = (
-            isinstance(node, ast.Attribute)
-            and node.attr == "value"
-            and isinstance(node.value, ast.Name)
-            and point.get(f"present({node.value.id})") is False
-        )
+        absent = isinstance(node, ast.Name) and point.get(f"present({node.id})") is False
         # An absent payload has no value; only `_` matches it.
         got.append(OPEN if absent else _discriminant(node, point))
     got = tuple(got)
     hits = []
     for case in family.get("cases", []) or []:
-        pattern = case["when"] if isinstance(case["when"], list) else [case["when"]]
+        pattern = components(case["when"])
         if len(pattern) != len(got):
             raise SignatureError(
                 f"{fam}: case {pattern} has {len(pattern)} components, match has {len(got)}"
@@ -664,7 +876,7 @@ def expand(sig: Signature, shape: str, point: dict) -> ast.List:
 class SignatureBranch:
     """What one discriminant point selects, folded at that point."""
 
-    # The shape and dtype of every passed input and construction-time tensor, and every
+    # The shape and dtype of every passed input, and every
     # emitted output.
     shapes: dict[str, ast.List]
     dtypes: dict[str, ast.expr]
@@ -673,6 +885,8 @@ class SignatureBranch:
     lets: dict[str, ast.expr]
     # Every name the branch's shapes, dtypes, refinements and reached `let`s read.
     relevant: set[str]
+    # Each passed tensor sequence's element-wise indices, in order of first reading.
+    sequences: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 def reach(sig: Signature, point: dict, relevant: set[str], lets: dict) -> None:
@@ -689,8 +903,8 @@ def branch(sig: Signature, point: dict, complete: bool = True) -> SignatureBranc
     A refinement is folded before its names count, so one whose guard folds to true there makes
     nothing relevant.
     """
-    shapes, dtypes_ = {}, {}
-    for t in (*sig.call_tensors.values(), *sig.outputs.values()):
+    shapes, dtypes_, sequences = {}, {}, {}
+    for t in (*sig.inputs.values(), *sig.outputs.values()):
         if not (output_emitted(t, point) if t.name in sig.outputs else tensor_passed(t, point)):
             continue
         try:
@@ -700,6 +914,11 @@ def branch(sig: Signature, point: dict, complete: bool = True) -> SignatureBranc
                 raise
             continue
         dtypes_[t.name] = fold(parse(t.dtype), point, f"tensor {t.name!r} dtype")
+        if t.name in sig.inputs and tensor_passed(t, point) and t.sequence:
+            each = elementwise(sig)
+            sequences[t.name] = tuple(
+                dict.fromkeys(items(shapes[t.name], each) + items(dtypes_[t.name], each))
+            )
     rules = [fold(parse(r), point, f"shape_rules[{i}]") for i, r in enumerate(sig.rules)]
     relevant = set().union(
         set(), *(names(n) for n in (*shapes.values(), *dtypes_.values(), *rules))
@@ -707,14 +926,18 @@ def branch(sig: Signature, point: dict, complete: bool = True) -> SignatureBranc
     relevant -= set(DTYPE_BITS)
     lets: dict[str, ast.expr] = {}
     reach(sig, point, relevant, lets)
-    return SignatureBranch(shapes, dtypes_, rules, lets, relevant)
+    return SignatureBranch(shapes, dtypes_, rules, lets, relevant, sequences)
 
 
 # ---------------------------------------------------------------- inference
 
 
 def _affine_in(node: ast.expr, var: str) -> bool:
-    """`var`, `a * var + e`, `var + e` or `var - e` for a positive integer literal `a`."""
+    """Whether `node` is `var`, `a * var + e`, `var + e` or `var - e`.
+
+    `a` does not read `var`: a positive integer literal, or a known quantity whose sign the
+    call checks.
+    """
     if isinstance(node, ast.Name):
         return node.id == var
     if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub)):
@@ -723,12 +946,9 @@ def _affine_in(node: ast.expr, var: str) -> bool:
             return _affine_in(node.left, var)
         return right and not left and isinstance(node.op, ast.Add) and _affine_in(node.right, var)
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
-        return (
-            isinstance(node.left, ast.Constant)
-            and isinstance(node.left.value, int)
-            and node.left.value > 0
-            and _affine_in(node.right, var)
-        )
+        literal = isinstance(node.left, ast.Constant)
+        positive = isinstance(node.left.value, int) and node.left.value > 0 if literal else True
+        return positive and var not in names(node.left) and _affine_in(node.right, var)
     return False
 
 
@@ -739,6 +959,11 @@ class Step:
     `let` defines `name`; `bind` solves `name` from element `index` of `tensor`'s shape;
     `check` compares that element, whose names are all known, with the tensor. `before` and
     `after` are the elements on either side whose lengths place it, when those are known.
+
+    On a tensor sequence, `first` makes its element 0 the `tensor` the following steps read,
+    solving shared names no other tensor solves; where it is empty, the element 0 of the first
+    nonempty sequence of `items` stands in. `each` runs the plan `sub` on every element,
+    checking the items already known and collecting the others into the indices `items`.
     """
 
     action: str
@@ -747,14 +972,89 @@ class Step:
     index: int | None = None
     before: tuple | None = None
     after: tuple | None = None
+    sub: tuple = ()
+    items: tuple = ()
+
+    @property
+    def solved(self) -> tuple:
+        """The names this step solves; a `first` step solves none itself."""
+        if self.action == "first":
+            return ()
+        return (self.name,) if self.name else self.items
 
 
 def unification(
-    shapes: dict[str, ast.List], known: set[str], lets: dict[str, ast.expr]
+    shapes: dict[str, ast.List],
+    known: set[str],
+    lets: dict[str, ast.expr],
+    sequences: dict | None = None,
 ) -> list[Step]:
-    """The order in which `shapes` and `lets` solve their indices, starting from `known`."""
-    known, steps, done = set(known), [], set()
-    progress = True
+    """The order in which `shapes` and `lets` solve their indices, starting from `known`.
+
+    `sequences` maps each tensor sequence among `shapes` to its element-wise indices; its shape
+    is its element type. An element-wise index is solved per element, and known once every
+    element is solved. A sequence's element 0 solves shared names only when nothing else
+    progresses.
+    """
+    sequences = sequences or {}
+    local = {t: localized(shapes[t], each) for t, each in sequences.items()}
+    owned = {t: items(shapes[t], frozenset(each)) for t, each in sequences.items()}
+    known, steps = set(known), []
+    pool = {t: n for t, n in shapes.items() if t not in sequences}
+    done: set = set()
+    collected, first = set(), []
+    while True:
+        progress = _solve_axes(pool, known, lets, steps, done)
+        for t in sequences:
+            if t in collected:
+                continue
+            mine = {f"{ITEM}{x}" for x in owned[t]}
+            outer = {f"{ITEM}{x}" for x in owned[t] if x in known}
+            base = (known - {n for n in known if n.startswith(ITEM)}) | outer
+            if names(local[t]) - mine - base:
+                continue
+            sub = unification({t: local[t]}, base, {})
+            if not mine <= base | {s.name for s in sub if s.name}:
+                continue
+            fresh = tuple(x for x in owned[t] if x not in known)
+            steps.append(Step("each", None, t, sub=tuple(sub), items=fresh))
+            known |= set(fresh)
+            collected.add(t)
+            progress = True
+        if progress:
+            continue
+        idle = [t for t in sequences if t not in collected and t not in first]
+        if not idle:
+            break
+        chosen = idle[0]
+        # A sequence whose element type differs only in element-wise names solves the same
+        # shared names from its element 0, where the chosen one is empty.
+        alternates = tuple(
+            u for u in idle[1:] if _shared_form(local[u]) == _shared_form(local[chosen])
+        )
+        first.append(chosen)
+        steps.append(Step("first", None, chosen, items=alternates))
+        pool[chosen] = local[chosen]
+    return steps
+
+
+def _shared_form(node: ast.expr) -> str:
+    """*node* with every element-wise item name replaced by one placeholder."""
+    renamed = Substitute(
+        {n: ast.Name(ITEM, ast.Load()) for n in names(node) if n.startswith(ITEM)}
+    ).visit(copy.deepcopy(node))
+    return ast.dump(renamed)
+
+
+def _solve_axes(
+    shapes: dict[str, ast.List], known: set[str], lets: dict, steps: list, done: set
+) -> bool:
+    """Run the axis rules of table 19 over `shapes` and `lets` to a fixpoint.
+
+    `steps` and `known` are extended in place; the result is whether anything was solved or
+    checked.
+    """
+    any_progress, progress = False, True
     while progress:
         progress = False
         for n, node in lets.items():
@@ -788,5 +1088,5 @@ def unification(
                 done.add((t, i))
                 if name:
                     known.add(name)
-                progress = True
-    return steps
+                progress = any_progress = True
+    return any_progress

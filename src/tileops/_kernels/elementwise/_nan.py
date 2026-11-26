@@ -3,7 +3,18 @@
 import tilelang.language as T
 import tvm.tirx as tirx
 
-__all__ = ["keep_nan", "nan_max", "nan_min"]
+__all__ = [
+    "HALF_COMPARE_HEADER",
+    "keep_nan",
+    "lane_compare",
+    "nan_max",
+    "nan_min",
+    "ne_unordered",
+]
+
+# The header ``ne_unordered`` calls into; a kernel whose body calls it lists it in
+# ``CSRC_HEADERS``.
+HALF_COMPARE_HEADER = "half_compare.h"
 
 
 def bound(x, body):
@@ -67,6 +78,32 @@ def keep_nan(x, fn):
     For a body that drops NaN somewhere inside, such as a clamp ahead of a
     polynomial: one select on the argument restores it. Only *x* is bound. A
     bound ``fn(x)`` keeps every unrolled element's value live at once, which
-    raises the erf body from 29 to 40 registers and slows GELUAndMul by 2%.
+    raises register pressure.
     """
     return bound(x, lambda x: tirx.Select(_is_nan(x), x, fn(x)))
+
+
+def ne_unordered(a, b):
+    """``a != b``, true where either operand is NaN, as torch.ne answers."""
+    if str(a.dtype) in ("float16", "bfloat16"):
+        return T.call_extern("bool", "tileops::ne_unordered", a, b)
+    return a != b
+
+
+def lane_compare(name):
+    """A body's form over two 16-bit lanes of a word: ``half_compare.h``'s ``<name>_lanes``.
+
+    The form maps two uint32 words of *dtype* lanes to a mask, 0xffff a lane where the
+    body holds. ``None`` for a dtype without a 16-bit float pair type.
+    """
+
+    # The CUDA pair type of a 16-bit float, as ``half_compare.h``'s lane compares take it.
+    pair_types = {"float16": "__half2", "bfloat16": "__nv_bfloat162"}
+
+    def form(dtype):
+        pair = pair_types.get(str(dtype))
+        if pair is None:
+            return None
+        return lambda a, b: T.call_extern("uint32", f"tileops::{name}_lanes<{pair}>", a, b)
+
+    return form

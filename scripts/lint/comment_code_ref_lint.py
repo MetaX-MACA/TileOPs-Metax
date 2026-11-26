@@ -5,18 +5,17 @@ A location is a file name followed by ``:<n>``, ``:L<n>``, ``#L<n>`` or ``line <
 ``line(s) <n> of|in <file>``. A line number with no file passes.
 
 Exempt: ``lint: code-ref allow: <reason>`` on the line. Default scan: ``src/tileops/``,
-``tests/``, ``benchmarks/``, ``workloads/``, ``scripts/``.
+``tests/``, ``benchmarks/``, ``workloads/``, ``scripts/``, ``models/``.
 """
 
-import argparse
 import re
 import sys
 from pathlib import Path
 
 from comment_lines import allowed_lines, prose_lines
-from common import files, relative, report
+from common import lint_files, relative
 
-SCANNED = ("src/tileops", "tests", "benchmarks", "workloads", "scripts")
+SCANNED = ("src/tileops", "tests", "benchmarks", "workloads", "scripts", "models")
 
 _FILE = r"[\w./-]*\w\.(?:py|pyi|cu|cuh|cc|cpp|cxx|c|h|hpp|inl|yaml|yml|toml|md|json|sh)"
 _LOCATIONS = (
@@ -49,10 +48,7 @@ def findings(path: Path) -> list[str]:
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("files", nargs="*", type=Path)
-    args = parser.parse_args(argv)
-    return report(e for p in files(args.files, SCANNED, (".py",)) for e in findings(p))
+    return lint_files(argv, __doc__, SCANNED, (".py",), findings)
 
 
 if __name__ == "__main__":

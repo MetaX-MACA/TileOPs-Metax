@@ -1,5 +1,5 @@
 import math
-from typing import Callable, Optional
+from collections.abc import Callable
 
 import tilelang
 import torch
@@ -10,7 +10,6 @@ from tileops._kernels.build_target import target_cache
 from tileops._kernels.constants import LOG2E
 from tileops._kernels.kernel_base import Entry, Kernel
 from tileops._utils import WARP_LANES, is_maca
-from tileops.backend._dispatch import device_facts_of
 
 
 def _sort_widths(chunks: int) -> list[int]:
@@ -360,7 +359,6 @@ def _nsa_topk_varlen_pool_kernel(
     group: int,
     scale: float,
     selected_block_num: int,
-    bc: int,
     bs: int,
     dtype: str,
     accum_dtype: str,
@@ -371,6 +369,8 @@ def _nsa_topk_varlen_pool_kernel(
     multiple of one WGMMA row tile.
     """
     head_kv = heads // group
+    # Chunks a key tile holds.
+    bc = bs
     # The shared-memory tiles span the whole head dimension: a narrower tile
     # would silently truncate the QK contraction.
     bk = dim
@@ -590,7 +590,6 @@ class NSATopKVarlenKernel(Kernel, NSATopKFwdInterface):
             group=call.heads // call.heads_kv,
             scale=call.scale,
             selected_block_num=call.selected_blocks,
-            block_n=cls._BLOCK_N,
             bs=call.block_size,
             dtype=call.dtype,
             accum_dtype=torch.float32,
@@ -606,11 +605,10 @@ class NSATopKVarlenKernel(Kernel, NSATopKFwdInterface):
         group: int,
         scale: float,
         selected_block_num: int,
-        block_n: int,
         bs: int,
         dtype: torch.dtype,
         accum_dtype: torch.dtype,
-        config: Optional[dict] = None,
+        config: dict | None = None,
     ) -> None:
         super().__init__()
         self.seq_num = seq_num
@@ -621,7 +619,6 @@ class NSATopKVarlenKernel(Kernel, NSATopKFwdInterface):
         self.group = group
         self.scale = scale
         self.selected_block_num = selected_block_num
-        self.block_n = block_n
         self.bs = bs
         self.dtype = dtype
         self.accum_dtype = accum_dtype
@@ -657,12 +654,12 @@ class NSATopKVarlenKernel(Kernel, NSATopKFwdInterface):
             chunk_offsets.to(torch.int32),
             token_indices.to(torch.int32),
         )
-        # The schedule depends on the architecture of the device the input is on.
-        return self.program(self._compile, device_facts_of(q.device).arch)(*tensors)
+        # The schedule depends on the architecture of the device the kernel is built for.
+        return self.program(self._compile, self.build_target.arch)(*tensors)
 
     def _compile(self, cfg: dict, arch: int):
         """The program for a device of architecture *arch*, compiled from *cfg*."""
-        # Bound the new SM89 layout to the compiled and checked chunk range.
+        # The 16-row SM89 layout serves group 48 over the chunk range it is checked on.
         narrow = (
             self.group == 48
             and self.dim in (64, 128, 256)
@@ -680,7 +677,6 @@ class NSATopKVarlenKernel(Kernel, NSATopKFwdInterface):
                 self.scale,
                 self.selected_block_num,
                 self.bs,
-                self.bs,
                 self.dtype_str,
                 self.accum_dtype_str,
             )(cfg["threads"])
@@ -696,7 +692,7 @@ class NSATopKVarlenKernel(Kernel, NSATopKFwdInterface):
             (
                 32
                 if self.group in (32, 64) and self.dim in (64, 128) and arch == 89
-                else self.block_n
+                else self._BLOCK_N
             ),
             self.bs,
             16 if narrow else self._TILE_ROWS,

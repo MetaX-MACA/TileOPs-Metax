@@ -35,6 +35,9 @@ def _assert_same(actual: object, expected: object) -> None:
         for a, e in zip(actual, expected, strict=True):
             _assert_same(a, e)
         return
+    if expected is None:
+        assert actual is None
+        return
     assert (actual.shape, actual.dtype, actual.device) == (
         expected.shape,
         expected.dtype,
@@ -62,10 +65,11 @@ def _post_permute(out: "torch.Tensor | None" = None) -> torch.Tensor:
             id="two-outputs",
         ),
         pytest.param(
-            lambda x: FP8QuantPerTokenGroupFwdOp()(x.reshape(0, 4, 1, 2)),
+            lambda x: FP8QuantPerTokenGroupFwdOp(2)(x.reshape(0, 4, 2)),
             lambda x: (
-                torch.empty(0, 4, 1, 2, device=x.device, dtype=torch.float8_e4m3fn),
+                torch.empty(0, 4, 2, device=x.device, dtype=torch.float8_e4m3fn),
                 torch.empty(0, 4, 1, device=x.device),
+                None,
             ),
             id="output-dtype",
         ),

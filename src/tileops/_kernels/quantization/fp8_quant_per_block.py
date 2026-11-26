@@ -1,6 +1,6 @@
 """Block-scaled FP8 quantization: a CTA owns one 128x128 tile and holds it in registers."""
 
-from typing import ClassVar, Optional
+from typing import ClassVar
 
 import tilelang
 import tilelang.language as T
@@ -16,7 +16,8 @@ from tileops._kernels.constants import (
 from tileops._kernels.kernel_base import Kernel
 from tileops._kernels.quantization.call_spec import FP8QuantPerBlockFwdInterface, QuantizeCall
 from tileops._kernels.quantization.int8_codes import SMALL_SCALE, widen
-from tileops._utils import WARP_LANES, WARP_SHUFFLE_STAGES
+from tileops._kernels.warp_reduce import warp_reduce
+from tileops._utils import WARP_LANES
 
 __all__ = ["FP8QuantPerBlockFwdKernel", "FP8QuantPerBlockUnalignedFwdKernel"]
 
@@ -32,7 +33,7 @@ def _fp8_quant_per_block_kernel(n: int, k: int, dtype: str, aligned: bool):
     loaded alone, so that adjacent lanes still read adjacent elements.
     """
     tn, tk = -(-n // QUANT_SCALE_BLOCK), -(-k // QUANT_SCALE_BLOCK)
-    itemsize = torch.empty((), dtype=getattr(torch, dtype)).element_size()
+    itemsize = getattr(torch, dtype).itemsize
     vec = VECTOR_ACCESS_BYTES // itemsize
     # A thread's elements are held as 32-bit words, ``per_word`` elements to a word.
     words = VECTOR_ACCESS_BYTES // 4
@@ -51,7 +52,7 @@ def _fp8_quant_per_block_kernel(n: int, k: int, dtype: str, aligned: bool):
     largest = torch.finfo(torch.float32).max
 
     @tilelang.jit(compile_flags=csrc_include("streaming_load.h"))
-    def _fp8_quant_per_block_func(threads: int, min_blocks: Optional[int], evict_first: bool):
+    def _fp8_quant_per_block_func(threads: int, min_blocks: int | None, evict_first: bool):
         cols = QUANT_SCALE_BLOCK // vec
         rows = threads // cols
         slots = QUANT_SCALE_BLOCK // rows
@@ -156,8 +157,7 @@ def _fp8_quant_per_block_kernel(n: int, k: int, dtype: str, aligned: bool):
                             acc[0] = T.max(acc[0], bits)
                 if per_word == 2:
                     acc[0] = T.max(acc[0] & T.uint32(0xFFFF), acc[0] >> T.uint32(16))
-                for stage in T.unroll(WARP_SHUFFLE_STAGES):
-                    acc[0] = T.max(acc[0], T.shfl_xor(acc[0], 1 << stage, width=WARP_LANES))
+                warp_reduce(acc, T.max)
                 if tx % WARP_LANES == 0:
                     partial[tx // WARP_LANES] = acc[0]
                 T.sync_threads()
@@ -192,19 +192,19 @@ class _FP8QuantPerBlockFwdKernel(Kernel, FP8QuantPerBlockFwdInterface):
     # 16-byte vectors per thread; threads = tile bytes / (16 * _SLOTS).
     _SLOTS: ClassVar[int] = 8
     # Register cap controls CTA residency; None leaves allocation to the compiler.
-    _REGISTERS: ClassVar[Optional[int]] = 64
+    _REGISTERS: ClassVar[int | None] = 64
     # Use evict-first loads below this fraction of L2 capacity.
     _EVICT_FIRST_L2_SHARE: ClassVar[float] = 0.5
 
     @classmethod
-    def refusal(cls, call: QuantizeCall) -> Optional[str]:
+    def refusal(cls, call: QuantizeCall) -> str | None:
         reason = super().refusal(call)
         if reason is None and call.rows * call.cols > 2**31 - 1:
             return f"indexes elements with int32, and N * K = {call.rows * call.cols}"
         return reason
 
-    def __init__(self, call: QuantizeCall, config: Optional[dict] = None) -> None:
-        super().__init__(device_index=call.device.index if call.device is not None else None)
+    def __init__(self, call: QuantizeCall, config: dict | None = None) -> None:
+        super().__init__(device_index=call.device_index)
         self.call = call
         self.dtype = call.dtype
         self.kernel = _fp8_quant_per_block_kernel(
@@ -214,18 +214,17 @@ class _FP8QuantPerBlockFwdKernel(Kernel, FP8QuantPerBlockFwdInterface):
 
     @property
     def default_config(self) -> dict:
-        props = torch.cuda.get_device_properties(self.call.device)
         itemsize = self.call.dtype.itemsize
         threads = (
             QUANT_SCALE_BLOCK * QUANT_SCALE_BLOCK * itemsize // (VECTOR_ACCESS_BYTES * self._SLOTS)
         )
         cap = self._REGISTERS
-        min_blocks = None if cap is None else props.regs_per_multiprocessor // (threads * cap)
+        min_blocks = None if cap is None else self.call.regs_per_sm // (threads * cap)
         size = self.call.rows * self.call.cols * itemsize
         return {
             "threads": threads,
             "min_blocks": min_blocks,
-            "evict_first": size < self._EVICT_FIRST_L2_SHARE * props.L2_cache_size,
+            "evict_first": size < self._EVICT_FIRST_L2_SHARE * self.call.l2_bytes,
         }
 
     @property
@@ -266,7 +265,7 @@ class FP8QuantPerBlockFwdKernel(_FP8QuantPerBlockFwdKernel):
     _aligned = True
 
     @classmethod
-    def refusal(cls, call: QuantizeCall) -> "str | None":
+    def refusal(cls, call: QuantizeCall) -> str | None:
         if call.cols * call.dtype.itemsize % VECTOR_ACCESS_BYTES:
             return f"requires a row of whole {VECTOR_ACCESS_BYTES}-byte vectors"
         return super().refusal(call)
@@ -288,5 +287,5 @@ class FP8QuantPerBlockUnalignedFwdKernel(_FP8QuantPerBlockFwdKernel):
 
     general = True
 
-    # Fitted on the ragged-k row: caps of 64 and 85 registers measured 1% slower than none.
+    # No register cap: a cap only slows the ragged-K row.
     _REGISTERS = None

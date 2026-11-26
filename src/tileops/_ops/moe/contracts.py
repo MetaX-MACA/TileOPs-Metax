@@ -5,7 +5,6 @@ from __future__ import annotations
 import dataclasses
 import enum
 import math
-from typing import TypeAlias
 
 import torch
 
@@ -16,6 +15,7 @@ __all__ = [
     "MGroupedLayoutSpec",
     "MaskedLayoutSpec",
     "RoutingEpilogueSpec",
+    "layout_call_fields",
 ]
 
 
@@ -31,12 +31,6 @@ class ContiguousMetadata(str, enum.Enum):
 
     PHYSICAL_PSUM = "physical_psum"
     PER_ROW = "per_row"
-
-
-class _LayoutKind(str, enum.Enum):
-    """Non-contiguous layout specializations understood by kernel candidates."""
-
-    MASKED_PREDICATED = "masked_predicated"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -58,22 +52,22 @@ class ContiguousLayoutSpec:
             raise ValueError("aligned contiguous packing requires alignment > 1")
 
     @classmethod
-    def tight_physical_psum(cls) -> "ContiguousLayoutSpec":
+    def tight_physical_psum(cls) -> ContiguousLayoutSpec:
         """Use tight rows described by per-expert physical segment ends."""
         return cls(ContiguousPacking.TIGHT, ContiguousMetadata.PHYSICAL_PSUM)
 
     @classmethod
-    def tight_per_row(cls) -> "ContiguousLayoutSpec":
+    def tight_per_row(cls) -> ContiguousLayoutSpec:
         """Use tight rows described by one expert ID per materialized row."""
         return cls(ContiguousPacking.TIGHT, ContiguousMetadata.PER_ROW)
 
     @classmethod
-    def aligned_per_row(cls, alignment: int) -> "ContiguousLayoutSpec":
+    def aligned_per_row(cls, alignment: int) -> ContiguousLayoutSpec:
         """Use aligned expert segments described by one expert ID per row."""
         return cls(ContiguousPacking.ALIGNED, ContiguousMetadata.PER_ROW, alignment)
 
     @classmethod
-    def aligned_physical_psum(cls, alignment: int) -> "ContiguousLayoutSpec":
+    def aligned_physical_psum(cls, alignment: int) -> ContiguousLayoutSpec:
         """Use aligned expert segments described by per-expert physical segment ends."""
         return cls(ContiguousPacking.ALIGNED, ContiguousMetadata.PHYSICAL_PSUM, alignment)
 
@@ -111,7 +105,7 @@ class MaskedLayoutSpec:
     @property
     def selection_key(self) -> str:
         """Return the concrete specialization key recorded in CallSpecs."""
-        return _LayoutKind.MASKED_PREDICATED.value
+        return "masked_predicated"
 
     @property
     def kind(self) -> str:
@@ -119,7 +113,20 @@ class MaskedLayoutSpec:
         return "masked"
 
 
-MGroupedLayoutSpec: TypeAlias = ContiguousLayoutSpec | MaskedLayoutSpec
+type MGroupedLayoutSpec = ContiguousLayoutSpec | MaskedLayoutSpec
+
+
+def layout_call_fields(layout: MGroupedLayoutSpec) -> dict:
+    """The layout fields an M-grouped GEMM call record opens with: ``kind``, ``packing``,
+    ``metadata_kind``, ``alignment`` and ``max_m``."""
+    contiguous = isinstance(layout, ContiguousLayoutSpec)
+    return {
+        "kind": layout.kind,
+        "packing": layout.packing.value if contiguous else None,
+        "metadata_kind": layout.metadata_kind.value if contiguous else None,
+        "alignment": layout.alignment if contiguous else 1,
+        "max_m": layout.max_m,
+    }
 
 
 @dataclasses.dataclass(frozen=True)

@@ -3,13 +3,14 @@
 Shapes are strict 3D-3D — ``a``: $[B \\times M \\times K]$, ``b``: $[B \\times K \\times N]$, ``c``: $[B \\times M \\times N]$.
 """
 
-from typing import Callable, NamedTuple, Optional
+from collections.abc import Callable
+from typing import NamedTuple
 
 import tilelang
 import tilelang.language as T
 import torch
 
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.constants import BLOCK_SHARED_BYTES_OPT_IN
 from tileops._kernels.gemm.call_spec import (
     BMMCall,
@@ -22,7 +23,6 @@ from tileops._kernels.gemm.call_spec import (
 from tileops._kernels.gemm.persistent.heuristics import GEMMType
 from tileops._kernels.gemm.persistent.template import GEMMTemplate
 from tileops._kernels.kernel_base import Entry, Kernel
-from tileops._utils import device_calibration, get_sm_count, get_sm_version
 
 __all__ = [
     "BMMFP8Kernel",
@@ -55,17 +55,13 @@ def _bmm_kernel(batch: int, m: int, n: int, k: int, dtype: str = "float16") -> C
     Returns:
         A ``@tilelang.jit`` factory; calling it with ``(block_m, block_n,
         block_k, num_stages, threads)`` returns the compiled ``prim_func``.
-
-    Note:
-        WS pass is hard-disabled (``tl.disable_warp_specialized=True``);
-        a full manifest scan on H20-3e showed it never won a shape.
     """
     accum_dtype = "float"
 
     @tilelang.jit(
         out_idx=[-1],
         pass_configs={"tl.disable_warp_specialized": True},
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
     )
     def _bmm_func(
         block_m: int = 128,
@@ -74,6 +70,41 @@ def _bmm_kernel(batch: int, m: int, n: int, k: int, dtype: str = "float16") -> C
         num_stages: int = 3,
         threads: int = 128,
     ) -> Callable:
+        if (
+            (block_m, block_n, block_k, threads) == (16, 64, 64, 64)
+            and k == 128
+            and m % 16 == 0
+            and n % 64 == 0
+        ):
+
+            @T.prim_func
+            def two_panels(
+                a: T.Tensor((batch, m, k), dtype),
+                b: T.Tensor((batch, k, n), dtype),
+                c: T.Tensor((batch, m, n), dtype),
+            ):
+                with T.Kernel(n // block_n, m // block_m, batch, threads=threads) as (bx, by, bz):
+                    a0 = T.alloc_shared((block_m, block_k), dtype)
+                    b0 = T.alloc_shared((block_k, block_n), dtype)
+                    a1 = T.alloc_shared((block_m, block_k), dtype)
+                    b1 = T.alloc_shared((block_k, block_n), dtype)
+                    acc = T.alloc_fragment((block_m, block_n), "float32")
+                    T.async_copy(a[bz, by * block_m, 0], a0)
+                    T.async_copy(b[bz, 0, bx * block_n], b0)
+                    T.async_copy(a[bz, by * block_m, block_k], a1)
+                    T.async_copy(b[bz, block_k, bx * block_n], b1)
+                    T.clear(acc)
+                    # Issue both panels before computing the first one.
+                    T.ptx_wait_group(2)
+                    T.sync_threads()
+                    T.gemm(a0, b0, acc)
+                    T.ptx_wait_group(0)
+                    T.sync_threads()
+                    T.gemm(a1, b1, acc)
+                    T.copy(acc, c[bz, by * block_m, bx * block_n])
+
+            return two_panels
+
         @T.prim_func
         def _bmm_main(
             a: T.Tensor((batch, m, k), dtype),
@@ -98,9 +129,8 @@ def _bmm_kernel(batch: int, m: int, n: int, k: int, dtype: str = "float16") -> C
                     }
                 )
 
-                # L2 rasterization: reshape the (bx, by) traversal order into
-                # panels of ``panel_size`` blocks along N so neighbouring waves
-                # reuse the same A/B rows in L2.
+                # L2 rasterization: walk (bx, by) in panels of 10 blocks along N so
+                # neighbouring waves reuse the same A/B rows in L2.
                 T.use_swizzle(10, enable=True)
 
                 T.clear(c_local)
@@ -149,7 +179,7 @@ def _bmm_fp8_kernel(
             tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
             "tl.disable_warp_specialized": False,
         },
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
     )
     def _bmm_fp8_func(
         block_m: int = 128,
@@ -257,7 +287,7 @@ def _bmm_fp8_persistent_kernel(
             tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
             "tl.disable_warp_specialized": True,
         },
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
     )
     def _bmm_fp8_persistent_func(
         block_m: int = 128,
@@ -387,7 +417,10 @@ def _bmm_fp8_persistent_ws_kernel(
         scale_b_shape = (1,)
 
         @T.macro
-        def _swizzle_decode(mn_id, swz_m, swz_n):
+        def _decode_tile(flat_id, bs, ms, ns_, swz_m, swz_n):
+            # flat_id = tile_b * (Mt*Nt) + mn_id; mn_id walks group_size_m-row swizzle groups.
+            bs[0] = flat_id // T.int32(num_pid_m * num_pid_n)
+            mn_id = flat_id % T.int32(num_pid_m * num_pid_n)
             _gin = T.int32(group_size_m * num_pid_n)
             _fpm = (mn_id // _gin) * T.int32(group_size_m)
             if T.int32(num_pid_m) - _fpm >= T.int32(group_size_m):
@@ -397,6 +430,8 @@ def _bmm_fp8_persistent_ws_kernel(
                 _gsm = T.int32(num_pid_m) - _fpm
                 swz_m[0] = _fpm + (mn_id % _gin) % _gsm
                 swz_n[0] = (mn_id % _gin) // _gsm
+            ms[0] = swz_m[0] * T.int32(block_m)
+            ns_[0] = swz_n[0] * T.int32(block_n)
 
         @T.prim_func
         def _bmm_fp8_persistent_ws_main(
@@ -456,12 +491,7 @@ def _bmm_fp8_persistent_ws_kernel(
                         flat_id = T.int32(grid_cta) * w + pid
 
                         if flat_id < T.int32(total_tiles):
-                            # BMM tile decode: flat_id = tile_b * (Mt*Nt) + mn_id
-                            bs[0] = flat_id // T.int32(num_pid_m * num_pid_n)
-                            mn_id = flat_id % T.int32(num_pid_m * num_pid_n)
-                            _swizzle_decode(mn_id, swz_m, swz_n)
-                            ms[0] = swz_m[0] * T.int32(block_m)
-                            ns_[0] = swz_n[0] * T.int32(block_n)
+                            _decode_tile(flat_id, bs, ms, ns_, swz_m, swz_n)
 
                             for kk in T.Pipelined(k_iters, num_stages=0):
                                 k_start = kk * block_k
@@ -504,11 +534,7 @@ def _bmm_fp8_persistent_ws_kernel(
                         flat_id = T.int32(grid_cta) * w + pid
 
                         if flat_id < T.int32(total_tiles):
-                            bs[0] = flat_id // T.int32(num_pid_m * num_pid_n)
-                            mn_id = flat_id % T.int32(num_pid_m * num_pid_n)
-                            _swizzle_decode(mn_id, swz_m, swz_n)
-                            ms[0] = swz_m[0] * T.int32(block_m)
-                            ns_[0] = swz_n[0] * T.int32(block_n)
+                            _decode_tile(flat_id, bs, ms, ns_, swz_m, swz_n)
 
                             for kk in T.Pipelined(k_iters, num_stages=0):
                                 slot = gi_cons_0 % num_stages
@@ -551,11 +577,7 @@ def _bmm_fp8_persistent_ws_kernel(
                         flat_id = T.int32(grid_cta) * w + pid
 
                         if flat_id < T.int32(total_tiles):
-                            bs[0] = flat_id // T.int32(num_pid_m * num_pid_n)
-                            mn_id = flat_id % T.int32(num_pid_m * num_pid_n)
-                            _swizzle_decode(mn_id, swz_m, swz_n)
-                            ms[0] = swz_m[0] * T.int32(block_m)
-                            ns_[0] = swz_n[0] * T.int32(block_n)
+                            _decode_tile(flat_id, bs, ms, ns_, swz_m, swz_n)
 
                             for kk in T.Pipelined(k_iters, num_stages=0):
                                 slot = gi_cons_1 % num_stages
@@ -578,7 +600,6 @@ def _bmm_fp8_persistent_ws_kernel(
                             T.barrier_arrive(ab_empty[ps1[0]])
                             T.warpgroup_fence_operand(C_local_wg1, num_regs=64)
 
-                            # ── Epilogue: scale + cast + TMA-store ──
                             for i, j in T.Parallel(half_m, block_n):
                                 C_local_wg1[i, j] = C_local_wg1[i, j] * scale_a[0] * scale_b[0]
                             T.copy(C_local_wg1, C_local_cast_wg1)
@@ -609,7 +630,7 @@ def _bmm_fp8_transpose_kernel(batch: int, rows: int, cols: int, dtype: str) -> C
         A ``(block, threads)`` builder returning the compiled ``prim_func``.
     """
 
-    @tilelang.jit(out_idx=[-1], compile_flags=["-O3"])
+    @tilelang.jit(out_idx=[-1], compile_flags=[*CUDA_COMPILE_FLAGS])
     def _bmm_fp8_transpose_func(block: int = 64, threads: int = 128) -> Callable:
         exact = rows % block == 0 and cols % block == 0
 
@@ -658,22 +679,18 @@ class BMMKernel(Kernel, BMMFwdInterface):
     general = True
 
     @classmethod
-    def refusal(cls, call: BMMCall) -> Optional[str]:
-        return cls._region_refusal(call)
+    def refusal(cls, call: BMMCall) -> str | None:
+        return cls._k_refusal(call.k)
 
     @staticmethod
-    def _region_refusal(call: BMMCall) -> Optional[str]:
-        return BMMKernel._k_refusal(call.k)
-
-    @staticmethod
-    def _k_refusal(k: int) -> Optional[str]:
+    def _k_refusal(k: int) -> str | None:
         """The tile loop steps K by 16."""
         return None if k % 16 == 0 else f"requires k a multiple of 16, got k={k}"
 
     @classmethod
     def entry_for(cls, call: BMMCall) -> Entry:
         """Build the shape-specialized classic BMM fallback."""
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         identity = (call.batch, call.m, call.n, call.k, call.dtype, index)
         return identity, lambda: cls(
             call.batch,
@@ -691,8 +708,8 @@ class BMMKernel(Kernel, BMMFwdInterface):
         n: int,
         k: int,
         dtype: torch.dtype,
-        config: Optional[dict] = None,
-        device_index: Optional[int] = None,
+        config: dict | None = None,
+        device_index: int | None = None,
     ) -> None:
         super().__init__(device_index=device_index)
         reason = self._k_refusal(k)
@@ -708,6 +725,14 @@ class BMMKernel(Kernel, BMMFwdInterface):
 
     @property
     def default_config(self) -> dict:
+        if (
+            self.build_target.arch == 90
+            and self.dtype in (torch.float16, torch.bfloat16)
+            and (self.m, self.n, self.k) == (128, 128, 128)
+            and self.batch <= 8
+        ):
+            # Builds the two-panel program: both 64-wide K panels load before the first MMA.
+            return {"block_m": 16, "block_n": 64, "block_k": 64, "num_stages": 2, "threads": 64}
         # 64x64x64, stages=2, one warpgroup: the tile the manifest shapes share.
         block_k = 64 if self.k % 64 == 0 else (32 if self.k % 32 == 0 else 16)
         return {
@@ -730,6 +755,10 @@ class BMMKernel(Kernel, BMMFwdInterface):
             for bk in block_k_options
             for ns in [2, 3, 4]
         ]
+        default = self.default_config
+        if default["threads"] == 64:
+            # The two-panel program, which the grid above does not reach.
+            configs.append(default)
         return [c for c in configs if self.k % c["block_k"] == 0]
 
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -760,11 +789,10 @@ class BMMPersistentKernel(Kernel, BMMFwdInterface):
     """
 
     supported_archs: list[int] = [90]
-    # Fitted on the manifest workloads: square-512 reaches 128 tiles and wins, square-256
-    # reaches 64 and loses. A board without an entry keeps BMMKernel.
+    # By calibration key; a board without an entry keeps BMMKernel.
     _PERSISTENT_BANDS = {"h200": _PersistentBand(tile_m=128, tile_n=256, min_wave_denom=2)}
     # None takes the template selector's configuration.
-    _TEMPLATE_CONFIG: Optional[dict] = None
+    _TEMPLATE_CONFIG: dict | None = None
 
     @staticmethod
     def _tiles(band: _PersistentBand, batch: int, m: int, n: int) -> int:
@@ -772,11 +800,7 @@ class BMMPersistentKernel(Kernel, BMMFwdInterface):
         return batch * -(-m // band.tile_m) * -(-n // band.tile_n)
 
     @classmethod
-    def refusal(cls, call: BMMCall) -> Optional[str]:
-        return cls._region_refusal(call)
-
-    @classmethod
-    def _region_refusal(cls, call: BMMCall) -> Optional[str]:
+    def refusal(cls, call: BMMCall) -> str | None:
         band = cls._PERSISTENT_BANDS.get(call.calibration)
         if band is None:
             return "has no persistent band for this board"
@@ -788,19 +812,16 @@ class BMMPersistentKernel(Kernel, BMMFwdInterface):
             return "does not fill a persistent wave"
         return None
 
-    @classmethod
-    def _persistent_grid(
-        cls, band: _PersistentBand, batch: int, m: int, n: int, physical_sms: int
-    ) -> int:
-        """Choose a full-wave grid for the band's tile."""
-        tiles = cls._tiles(band, batch, m, n)
+    @staticmethod
+    def _full_wave_grid(tiles: int, physical_sms: int) -> int:
+        """The largest power-of-two grid when it divides *tiles*, else every SM."""
         power_of_two_grid = 1 << (physical_sms.bit_length() - 1)
         return power_of_two_grid if tiles % power_of_two_grid == 0 else physical_sms
 
     @classmethod
     def entry_for(cls, call: BMMCall) -> Entry:
         """Build the persistent template specialization for this BMM call."""
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         identity = (call.batch, call.m, call.n, call.k, call.dtype, index)
         return identity, lambda: cls(
             call.batch,
@@ -814,8 +835,8 @@ class BMMPersistentKernel(Kernel, BMMFwdInterface):
         batch: int,
         m: int,
         n: int,
-        device_index: Optional[int] = None,
-        template_config: Optional[dict] = None,
+        device_index: int | None = None,
+        template_config: dict | None = None,
     ) -> None:
         super().__init__(device_index=device_index)
         self.batch, self.m, self.n = batch, m, n
@@ -823,13 +844,13 @@ class BMMPersistentKernel(Kernel, BMMFwdInterface):
         self._class_config = template_config or self._TEMPLATE_CONFIG
         self.program(self._template)
 
-    def _template(self, cfg: Optional[dict]) -> GEMMTemplate:
+    def _template(self, cfg: dict | None) -> GEMMTemplate:
         """The template *cfg* pins, a description :meth:`forward` published; the class's
         tile, or the selector's, before one is."""
         pinned = dict(cfg or {})
         sms = pinned.pop("persistent_sms", None)
         if sms is None:
-            sms = self._grid(self.batch, self.m, self.n, self.device_index)
+            sms = self._grid(self.batch, self.m, self.n)
         return GEMMTemplate(
             GEMMType.BATCHED,
             num_groups=self.batch,
@@ -839,13 +860,13 @@ class BMMPersistentKernel(Kernel, BMMFwdInterface):
             config=pinned or self._class_config,
         )
 
-    def _grid(self, batch: int, m: int, n: int, device_index: Optional[int]) -> int:
+    def _grid(self, batch: int, m: int, n: int) -> int:
         """Persistent CTAs: a full wave of the board's band tile, or every SM."""
-        physical_sms = get_sm_count(device_index)
-        band = self._PERSISTENT_BANDS.get(device_calibration(device_index))
+        physical_sms = self.build_target.sm_count
+        band = self._PERSISTENT_BANDS.get(self.build_target.calibration)
         if band is None:
             return physical_sms
-        return self._persistent_grid(band, batch, m, n, physical_sms)
+        return self._full_wave_grid(self._tiles(band, batch, m, n), physical_sms)
 
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         b_nk = b.transpose(-2, -1)
@@ -883,8 +904,6 @@ class _PingPongBand(NamedTuple):
     # less per FLOP.
     min_k: int
     max_k: int
-    # Least M and N.
-    min_mn: int
 
 
 class BMMPingPongKernel(BMMPersistentKernel):
@@ -899,20 +918,18 @@ class BMMPingPongKernel(BMMPersistentKernel):
     """
 
     preferred_over = frozenset({"bmm_persistent"})
-    _PINGPONG_BANDS = {"h200": _PingPongBand(max_waves=2, min_k=384, max_k=1024, min_mn=1024)}
+    _PINGPONG_BANDS = {"h200": _PingPongBand(max_waves=2, min_k=384, max_k=1024)}
     # Two staging chunks used in turn keep six ring stages; staging the whole tile leaves five.
     _TEMPLATE_CONFIG = {"block_m": 128, "block_n": 128, "pingpong": True, "epilogue_buffers": 2}
 
     @classmethod
     def entry_for(cls, call: BMMCall) -> Entry:
         """Build the ping-pong specialization for the call's K."""
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         identity = (call.batch, call.m, call.n, call.k, call.dtype, index)
         return identity, lambda: cls(call.batch, call.m, call.n, call.k, device_index=index)
 
-    def __init__(
-        self, batch: int, m: int, n: int, k: int, device_index: Optional[int] = None
-    ) -> None:
+    def __init__(self, batch: int, m: int, n: int, k: int, device_index: int | None = None) -> None:
         super().__init__(
             batch, m, n, device_index=device_index, template_config=self._template_config(k)
         )
@@ -927,7 +944,7 @@ class BMMPingPongKernel(BMMPersistentKernel):
         return {**cls._TEMPLATE_CONFIG, "epilogue_stage_n": width}
 
     @classmethod
-    def refusal(cls, call: BMMCall) -> Optional[str]:
+    def refusal(cls, call: BMMCall) -> str | None:
         band = cls._PINGPONG_BANDS.get(call.calibration)
         persistent = cls._PERSISTENT_BANDS.get(call.calibration)
         if band is None or persistent is None:
@@ -936,21 +953,21 @@ class BMMPingPongKernel(BMMPersistentKernel):
             return f"fills more than {band.max_waves} waves of the persistent tile"
         if not band.min_k <= call.k <= band.max_k:
             return f"requires k in [{band.min_k}, {band.max_k}], got k={call.k}"
-        if min(call.m, call.n) < band.min_mn:
-            return f"requires m and n of at least {band.min_mn}, got m={call.m}, n={call.n}"
-        # Whole tiles leave through the asynchronous TMA store the band was measured on.
+        # Whole tiles leave through the asynchronous TMA store.
         block = cls._TEMPLATE_CONFIG["block_m"]
         if call.m % block or call.n % block:
             return f"requires m and n multiples of {block}, got m={call.m}, n={call.n}"
+        # The grid has at most one CTA an SM, so past sm_count tiles some CTA runs a second
+        # tile, whose mainloop covers the first tile's epilogue.
+        if call.batch * (call.m // block) * (call.n // block) <= call.sm_count:
+            return f"gives no CTA a second {block}x{block} tile on {call.sm_count} SMs"
         return super().refusal(call)
 
-    def _grid(self, batch: int, m: int, n: int, device_index: Optional[int]) -> int:
+    def _grid(self, batch: int, m: int, n: int) -> int:
         """The power-of-two grid when it divides the 128x128 tiles, else every SM."""
-        physical_sms = get_sm_count(device_index)
         block = self._TEMPLATE_CONFIG["block_m"]
         tiles = batch * -(-m // block) * -(-n // block)
-        power_of_two_grid = 1 << (physical_sms.bit_length() - 1)
-        return power_of_two_grid if tiles % power_of_two_grid == 0 else physical_sms
+        return self._full_wave_grid(tiles, self.build_target.sm_count)
 
 
 class _BMMFP8Kernel(Kernel, BMMFP8FwdInterface):
@@ -963,20 +980,20 @@ class _BMMFP8Kernel(Kernel, BMMFP8FwdInterface):
     supported_archs: list[int] = [89, 90]
 
     @staticmethod
-    def _k_refusal(k: int) -> Optional[str]:
+    def _k_refusal(k: int) -> str | None:
         """The FP8 WGMMA K-step is 32 elements wide."""
         if k % 32 == 0:
             return None
         return f"requires k a multiple of 32 (the FP8 WGMMA K step), got k={k}"
 
     @classmethod
-    def refusal(cls, call: BMMFP8Call) -> Optional[str]:
+    def refusal(cls, call: BMMFP8Call) -> str | None:
         return cls._k_refusal(call.k)
 
     @classmethod
     def entry_for(cls, call: BMMFP8Call) -> Entry:
         """The device index is in the identity: the grid is sized from its SM count."""
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         arguments = (call.batch, call.m, call.n, call.k, call.dtype, call.out_dtype)
         return (*arguments, index), lambda: cls(*arguments, device_index=index)
 
@@ -988,9 +1005,9 @@ class _BMMFP8Kernel(Kernel, BMMFP8FwdInterface):
         k: int,
         dtype: torch.dtype,
         out_dtype: torch.dtype,
-        config: Optional[dict] = None,
+        config: dict | None = None,
         *,
-        device_index: Optional[int] = None,
+        device_index: int | None = None,
     ) -> None:
         super().__init__(device_index=device_index)
         reason = self._k_refusal(k)
@@ -1002,7 +1019,7 @@ class _BMMFP8Kernel(Kernel, BMMFP8FwdInterface):
         self.k = k
         self.dtype = dtype
         self.out_dtype = out_dtype
-        self.sm_count = get_sm_count(self.device_index)
+        self.sm_count = self.build_target.sm_count
         self._build_program()
         self.init_config(config)
 
@@ -1218,7 +1235,7 @@ class BMMFP8Kernel(_BMMFP8Kernel):
     @property
     def _arch(self) -> int:
         """The architecture this instance compiled for, which sizes its shared memory."""
-        return get_sm_version(self.device_index)
+        return self.build_target.arch
 
     @property
     def default_config(self) -> dict:
@@ -1276,10 +1293,8 @@ class BMMFP8TransposeKernel(Kernel, BMMFP8TransposeFwdInterface):
     ``src.transpose(-2, -1).contiguous()``.
     """
 
-    # Square staging tile and the lanes that fill it. Fitted on the FP8 BMM
-    # workloads in benchmarks/ops/bench_bmm.py; re-fit against those when the
-    # staging layout changes. Keep the thread count fixed during autotune so a
-    # BMM tune does not spend most of its time on the copy kernel. TILE must
+    # Square staging tile and the lanes that fill it. The thread count stays fixed during
+    # autotune so a BMM tune does not spend most of its time on the copy kernel. TILE must
     # appear among the candidates.
     TILE: int = 64
     THREADS: int = 128
@@ -1288,7 +1303,7 @@ class BMMFP8TransposeKernel(Kernel, BMMFP8TransposeFwdInterface):
 
     @classmethod
     def entry_for(cls, call: BMMFP8TransposeCall) -> Entry:
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         arguments = (call.batch, call.rows, call.cols, call.dtype)
         return (*arguments, index), lambda: cls(*arguments, device_index=index)
 
@@ -1298,9 +1313,9 @@ class BMMFP8TransposeKernel(Kernel, BMMFP8TransposeFwdInterface):
         rows: int,
         cols: int,
         dtype: torch.dtype,
-        config: Optional[dict] = None,
+        config: dict | None = None,
         *,
-        device_index: Optional[int] = None,
+        device_index: int | None = None,
     ) -> None:
         """Build the transpose for one shape and dtype.
 

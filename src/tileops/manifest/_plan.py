@@ -14,6 +14,7 @@ import contextlib
 import copy
 import importlib
 from dataclasses import dataclass
+from typing import Any
 
 from tileops.manifest._dtype_rules import DTYPE_BITS
 from tileops.manifest._expr import (
@@ -25,21 +26,39 @@ from tileops.manifest._expr import (
     fold,
     infer_kinds,
     language_errors,
+    member_kind,
     names,
     parse,
+    value_names,
 )
-from tileops.manifest._kinds import BOOL, INT, NONE, VALUE, Kind, parse_spec, parse_type, seq
+from tileops.manifest._kinds import (
+    BOOL,
+    INT,
+    NONE,
+    VALUE,
+    Kind,
+    parse_spec,
+    parse_type,
+    seq,
+)
 from tileops.manifest._signature import (
+    REQUIRED,
+    TENSOR_MEMBERS,
     Signature,
     SignatureBranch,
     adt_fields,
     branch,
+    call_scalar_lets,
     complete_point,
+    components,
     discriminant_groups,
     dtype_kind,
+    elementwise,
     field_kind,
     holds,
+    items,
     kind_env,
+    member_of,
     parse_signature,
     points,
     reach,
@@ -55,6 +74,7 @@ __all__ = [
     "check_entry",
     "effect_errors",
     "entry_plan",
+    "parse_call",
     "roofline_plan",
     "signature_schema_errors",
 ]
@@ -66,7 +86,7 @@ _SIGNATURE_KEYS = frozenset(
 _TENSOR_FIELDS: dict[str, tuple] = {
     "dtype": (lambda v: isinstance(v, str), "a dtype expression"),
     "shape": (lambda v: isinstance(v, str), "a shape"),
-    "optional": (lambda v: v is True or isinstance(v, str), "true or a presence condition"),
+    "type": (lambda v: isinstance(v, str), "an argument type"),
     "nullable": (lambda v: isinstance(v, str), "a presence condition"),
     "mutated": (lambda v: isinstance(v, (bool, str)), "a bool or a discriminant condition"),
     "write_only": (lambda v: isinstance(v, bool), "a bool"),
@@ -85,11 +105,11 @@ _TENSOR_FIELDS: dict[str, tuple] = {
 _COMMON_TENSOR_KEYS = {"dtype", "shape", "contiguous"}
 # The tensor keys each role admits.
 _ROLE_KEYS = {
-    "params": frozenset(_COMMON_TENSOR_KEYS | {"optional", "device", "values", "requires"}),
     "inputs": frozenset(
         _COMMON_TENSOR_KEYS
         | {
-            "optional",
+            "type",
+            "default",
             "kw_only",
             "mutated",
             "write_only",
@@ -126,7 +146,8 @@ def _formula_reads(node: ast.expr) -> set[str]:
     return names(Unpresent().visit(_Unbytes().visit(copy.deepcopy(node))))
 
 
-def _call_or_none(text: object) -> ast.Call | None:
+def parse_call(text: object) -> ast.Call | None:
+    """The call `text` writes; None when it does not parse to a call."""
     try:
         node = parse(text)
     except SignatureError:
@@ -136,16 +157,18 @@ def _call_or_none(text: object) -> ast.Call | None:
 
 @dataclass
 class PlanBranch(SignatureBranch):
-    """The branch view: the signature's branch plus the generator arguments, `requires` and
-    roofline expressions at the same point, all folded there."""
+    """The branch view: the signature's branch plus what generators and `requires` read.
+
+    The generator arguments, `requires` and roofline expressions are folded at the same point.
+    """
 
     # Each passed generated tensor's generator arguments, and each `requires` call.
-    generators: dict = None
-    requires: dict = None
+    generators: dict[str, list[ast.expr]] | None = None
+    requires: dict[str, list[ast.Call]] | None = None
     # The inline roofline `{"flops": tree, "bytes": tree or None}`; None for `func` or none.
-    roofline: dict | None = None
+    roofline: dict[str, ast.expr | None] | None = None
     # What a call reads: `relevant` less what only generators and `requires` read.
-    called: set = None
+    called: set[str] | None = None
 
 
 @dataclass
@@ -154,13 +177,13 @@ class EntryPlan:
 
     sig: Signature
     # `{"func": callable}` or `{"flops": tree, "bytes": tree or None}`; None without one.
-    roofline: dict | None = None
+    roofline: dict[str, Any] | None = None
 
-    def branch(self, point: dict, complete: bool = True) -> PlanBranch:
+    def branch(self, point: dict[str, object], complete: bool = True) -> PlanBranch:
         """Every per-call quantity at `point`, folded there."""
         sig = self.sig
         b = branch(sig, point, complete)
-        tensors = {*sig.call_tensors, *sig.outputs, _RESERVED}
+        tensors = {*sig.inputs, *sig.outputs, _RESERVED}
         roofline = None
         called = set(b.relevant)
         if self.roofline is not None and "flops" in self.roofline:
@@ -178,29 +201,42 @@ class EntryPlan:
         lets = dict(b.lets)
         reach(sig, point, called, lets)
         generators, requires, relevant = {}, {}, set(called)
-        for t in sig.call_tensors.values():
+        for t in sig.inputs.values():
             if t.name not in b.shapes:
                 continue
             # A call that is not well formed is `check_workloads`' to report.
-            if (call := _call_or_none(t.values)) is not None:
+            if (call := parse_call(t.values)) is not None:
                 generators[t.name] = [
                     fold(a, point, f"tensor {t.name!r} values") for a in call.args
                 ]
                 relevant |= set().union(set(), *(names(a) for a in generators[t.name])) - tensors
             requires[t.name] = []
-            for call in filter(None, map(_call_or_none, t.requires)):
+            for call in filter(None, map(parse_call, t.requires)):
                 call.args = [fold(a, point, f"tensor {t.name!r} requires") for a in call.args]
                 requires[t.name].append(call)
             relevant |= set().union(set(), *(names(r) for r in requires[t.name])) - tensors
         reach(sig, point, relevant, lets)
         return PlanBranch(
-            b.shapes, b.dtypes, b.rules, lets, relevant, generators, requires, roofline, called
+            b.shapes,
+            b.dtypes,
+            b.rules,
+            lets,
+            relevant,
+            b.sequences,
+            generators,
+            requires,
+            roofline,
+            called,
         )
 
 
-def entry_plan(name: str, entry: dict, adts: dict, resolve: bool = True) -> EntryPlan:
-    """The plan of an entry; `SignatureError` on a malformed signature. A roofline with
-    diagnostics leaves the plan without one."""
+def entry_plan(
+    name: str, entry: dict[str, Any], adts: dict[str, dict[str, Any]], resolve: bool = True
+) -> EntryPlan:
+    """The plan of an entry; `SignatureError` on a malformed signature.
+
+    A roofline with diagnostics leaves the plan without one.
+    """
     sig = parse_signature(name, entry, adts)
     errors, roofline = roofline_plan(sig, entry.get("roofline"), resolve=resolve)
     return EntryPlan(sig, None if errors else roofline)
@@ -227,12 +263,7 @@ def roofline_plan(
         errors.append("roofline gives either `flops` (and optional `bytes`) or `func`")
     if "func" in roofline:
         path, fn = roofline["func"], None
-        parts = path.split(".") if isinstance(path, str) else []
-        if not (
-            len(parts) > 1
-            and all(p.isidentifier() for p in parts)
-            and path.startswith("tileops._perf.formulas.")
-        ):
+        if not (_qualified(path) and path.startswith("tileops._perf.formulas.")):
             errors.append(f"roofline.func {path!r} is not tileops._perf.formulas.<name>")
         elif resolve:
             module, _, attr = path.rpartition(".")
@@ -260,35 +291,46 @@ def roofline_plan(
         plan[key] = node
         if sig is None:
             continue
+        scalar_lets = call_scalar_lets(sig)
         indices = (
             {n for n, k in sig.forall.items() if k != "Seq[Int]"} | set(sig.params) | set(sig.let)
-        )
-        tensors = {*sig.call_tensors, *sig.outputs}
+        ) - scalar_lets
+        errors += [
+            f"roofline.{key}: let {n!r} reads a call-time scalar; read it only in a refinement"
+            for n in sorted(_formula_reads(node) & scalar_lets)
+        ]
+        tensors = {*sig.inputs, *sig.outputs}
         maybes = {p for p in sig.params if sig.kind(p).tag == "Maybe"}
         buffered = {_RESERVED} if any(o.buffer for o in sig.outputs.values()) else set()
         for call in (c for c in ast.walk(node) if isinstance(c, ast.Call)):
             name = callee(call.func)
             allowed = tensors | (maybes | buffered if name == "present" else set())
-            if name in ("bytes", "present") and not (
+            if name == "member":
+                allowed = set(sig.inputs)
+            if name in ("bytes", "present", "member") and not (
                 len(call.args) == 1
+                and not call.keywords
                 and isinstance(call.args[0], ast.Name)
                 and call.args[0].id in allowed
             ):
-                errors.append(f"roofline.{key}: {ast.unparse(call)} names no tensor")
+                what = "call-time argument" if name == "member" else "tensor"
+                errors.append(f"roofline.{key}: {ast.unparse(call)} names no {what}")
         errors += [
             f"roofline.{key}: name {n!r} is not in indices"
-            for n in sorted(_formula_reads(node) - indices)
+            for n in sorted(_formula_reads(node) - indices - scalar_lets)
         ]
     return errors, (None if errors else {"bytes": None, **plan})
 
 
 def effect_errors(sig: Signature) -> list[str]:
-    """Effect declarations: `write_only` is written, an alias names a written input,
-    one output at most is buffered, and `overlaps` sits on a written tensor and names other
-    inputs, once each."""
+    """Diagnostics of the effect declarations.
+
+    `write_only` is written, an alias names a written input, one output at most is buffered,
+    and `overlaps` sits on a written tensor and names other inputs, once each.
+    """
     errors = [
         f"tensor {t.name!r}: `write_only` needs `mutated: true`"
-        for t in sig.call_tensors.values()
+        for t in sig.inputs.values()
         if t.write_only and t.mutated is not True
     ]
     for t in (*sig.inputs.values(), *sig.outputs.values()):
@@ -404,9 +446,7 @@ def signature_schema_errors(sig: dict) -> list[str]:
         (g, f"{g}.{n}", d) for g in ("inputs", "outputs") for n, d in (sig.get(g) or {}).items()
     ]
     for n, d in (sig.get("params") or {}).items():
-        if isinstance(d, dict) and "shape" in d:
-            tensors.append(("params", f"params.{n}", d))
-        else:
+        if not (isinstance(d, dict) and "shape" in d):
             sections.append((f"params.{n}", d, _PARAM_KEYS))
     sections += [(where, d, _ROLE_KEYS[role]) for role, where, d in tensors]
     sections += [(f"types.{n}", d, _FAMILY_KEYS) for n, d in (sig.get("types") or {}).items()]
@@ -425,33 +465,26 @@ def signature_schema_errors(sig: dict) -> list[str]:
 
 
 def _input_order_errors(inputs: dict) -> list[str]:
-    """An optional input may not precede a required positional one, nor a `kw_only` input a
-    positional one, and a `kw_only` input is optional unless it is the required buffer `out`.
+    """Diagnostics of the input order.
 
-    Input order is the generated signature's parameter order, and an optional input becomes a
-    parameter with a default, so a required input after one emits `parameter without a default
-    follows parameter with a default` and the generated validator does not compile. A `kw_only`
-    input is a keyword-only parameter after every positional one, which a caller may omit.
+    A positional input without a `default` may not follow one with a `default`, nor a
+    positional input a `kw_only` one.
+
+    Input order is the generated signature's parameter order, so a positional input without a
+    default after one with a default emits `parameter without a default follows parameter with
+    a default` and the generated validator does not compile.
     """
     decls = {n: d for n, d in inputs.items() if isinstance(d, dict)}
-    optional = [n for n, d in decls.items() if d.get("optional")]
-    errors = [
-        f"inputs.{n}: a kw_only input must be optional"
-        for n, d in decls.items()
-        if d.get("kw_only") is True and n not in optional and n != _RESERVED
-    ]
     keyword = [n for n, d in decls.items() if d.get("kw_only") is True]
-    if optional:
-        first = next(n for n in inputs if n in optional)
-        after = [
-            n
-            for n in list(inputs)[list(inputs).index(first) + 1 :]
-            if n not in optional and n not in keyword
-        ]
+    positional = [n for n in decls if n not in keyword]
+    defaulted = [n for n in positional if "default" in decls[n]]
+    errors = []
+    if defaulted:
+        first = defaulted[0]
         errors += [
-            f"inputs.{n}: a required input may not follow the optional {first!r}; "
-            "order every optional input last"
-            for n in after
+            f"inputs.{n}: an input without a default may not follow {first!r}, which has one"
+            for n in positional[positional.index(first) + 1 :]
+            if n not in defaulted
         ]
     if keyword:
         first = keyword[0]
@@ -513,10 +546,8 @@ def _family_env(formals: dict, sig: Signature) -> KindEnv:
 
 def _case_facts(spec: dict, case: dict) -> dict:
     """What a case's pattern fixes: each ADT formal's constructor, as `w`, and its fields, `w.f`."""
-    keys = spec["match"] if isinstance(spec["match"], list) else [spec["match"]]
-    patterns = case["when"] if isinstance(case["when"], list) else [case["when"]]
     facts = {}
-    for k, p in zip(keys, patterns, strict=False):
+    for k, p in zip(components(spec["match"]), components(case["when"]), strict=False):
         if isinstance(p, dict) and len(p) == 1:
             ((ctor, fields),) = p.items()
             facts[k] = ctor
@@ -541,7 +572,7 @@ def _family_errors(fam: str, spec: object, sig: Signature) -> list[str]:
         for p in formals
         if not (isinstance(p, str) and p.isidentifier()) or p not in env.kinds
     ]
-    keys = spec["match"] if isinstance(spec["match"], list) else [spec["match"]]
+    keys = components(spec["match"])
     kinds = []
     for key in keys:
         where = f"type family {fam} match {key!r}"
@@ -556,6 +587,9 @@ def _family_errors(fam: str, spec: object, sig: Signature) -> list[str]:
         ]
         kind, found = infer_kinds(node, env, where)
         errors += found
+        # A `Maybe[ADT]` discriminant matches by its payload; only `_` matches it absent.
+        if kind is not None and kind.tag == "Maybe" and kind.item.tag == "ADT":
+            kind = kind.item
         if kind is not None and (
             kind == BOOL or kind.tag == "ADT" or (kind.tag == "Str" and kind.values)
         ):
@@ -569,7 +603,7 @@ def _family_errors(fam: str, spec: object, sig: Signature) -> list[str]:
         if not isinstance(case, dict) or set(case) != {"when", "is"}:
             errors.append(f"{where}: needs exactly `when` and `is`")
             continue
-        patterns = case["when"] if isinstance(case["when"], list) else [case["when"]]
+        patterns = components(case["when"])
         if len(patterns) != len(keys):
             errors.append(f"{where}: {len(patterns)} components, `match` has {len(keys)}")
             continue
@@ -661,6 +695,55 @@ def _shape_errors(node: ast.expr | None, env: KindEnv, where: str, families: dic
     return [f"{where}: {ast.unparse(node)!r} is not a list or a type-family application"]
 
 
+def _argument_errors(sig: Signature) -> list[str]:
+    """Diagnostics of each input's argument type.
+
+    A tensor is among its members, a `list[Tensor]` stands alone and reads an element-wise
+    index, a `default` is a value of the type, no effect sits on a sequence or a union with a
+    scalar member, no contents or device declaration sits on a sequence, and no operator slot
+    takes another argument's name.
+    """
+    # `Tensor` attribute -> manifest key. A tensor sequence takes neither group; an argument
+    # with a scalar member takes no effect.
+    effects = {"mutated": "mutated", "write_only": "write_only", "overlaps": "overlaps"}
+    contents = {"cpu": "device", "values": "values", "requires": "requires"}
+    errors, each = [], elementwise(sig)
+    for t in sig.inputs.values():
+        where, found = f"tensor {t.name!r}", t.members
+        if not set(found) & TENSOR_MEMBERS:
+            errors.append(f"{where}: type {t.type!r} holds no tensor; a scalar is a parameter")
+        if t.sequence and len(found) > 1:
+            errors.append(f"{where}: `list[Tensor]` is not yet a member of a union")
+        barred = {**effects, **contents} if t.sequence else effects if t.scalars else {}
+        keys = [k for a, k in barred.items() if getattr(t, a)]
+        if keys:
+            errors.append(f"{where}: {keys} apply to one tensor, not to type {t.type!r}")
+        with contextlib.suppress(SignatureError):
+            reads = items(parse(t.shape), each) + items(parse(t.dtype), each)
+            if t.sequence and not reads:
+                errors.append(f"{where}: a `list[Tensor]` reads an element-wise (`Seq`) index")
+            if not t.sequence and set(reads) & {n for n in each if sig.forall[n] == "Seq[Shape]"}:
+                errors.append(f"{where}: a Seq[Shape] index is read per element, in a list[Tensor]")
+        taken = {*sig.params, *sig.inputs, *sig.outputs, "out"} - {t.name}
+        errors += [
+            f"{where}: operator slot {slot!r} takes the name of another argument"
+            for _, slot, _ in t.slots
+            if slot in taken
+        ]
+        if t.default is not REQUIRED and member_of(t.default, found) in (None, *TENSOR_MEMBERS):
+            errors.append(f"{where}: default {t.default!r} is not a value of {t.type!r}")
+    return errors
+
+
+def _items_kinds(env: KindEnv, each) -> dict:
+    """Each element-wise index as its item: what it denotes inside a `list[Tensor]` element."""
+    return {
+        x: k.item
+        for x in each
+        if (k := env.kinds.get(x)) is not None and k.tag == "Seq" and k.item is not None
+    }
+
+
 def check_entry(name: str, entry: dict, adts: dict) -> tuple[list[str], list[str]]:
     """Return `(errors, warnings)` for one entry; each message is prefixed with its op name.
 
@@ -676,7 +759,7 @@ def check_entry(name: str, entry: dict, adts: dict) -> tuple[list[str], list[str
             parse_type(decl.get("type"), sig.adts)
         except ValueError as exc:
             errors.append(f"params.{p}: {exc}")
-    declared = [*sig.forall, *sig.params, *sig.ctor_tensors, *sig.let, *sig.inputs, *sig.outputs]
+    declared = [*sig.forall, *sig.params, *sig.let, *sig.inputs, *sig.outputs]
     errors += [
         f"name {d!r} is declared twice"
         for d in sorted({n for n in declared if declared.count(n) > 1})
@@ -702,7 +785,7 @@ def check_entry(name: str, entry: dict, adts: dict) -> tuple[list[str], list[str
         parsed[key] = node
         return node
 
-    tensors = {**sig.call_tensors, **sig.outputs}
+    tensors = {**sig.inputs, **sig.outputs}
     lets = {n: node for n, e in sig.let.items() if (node := parse_field(f"let {n}", e)) is not None}
     rules = [
         node
@@ -715,14 +798,15 @@ def check_entry(name: str, entry: dict, adts: dict) -> tuple[list[str], list[str
     flags = {
         (t, a): parse_field(f"tensor {t!r} {a}", getattr(d, a))
         for t, d in tensors.items()
-        for a in ("optional", "nullable", "mutated")
+        for a in ("nullable", "mutated")
         if isinstance(getattr(d, a), str)
     }
     for t, d in tensors.items():
         node = parse_field(f"tensor {t!r} dtype", d.dtype)
         if node is not None:
             found: list[str] = []
-            kind = dtype_kind(sig, node, found)
+            listed = d.type.replace(" ", "") == "list[Tensor]"
+            kind = dtype_kind(sig, node, found, elementwise(sig) if listed else frozenset())
             if kind is not None and kind.tag == "Maybe":
                 found.append(f"{ast.unparse(node)} may be absent; use coalesce_dtype")
             errors += [f"tensor {t!r} dtype: {e}" for e in found]
@@ -735,7 +819,10 @@ def check_entry(name: str, entry: dict, adts: dict) -> tuple[list[str], list[str
             cases[(fam, j)] = parse_field(f"type family {fam} case {j}", case["is"], shape=True)
 
     env, let_errors = kind_env(sig, lets)
-    errors += let_errors
+    errors += let_errors + _argument_errors(sig)
+    each = elementwise(sig)
+    scalar_inputs = sig.scalar_inputs
+    scalar_lets = call_scalar_lets(sig)
     value_lists = {n for n, k in sig.forall.items() if k == "Seq[Int]"}
     # A parameter outside the type system appears only in refinements.
     untyped = {
@@ -754,11 +841,19 @@ def check_entry(name: str, entry: dict, adts: dict) -> tuple[list[str], list[str
             if key.startswith("type family ")
             else set()
         )
-        read = names(Unpresent().visit(copy.deepcopy(node))) - formals
+        read = value_names(node) - formals
+        refining = key.startswith("shape_rules") or key[len("let ") :] in scalar_lets
+        values = scalar_inputs if refining else set()
         errors += [
-            f"{key}: tensor {n!r} is read as a value; use its shape or present({n})"
-            for n in sorted(read & set(tensors))
+            f"{key}: tensor {n!r} is read as a value; use its shape or member({n}), and read a "
+            "scalar member only in a refinement"
+            for n in sorted(read & set(tensors) - values)
         ]
+        if not refining:
+            errors += [
+                f"{key}: let {n!r} reads a call-time scalar; read it only in a refinement"
+                for n in sorted(read & scalar_lets)
+            ]
         if not key.startswith("shape_rules"):
             errors += [
                 f"{key}: parameter {n!r} of type {sig.params[n].get('type')} takes no part in types"
@@ -780,8 +875,13 @@ def check_entry(name: str, entry: dict, adts: dict) -> tuple[list[str], list[str
         if node is not None:
             errors += infer_kinds(node, env, f"tensor {t!r} {a}", BOOL)[1]
     families = {fam: (None if malformed[fam] else sig.types[fam]) for fam in malformed}
+    # A `Maybe` parameter a shape reads is its payload; where it is absent, the point check reports.
+    payloads = env.narrowed(
+        {n: k.item for n, k in env.kinds.items() if n in sig.params and k and k.tag == "Maybe"}
+    )
     for t, node in shapes.items():
-        errors += _shape_errors(node, env, f"tensor {t!r} shape", families)
+        local = payloads.narrowed(_items_kinds(env, each)) if tensors[t].sequence else payloads
+        errors += _shape_errors(node, local, f"tensor {t!r} shape", families)
     for (fam, j), node in cases.items():
         spec = sig.types[fam]
         local = _family_env(spec.get("params") or {}, sig)
@@ -823,16 +923,19 @@ def check_entry(name: str, entry: dict, adts: dict) -> tuple[list[str], list[str
 
 
 def inference_errors(plan: EntryPlan, point: dict, b: PlanBranch) -> list[str]:
-    """Why the inference plan fails at `point`, or nothing: an index a call reads that no input,
-    parameter or `let` solves."""
+    """Why the inference plan fails at `point`, or nothing.
+
+    It fails on an index a call reads that no input, parameter or `let` solves.
+    """
     sig = plan.sig
     solvable = {n for n, k in sig.forall.items() if k != "Seq[Int]"}
-    inputs = {t: node for t, node in b.shapes.items() if t in sig.call_tensors}
+    inputs = {t: node for t, node in b.shapes.items() if t in sig.inputs}
     known = set(sig.params) | {k for k in point if "(" not in k and "." not in k}
     known |= {
         d.id for t, d in b.dtypes.items() if t in inputs and isinstance(d, ast.Name)
     } & solvable
-    known |= {s.name for s in unification(inputs, known, b.lets) if s.name}
+    sequences = {t: b.sequences[t] for t in inputs if t in b.sequences}
+    known |= {n for s in unification(inputs, known, b.lets, sequences) for n in s.solved}
     return [
         f"index {u!r} cannot be solved from the inputs"
         for u in sorted((b.called & solvable) - known)
@@ -840,7 +943,7 @@ def inference_errors(plan: EntryPlan, point: dict, b: PlanBranch) -> list[str]:
 
 
 def _read_errors(sig: Signature, point: dict, b: PlanBranch, env: KindEnv) -> list[str]:
-    """Reads the branch forbids: `v.value` where `present(v)` is false, a field its constructor lacks."""
+    """Reads the branch forbids: a field its constructor lacks."""
     nodes = {
         **{f"tensor {t!r} shape": n for t, n in b.shapes.items()},
         **{f"shape_rules[{i}]": n for i, n in enumerate(b.rules)},
@@ -849,22 +952,12 @@ def _read_errors(sig: Signature, point: dict, b: PlanBranch, env: KindEnv) -> li
     errors = []
     for where, node in nodes.items():
         for n in ast.walk(node):
-            if not isinstance(n, ast.Attribute):
+            if not (isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)):
                 continue
-            receiver = n.value
-            payload = (
-                isinstance(receiver, ast.Attribute)
-                and receiver.attr == "value"
-                and isinstance(receiver.value, ast.Name)
-            )
-            if not (isinstance(receiver, ast.Name) or payload):
-                continue
-            v, f = ast.unparse(receiver), n.attr
-            if f == "value" and point.get(f"present({v})") is False:
-                errors.append(f"{where} reads {v}.value where present({v}) is false")
+            v, f = n.value.id, n.attr
             ctor = point.get(f"{v}.kind")
-            kind = sig.kind(receiver.value.id if payload else v)
-            kind = kind.payload() if kind is not None and payload else kind
+            kind = sig.kind(v)
+            kind = kind.payload() if kind is not None else kind
             fields = (
                 env.adts.get(kind.name, {}).get(ctor)
                 if kind is not None and kind.tag == "ADT"
@@ -878,6 +971,7 @@ def _read_errors(sig: Signature, point: dict, b: PlanBranch, env: KindEnv) -> li
 def _point_errors(plan: EntryPlan, env: KindEnv) -> tuple[list[str], list[str]]:
     """Check each group of dependent discriminants on its own, the other groups held accepted."""
     sig = plan.sig
+    scalar_inputs = sig.scalar_inputs
 
     def accepted(point: dict) -> bool:
         try:
@@ -890,8 +984,8 @@ def _point_errors(plan: EntryPlan, env: KindEnv) -> tuple[list[str], list[str]]:
     for group in groups:
         held.update(next((p for p in group if accepted(p)), group[0]))
     warnings = []
-    combinations = sum(len(group) for group in groups)
-    # Discriminant combinations above this count draw an advisory diagnostic.
+    combinations = sum(sum(map(accepted, group)) for group in groups)
+    # Accepted discriminant combinations above this count draw an advisory diagnostic.
     limit = 256
     if combinations > limit:
         warnings.append(f"{sig.name}: {combinations} discriminant combinations exceed {limit}")
@@ -901,24 +995,35 @@ def _point_errors(plan: EntryPlan, env: KindEnv) -> tuple[list[str], list[str]]:
         try:
             point = complete_point(sig, point)
             ok = rejecting_rule(sig, point) is None
-            for t in sig.call_tensors.values():
+            for t in sig.inputs.values():
                 holds(t.mutated if isinstance(t.mutated, str) else None, point)
             b = plan.branch(point, complete=ok)
-            errors += _read_errors(sig, point, b, env)
+            errors += _read_errors(sig, point, b, env) if ok else []
             facts = {k[: -len(".kind")]: v for k, v in point.items() if k.endswith(".kind")}
-            # An absent `Maybe` parameter is None on this branch.
+            # A `Maybe` parameter is None or its payload on this branch.
             local = env.narrowed(
                 {
-                    n: NONE
+                    n: NONE if point[f"present({n})"] is False else k.item
                     for n, k in env.kinds.items()
-                    if k is not None and k.tag == "Maybe" and point.get(f"present({n})") is False
+                    if k is not None and k.tag == "Maybe" and f"present({n})" in point
+                }
+                | {
+                    t: member_kind([point[f"member({t})"]])
+                    for t in scalar_inputs
+                    if f"member({t})" in point
                 }
             )
             local.facts, local.point = facts, True
             families = dict.fromkeys(sig.types)
-            for t, node in b.shapes.items():
-                errors += _shape_errors(node, local, f"tensor {t!r} shape", families)
-            for n, node in b.lets.items():
+            # What a domain restriction rejects reads nothing.
+            for t, node in b.shapes.items() if ok else ():
+                scoped = (
+                    local.narrowed(_items_kinds(local, b.sequences[t]))
+                    if t in b.sequences
+                    else local
+                )
+                errors += _shape_errors(node, scoped, f"tensor {t!r} shape", families)
+            for n, node in b.lets.items() if ok else ():
                 errors += infer_kinds(node, local, f"let {n}")[1]
             for i, rule in enumerate(b.rules):
                 errors += infer_kinds(rule, local, f"shape_rules[{i}]", BOOL)[1]

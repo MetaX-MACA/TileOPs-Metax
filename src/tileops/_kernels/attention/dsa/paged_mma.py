@@ -129,6 +129,12 @@ class DSAPagedMMAKernel(DSAPagedKernelBase):
     cluster: ClassVar[int] = 1
 
     @classmethod
+    def refusal(cls, call):
+        if call.cache_dtype != torch.uint8:
+            return "reads the FP8 656-byte cache row only"
+        return super().refusal(call)
+
+    @classmethod
     def entry_for(cls, call):
         split = cls.split_for(
             call.batch * call.seq_len * (call.heads // 16), call.topk, call.sm_count
@@ -136,10 +142,11 @@ class DSAPagedMMAKernel(DSAPagedKernelBase):
         return (call, split), lambda: cls(call, split)
 
     def __init__(self, call, split=1):
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         Kernel.__init__(self, device_index=index)
         self.call = call
         self.split = split
+        self._sinkless = None
         self.program(self._compile)
 
     def _compile(self, cfg: dict):
@@ -165,7 +172,7 @@ class DSAPagedMMAKernel(DSAPagedKernelBase):
         )
         return CompiledProgram(kernel), combine
 
-    def forward(self, q, kv_cache, block_table, cache_seqlens, indices):
+    def forward(self, q, kv_cache, block_table, cache_seqlens, indices, attn_sink=None):
         self._require_devices(
             q=q,
             kv_cache=kv_cache,
@@ -193,7 +200,7 @@ class DSAPagedMMAKernel(DSAPagedKernelBase):
             final = torch.empty(
                 (call.batch, call.heads, call.seq_len), dtype=torch.float32, device=q.device
             )
-            combine(out, lse, output, final)
+            combine(out, lse, self._sink(None, call.heads, q.device), output, final)
             out, lse = output, final
         else:
             lse = lse[0]

@@ -10,6 +10,7 @@ from tileops._kernels.elementwise._base import (
     Uint8StorageBinaryKernel,
 )
 from tileops._kernels.elementwise._dtype import BINARY_FULL_DTYPES, INT_DTYPES
+from tileops._kernels.elementwise._nan import HALF_COMPARE_HEADER, lane_compare, ne_unordered
 from tileops._kernels.elementwise.call_spec import (
     BinaryPredicateFwdInterface,
     UnaryPredicateFwdInterface,
@@ -40,11 +41,18 @@ __all__ = [
 ]
 
 
-class EqFwdKernel(BinaryKernel, BinaryPredicateFwdInterface):
-    """Element-wise equality: y = (a == b)."""
+class _CompareKernel(BinaryKernel, BinaryPredicateFwdInterface):
+    """A comparison with a bool result; the 16-bit float forms call ``half_compare.h``."""
 
     SUPPORTED_DTYPES = BINARY_FULL_DTYPES
     OUTPUT_DTYPE = torch.bool
+    CSRC_HEADERS = (HALF_COMPARE_HEADER,)
+
+
+class EqFwdKernel(_CompareKernel):
+    """Element-wise equality: y = (a == b)."""
+
+    lane_mask_func = staticmethod(lane_compare("eq"))
 
     @staticmethod
     def op_func(a, b):
@@ -61,31 +69,14 @@ class EqBoolStorageFwdKernel(Uint8StorageBinaryKernel, BinaryPredicateFwdInterfa
         return T.bitwise_xor(T.bitwise_xor(a, b), T.cast(1, "uint8"))
 
 
-class NeFwdKernel(BinaryKernel, BinaryPredicateFwdInterface):
-    """Element-wise not-equal: y = (a != b).
+class NeFwdKernel(_CompareKernel):
+    """Element-wise not-equal: y = (a != b), true where either operand is NaN."""
 
-    A half operand is compared in float32, which is where ``!=`` means what
-    IEEE 754 says. CUDA's ``__hne`` is an *ordered* comparison and answers
-    false when either operand is NaN; ``!=`` is the unordered one and answers
-    true, since NaN is unequal to everything, itself included. Widening is
-    exact for float16 and bfloat16, and float32's own ``!=`` already carries
-    the case, so only the half formats pay it.
-
-    The other five comparisons want the ordered answer -- IEEE reads ``<``,
-    ``<=``, ``>``, ``>=`` and ``==`` as false against a NaN -- and take the
-    operator directly. Negating equality does not work here: the simplifier
-    folds ``not (a == b)`` back to ``a != b``, which is the comparison being
-    avoided.
-    """
-
-    SUPPORTED_DTYPES = BINARY_FULL_DTYPES
-    OUTPUT_DTYPE = torch.bool
+    lane_mask_func = staticmethod(lane_compare("ne"))
 
     @staticmethod
     def op_func(a, b):
-        if str(a.dtype) in ("float16", "bfloat16"):
-            return T.Cast("float32", a) != T.Cast("float32", b)
-        return a != b
+        return ne_unordered(a, b)
 
 
 class NeBoolStorageFwdKernel(Uint8StorageBinaryKernel, BinaryPredicateFwdInterface):
@@ -98,11 +89,10 @@ class NeBoolStorageFwdKernel(Uint8StorageBinaryKernel, BinaryPredicateFwdInterfa
         return T.bitwise_xor(a, b)
 
 
-class GtFwdKernel(BinaryKernel, BinaryPredicateFwdInterface):
+class GtFwdKernel(_CompareKernel):
     """Element-wise greater-than: y = (a > b)."""
 
-    SUPPORTED_DTYPES = BINARY_FULL_DTYPES
-    OUTPUT_DTYPE = torch.bool
+    lane_mask_func = staticmethod(lane_compare("gt"))
 
     @staticmethod
     def op_func(a, b):
@@ -119,11 +109,10 @@ class GtBoolStorageFwdKernel(Uint8StorageBinaryKernel, BinaryPredicateFwdInterfa
         return T.bitwise_and(a, T.bitwise_xor(b, T.cast(1, "uint8")))
 
 
-class LtFwdKernel(BinaryKernel, BinaryPredicateFwdInterface):
+class LtFwdKernel(_CompareKernel):
     """Element-wise less-than: y = (a < b)."""
 
-    SUPPORTED_DTYPES = BINARY_FULL_DTYPES
-    OUTPUT_DTYPE = torch.bool
+    lane_mask_func = staticmethod(lane_compare("lt"))
 
     @staticmethod
     def op_func(a, b):
@@ -140,11 +129,10 @@ class LtBoolStorageFwdKernel(Uint8StorageBinaryKernel, BinaryPredicateFwdInterfa
         return T.bitwise_and(T.bitwise_xor(a, T.cast(1, "uint8")), b)
 
 
-class GeFwdKernel(BinaryKernel, BinaryPredicateFwdInterface):
+class GeFwdKernel(_CompareKernel):
     """Element-wise greater-equal: y = (a >= b)."""
 
-    SUPPORTED_DTYPES = BINARY_FULL_DTYPES
-    OUTPUT_DTYPE = torch.bool
+    lane_mask_func = staticmethod(lane_compare("ge"))
 
     @staticmethod
     def op_func(a, b):
@@ -161,11 +149,10 @@ class GeBoolStorageFwdKernel(Uint8StorageBinaryKernel, BinaryPredicateFwdInterfa
         return T.bitwise_or(a, T.bitwise_xor(b, T.cast(1, "uint8")))
 
 
-class LeFwdKernel(BinaryKernel, BinaryPredicateFwdInterface):
+class LeFwdKernel(_CompareKernel):
     """Element-wise less-equal: y = (a <= b)."""
 
-    SUPPORTED_DTYPES = BINARY_FULL_DTYPES
-    OUTPUT_DTYPE = torch.bool
+    lane_mask_func = staticmethod(lane_compare("le"))
 
     @staticmethod
     def op_func(a, b):

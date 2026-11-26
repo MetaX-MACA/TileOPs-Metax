@@ -1,10 +1,12 @@
-from typing import ClassVar, Mapping, Tuple
+from collections.abc import Mapping
+from typing import ClassVar
 
 import torch
 
 from tileops._kernels.kernel_base import Kernel, KernelInterface
 from tileops._kernels.linear_attention import (
     DeltaNetDecodeCall,
+    DeltaNetDecodeColumnKernel,
     DeltaNetDecodeFP32Kernel,
     DeltaNetDecodeFwdInterface,
     DeltaNetDecodeKernel,
@@ -26,6 +28,7 @@ class DeltaNetRecurrentFwdOp(Op):
 
     Layout: BHD (batch, head, dim).
     Supports float32, float16, and bfloat16 with fp32 accumulation.
+    The read-only tensor inputs may be non-contiguous.
 
     For fp32 dtype, dispatches to a dedicated FP32 kernel that uses
     element-wise matvec instead of T.gemm to avoid TF32 mantissa truncation.
@@ -33,6 +36,7 @@ class DeltaNetRecurrentFwdOp(Op):
 
     kernel_types: ClassVar[Mapping[str, type[Kernel]]] = {
         "deltanet_decode": DeltaNetDecodeKernel,
+        "deltanet_decode_columns": DeltaNetDecodeColumnKernel,
         "deltanet_decode_fp32": DeltaNetDecodeFP32Kernel,
         "deltanet_decode_warp": DeltaNetDecodeWarpKernel,
     }
@@ -60,7 +64,7 @@ class DeltaNetRecurrentFwdOp(Op):
         v: torch.Tensor,
         beta: torch.Tensor,
         state: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run one decode step.
 
         Args:

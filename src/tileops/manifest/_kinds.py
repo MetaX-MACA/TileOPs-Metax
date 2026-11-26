@@ -7,6 +7,7 @@ as the specification writes it; `fits`, `join` and `comparable` compose them.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass, field
 
 from tileops.manifest._dtype_rules import DTYPE_BITS
@@ -16,6 +17,8 @@ __all__ = [
     "DTYPE",
     "INT",
     "NONE",
+    "STR",
+    "TENSOR",
     "VALUE",
     "Kind",
     "common",
@@ -23,6 +26,7 @@ __all__ = [
     "dtypes",
     "exclude",
     "fits",
+    "flat_members",
     "join",
     "literals",
     "ordered",
@@ -30,6 +34,7 @@ __all__ = [
     "parse_type",
     "restrict",
     "seq",
+    "split_commas",
     "split_union",
     "union",
 ]
@@ -37,17 +42,19 @@ __all__ = [
 
 @dataclass(frozen=True)
 class Kind:
-    # One of Int, Bool, Str, DType, Seq, Maybe, Union, ADT, None, Value.
+    """The kind of a manifest value: a `tag` and the structure that tag carries."""
+
+    # One of Int, Bool, Str, DType, Seq, Maybe, Union, ADT, None, Value, Tensor.
     tag: str
     # Int: never negative (`Dim`).
     nonneg: bool = False
     # Str: its literals; DType: its members; None where any value is possible.
-    values: frozenset | None = None
+    values: frozenset[str] | None = None
     # Seq: its element kind (None for the empty tuple); Maybe: its payload.
     item: Kind | None = None
     # Seq: its fixed length, where known.
     length: int | None = None
-    members: tuple = field(default=())
+    members: tuple[Kind, ...] = field(default=())
     # ADT: its name.
     name: str | None = None
 
@@ -70,6 +77,7 @@ class Kind:
         return "NoneType" if self.tag == "None" else self.tag
 
     def payload(self) -> Kind:
+        """The payload of a `Maybe`; any other kind is its own payload."""
         return self.item if self.tag == "Maybe" else self
 
     def sequence(self) -> Kind | None:
@@ -77,15 +85,14 @@ class Kind:
         if self.tag == "Seq":
             return self
         if self.tag == "Union" and all(m.tag == "Seq" for m in self.members):
-            view = self.members[0]
-            for m in self.members[1:]:
-                view = join(view, m)
-            return view
+            return functools.reduce(join, self.members)
         return None
 
 
 INT, DIM, BOOL = Kind("Int"), Kind("Int", nonneg=True), Kind("Bool")
 STR, DTYPE, NONE, VALUE = Kind("Str"), Kind("DType"), Kind("None"), Kind("Value")
+# A call-time argument holding a tensor or a tensor sequence: never read as a value.
+TENSOR = Kind("Tensor")
 
 
 def seq(item: Kind | None, length: int | None = None) -> Kind:
@@ -128,16 +135,26 @@ def union(*kinds: Kind) -> Kind:
     return Kind("Maybe", item=inner) if optional else inner
 
 
-def split_union(text: str) -> list[str]:
-    """The top-level members of `A | B`, splitting only outside brackets and quotes."""
+def _split(text: str, sep: str) -> list[str]:
+    """The parts of `text` between the `sep`s that lie outside brackets and quotes."""
     parts, depth, start, quoted = [], 0, 0, False
     for i, c in enumerate(text):
         quoted ^= c == "'"
         depth += 0 if quoted else {"[": 1, "]": -1}.get(c, 0)
-        if c == "|" and depth == 0 and not quoted:
+        if c == sep and depth == 0 and not quoted:
             parts.append(text[start:i].strip())
             start = i + 1
     return [*parts, text[start:].strip()]
+
+
+def split_union(text: str) -> list[str]:
+    """The top-level members of `A | B`."""
+    return _split(text, "|")
+
+
+def split_commas(text: str) -> list[str]:
+    """The top-level items of `A, B`."""
+    return _split(text, ",")
 
 
 def _quoted(text: str) -> bool:
@@ -160,7 +177,7 @@ def parse_type(text: object, adts: dict) -> Kind:
     simple = {"int": INT, "bool": BOOL, "None": NONE, "torch.dtype": DTYPE, "str": STR}
     if t in simple:
         return simple[t]
-    if t in ("float", "Number", "dict", "torch.Tensor"):
+    if t in ("float", "Number", "dict"):
         return VALUE
     if _quoted(t):
         return literals([t[1:-1]])
@@ -170,33 +187,15 @@ def parse_type(text: object, adts: dict) -> Kind:
         return adt(t)
     # A sequence's element type maps by this same table; a fixed tuple also carries its arity.
     if (inner := _bracket(t, "list")) is not None:
-        return seq(_element(inner, text, adts))
+        return seq(parse_type(inner, adts))
     if (inner := _bracket(t, "tuple")) is not None:
-        items = _commas(inner)
+        items = split_commas(inner)
         if len(items) == 2 and items[1] == "...":
-            return seq(_element(items[0], text, adts))
-        return seq(union(*(_element(i, text, adts) for i in items)), len(items))
+            return seq(parse_type(items[0], adts))
+        return seq(union(*(parse_type(i, adts) for i in items)), len(items))
     if t.replace(".", "_").isidentifier():
         return VALUE  # another Python object
     raise ValueError(f"{text!r} is not a parameter type")
-
-
-def _element(text: str, whole: object, adts: dict) -> Kind:
-    """A container's element kind; only `Int` and `Maybe[Int]` are admitted."""
-    kind = parse_type(text, adts)
-    if kind not in (INT, Kind("Maybe", item=INT)):
-        raise ValueError(f"{whole!r}: a sequence holds int or int | None, not {text}")
-    return kind
-
-
-def _commas(text: str) -> list[str]:
-    parts, depth, start = [], 0, 0
-    for i, c in enumerate(text):
-        depth += {"[": 1, "]": -1}.get(c, 0)
-        if c == "," and depth == 0:
-            parts.append(text[start:i].strip())
-            start = i + 1
-    return [*parts, text[start:].strip()]
 
 
 def parse_spec(text: str, adts: dict | None = None) -> Kind:
@@ -339,11 +338,11 @@ def comparable(a: Kind | None, b: Kind | None) -> bool:
     return False
 
 
-def _members(kind: Kind) -> tuple:
+def flat_members(kind: Kind) -> tuple:
     """`kind` flattened to its members: a `Maybe` contributes its payload's members and `None`."""
     if kind.tag == "Union":
-        return tuple(m for k in kind.members for m in _members(k))
-    return (*_members(kind.item), NONE) if kind.tag == "Maybe" else (kind,)
+        return tuple(m for k in kind.members for m in flat_members(k))
+    return (*flat_members(kind.item), NONE) if kind.tag == "Maybe" else (kind,)
 
 
 def _literal_tag(value) -> str:
@@ -355,14 +354,16 @@ def _literal_tag(value) -> str:
 
 
 def restrict(kind: Kind | None, values: frozenset) -> Kind | None:
-    """`kind` where it equals one of the literal `values`: the members some literal inhabits,
-    an enum or dtype set intersected with the strings."""
+    """`kind` where it equals one of the literal `values`.
+
+    The members some literal inhabits remain, an enum or dtype set intersected with the strings.
+    """
     if kind is None:
         return kind
     strings = frozenset(v for v in values if isinstance(v, str))
     tags = {_literal_tag(v) for v in values}
     kept = []
-    for m in _members(kind):
+    for m in flat_members(kind):
         if m.tag in ("Str", "DType"):
             named = _named(m)
             narrowed = strings if named is None else named & strings
@@ -374,12 +375,15 @@ def restrict(kind: Kind | None, values: frozenset) -> Kind | None:
 
 
 def exclude(kind: Kind | None, values: frozenset) -> Kind | None:
-    """`kind` where it equals none of the literal `values`: enum and dtype members lose those
-    strings, and a member left without values, or the `None` a `None` literal names, drops."""
+    """`kind` where it equals none of the literal `values`.
+
+    Enum and dtype members lose those strings, and a member left without values, or the `None`
+    a `None` literal names, drops.
+    """
     if kind is None:
         return kind
     kept = []
-    for m in _members(kind):
+    for m in flat_members(kind):
         if m.tag in ("Str", "DType") and _named(m) is not None:
             rest = _named(m) - values
             if rest:

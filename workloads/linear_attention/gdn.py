@@ -1,10 +1,35 @@
 import torch
 
 from workloads.device import run_device
-from workloads.linear_attention.input_values import _log_gates, _small, _step_sizes
+from workloads.linear_attention.common import (
+    in_call_order,
+    log_gates,
+    longest_first,
+    on_state_pool,
+    read_states,
+    sequences,
+    small,
+    step_sizes,
+    write_states,
+)
+from workloads.numerics import (
+    Custom,
+    assert_close,
+    assert_normalized_error,
+    assert_rounded,
+    zeroed_input,
+)
 from workloads.workload_base import CallWorkload, WorkloadBase
 
 __all__ = ["GDNFwdCall", "GDNFwdWorkload"]
+
+
+def _decay_parameters(a_log: torch.Tensor, dt_bias: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """``A_log`` and ``dt_bias`` shaped like *a_log* and *dt_bias*: log decay rates in
+    ``[1, 16]`` and inverse-softplus time steps in ``[1e-3, 0.1]``."""
+    rates = torch.empty_like(a_log).uniform_(1.0, 16.0)
+    steps = torch.empty_like(dt_bias).uniform_(1e-3, 0.1)
+    return rates.log(), steps.expm1().log()
 
 
 class GDNFwdWorkload(WorkloadBase):
@@ -100,12 +125,9 @@ class GDNFwdWorkload(WorkloadBase):
             else None
         )
         if self.raw_gate:
-            rates = torch.empty(
-                self.value_heads, device=run_device(), dtype=torch.float32
-            ).uniform_(1.0, 16.0)
-            steps = torch.empty(
-                self.value_heads, device=run_device(), dtype=torch.float32
-            ).uniform_(1e-3, 0.1)
+            a_log, dt_bias = _decay_parameters(
+                *(torch.empty(self.value_heads, device=run_device()) for _ in range(2))
+            )
             return (
                 q,
                 k,
@@ -115,8 +137,8 @@ class GDNFwdWorkload(WorkloadBase):
                 initial_state,
                 offsets,
                 None if offsets is None else offsets.cpu(),
-                rates.log(),
-                steps.expm1().log(),
+                a_log,
+                dt_bias,
             )
         if not packed:
             return (
@@ -168,48 +190,61 @@ class GDNFwdCall(CallWorkload):
     """A manifest call sharing the focused workload's FP32 recurrence and verification."""
 
     def gen_inputs(self):
-        q, k, v, g, beta, initial_state, cu_seqlens, cu_seqlens_cpu, a_log, dt_bias = (
+        q, k, v, g, beta, initial_state, cu_seqlens, cu_seqlens_cpu, a_log, dt_bias, *serving = (
             super().gen_inputs()
         )
         raw_gate = self.call.indices["use_gate_in_kernel"]
         if raw_gate:
-            # Log decay rates in [1, 16] and inverse-softplus time steps in [1e-3, 0.1].
-            a_log = torch.empty_like(a_log).uniform_(1.0, 16.0).log()
-            dt_bias = torch.empty_like(dt_bias).uniform_(1e-3, 0.1).expm1().log()
+            a_log, dt_bias = _decay_parameters(a_log, dt_bias)
         return (
-            _small(q),
-            _small(k),
-            _small(v),
-            g if raw_gate else _log_gates(g),
-            beta if self.call.indices["use_beta_sigmoid_in_kernel"] else _step_sizes(beta),
-            _small(initial_state, 0.01),
+            small(q),
+            small(k),
+            small(v),
+            g if raw_gate else log_gates(g),
+            beta if self.call.indices["use_beta_sigmoid_in_kernel"] else step_sizes(beta),
+            small(initial_state, 0.01),
             cu_seqlens,
             cu_seqlens_cpu,
             a_log,
             dt_bias,
+            *serving,
         )
 
     def ref_program(
-        self, q, k, v, g, beta, initial_state, cu_seqlens, cu_seqlens_cpu, a_log, dt_bias
+        self,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state,
+        cu_seqlens,
+        cu_seqlens_cpu,
+        a_log,
+        dt_bias,
+        state_indices=None,
+        num_accepted_tokens=None,
     ):
         p = self.call.indices
-        return gdn_ref(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            initial_state,
-            cu_seqlens,
-            cu_seqlens_cpu,
-            a_log,
-            dt_bias,
+        flags = dict(
             scale=p["scale"],
             raw_gate=p["use_gate_in_kernel"],
             beta_sigmoid=p["use_beta_sigmoid_in_kernel"],
             allow_neg_eigval=p["allow_neg_eigval"],
             l2norm=p["use_qk_l2norm_in_kernel"],
             state_v_first=p["state_v_first"],
+        )
+        if num_accepted_tokens is not None:
+            return gdn_rollback_ref(
+                q, k, v, g, beta, initial_state, cu_seqlens, cu_seqlens_cpu, a_log, dt_bias,
+                state_indices, num_accepted_tokens, **flags,
+            )  # fmt: skip
+        return on_state_pool(
+            lambda state: gdn_ref(
+                q, k, v, g, beta, state, cu_seqlens, cu_seqlens_cpu, a_log, dt_bias, **flags
+            ),
+            initial_state,
+            state_indices,
         )
 
     def verification(self, *inputs):
@@ -251,31 +286,16 @@ def gdn_ref(
     """
     scale = q.shape[-1] ** -0.5 if scale is None else scale
     group = v.shape[2] // q.shape[2]
-    if cu_seqlens is None:
-        rows = list(range(q.shape[0]))
-        starts, lengths = [0] * q.shape[0], [q.shape[1]] * q.shape[0]
-    else:
-        bounds = (cu_seqlens if cu_seqlens_cpu is None else cu_seqlens_cpu).tolist()
-        rows, starts = [0] * (len(bounds) - 1), bounds[:-1]
-        lengths = [end - start for start, end in zip(bounds[:-1], bounds[1:], strict=True)]
+    rows, starts, lengths = sequences(q, cu_seqlens, cu_seqlens_cpu)
     if raw_gate:
         g = -torch.exp(a_log) * torch.nn.functional.softplus(g.float() + dt_bias)
     if beta_sigmoid:
         beta = torch.sigmoid(beta.float()) * (2.0 if allow_neg_eigval else 1.0)
     longest = max(lengths, default=0)
     chunk, dtype = (1, torch.float32) if longest <= 1 else (64, torch.float64)
-    # Longest first, so the sequences still running at a step are a prefix.
-    order = sorted(range(len(lengths)), key=lambda sequence: -lengths[sequence])
-    row = torch.tensor([rows[s] for s in order], dtype=torch.long, device=q.device)
-    start = torch.tensor([starts[s] for s in order], dtype=torch.long, device=q.device)
-    length = torch.tensor([lengths[s] for s in order], dtype=torch.long, device=q.device)
-    if initial_state is None:
-        state = torch.zeros(
-            len(order), v.shape[2], q.shape[-1], v.shape[-1], dtype=dtype, device=q.device
-        )
-    else:
-        state = initial_state[order].to(dtype)
-        state = state.transpose(-1, -2).contiguous() if state_v_first else state
+    order, row, start, length, state = longest_first(
+        q, v, rows, starts, lengths, initial_state, state_v_first, dtype
+    )
     output = torch.empty_like(v)
     offset = torch.arange(chunk, device=q.device)
     inclusive = torch.ones(chunk, chunk, dtype=torch.bool, device=q.device).tril()
@@ -329,10 +349,51 @@ def gdn_ref(
             )
         state[:running] = live
         output[r.expand_as(t)[valid], t[valid]] = out[valid].to(q.dtype)
-    final = torch.empty_like(state)
-    final[order] = state
-    final = final.transpose(-1, -2) if state_v_first else final
-    return output, final.float()
+    return output, in_call_order(state, order, state_v_first)
+
+
+def gdn_rollback_ref(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    pool,
+    cu_seqlens,
+    cu_seqlens_cpu,
+    a_log,
+    dt_bias,
+    state_indices,
+    num_accepted_tokens,
+    **flags,
+):
+    """The verification of drafts on a state pool: sequence ``n`` starts from slot
+    ``state_indices[n, num_accepted_tokens[n] - 1]`` and the state after its token ``t`` goes
+    to slot ``state_indices[n, t]``; every other slot keeps its state. A slot of -1 is never
+    written, and a sequence starting from one writes none of its slots.
+
+    Each token is one FP32 step of :func:`gdn_ref`, all sequences still running stepping
+    together, so a sequence's tokens see the state exactly as one-token decode calls leave it.
+    """
+    rows, starts, lengths = sequences(q, cu_seqlens, cu_seqlens_cpu)
+    slots = state_indices.long()
+    first = slots[torch.arange(len(lengths), device=q.device), num_accepted_tokens.long() - 1]
+    state = read_states(pool, first)
+    slots = slots.masked_fill((first < 0)[:, None], -1)
+    pool = pool.clone()
+    output = torch.empty_like(v)
+    for t in range(max(lengths, default=0)):
+        live = [n for n, length in enumerate(lengths) if length > t]
+        n = torch.tensor(live, dtype=torch.long, device=q.device)
+        r = torch.tensor([rows[i] for i in live], dtype=torch.long, device=q.device)
+        c = torch.tensor([starts[i] + t for i in live], dtype=torch.long, device=q.device)
+        out, state[n] = gdn_ref(
+            *(x[r, c][:, None] for x in (q, k, v, g, beta)), state[n], None, None, a_log, dt_bias,
+            **flags,
+        )  # fmt: skip
+        output[r, c] = out[:, 0]
+        write_states(pool, slots[n, t], state[n])
+    return output, pool
 
 
 def gated_verification(
@@ -341,14 +402,6 @@ def gated_verification(
     l2norm=False,
     state_v_first=False,
 ):
-    from workloads.numerics import (
-        Custom,
-        assert_close,
-        assert_normalized_error,
-        assert_rounded,
-        zeroed_input,
-    )
-
     q = inputs[0]
     if q.shape[1] == 1:
         tol = 6e-7 if q.dtype == torch.float16 else 1e-7

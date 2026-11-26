@@ -177,12 +177,15 @@ def _dump_stack(pid: int, dump_path: Path) -> None:
     dump_path.write_text("py-spy dump failed:\n" + "\n".join(errors) + "\n")
 
 
-def _discover_bench_files(targets: list[str]) -> list[str]:
+def _discover_bench_files(targets: list[str], ignored: list[str] | None = None) -> list[str]:
     """Return bench_*.py files under targets by filesystem walk.
 
     Discovery must not import benchmark modules: a module-level crash or
     hang would take down the whole run before any isolation exists. A
     spawned file with nothing to run exits with pytest code 5 (skipped).
+
+    Ignored paths may name a file or a directory; directory ignores exclude
+    every benchmark nested under that path.
     """
     files: dict[str, None] = {}
     for target in targets:
@@ -194,7 +197,12 @@ def _discover_bench_files(targets: list[str]) -> list[str]:
                 files[str(f)] = None
         else:
             raise SystemExit(f"no such benchmark target: {target}")
-    return list(files)
+    ignored_paths = [Path(path).resolve() for path in ignored or ()]
+    return [
+        file
+        for file in files
+        if not any(Path(file).resolve().is_relative_to(path) for path in ignored_paths)
+    ]
 
 
 def _unrun_suite(rel: str) -> ET.Element:
@@ -292,6 +300,12 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--ignore",
+        action="append",
+        default=[],
+        help="skip a benchmark file or directory during discovery; repeatable",
+    )
+    parser.add_argument(
         "--progress-interval", type=float, default=30, help="seconds between live progress updates"
     )
     parser.add_argument("--dump-dir", default="bench_stack_dumps", help="stack dump directory")
@@ -325,7 +339,12 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="bench_runner_") as work:
         work_dir = Path(work)
-        bench_files = _discover_bench_files(args.targets)
+        missing_ignores = [path for path in args.ignore if not Path(path).exists()]
+        if missing_ignores:
+            raise SystemExit(f"ignored benchmark path(s) do not exist: {missing_ignores}")
+        bench_files = _discover_bench_files(args.targets, args.ignore)
+        for path in sorted(args.ignore):
+            print(f"ignoring benchmark target: {path}", flush=True)
         if not bench_files:
             raise SystemExit("no benchmark files found")
         print(f"discovered {len(bench_files)} benchmark files", flush=True)

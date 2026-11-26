@@ -1,5 +1,3 @@
-from typing import Optional
-
 import torch
 
 from tileops._kernels.attention.call_spec import AttentionCall, GQADenseFwdInterface
@@ -21,11 +19,20 @@ def _offsets(batch: int, length: int, device: torch.device) -> torch.Tensor:
     return torch.arange(batch + 1, device=device, dtype=torch.int32) * length
 
 
+def _qk_dtype(call: AttentionCall) -> torch.dtype:
+    """Q/K element type; rotated FP8 inputs stay 16-bit to avoid a second FP8 rounding."""
+    return call.dtype if not call.is_fp8 or call.fuse_rope else torch.float8_e4m3fn
+
+
 def _plan(call: AttentionCall):
     if call.is_fp8:
         config = {"block_m": 64, "block_n": 64, "num_stages": 1, "threads": 128}
         needed = fp8_prefill_shared_bytes(
-            config, batch=call.batch, dim=call.dim, element=call.dtype.itemsize
+            config,
+            batch=call.batch,
+            dim=call.dim,
+            element=call.dtype.itemsize,
+            qk_element=_qk_dtype(call).itemsize,
         )
         return config if needed <= call.smem_budget else None
     return prefill_default_config(
@@ -34,16 +41,16 @@ def _plan(call: AttentionCall):
 
 
 class GQADensePrefillFwdKernel(Kernel, GQADenseFwdInterface):
-    """Dense SM89 prefill using the existing packed attention program."""
+    """Dense SM89 prefill on the packed varlen prefill programs, one sequence a batch entry."""
 
     supported_archs = [89]
 
     @classmethod
-    def refusal(cls, call: AttentionCall) -> Optional[str]:
+    def refusal(cls, call: AttentionCall) -> str | None:
         if call.return_lse:
             return "does not return the log-sum-exp"
-        if call.has_sinks:
-            return "attention sinks require SM90"
+        if call.has_sinks and call.is_fp8:
+            return "FP8 attention sinks require SM90"
         if call.max_seqlen_q == 1:
             return "serves prefill"
         if call.is_fp8 and call.dim != 128:
@@ -75,14 +82,24 @@ class GQADensePrefillFwdKernel(Kernel, GQADenseFwdInterface):
             call.max_position,
             call.rotary_dim,
             call.rope_layout,
+            call.has_sinks,
             call.device,
         )
         return identity, lambda: cls(call)
 
     def __init__(self, call: AttentionCall) -> None:
-        super().__init__(device_index=call.device.index if call.device is not None else None)
+        super().__init__(device_index=call.device_index)
         self.call = call
         self.dtype = call.dtype
+        # The packed ABI keeps this input even when sink arithmetic is disabled.
+        self._unused_sinks = (
+            torch.empty(
+                call.heads, dtype=torch.float32, device=torch.device("cuda", self.device_index)
+            )
+            if not call.has_sinks
+            else None
+        )
+        self.qk_dtype = _qk_dtype(call)
         builder = _gqa_varlen_fp8_fwd_kernel if call.is_fp8 else _gqa_prefill_varlen_fwd_kernel
         self.kernel = builder(
             call.batch,
@@ -95,6 +112,8 @@ class GQADensePrefillFwdKernel(Kernel, GQADenseFwdInterface):
             self.dtype_str,
             call.window_size_left,
             call.window_size_right,
+            **({"has_sinks": True} if call.has_sinks else {}),
+            **({"qk_dtype": str(self.qk_dtype).split(".")[-1]} if call.is_fp8 else {}),
         )
         self.rope = make_dense_qk_rope_preprocessor(
             batch=call.batch,
@@ -105,21 +124,20 @@ class GQADensePrefillFwdKernel(Kernel, GQADenseFwdInterface):
             dim=call.dim,
             dtype="float8_e4m3fn" if call.is_fp8 else self.dtype_str,
             rope_dtype=self.dtype_str,
+            out_dtype=self.dtype_str if call.is_fp8 else None,
             **call.rope_args,
         )
         self.init_config(None)
 
     @property
     def default_config(self) -> dict:
-        call = self.call
-        plan = _plan(call)
+        plan = _plan(self.call)
         if plan is None:
             raise ValueError("no prefill tile fits the device shared-memory budget")
         return plan
 
     @property
     def autotune_configs(self) -> list[dict]:
-        # Keep the admitted one-stage plan until other configurations are measured.
         return [self.default_config]
 
     @property
@@ -127,14 +145,20 @@ class GQADensePrefillFwdKernel(Kernel, GQADenseFwdInterface):
         call = self.call
 
         def supply(params):
-            if len(params) != (8 if call.is_fp8 else 5):
+            if len(params) != (9 if call.is_fp8 else 6):
                 raise ValueError("unexpected dense prefill program input count")
             q_shape = (call.batch * call.max_seqlen_q, call.heads, call.dim)
             kv_shape = (call.batch * call.seqlen_kv, call.heads_kv, call.dim)
             input_dtype = torch.float8_e4m3fn if call.is_fp8 else call.dtype
             tensors = [
-                torch.randn(shape, dtype=call.dtype, device=call.device).to(input_dtype)
-                for shape in (q_shape, kv_shape, kv_shape)
+                torch.randn(shape, dtype=call.dtype, device=call.device).to(dtype)
+                for shape, dtype in zip(
+                    (q_shape, kv_shape, kv_shape),
+                    (self.qk_dtype, self.qk_dtype, input_dtype)
+                    if call.is_fp8
+                    else (call.dtype,) * 3,
+                    strict=True,
+                )
             ]
             tensors += [
                 _offsets(call.batch, call.max_seqlen_q, call.device),
@@ -145,6 +169,10 @@ class GQADensePrefillFwdKernel(Kernel, GQADenseFwdInterface):
                     torch.ones((call.batch, call.heads_kv), device=call.device, dtype=torch.float32)
                     for _ in range(3)
                 ]
+            if call.has_sinks:
+                tensors.append(torch.randn(call.heads, device=call.device, dtype=torch.float32))
+            else:
+                tensors.append(self._unused_sinks)
             return tensors
 
         return supply
@@ -154,12 +182,12 @@ class GQADensePrefillFwdKernel(Kernel, GQADenseFwdInterface):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        q_scale: Optional[torch.Tensor] = None,
-        k_scale: Optional[torch.Tensor] = None,
-        v_scale: Optional[torch.Tensor] = None,
-        rope_cos: Optional[torch.Tensor] = None,
-        rope_sin: Optional[torch.Tensor] = None,
-        sinks: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+        rope_cos: torch.Tensor | None = None,
+        rope_sin: torch.Tensor | None = None,
+        sinks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         attention, rope = self.program(self._compile)
         if rope is not None:
@@ -175,6 +203,7 @@ class GQADensePrefillFwdKernel(Kernel, GQADenseFwdInterface):
         ]
         if self.call.is_fp8:
             inputs += [q_scale, k_scale, v_scale]
+        inputs.append(sinks if self.call.has_sinks else self._unused_sinks)
         output = attention(*inputs)
         return output.reshape_as(q)
 

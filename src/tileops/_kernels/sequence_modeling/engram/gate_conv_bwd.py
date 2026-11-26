@@ -14,27 +14,26 @@ Staged design:
     Pass 2:  Gate bwd -> RMSNorm(H) bwd, RMSNorm(k) bwd -> dH, dk, dv
 """
 
-from typing import Optional
-
 import tilelang
 import tilelang.language as T
 import torch
 import torch.nn.functional as F
 
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.kernel_base import Entry, Kernel
 from tileops._kernels.sequence_modeling.engram.call_spec import (
     CONV_KERNEL_SIZE,
     EngramGateConvBwdInterface,
     EngramGateConvCall,
 )
+from tileops._kernels.sequence_modeling.engram.gate_conv_fwd import causal_conv
 from tileops._kernels.tiling import ALIGNMENT, align_up
 
 __all__ = ["EngramGateConvBwdKernel"]
 
 
 @target_cache(maxsize=32)
-def _engram_gate_conv_bwd_kernel(M, seq_len, d, eps, dtype, run_len):
+def _engram_gate_conv_bwd_kernel(M, seq_len, d, dtype, run_len):
     accum_dtype = "float"
     d_padded = align_up(d, ALIGNMENT)
     KS = CONV_KERNEL_SIZE
@@ -43,11 +42,11 @@ def _engram_gate_conv_bwd_kernel(M, seq_len, d, eps, dtype, run_len):
 
     @tilelang.jit(
         out_idx=[12, 13, 14, 15, 16, 17, 18, 19],
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
     )
     def _func(threads):
-        @T.macro
-        def _gate_conv_bwd(
+        @T.prim_func
+        def main(
             dY: T.Tensor((M, seq_len, d_padded), dtype),
             H: T.Tensor((M, seq_len, d_padded), dtype),
             k: T.Tensor((M, seq_len, d_padded), dtype),
@@ -88,24 +87,8 @@ def _engram_gate_conv_bwd_kernel(M, seq_len, d, eps, dtype, run_len):
                 for j in T.Parallel(d_padded):
                     dy_local[j] = T.cast(dY[bid, tid, j], accum_dtype)
 
-                # Recompute conv_out (same as forward pass 2)
-                for j in T.Parallel(d_padded):
-                    conv_out[j] = 0.0
-                for p in T.serial(KS):
-                    src_t = tid - (KS - 1) + p
-                    for j in T.Parallel(d_padded):
-                        raw_val = T.if_then_else(
-                            src_t >= 0,
-                            T.cast(vhat[bid, src_t, j], accum_dtype),
-                            0.0,
-                        )
-                        src_rrms = T.if_then_else(
-                            src_t >= 0,
-                            rrms_v[bid, src_t],
-                            0.0,
-                        )
-                        normed = raw_val * src_rrms * T.cast(rms_w_v[j], accum_dtype)
-                        conv_out[j] += T.cast(conv_w[p, j], accum_dtype) * normed
+                # The forward pass does not save conv_out, so it is recomputed.
+                causal_conv(conv_out, vhat, rrms_v, rms_w_v, conv_w, bid, tid, d_padded)
 
                 # Y = SiLU(conv_out) + vhat
                 # d_silu = dY * silu'(conv_out)
@@ -113,7 +96,6 @@ def _engram_gate_conv_bwd_kernel(M, seq_len, d, eps, dtype, run_len):
                     sig = 1.0 / (1.0 + T.exp(-conv_out[j]))
                     d_silu[j] = dy_local[j] * (sig + conv_out[j] * sig * (1.0 - sig))
 
-                # Store d_silu for conv transpose in pass 1b
                 for j in T.Parallel(d_padded):
                     dvhat_buf[bid, tid, j] = d_silu[j]
 
@@ -162,7 +144,6 @@ def _engram_gate_conv_bwd_kernel(M, seq_len, d, eps, dtype, run_len):
                 bid = by
                 tid = bx
 
-                # Conv transpose
                 for j in T.Parallel(d_padded):
                     d_vnorm[j] = 0.0
                 for p in T.serial(KS):
@@ -200,7 +181,7 @@ def _engram_gate_conv_bwd_kernel(M, seq_len, d, eps, dtype, run_len):
                         j
                     ] - rrms_v_val * rrms_v_val * rrms_v_val * vhat_local[j] * dot_sum[0] / float(d)
 
-                # Add residual gradient from SiLU bypass (dY)
+                # Residual gradient from the SiLU bypass.
                 for j in T.Parallel(d_padded):
                     dvhat_local[j] += T.cast(dY[bid, tid, j], accum_dtype)
 
@@ -297,97 +278,37 @@ def _engram_gate_conv_bwd_kernel(M, seq_len, d, eps, dtype, run_len):
                     dk[bid, tid, j] = T.cast(dk_local[j], dtype)
                     dv[bid, tid, j] = T.cast(dv_local[j], dtype)
 
-        @T.prim_func
-        def main(
-            dY: T.Tensor((M, seq_len, d_padded), dtype),
-            H: T.Tensor((M, seq_len, d_padded), dtype),
-            k: T.Tensor((M, seq_len, d_padded), dtype),
-            v: T.Tensor((M, seq_len, d_padded), dtype),
-            rms_w_h: T.Tensor((d_padded,), dtype),
-            rms_w_v: T.Tensor((d_padded,), dtype),
-            conv_w: T.Tensor((KS, d_padded), dtype),
-            vhat: T.Tensor((M, seq_len, d_padded), dtype),
-            alpha: T.Tensor((M, seq_len), accum_dtype),
-            rrms_h: T.Tensor((M, seq_len), accum_dtype),
-            rrms_k: T.Tensor((M, seq_len), accum_dtype),
-            rrms_v: T.Tensor((M, seq_len), accum_dtype),
-            dH: T.Tensor((M, seq_len, d_padded), dtype),
-            dk: T.Tensor((M, seq_len, d_padded), dtype),
-            dv: T.Tensor((M, seq_len, d_padded), dtype),
-            drms_w_h: T.Tensor((d_padded,), accum_dtype),
-            drms_w_v: T.Tensor((d_padded,), accum_dtype),
-            dconv_w: T.Tensor((KS, d_padded), accum_dtype),
-            dvhat_buf: T.Tensor((M, seq_len, d_padded), accum_dtype),
-            dvhat_out: T.Tensor((M, seq_len, d_padded), accum_dtype),
-        ):
-            _gate_conv_bwd(
-                dY,
-                H,
-                k,
-                v,
-                rms_w_h,
-                rms_w_v,
-                conv_w,
-                vhat,
-                alpha,
-                rrms_h,
-                rrms_k,
-                rrms_v,
-                dH,
-                dk,
-                dv,
-                drms_w_h,
-                drms_w_v,
-                dconv_w,
-                dvhat_buf,
-                dvhat_out,
-            )
-
         return main
 
     return _func
 
 
 class EngramGateConvBwdKernel(Kernel, EngramGateConvBwdInterface):
-    """Engram GateConv backward kernel.
-
-    Staged backward:
-      Pass 1:  SiLU bwd -> d_silu buffer
-      Pass 1a: dconv_w reduction, split into runs of tokens
-      Pass 1b: Conv transpose + RMSNorm(vhat) bwd -> d(vhat)
-      Pass 2:  Gate bwd -> dH, dk, dv + drms_w_h accumulation
-    """
+    """Engram GateConv backward kernel; the module docstring lists its passes."""
 
     supported_archs: list[int] = [80, 86, 89, 90]
 
     @classmethod
     def entry_for(cls, call: EngramGateConvCall) -> Entry:
-        return call, lambda: cls(
-            call.m, call.seq_len, call.d, call.eps, call.dtype, sm_count=call.sm_count
-        )
+        return call, lambda: cls(call.m, call.seq_len, call.d, call.dtype, sm_count=call.sm_count)
 
     def __init__(
         self,
         M: int,
         seq_len: int,
         d: int,
-        eps: float,
         dtype: torch.dtype,
         sm_count: int,
-        config: Optional[dict] = None,
+        config: dict | None = None,
     ):
         super().__init__()
-        self.M = M
-        self.seq_len = seq_len
         self.d = d
-        self.eps = eps
         self.dtype = dtype
         self.d_padded = align_up(d, ALIGNMENT)
         self.kernel = _engram_gate_conv_bwd_kernel(
             M,
             seq_len,
             d,
-            eps,
             self.dtype_str,
             self._run_len(M * seq_len, sm_count),
         )
@@ -401,8 +322,7 @@ class EngramGateConvBwdKernel(Kernel, EngramGateConvBwdInterface):
         the reduction launches at most 4 CTAs per SM. The run length is
         ``ceil(tokens / target)``; the reduction launches ``ceil(tokens / run_len)`` runs,
         the last of which may be shorter, and none is empty. A run of about 8 rows
-        spreads the d-wide atomic add that ends each CTA over the rows it reads. Both numbers are fitted on H200 over 8 to 65536 tokens;
-        re-measure both to move them.
+        spreads the d-wide atomic add that ends each CTA over the rows it reads.
         """
         target_run = 8
         ctas_per_sm = 4
@@ -436,27 +356,7 @@ class EngramGateConvBwdKernel(Kernel, EngramGateConvBwdInterface):
         rrms_k: torch.Tensor,
         rrms_v: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
-        """Run the fused gate + conv backward pass.
-
-        Args:
-            dY: Gradient of the output, shape $[M \\times seq\\_len \\times d]$.
-            H: Hidden states of shape $[M \\times seq\\_len \\times d]$.
-            k: Key projection of shape $[M \\times seq\\_len \\times d]$.
-            v: Value projection of shape $[M \\times seq\\_len \\times d]$.
-            rms_w_h: RMSNorm weight of shape $[d]$ for ``H`` and ``k``.
-            rms_w_v: RMSNorm weight of shape $[d]$ for the gated value.
-            conv_w: Depthwise conv weights of shape $[4 \\times d]$.
-            vhat: Gated value saved by the forward pass, ``(M, seq_len, d)``.
-            alpha: Scalar gate saved by the forward pass, ``(M, seq_len)``.
-            rrms_h: Reciprocal RMS of ``H``, shape $[M \\times seq\\_len]$.
-            rrms_k: Reciprocal RMS of ``k``, shape $[M \\times seq\\_len]$.
-            rrms_v: Reciprocal RMS of ``vhat``, shape $[M \\times seq\\_len]$.
-
-        Returns:
-            ``(dH, dk, dv, drms_w_h, drms_w_v, dconv_w)``, trimmed to ``d``.
-            The staging buffers the prim_func writes are internal and are not
-            returned.
-        """
+        """Run the fused gate + conv backward pass; outputs are trimmed to ``d``."""
         pad = self.d_padded - self.d
         if pad:
             dY = F.pad(dY, (0, pad))

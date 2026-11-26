@@ -5,8 +5,6 @@ A contiguous ``[batch, seq_len, heads, dim]`` tensor is the same bytes as a pack
 equal-length call with a ragged ``seq_len`` is a packed call and runs the same four passes.
 """
 
-from typing import Optional
-
 import tilelang
 import tilelang.language as T
 import torch
@@ -403,6 +401,41 @@ def gla_varlen_causal_kernel(
     return _fn
 
 
+@T.macro
+def stage_chunk_operands(q, v, g_cumsum, causal, q_gated, values, weights, start, end, i_h):
+    """Stage a chunk's gated query, its values and its causal weights for the output
+    contractions; rows past the sequence's *end* repeat its last row."""
+    # The query and its gate are read into the gated query and not staged: each is read
+    # once, and the two tiles they would occupy bound the block's shared footprint.
+    for i, d in T.Parallel(CHUNK_TOKENS, q_gated.shape[1]):
+        q_gated[i, d] = T.cast(
+            T.cast(q[0, T.min(start + i, end - 1), i_h, d], "float32")
+            * T.exp2(g_cumsum[0, T.min(start + i, end - 1), i_h, d] * LOG2E),
+            q_gated.dtype,
+        )
+    for i, d in T.Parallel(CHUNK_TOKENS, values.shape[1]):
+        values[i, d] = v[0, T.min(start + i, end - 1), i_h, d]
+    # The causal pass launches only the sub-block pairs at or below the diagonal, so the
+    # product above the diagonal is read as the zero it is.
+    for i, j in T.Parallel(CHUNK_TOKENS, CHUNK_TOKENS):
+        weights[i, j] = T.if_then_else(
+            j <= i, causal[0, T.min(start + i, end - 1), i_h, j], T.cast(0, weights.dtype)
+        )
+
+
+@T.macro
+def contract_chunk(q_gated, state, weights, values, acc, o, start, end, i_h, scale):
+    """Store ``scale * q_gated @ state + weights @ values`` for the chunk's rows before *end*."""
+    T.fill(acc, 0.0)
+    T.gemm(q_gated, state, acc)
+    for i, j in T.Parallel(CHUNK_TOKENS, values.shape[1]):
+        acc[i, j] *= scale
+    T.gemm(weights, values, acc)
+    for i, j in T.Parallel(CHUNK_TOKENS, values.shape[1]):
+        if start + i < end:
+            o[0, start + i, i_h, j] = T.cast(acc[i, j], o.dtype)
+
+
 @target_cache(maxsize=32)
 def gla_varlen_output_kernel(
     total_tokens: int,
@@ -447,33 +480,12 @@ def gla_varlen_output_kernel(
                     start = T.cast(cu_seqlens[seq[0]], "int32") + first[0]
                     end = T.cast(cu_seqlens[seq[0] + 1], "int32")
 
-                    # The query and its gate are read into the gated query and not staged:
-                    # each is read once, and the two tiles they would occupy are what holds
-                    # this block's shared footprint to one that keeps three blocks resident.
-                    for i, d in T.Parallel(CHUNK_TOKENS, dim_k):
-                        q_gated[i, d] = T.cast(
-                            T.cast(q[0, T.min(start + i, end - 1), i_h, d], "float32")
-                            * T.exp2(g_cumsum[0, T.min(start + i, end - 1), i_h, d] * LOG2E),
-                            dtype,
-                        )
-                    for i, d in T.Parallel(CHUNK_TOKENS, dim_v):
-                        values[i, d] = v[0, T.min(start + i, end - 1), i_h, d]
-                    # The causal pass launches only the sub-block pairs at or below the
-                    # diagonal, so the product above the diagonal is read as the zero it is.
-                    for i, j in T.Parallel(CHUNK_TOKENS, CHUNK_TOKENS):
-                        weights[i, j] = T.if_then_else(
-                            j <= i, causal[0, T.min(start + i, end - 1), i_h, j], T.cast(0, dtype)
-                        )
+                    stage_chunk_operands(
+                        q, v, g_cumsum, causal, q_gated, values, weights, start, end, i_h
+                    )
                     for d, j in T.Parallel(dim_k, dim_v):
                         state[d, j] = chunk_state[chunk, i_h, d, j]
-                    T.fill(acc, 0.0)
-                    T.gemm(q_gated, state, acc)
-                    for i, j in T.Parallel(CHUNK_TOKENS, dim_v):
-                        acc[i, j] *= scale
-                    T.gemm(weights, values, acc)
-                    for i, j in T.Parallel(CHUNK_TOKENS, dim_v):
-                        if start + i < end:
-                            o[0, start + i, i_h, j] = T.cast(acc[i, j], dtype)
+                    contract_chunk(q_gated, state, weights, values, acc, o, start, end, i_h, scale)
 
         return _main
 
@@ -492,18 +504,18 @@ class GLAVarlenPrefillFwdKernel(Kernel, GLAFwdInterface):
     # Threads per block. The state walk and the causal product run two warps: their GEMMs
     # tile a 16-wide operand, which a wider block cannot partition into whole warps. The
     # gate accumulation and the output contractions run eight, which is what their
-    # full-width tiles fill. Re-fit by timing the manifest rows at 64, 128 and 256.
+    # full-width tiles fill.
     _state_threads = 64
     _wide_threads = 256
 
     # Chunks the state walk prefetches ahead. The walk is serial, so without them every
     # chunk's product waits on its own loads; the depth only pays once the loop body holds
-    # no branch, which is why the sequence's last chunk is taken outside it. Re-fit with the
-    # manifest rows over 2 to 6; more stages cost shared memory the state tile also needs.
+    # no branch, which is why the sequence's last chunk is taken outside it. More stages cost
+    # shared memory the state tile also needs.
     _state_stages = 4
 
     @classmethod
-    def refusal(cls, call: GLACall) -> Optional[str]:
+    def refusal(cls, call: GLACall) -> str | None:
         """Either the call is packed, or its rows are equal-length and not a whole chunk.
 
         The two are the same work once the rows are read as one packed sequence each.
@@ -532,9 +544,7 @@ class GLAVarlenPrefillFwdKernel(Kernel, GLAFwdInterface):
         # then reads only its own key channels and its own slice of the float32 gate, and
         # nothing is read twice. The value axis is split once more, which halves the tile a
         # prefetch stage stages and so raises how many blocks stay resident at the walk's
-        # prefetch depth; splitting it further reads the keys and the gate again per slice
-        # and measures worse. Re-fit by timing the manifest rows over the pairs that keep
-        # both slices at or above the GEMM's minimum operand extent.
+        # prefetch depth; splitting it further reads the keys and the gate again per slice.
         return dim_k // GEMM_MIN_N, 2 if dim_v // 2 >= GEMM_MIN_N else 1
 
     @classmethod
@@ -578,7 +588,7 @@ class GLAVarlenPrefillFwdKernel(Kernel, GLAFwdInterface):
         scale: float,
         dtype: torch.dtype,
         has_initial_state: bool = False,
-        device_index: Optional[int] = None,
+        device_index: int | None = None,
     ) -> None:
         self.has_initial_state = has_initial_state
         super().__init__(device_index=device_index)
@@ -630,9 +640,9 @@ class GLAVarlenPrefillFwdKernel(Kernel, GLAFwdInterface):
         k: torch.Tensor,
         v: torch.Tensor,
         g: torch.Tensor,
-        initial_state: Optional[torch.Tensor] = None,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        cu_seqlens_cpu: Optional[torch.Tensor] = None,
+        initial_state: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # The offsets are read on the device, so the host copy is never needed.
         del cu_seqlens_cpu

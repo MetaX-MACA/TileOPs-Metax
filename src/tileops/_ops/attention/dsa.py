@@ -1,4 +1,5 @@
-from typing import ClassVar, Mapping, Optional
+from collections.abc import Mapping
+from typing import ClassVar
 
 import torch
 
@@ -7,6 +8,7 @@ from tileops._kernels.attention import (
     DSADecodeKernel,
     DSADecodeWSKernel,
     DSAPagedClusterKernel,
+    DSAPagedMMAKernel,
     DSAPagedWSKernel,
 )
 from tileops._kernels.attention.call_spec import (
@@ -15,7 +17,6 @@ from tileops._kernels.attention.call_spec import (
     DSAPagedFwdInterface,
     SparseMLADecodeFwdInterface,
 )
-from tileops._kernels.attention.dsa.paged_mma import DSAPagedMMAKernel
 from tileops._kernels.kernel_base import Kernel, KernelInterface
 from tileops._ops.op_base import Op
 from tileops._perf.profile import tensor_core_roof
@@ -32,13 +33,18 @@ class DSADenseFwdOp(Op):
 
     The layout of the operation is BSHD.
 
-    The in-tree kernels serve causal calls with a power-of-two value dimension
-    and a zero or power-of-two tail dimension, subject to shared-memory limits.
+    With ``is_causal`` false only the indices select keys, and -1 pads; ``attn_sink`` adds
+    ``exp(attn_sink[h])`` to head ``h``'s softmax denominator.
+
+    On SM90 the in-tree kernels serve a value dimension of 512 with a tail of 0 or 64 and a
+    multiple of 64 heads per kv head, with or without the causal mask and ``attn_sink``.
+    Otherwise they serve causal calls without ``attn_sink``, with a power-of-two value
+    dimension and a zero or power-of-two tail dimension, subject to shared-memory limits.
     """
 
-    # The WGMMA warp-specialized kernels serve SM90 -- the seesaw kernel value dim 512,
-    # the older one the other widths it covers; the architecture-agnostic basic kernel
-    # serves everywhere else. Selection reads the device when a call arrives.
+    # On SM90 DSADecodeWSKernel serves value dim 512 and DSADecodeKernel the other widths it
+    # covers; DSADecodeBasicKernel serves every other architecture. Selection reads the
+    # device when a call arrives.
     kernel_types: ClassVar[Mapping[str, type[Kernel]]] = {
         "dsa_decode_ws_kernel": DSADecodeWSKernel,
         "dsa_decode_kernel": DSADecodeKernel,
@@ -63,7 +69,7 @@ class DSADenseFwdOp(Op):
         dim_tail: int,
         stride_kv: int,
         q_start_index_s: int,
-        sm_scale: Optional[float] = None,
+        sm_scale: float | None = None,
         is_causal: bool = True,
         *,
         target: Target = None,
@@ -74,12 +80,12 @@ class DSADenseFwdOp(Op):
             dim_tail (int): The dimension of the tail portion of the attention vectors.
             stride_kv (int): The stride for the key-value sequence.
             q_start_index_s (int): The start index for queries in the sequence.
-            sm_scale (Optional[float], default=None): Scaling factor for the softmax
+            sm_scale (float | None, default=None): Scaling factor for the softmax
                 function; ``None`` means ``(D + dim_tail) ** -0.5``, the query-key head
                 dimension including the tail.
-            is_causal (bool, default=True): Whether the attention is causal. The
-                ``indices`` already name the keys each query attends to, and the in-tree
-                kernels serve only causal calls, so the default stays ``True``.
+            is_causal (bool, default=True): Whether an index past the query's position
+                selects nothing. ``False`` lets the indices alone select keys, as
+                ``flash_mla_sparse_fwd`` does.
             target: Which set of kernels serves this op — a target name, ``BUILTIN``
                 for the in-tree kernels, or ``None`` to decide from the input device.
         """
@@ -87,38 +93,17 @@ class DSADenseFwdOp(Op):
         self.stride_kv = stride_kv
         self.sm_scale = sm_scale
         self.is_causal = is_causal
-
-        cp0 = q_start_index_s == 0
         self.q_start_index_s = q_start_index_s
-
-        self._cp0 = cp0
         super().__init__(target=target)
 
-    def _dsa_decode_call(
-        self, q: torch.Tensor, kv: torch.Tensor, indices: torch.Tensor
-    ) -> DSADecodeCall:
-        """State what one call is, for selection to filter against."""
-        batch, seq_len, heads, q_dim = q.shape
-        _, seq_len_kv, heads_kv, _ = kv.shape
-        return DSADecodeCall(
-            batch=batch,
-            seq_len=seq_len,
-            seq_len_kv=seq_len_kv,
-            heads=heads,
-            dim=q_dim - self.dim_tail,
-            tail_dim=self.dim_tail,
-            dtype=q.dtype,
-            topk=indices.shape[3],
-            kv_stride=self.stride_kv,
-            q_start_index_s=self.q_start_index_s,
-            kv_group=heads_kv,
-            sm_scale=self.sm_scale,
-            is_causal=self.is_causal,
-            cp0=self._cp0,
-            device=q.device,
-        )
-
-    def forward(self, q: torch.Tensor, kv: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        indices: torch.Tensor,
+        *,
+        attn_sink: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         Performs the forward pass of the sparse attention operation.
 
@@ -128,14 +113,35 @@ class DSADenseFwdOp(Op):
             kv (torch.Tensor): The key-value tensor with shape
                         (batch, seq_len_kv, heads_kv, dim + dim_tail).
             indices (torch.Tensor): Indices tensor for sparse attention.
+            attn_sink (torch.Tensor | None): ``float32`` logits (heads,) that join each
+                head's softmax denominator.
 
         Returns:
             torch.Tensor: The result of applying the sparse attention
                             operation on the input tensors.
         """
-        inputs = (q, kv, indices)
-        kernel = self.kernel_for("dsa_decode", lambda: self._dsa_decode_call(q, kv, indices))
-        return kernel(*inputs)
+        batch, seq_len, heads, q_dim = q.shape
+        kernel = self.kernel_for(
+            "dsa_decode",
+            lambda: DSADecodeCall(
+                batch=batch,
+                seq_len=seq_len,
+                seq_len_kv=kv.shape[1],
+                heads=heads,
+                dim=q_dim - self.dim_tail,
+                tail_dim=self.dim_tail,
+                dtype=q.dtype,
+                topk=indices.shape[3],
+                kv_stride=self.stride_kv,
+                q_start_index_s=self.q_start_index_s,
+                kv_group=kv.shape[2],
+                sm_scale=self.sm_scale,
+                is_causal=self.is_causal,
+                has_attn_sink=attn_sink is not None,
+                device=q.device,
+            ),
+        )
+        return kernel(q, kv, indices, attn_sink)
 
     def roof_key(self) -> str:
         """FLOPs are matmul contractions; priced on tensor cores."""
@@ -143,19 +149,23 @@ class DSADenseFwdOp(Op):
 
 
 class DSAPagedFwdOp(Op):
-    """DeepSeek Sparse Attention (DSA) decode over a paged FP8 latent cache.
+    """DeepSeek Sparse Attention (DSA) decode over a paged latent cache.
 
     Each query row attends to the cache positions ``indices`` names, resolved through the
-    request's ``block_table`` page by page. A cache row is FlashMLA's DeepSeek-V3.2 FP8
-    layout: 512 float8_e4m3fn latent values, one float32 scale per 128 of them, then 64
-    bfloat16 rope values. The key is the dequantized latent and the rope; the value is the
-    dequantized latent. A position of -1, or at or past ``cache_seqlens``, is dead.
+    request's ``block_table`` page by page. A ``uint8`` cache row is FlashMLA's
+    DeepSeek-V3.2 FP8 layout: 512 float8_e4m3fn latent values, one float32 scale per 128 of
+    them, then 64 bfloat16 rope values. The key is the dequantized latent and the rope; the
+    value is the dequantized latent. A ``bfloat16`` cache row holds the key, ``q``'s width:
+    the value is its first ``head_dim_v`` columns. A position of -1, or at or past
+    ``cache_seqlens``, is dead. ``attn_sink`` adds ``exp(attn_sink[h])`` to head ``h``'s
+    softmax denominator and leaves ``lse`` unchanged.
 
     The kernel rounds the dequantized key and the softmax weights to bfloat16 before their
     matmuls, which accumulate in float32. ``lse`` is the natural-log sum of exponentials of
     the scaled scores; a row with no live position returns zeros and ``lse`` -inf.
-    Serves SM89 and SM90, 64 or a multiple of 64 heads, ``topk`` a multiple of 64, and a cache
-    below 2^32 bytes.
+    Serves a multiple of 64 heads and a cache below 2^32 bytes: the FP8 cache without
+    ``attn_sink`` and ``topk`` a multiple of 64 on SM89 and SM90, and bfloat16 rows of 512
+    value columns and 0 or 64 more key columns, with any ``topk``, on SM90.
     """
 
     kernel_types: ClassVar[Mapping[str, type[Kernel]]] = {
@@ -165,16 +175,20 @@ class DSAPagedFwdOp(Op):
     }
     interfaces: ClassVar[Mapping[str, type[KernelInterface]]] = {"dsa_paged": DSAPagedFwdInterface}
 
-    def __init__(self, sm_scale: Optional[float] = None, *, target: Target = None) -> None:
+    def __init__(
+        self, sm_scale: float | None = None, head_dim_v: int = 512, *, target: Target = None
+    ) -> None:
         """Build the op. Shapes are taken from each call.
 
         Args:
-            sm_scale: Scale of the query-key scores; ``None`` means ``576 ** -0.5``, the
-                query-key head dimension (512 latent plus 64 rope columns).
+            sm_scale: Scale of the query-key scores; ``None`` means ``q``'s width to the power
+                -0.5, 576 for the FP8 row.
+            head_dim_v: The value width, the leading columns of the key; 512 for the FP8 row.
             target: Which set of kernels serves this op -- a target name, ``BUILTIN``
                 for the in-tree kernels, or ``None`` to decide from the input device.
         """
         self.sm_scale = sm_scale
+        self.head_dim_v = head_dim_v
         super().__init__(target=target)
 
     def forward(
@@ -184,21 +198,26 @@ class DSAPagedFwdOp(Op):
         block_table: torch.Tensor,
         cache_seqlens: torch.Tensor,
         indices: torch.Tensor,
+        *,
+        attn_sink: torch.Tensor | None = None,
     ) -> "tuple[torch.Tensor, torch.Tensor]":
         """Attend each query row to the cache rows its positions resolve to.
 
         Args:
-            q: ``bfloat16`` ``(batch, seq_len, heads, 576)``.
-            kv_cache: ``uint8`` ``(num_pages, page_size, 656)`` FP8 latent rows.
+            q: ``bfloat16`` ``(batch, seq_len, heads, dk)``.
+            kv_cache: ``uint8`` ``(num_pages, page_size, 656)`` FP8 latent rows, or
+                ``bfloat16`` ``(num_pages, page_size, dk)`` rows.
             block_table: ``int32`` ``(batch, table_width)`` page of each page slot.
             cache_seqlens: ``int32`` ``(batch,)`` cache length of each request.
             indices: ``int32`` ``(batch, seq_len, topk)`` positions; -1 pads.
+            attn_sink: ``float32`` ``(heads,)`` logits that join each head's softmax
+                denominator.
 
         Returns:
-            ``(o, lse)``: ``bfloat16`` ``(batch, seq_len, heads, 512)`` and ``float32``
+            ``(o, lse)``: ``bfloat16`` ``(batch, seq_len, heads, head_dim_v)`` and ``float32``
             ``(batch, heads, seq_len)``, the head-major layout flash-attn returns.
         """
-        batch, seq_len, heads, _ = q.shape
+        batch, seq_len, heads, q_dim = q.shape
         return self.kernel_for(
             "dsa_paged",
             lambda: DSAPagedCall(
@@ -208,9 +227,13 @@ class DSAPagedFwdOp(Op):
                 topk=indices.shape[-1],
                 page_size=kv_cache.shape[1],
                 sm_scale=self.sm_scale,
+                dim=self.head_dim_v,
+                dim_tail=q_dim - self.head_dim_v,
+                cache_dtype=kv_cache.dtype,
+                has_attn_sink=attn_sink is not None,
                 device=q.device,
             ),
-        )(q, kv_cache, block_table, cache_seqlens, indices)
+        )(q, kv_cache, block_table, cache_seqlens, indices, attn_sink)
 
     def roof_key(self) -> str:
         """FLOPs are bfloat16 matmul contractions; priced on tensor cores."""

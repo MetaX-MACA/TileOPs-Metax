@@ -47,7 +47,10 @@ MAX_BLOCK_THREADS: int = 1024
 # Blocks one thread-block cluster may hold without opting in to a non-portable size.
 MAX_PORTABLE_CLUSTER_BLOCKS: int = 8
 
-# Blocks a grid may hold along y or along z; x runs to 2**31 - 1.
+# Blocks a grid may hold along x.
+MAX_GRID_X_BLOCKS: int = 2**31 - 1
+
+# Blocks a grid may hold along y or along z.
 MAX_GRID_YZ_BLOCKS: int = 65535
 
 # Blocks one SM may hold resident at once, by architecture.
@@ -65,13 +68,6 @@ LOG2E: float = 1.4426950408889634
 # as exp(a) * exp(-a) holds only while both factors are representable, and bfloat16 runs to
 # 2**127; the margin leaves room for the operands the factors scale.
 BF16_SPLIT_EXP2_SPAN: float = 120.0
-
-# 1/sqrt(2), for the erf form of GELU: 0.5 * x * (1 + erf(x / sqrt(2))).
-INV_SQRT2: float = 0.7071067811865476
-
-# sqrt(2/pi) and the cubic coefficient of torch's tanh-approximate GELU.
-SQRT_2_OVER_PI: float = 0.7978845608028654
-GELU_TANH_COEFF: float = 0.044715
 
 # Largest finite float8_e4m3fn value; quantizers clamp to +-FP8_E4M3_MAX.
 FP8_E4M3_MAX: float = 448.0

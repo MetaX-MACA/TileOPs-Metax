@@ -9,8 +9,9 @@ from __future__ import annotations
 import threading
 import traceback
 import warnings
+from collections.abc import Callable
 from importlib.metadata import entry_points
-from typing import Callable, NamedTuple
+from typing import NamedTuple
 
 from tileops.backend._errors import BackendError
 from tileops.backend._protocol import BuildKernel, DetectFn, ReadDeviceFacts, Target
@@ -68,9 +69,10 @@ def register_kernel_builder(op: str, target: str, build_kernel: BuildKernel) -> 
     Args:
         op: The op's manifest key, e.g. ``"RMSNormFwdOp"``.
         target: The name this backend gives its set of kernels.
-        build_kernel: Called with a `.protocol.TensorSpec` per input and the op's
-            params by keyword. Must be lazy: importing this module must not compile anything.
-            An exception it raises reaches the op's caller unchanged.
+        build_kernel: Called with a description per input — a `.protocol.TensorSpec`, a
+            tuple of them for a tensor sequence, a call-time scalar's type, or ``None`` — and
+            the op's params by keyword. Must be lazy: importing this module must not compile
+            anything. An exception it raises reaches the op's caller unchanged.
 
     Raises:
         BackendError: *op* is not a key of this TileOPs' manifest, so no op would ever ask
@@ -129,8 +131,8 @@ def register_device_facts(device_type: str, read: ReadDeviceFacts) -> None:
 
     The facts describe the hardware, not a set of kernels, so they are registered per
     device type rather than per target: every implementation on that device type reads the
-    same ones, through ``supported_archs`` and the call spec's ``arch``, ``calibration``,
-    ``sm_count`` and ``smem_budget``. A device type nobody registers reports none.
+    same ones, through ``supported_archs`` and the call spec's ``arch``, ``sm_count`` and
+    ``smem_budget``. A device type nobody registers reports none.
 
     Args:
         device_type: A torch device type other than ``cuda``.

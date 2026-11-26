@@ -1,7 +1,8 @@
 """Gather ragged rows from a caller-owned paged cache."""
 
 import math
-from typing import ClassVar, Mapping, Optional
+from collections.abc import Mapping
+from typing import ClassVar
 
 import torch
 
@@ -9,6 +10,7 @@ from tileops._kernels.attention.paged_cache_gather import (
     PagedKVCacheGatherCall,
     PagedKVCacheGatherFwdInterface,
     PagedKVCacheGatherKernel,
+    PagedKVCacheGatherShortKernel,
 )
 from tileops._kernels.kernel_base import Kernel, KernelInterface
 from tileops._ops.op_base import Op
@@ -24,12 +26,14 @@ class PagedKVCacheGatherFwdOp(Op):
     dtype. A non-contiguous destination uses a contiguous staging buffer and a copy back
     into the caller's view; its previous contents are never read.
 
-    The caller guarantees well-formed ``cu_seqlens``, or passes ``validate_inputs=True``, which
-    checks it on the CPU on every call.
+    The caller guarantees well-formed ``cu_seqlens`` and in-range ``block_table`` and
+    ``seq_starts``, or passes ``validate_inputs=True``, which checks them on the CPU on every
+    call.
     """
 
     kernel_types: ClassVar[Mapping[str, type[Kernel]]] = {
-        "paged_cache_gather_kernel": PagedKVCacheGatherKernel
+        "paged_cache_gather_kernel": PagedKVCacheGatherKernel,
+        "paged_cache_gather_short_kernel": PagedKVCacheGatherShortKernel,
     }
     interfaces: ClassVar[Mapping[str, type[KernelInterface]]] = {
         "paged_cache_gather": PagedKVCacheGatherFwdInterface
@@ -37,7 +41,7 @@ class PagedKVCacheGatherFwdOp(Op):
 
     def __init__(
         self,
-        out_dtype: Optional[torch.dtype] = None,
+        out_dtype: torch.dtype | None = None,
         *,
         validate_inputs: bool = False,
         target: Target = None,
@@ -46,8 +50,10 @@ class PagedKVCacheGatherFwdOp(Op):
 
         Args:
             out_dtype: Destination dtype for FP8 dequantization; otherwise the cache dtype.
-            validate_inputs: Check on the CPU that ``cu_seqlens`` starts at 0, never decreases
-                and ends at ``out``'s row count.
+            validate_inputs: Check on the CPU that ``cu_seqlens`` starts at 0, never decreases,
+                ends at ``out``'s row count and holds no sequence longer than the tokens a
+                ``block_table`` row's pages hold, and that ``block_table`` and ``seq_starts``
+                lie in their manifest ranges.
             target: Backend target, or None to resolve from the input device.
         """
         self.out_dtype = out_dtype
@@ -59,8 +65,8 @@ class PagedKVCacheGatherFwdOp(Op):
         kv_cache: torch.Tensor,
         block_table: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        seq_starts: Optional[torch.Tensor] = None,
-        kv_scale: Optional[torch.Tensor] = None,
+        seq_starts: torch.Tensor | None = None,
+        kv_scale: torch.Tensor | None = None,
         *,
         out: torch.Tensor,
     ) -> torch.Tensor:
@@ -89,6 +95,7 @@ class PagedKVCacheGatherFwdOp(Op):
             "paged_cache_gather",
             lambda: PagedKVCacheGatherCall(
                 batch=block_table.shape[0],
+                total_tokens=out.shape[0],
                 num_pages=kv_cache.shape[0],
                 page_size=kv_cache.shape[1],
                 table_width=block_table.shape[1],

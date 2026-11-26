@@ -17,10 +17,6 @@ from benchmarks.baselines import (
 from tileops._utils import is_maca
 from tileops.quantization import INT8QuantPerTensorFwdOp
 
-# Autotuning is a bench-run policy, not a workload property; manifest
-# workloads do not carry it.
-_TUNE = True
-
 
 def _vllm_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """vllm's static per-tensor ``scaled_int8_quant``, given the scale the reference derives.
@@ -49,8 +45,7 @@ def test_int8_quant_per_tensor_bench(case) -> None:
         )
         return
     op = INT8QuantPerTensorFwdOp(**case.arguments)
-    if _TUNE:
-        op.request_tune()
+    op.request_tune()
     bench.Runner(op, case).compare(
         {
             VLLM_TAG: _vllm_quant,

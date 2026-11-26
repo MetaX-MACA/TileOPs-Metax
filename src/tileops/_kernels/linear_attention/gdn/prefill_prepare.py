@@ -8,15 +8,17 @@ import tilelang.language as T
 import torch
 import tvm.tirx as tirx
 
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.constants import LOG2E
 from tileops._kernels.grouped_tiling import GroupTiling
 from tileops._kernels.linear_attention.gdn.prefill_common import (
     INVERSE_BLOCK,
     L2NORM_EPS,
     block_inverse_macro,
+    softplus,
     step_size,
 )
+from tileops._kernels.state_pool import state_row
 
 
 @target_cache(maxsize=32)
@@ -34,20 +36,14 @@ def prefill_chunk_local_cumsum_bthd_tl(
     Adjacent cumulative gates are subtracted before exponentiation; rounding them to
     the input dtype loses precision in those differences and the recurrent state.
 
-    A contiguous ``[batch, seq_len, head]`` gate is the same bytes as a packed
-    ``[1, batch * seq_len, head]`` one whose offsets step by ``seq_len``, so an equal-length
-    call is a packed call and runs this kernel too. The grid covers the most chunks the
-    offsets can describe and a block past the count they give retires at once, which is what
-    keeps the launch extent out of the offsets' values.
+    An equal-length call runs as a packed call whose offsets step by ``seq_len``. The grid
+    covers the most chunks the offsets can describe; a block past their count retires at once.
 
     With *gate_in_kernel*, ``g`` carries the raw gate and the log-space decay
-    ``-exp(A_log) * softplus(g + dt_bias)`` is formed here, inside the pass that already
-    reads every gate value and writes it back, so the transform moves no extra bytes.
+    ``-exp(A_log) * softplus(g + dt_bias)`` is formed here.
     """
     tiling = GroupTiling(num_sequences, chunk_size)
     num_chunks = tiling.tile_upper_bound(total_tokens)
-    # Above this, softplus is the identity to float32 precision; torch's default.
-    softplus_threshold = 20.0
     # The staged chunk dominates the block's shared memory; the tile holds it at 16 KiB
     # for a 64-row chunk whatever the head count.
     head_tile = min(head, 64)
@@ -58,7 +54,7 @@ def prefill_chunk_local_cumsum_bthd_tl(
         pass_configs={
             tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
         },
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
     )
     def _func(threads: int = 128):
         @T.macro
@@ -104,9 +100,7 @@ def prefill_chunk_local_cumsum_bthd_tl(
                         )
                         if gate_in_kernel:
                             biased = raw + shift_s[hid]
-                            chunk_s[i, hid] = rate_s[hid] * T.if_then_else(
-                                biased > softplus_threshold, biased, T.log1p(T.exp(biased))
-                            )
+                            chunk_s[i, hid] = rate_s[hid] * softplus(biased)
                         else:
                             chunk_s[i, hid] = raw
 
@@ -226,7 +220,7 @@ def prefill_blocksolve_A_bthd_tl(
         pass_configs={
             tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
         },
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
     )
     def _func(threads=32):
         @T.prim_func
@@ -651,7 +645,7 @@ def prefill_solve_warpgroup_tl(
     @tilelang.jit(
         out_idx=[],
         pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
     )
     def _func():
         @T.prim_func
@@ -915,9 +909,11 @@ def _build_correct_h0_kernel(
     use_raw_h0,
     state_v_first: bool = False,
     block_DV: int = 32,
+    pooled: bool = False,
 ):
     cp_batch_size = T.dynamic("cp_batch_size")
     raw_batch_size = T.dynamic("raw_batch_size")
+    pool_size = T.dynamic("pool_size")
     # Under a value-major state this accumulator holds the transpose, like the recurrence's.
     # The warmup pass writes ht_buffer and mt_buffer key-major either way, so a value-major
     # build transposes ht_buffer as it stages it.
@@ -926,16 +922,13 @@ def _build_correct_h0_kernel(
 
     @T.macro
     def kernel_body(
-        bb,
         bh,
         bv,
         seq_start_idx,
-        seq_end_idx,
         num_iters,
         ht_buffer,
         mt_buffer,
         fallback_mask,
-        seq_map_r2c,
         cp_h0,
         h_fragment,
     ):
@@ -982,7 +975,69 @@ def _build_correct_h0_kernel(
                     ],
                 )
 
-    if use_raw_h0:
+    @T.macro
+    def start_from_raw(raw_h0, slots, ht_buffer, mt_buffer, fallback_mask, seq_map_r2c, cp_h0):
+        with T.Kernel(T.ceildiv(DV, block_DV) * H * raw_batch_size, threads=128) as (bbhv,):
+            bbh, bv = (
+                bbhv // T.ceildiv(DV, block_DV),
+                bbhv % T.ceildiv(DV, block_DV),
+            )
+            bb, bh = bbh // H, bbh % H
+
+            seq_start_idx = seq_map_r2c[bb]
+            seq_end_idx = seq_map_r2c[bb + 1]
+            num_iters = seq_end_idx - seq_start_idx
+
+            h_fragment = T.alloc_fragment((state_rows, state_cols), dtype=accum_dtype)
+            # The loop never writes the partition a sequence starts on, and a
+            # fragment-to-global T.copy before it is dropped — the fragment's
+            # layout comes from how the loop consumes it. Hence a plain store.
+            if state_v_first:
+                T.copy(
+                    raw_h0[state_row(slots, bb), bh, bv * block_DV : (bv + 1) * block_DV, 0:DK],
+                    h_fragment,
+                )
+                for iv, ik in T.Parallel(block_DV, DK):
+                    cp_h0[seq_start_idx, bh, bv * block_DV + iv, ik] = raw_h0[
+                        state_row(slots, bb), bh, bv * block_DV + iv, ik
+                    ]
+            else:
+                T.copy(
+                    raw_h0[state_row(slots, bb), bh, 0:DK, bv * block_DV : (bv + 1) * block_DV],
+                    h_fragment,
+                )
+                for ik, iv in T.Parallel(DK, block_DV):
+                    cp_h0[seq_start_idx, bh, ik, bv * block_DV + iv] = raw_h0[
+                        state_row(slots, bb), bh, ik, bv * block_DV + iv
+                    ]
+
+            kernel_body(
+                bh,
+                bv,
+                seq_start_idx,
+                num_iters,
+                ht_buffer,
+                mt_buffer,
+                fallback_mask,
+                cp_h0,
+                h_fragment,
+            )
+
+    if use_raw_h0 and pooled:
+
+        @T.prim_func
+        def correct_h0_kernel(
+            raw_h0: T.Tensor([pool_size, H, *state_axes], dtype=res_dtype),
+            slots: T.Tensor([raw_batch_size], dtype="int32"),
+            ht_buffer: T.Tensor([cp_batch_size, H, DK, DV], dtype=buffer_dtype),
+            mt_buffer: T.Tensor([cp_batch_size, H, DK, DK], dtype=buffer_dtype),
+            fallback_mask: T.Tensor([cp_batch_size, H], dtype=mask_dtype),
+            seq_map_r2c: T.Tensor([raw_batch_size + 1], dtype=seqlen_dtype),
+            cp_h0: T.Tensor([cp_batch_size, H, *state_axes], dtype=res_dtype),
+        ):
+            start_from_raw(raw_h0, slots, ht_buffer, mt_buffer, fallback_mask, seq_map_r2c, cp_h0)
+
+    elif use_raw_h0:
 
         @T.prim_func
         def correct_h0_kernel(
@@ -993,54 +1048,7 @@ def _build_correct_h0_kernel(
             seq_map_r2c: T.Tensor([raw_batch_size + 1], dtype=seqlen_dtype),
             cp_h0: T.Tensor([cp_batch_size, H, *state_axes], dtype=res_dtype),
         ):
-            with T.Kernel(T.ceildiv(DV, block_DV) * H * raw_batch_size, threads=128) as (bbhv,):
-                bbh, bv = (
-                    bbhv // T.ceildiv(DV, block_DV),
-                    bbhv % T.ceildiv(DV, block_DV),
-                )
-                bb, bh = bbh // H, bbh % H
-
-                seq_start_idx = seq_map_r2c[bb]
-                seq_end_idx = seq_map_r2c[bb + 1]
-                num_iters = seq_end_idx - seq_start_idx
-
-                h_fragment = T.alloc_fragment((state_rows, state_cols), dtype=accum_dtype)
-                # The loop never writes the partition a sequence starts on, and a
-                # fragment-to-global T.copy before it is dropped — the fragment's
-                # layout comes from how the loop consumes it. Hence a plain store.
-                if state_v_first:
-                    T.copy(
-                        raw_h0[bb, bh, bv * block_DV : (bv + 1) * block_DV, 0:DK],
-                        h_fragment,
-                    )
-                    for iv, ik in T.Parallel(block_DV, DK):
-                        cp_h0[seq_start_idx, bh, bv * block_DV + iv, ik] = raw_h0[
-                            bb, bh, bv * block_DV + iv, ik
-                        ]
-                else:
-                    T.copy(
-                        raw_h0[bb, bh, 0:DK, bv * block_DV : (bv + 1) * block_DV],
-                        h_fragment,
-                    )
-                    for ik, iv in T.Parallel(DK, block_DV):
-                        cp_h0[seq_start_idx, bh, ik, bv * block_DV + iv] = raw_h0[
-                            bb, bh, ik, bv * block_DV + iv
-                        ]
-
-                kernel_body(
-                    bb,
-                    bh,
-                    bv,
-                    seq_start_idx,
-                    seq_end_idx,
-                    num_iters,
-                    ht_buffer,
-                    mt_buffer,
-                    fallback_mask,
-                    seq_map_r2c,
-                    cp_h0,
-                    h_fragment,
-                )
+            start_from_raw(raw_h0, None, ht_buffer, mt_buffer, fallback_mask, seq_map_r2c, cp_h0)
 
     else:
 
@@ -1074,16 +1082,13 @@ def _build_correct_h0_kernel(
                         cp_h0[seq_start_idx, bh, ik, bv * block_DV + iv] = 0.0
 
                 kernel_body(
-                    bb,
                     bh,
                     bv,
                     seq_start_idx,
-                    seq_end_idx,
                     num_iters,
                     ht_buffer,
                     mt_buffer,
                     fallback_mask,
-                    seq_map_r2c,
                     cp_h0,
                     h_fragment,
                 )
@@ -1092,11 +1097,20 @@ def _build_correct_h0_kernel(
 
 
 def correct_initial_states_program(
-    heads, dim, res_dtype, buffer_dtype, seqlen_dtype, mask_dtype, use_raw_h0, state_v_first
+    heads,
+    dim,
+    res_dtype,
+    buffer_dtype,
+    seqlen_dtype,
+    mask_dtype,
+    use_raw_h0,
+    state_v_first,
+    pooled=False,
 ):
     """The program :func:`correct_initial_states` launches.
 
-    *res_dtype* is the dtype of the raw initial state, or float32 without one.
+    *res_dtype* is the dtype of the raw initial state, or float32 without one. Under *pooled*
+    each sequence's raw state is its slot of a state pool.
     """
     assert dim in (64, 128)
     return _build_correct_h0_kernel(
@@ -1110,6 +1124,7 @@ def correct_initial_states_program(
         mask_dtype=mask_dtype,
         use_raw_h0=use_raw_h0,
         state_v_first=state_v_first,
+        pooled=pooled,
     )
 
 
@@ -1121,6 +1136,7 @@ def correct_initial_states(
     fallback_mask: torch.Tensor,  # [cp_batch_size, num_v_heads]
     seq_map_r2c: torch.Tensor,  # [raw_batch_size + 1]
     state_v_first: bool = False,
+    state_indices: torch.Tensor | None = None,  # [raw_batch_size], the slots of raw_h0
 ):
     cp_batch_size = fallback_mask.shape[0]
     _, num_heads, k_head_dim, v_head_dim = ht_buffer.shape
@@ -1134,8 +1150,10 @@ def correct_initial_states(
         device=ht_buffer.device,
     )
     if raw_h0 is not None:
+        slots = () if state_indices is None else (state_indices,)
         program(
             raw_h0,
+            *slots,
             ht_buffer,
             mt_buffer,
             fallback_mask,
@@ -1159,7 +1177,7 @@ def correct_initial_states(
     pass_configs={
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
     },
-    compile_flags=["-O3", "-DENABLE_BF16"],
+    compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
 )
 def _build_prepare_h_kernel(
     H,

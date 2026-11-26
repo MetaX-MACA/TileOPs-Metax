@@ -16,7 +16,8 @@ import importlib
 import importlib.abc
 import importlib.util
 import sys
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import pytest
 import torch
@@ -50,6 +51,7 @@ __all__ = [
     "private_inputs",
     "quack_op",
     "vllm_op",
+    "vllm_state_lines",
 ]
 
 QUACK_TAG = "quack"
@@ -187,7 +189,7 @@ def _claim_registry_before_flaggems() -> None:
     In the other order the process aborts: flag_gems claims schemas that vllm's
     ``_moe_C`` then re-defines, and the failed ``aoti_torch_library_def`` throws
     through a C++ static initializer, past any ``except``. Costs the vllm import
-    (5.9s, measured in the runner image) in every process that reaches flag_gems.
+    in every process that reaches flag_gems.
     """
     with contextlib.suppress(ImportError):
         importlib.import_module("vllm._custom_ops")
@@ -281,13 +283,22 @@ def quack_op(name: str, module: str = "quack") -> Callable:
     return _resolve(module, name, "quack")
 
 
+# The runner image's only DeepGEMM is the copy vllm's wheel vendors.
+DEEPGEMM_MODULE = "vllm.third_party.deep_gemm"
+
+
+def deepgemm_module() -> Any:
+    """Import DeepGEMM as the runner image carries it."""
+    return baseline_module(DEEPGEMM_MODULE, "deepgemm")
+
+
 def deepgemm_op(name: str) -> Callable:
-    """Return the ``deep_gemm`` entry point *name*.
+    """Return the DeepGEMM entry point *name*.
 
     Its GEMMs write into a caller-allocated output and return ``None``, so an adapter
     allocates before it calls.
     """
-    return _resolve("deep_gemm", name, "deepgemm")
+    return _resolve(DEEPGEMM_MODULE, name, "deepgemm")
 
 
 def deepspeed_op(name: str) -> Any:
@@ -346,10 +357,11 @@ def backward_of(output: torch.Tensor) -> Any:
     return getattr(node, "apply", None) or node
 
 
-def private_inputs(run: Callable, inputs: tuple, *positions: int) -> Implementation:
+def private_inputs(run: Callable, inputs: tuple, *positions: int, **kwargs: Any) -> Implementation:
     """*run* on *inputs*, with the ones at *positions* replaced by copies it may overwrite.
 
     The copies are restored from *inputs* before every round, outside the timed call.
+    *kwargs* go to the :class:`Implementation`.
     """
     args = list(inputs)
     owned = [i for i in positions if inputs[i] is not None]
@@ -360,7 +372,19 @@ def private_inputs(run: Callable, inputs: tuple, *positions: int) -> Implementat
         for i in owned:
             args[i].copy_(inputs[i])
 
-    return Implementation(run=run, args=tuple(args), reset=reset)
+    return Implementation(run=run, args=tuple(args), reset=reset, **kwargs)
+
+
+def vllm_state_lines(pool: torch.Tensor, slots: torch.Tensor):
+    """vLLM's cache lines for *pool*, the line of each of *slots*, and the reset that loads
+    the pool into them. vLLM skips cache line 0, its null block, so pool slot i is line i + 1.
+    """
+    lines = torch.empty((pool.shape[0] + 1, *pool.shape[1:]), dtype=pool.dtype, device=pool.device)
+
+    def reset() -> None:
+        lines[1:].copy_(pool)
+
+    return lines, slots + 1, reset
 
 
 def private_float32_logits(

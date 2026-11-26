@@ -12,7 +12,7 @@ shared memory. :class:`FusedAddRMSNormPerTokenQuantStreamKernel` serves the rows
 hold: it reads a row's inputs once per reduction and once to write the codes.
 """
 
-from typing import Optional
+import operator
 
 import tilelang
 import tilelang.language as T
@@ -20,15 +20,21 @@ import torch
 
 from tileops._csrc import csrc_include
 from tileops._kernels.build_target import target_cache
-from tileops._kernels.constants import VECTOR_ACCESS_BYTES
+from tileops._kernels.constants import (
+    FP8_E4M3_MAX,
+    MAX_PORTABLE_CLUSTER_BLOCKS,
+    VECTOR_ACCESS_BYTES,
+)
 from tileops._kernels.kernel_base import Entry, Kernel
+from tileops._kernels.norm._config import pairwise_sum
 from tileops._kernels.norm.call_spec import (
     FusedAddRMSNormPerTokenQuantFwdInterface,
     RMSNormQuantCall,
 )
 from tileops._kernels.streaming_load import load16, load16_evict_last
 from tileops._kernels.tiling import align_up
-from tileops._utils import WARP_LANES, get_sm_count, get_sm_version
+from tileops._kernels.warp_reduce import warp_reduce
+from tileops._utils import WARP_LANES
 
 __all__ = ["FusedAddRMSNormPerTokenQuantKernel", "FusedAddRMSNormPerTokenQuantStreamKernel"]
 
@@ -38,7 +44,7 @@ def _vec(n: int) -> int:
     return next(v for v in (VECTOR_ACCESS_BYTES // 2, 4, 2, 1) if n % v == 0)
 
 
-def _held_cluster(n: int, rows: int, arch: int, sm_count: int) -> Optional[int]:
+def _held_cluster(n: int, rows: int, arch: int, sm_count: int) -> int | None:
     """CTAs a row is split across in registers, or ``None`` when no cluster holds it.
 
     A row of more than 8192 elements splits on SM90 into the widest power-of-two cluster,
@@ -51,7 +57,7 @@ def _held_cluster(n: int, rows: int, arch: int, sm_count: int) -> Optional[int]:
     # registers a thread has there; more spill.
     max_held = 32768
     vec = _vec(n)
-    max_cluster = 8 if arch >= 90 else 1
+    max_cluster = MAX_PORTABLE_CLUSTER_BLOCKS if arch >= 90 else 1
 
     def divides(cluster):
         return n % (cluster * vec) == 0
@@ -75,13 +81,10 @@ def _held_cluster(n: int, rows: int, arch: int, sm_count: int) -> Optional[int]:
     return cluster
 
 
-def _pairwise_sum(part, row, count):
-    """``part[row, :count]`` summed as a pairwise tree."""
-    terms = [part[row, i] for i in range(count)]
-    while len(terms) > 1:
-        pairs = [terms[i] + terms[i + 1] for i in range(0, len(terms) - 1, 2)]
-        terms = pairs + terms[len(pairs) * 2 :]
-    return terms[0]
+def _row_sum(part, row, count):
+    """``part[row, :count]`` summed pairwise; a plain function, so the macro calling it does
+    not parse the comprehension as a TIR loop."""
+    return pairwise_sum([part[row, i] for i in range(count)])
 
 
 def _pair(buf, at):
@@ -89,13 +92,13 @@ def _pair(buf, at):
     return buf[T.Ramp(at, 1, 2)]
 
 
-def _constants(dtype, quant_dtype, scale_ub):
+def _constants(quant_dtype, scale_ub):
     """``(fp8, qmax, min_scale, bound)`` of a code dtype and amax bound."""
     fp8 = quant_dtype == "float8_e4m3fn"
     # vLLM's floor on a row's scale, so an all-zero row divides by a positive number.
-    min_scale = 1.0 / (448.0 * 512.0) if fp8 else float(torch.finfo(torch.float32).eps)
+    min_scale = 1.0 / (FP8_E4M3_MAX * 512.0) if fp8 else float(torch.finfo(torch.float32).eps)
     bound = float("inf") if scale_ub is None else scale_ub
-    return fp8, 448.0 if fp8 else 127.0, min_scale, bound
+    return fp8, FP8_E4M3_MAX if fp8 else 127.0, min_scale, bound
 
 
 @T.macro
@@ -168,7 +171,7 @@ def _codes(y, at, wide, codes, inv_scale, vec, quant_dtype, fp8, nan_clamp):
     if fp8:
         if nan_clamp:
             for i in T.vectorized(vec):
-                wide[i] = T.min(wide[i], T.float32(448.0))
+                wide[i] = T.min(wide[i], T.float32(FP8_E4M3_MAX))
         # Saturates finite values and infinities to +-448.
         for i in T.vectorized(vec):
             codes[i] = T.cast(wide[i], quant_dtype)
@@ -191,8 +194,7 @@ def _codes(y, at, wide, codes, inv_scale, vec, quant_dtype, fp8, nan_clamp):
 def _warp_sum(acc):
     """``acc[0] + acc[1]`` summed over the warp into ``acc[0]`` of every lane."""
     acc[0] += acc[1]
-    for k in T.unroll(WARP_LANES.bit_length() - 1):
-        acc[0] += T.shfl_xor(acc[0], T.shift_left(1, k))
+    warp_reduce(acc, operator.add)
 
 
 @T.macro
@@ -202,7 +204,7 @@ def _block_sum(acc, part, tx, warps):
         if tx % WARP_LANES == 0:
             part[0, tx // WARP_LANES] = acc[0]
         T.sync_threads()
-        acc[0] = _pairwise_sum(part, 0, warps)
+        acc[0] = _row_sum(part, 0, warps)
 
 
 @T.macro
@@ -230,7 +232,7 @@ def _fused_add_rms_norm_quant_kernel(M, N, eps, dtype, quant_dtype, scale_ub, ve
     The tensors are viewed as ``(M * cluster, N // cluster)``, one CTA a row of the view.
     ``vec`` divides a CTA's share; an access past the share's end is skipped whole.
     """
-    fp8, qmax, min_scale, bound = _constants(dtype, quant_dtype, scale_ub)
+    fp8, qmax, min_scale, bound = _constants(quant_dtype, scale_ub)
     chunk = N // cluster
 
     @tilelang.jit(
@@ -381,7 +383,7 @@ def _fused_add_rms_norm_quant_stream_kernel(M, N, eps, dtype, quant_dtype, scale
     absolute maximum, the third writes the codes, walking the tiles back from the row's end
     so the tiles read last are read first, while they are likeliest in L2.
     """
-    fp8, qmax, min_scale, bound = _constants(dtype, quant_dtype, scale_ub)
+    fp8, qmax, min_scale, bound = _constants(quant_dtype, scale_ub)
 
     @tilelang.jit(out_idx=[3, 4, 5], compile_flags=csrc_include("streaming_load.h"))
     def _func(threads, accesses):
@@ -496,8 +498,8 @@ class _FusedAddRMSNormPerTokenQuantBase(Kernel, FusedAddRMSNormPerTokenQuantFwdI
         eps: float,
         dtype: torch.dtype,
         quant_dtype: torch.dtype,
-        scale_ub: Optional[float],
-        config: Optional[dict] = None,
+        scale_ub: float | None,
+        config: dict | None = None,
     ):
         """Build for a hidden size, the storage and code dtypes and the amax bound.
 
@@ -581,8 +583,9 @@ class FusedAddRMSNormPerTokenQuantKernel(_FusedAddRMSNormPerTokenQuantBase):
         """
         self._require_devices(x=x, residual=residual, weight=weight)
         m = x.shape[0]
-        sm_count = get_sm_count(x.device.index)
-        cluster = _held_cluster(self.N, m, get_sm_version(x.device.index), sm_count)
+        target = self.build_target
+        sm_count = target.sm_count
+        cluster = _held_cluster(self.N, m, target.arch, sm_count)
         chunk = self.N // cluster
         q, scale, residual_out = self.program(self._compile, m, cluster, sm_count)(
             x.reshape(m * cluster, chunk),

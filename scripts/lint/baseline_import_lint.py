@@ -14,7 +14,7 @@ import ast
 import sys
 from pathlib import Path
 
-from common import files, relative, report
+from common import lint_files, relative
 
 SCANNED = ("benchmarks",)
 EXEMPT = {"benchmarks/baselines.py"}
@@ -30,7 +30,6 @@ LIBRARIES = frozenset(
         "flash_attn",
         "flash_attn_interface",
         "flashinfer",
-        "mamba_ssm",
         "nvidia",
         "nvmath",
         "quack",
@@ -65,7 +64,7 @@ def file_findings(path: Path) -> list[str]:
 
 
 def main(argv: list[str]) -> int:
-    return report(e for p in files(argv, SCANNED, (".py",)) for e in file_findings(p))
+    return lint_files(argv, __doc__, SCANNED, (".py",), file_findings)
 
 
 if __name__ == "__main__":

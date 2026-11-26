@@ -5,10 +5,11 @@ import pytest
 import torch
 from _pytest.outcomes import XFailed
 
+# Imported for its side effect: arming the guard that keeps flag_gems from
+# reaching torch's op registry before vllm. See benchmarks.baselines.
 import benchmarks.baselines  # noqa: F401
-
-# Imported for its side effect: arm the FlagGems/vLLM import-order guard before test modules load.
 from benchmarks import api
+from benchmarks.outcomes import UNAVAILABLE_PROPERTY
 from benchmarks.report import BenchmarkReport, _bench_results
 from benchmarks.timing import events_fallback_allowed, set_events_fallback_allowed
 from benchmarks.xfail_whitelist import MACA_XFAIL_PREFIXES, MACA_XFAILS
@@ -93,16 +94,17 @@ def _emit(item, tag: str, entry: dict) -> None:
 
     Generic over the keys: a measurement added to the benchmark layer reaches
     the XML, and the consumers that parse `<tag>_<metric>`, without a change
-    here. Hand-listing them is how the report came to publish a quantity the
-    benchmark had stopped comparing.
+    here.
     """
+    # What a row carries besides its measurements.
+    not_a_measurement = {"tag", "op", "op_module", "ops", "params", "kernel_config", "result"}
     measurements = {
         **entry["result"],
         "unverified": (entry.get("params") or {}).get("unverified"),
         "no_ratio": (entry.get("params") or {}).get("no_ratio"),
     }
     for key, value in measurements.items():
-        if key in _NOT_A_MEASUREMENT or value is None:
+        if key in not_a_measurement or value is None:
             continue
         item.user_properties.append((f"{tag}_{key}", _prop(value)))
 
@@ -127,11 +129,18 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="Run correctness warmup only, omitting timing. Normal benchmarks also verify "
         "before sampling.",
     )
+    parser.addoption(
+        "--tileops-nightly",
+        action="store_true",
+        help="Run the manifest calls the nightly sweep times, and time a reference ten "
+        "times slower than a baseline once.",
+    )
 
 
 # The settings in force before configure, put back at unconfigure.
 _OUTER_EVENTS_FALLBACK = pytest.StashKey[bool]()
 _OUTER_VERIFYING = pytest.StashKey[bool]()
+_OUTER_NIGHTLY = pytest.StashKey[bool]()
 
 
 def pytest_configure(config):
@@ -150,6 +159,8 @@ def pytest_configure(config):
     config.stash[_OUTER_EVENTS_FALLBACK] = events_fallback_allowed()
     config.stash[_OUTER_VERIFYING] = api.verifying()
     api.set_verifying(config.getoption("--tileops-verify"))
+    config.stash[_OUTER_NIGHTLY] = api.nightly()
+    api.set_nightly(config.getoption("--tileops-nightly"))
     set_events_fallback_allowed(config.getoption("--tileops-allow-events-fallback"))
 
 
@@ -159,6 +170,33 @@ def pytest_unconfigure(config):
         set_events_fallback_allowed(config.stash[_OUTER_EVENTS_FALLBACK])
     if _OUTER_VERIFYING in config.stash:
         api.set_verifying(config.stash[_OUTER_VERIFYING])
+    if _OUTER_NIGHTLY in config.stash:
+        api.set_nightly(config.stash[_OUTER_NIGHTLY])
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Report a row whose op raised ``OpNotAvailableError`` as skipped and unavailable.
+
+    A manifest row may declare a call no implementation serves yet. It is neither a failure
+    nor a coverage gap: the skip carries a fixed reason and the ``unavailable`` property, with
+    the op it names. Every other exception stays a failure.
+    """
+    outcome = yield
+    report = outcome.get_result()
+    if call.when != "call" or call.excinfo is None:
+        return
+    if not isinstance(call.excinfo.value, OpNotAvailableError):
+        return
+    reason = str(call.excinfo.value)
+    report.outcome = "skipped"
+    report.longrepr = (str(item.path), item.location[1] + 1, f"unavailable: {reason}")
+    # The JUnit report writes the item's properties with its teardown report.
+    item.user_properties.append((UNAVAILABLE_PROPERTY, reason))
+    cases = getattr(getattr(item, "callspec", None), "params", {}).values()
+    ops = sorted({c._call.signature.name for c in cases if isinstance(c, api.Case)})
+    if ops:
+        item.user_properties.append(("ops", ",".join(ops)))
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
@@ -214,7 +252,7 @@ def pytest_runtest_call(item):
             _emit(item, "tileops", tileops_entry)
 
         # Every baseline is written under its own tag. The first also uses the
-        # unprefixed legacy names that scripts/nightly_report.py reads.
+        # unprefixed names that scripts/nightly_report.py reads.
         for idx, be in enumerate(baseline_entries):
             tag = be["tag"]
             _emit(item, tag, be)

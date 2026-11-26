@@ -1,12 +1,11 @@
 import warnings
-from typing import Callable, Optional
+from collections.abc import Callable
 
 import tilelang
 import torch
 from tilelang import language as T
-from tilelang.profiler import do_bench
 
-from tileops._kernels.autotune import TUNING_FATAL
+from tileops._kernels.autotune import TUNING_FATAL, candidate_busy_ms
 from tileops._kernels.build_target import target_cache
 from tileops._kernels.constants import BF16_SPLIT_EXP2_SPAN, LOG2E
 from tileops._kernels.kernel_base import CompiledProgram, Entry, Kernel
@@ -16,7 +15,6 @@ from tileops._kernels.linear_attention.call_spec import (
     head_count_refusal,
 )
 from tileops._kernels.linear_attention.v_tile import GEMM_MIN_N, min_gemm_n
-from tileops._utils import get_shared_memory_optin, get_sm_count
 
 
 @target_cache(maxsize=32)
@@ -29,11 +27,7 @@ def gla_precompute_g_kernel(
     dtype: str,
     output_dtype: str = "float32",
 ) -> Callable:
-    """Pre-compute intra-chunk cumulative sum of g.
-
-    Parallel over (batch, heads, chunks): B*H*NC thread blocks.
-    Each block computes cumsum for one chunk independently.
-    """
+    """Intra-chunk cumulative sum of g, one block a (batch, head, chunk)."""
     accum_dtype = "float32"
     num_chunks = seq_len // chunk_size
 
@@ -45,7 +39,7 @@ def gla_precompute_g_kernel(
             tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         },
     )
-    def _fn(num_stages, threads=128):
+    def _fn(threads=128):
         g_shape = [batch, seq_len, heads, dim_k]
         g_cumsum_shape = [batch, seq_len, heads, dim_k]
 
@@ -415,22 +409,24 @@ def gla_state_walk_kernel(
     return _walk_func
 
 
-def state_walk_plan(batch: int, heads: int, dim_k: int, dim_v: int, stages: int) -> tuple:
-    """``(state_rows, num_stages, threads)`` of :func:`gla_state_walk_kernel` on this device.
+def state_walk_plan(
+    batch: int, heads: int, dim_k: int, dim_v: int, stages: int, budget: int, sm_count: int
+) -> tuple:
+    """``(state_rows, num_stages, threads)`` of :func:`gla_state_walk_kernel` on a device with
+    *budget* bytes of shared memory a block and *sm_count* SMs.
 
     The narrowest tile of state rows whose blocks fit one wave, else the widest whose stage
     fits shared memory; a stage holds one tile of the update and its rows' decay, the state
     stays in registers. At most *stages* stages, fewer where shared memory cannot hold them;
     four state elements a thread, clamped to between one warp and two warp groups.
     """
-    budget = get_shared_memory_optin()
     stage_bytes = {
         rows: rows * (dim_v + 1) * 4
         for rows in (2**i for i in range(1, dim_k.bit_length()))
         if dim_k % rows == 0 and rows * (dim_v + 1) * 4 <= budget
     }
     rows = next(
-        (rows for rows in stage_bytes if batch * heads * (dim_k // rows) <= get_sm_count()),
+        (rows for rows in stage_bytes if batch * heads * (dim_k // rows) <= sm_count),
         max(stage_bytes),
     )
     return rows, min(stages, budget // stage_bytes[rows]), max(32, min(256, rows * dim_v // 4))
@@ -599,7 +595,7 @@ class GLAChunkedFwdKernel(Kernel):
         scale: float,
         output_final_state: bool = False,
         dtype: torch.dtype = torch.float16,
-        config: Optional[dict] = None,
+        config: dict | None = None,
     ) -> None:
         super().__init__()
         self.batch = batch
@@ -618,7 +614,7 @@ class GLAChunkedFwdKernel(Kernel):
         self.program(self._programs)
 
     @staticmethod
-    def region_refusal(dim_k: int, dim_v: int, chunk_size: int) -> Optional[str]:
+    def region_refusal(dim_k: int, dim_v: int, chunk_size: int) -> str | None:
         """Why the default tiling cannot build these extents, or ``None`` when it can.
 
         Its three GEMMs run on two warps: the state update over
@@ -652,7 +648,7 @@ class GLAChunkedFwdKernel(Kernel):
     @property
     def default_config(self) -> dict:
         return self._default_config_for(
-            get_shared_memory_optin(),
+            self.build_target.smem_budget,
             self.chunk_size,
             self.dim_k,
             self.dim_v,
@@ -724,10 +720,8 @@ class GLAChunkedFwdKernel(Kernel):
                     self.forward(q, k, v, g, initial_state)
                     torch.cuda.synchronize()
 
-                    lat = do_bench(
-                        lambda: self.forward(q, k, v, g, initial_state),
-                        warmup=warmup,
-                        rep=rep,
+                    lat = candidate_busy_ms(
+                        lambda: self.forward(q, k, v, g, initial_state), warmup, rep
                     )
                     if lat < best_lat:
                         best_lat = lat
@@ -756,12 +750,11 @@ class GLAChunkFwdKernel(GLAChunkedFwdKernel, GLAChunkFwdInterface):
     Three launches: every chunk's state update in parallel; a walk of the state across the
     chunks, which writes the state entering each chunk (the backward reads it) and carries no
     matmul on its serial chain; and every chunk's output in parallel from the state it is
-    handed. The walk takes the narrowest tile of state rows whose blocks fit one wave, else the
-    widest whose stage fits shared memory.
+    handed.
     """
 
     # The one-element state a walk from zeros is handed and never reads, made on first use.
-    _unread_state: Optional[torch.Tensor] = None
+    _unread_state: torch.Tensor | None = None
 
     @staticmethod
     def _shared_bytes(c: int, k: int, v: int, elem: int) -> int:
@@ -815,8 +808,15 @@ class GLAChunkFwdKernel(GLAChunkedFwdKernel, GLAChunkFwdInterface):
 
     def _walk_program(self, cfg: dict, has_initial_state: bool):
         """The walk *cfg* states, starting from a given state or from zeros."""
+        target = self.build_target
         rows, stages, threads = state_walk_plan(
-            self.batch, self.heads, self.dim_k, self.dim_v, cfg["num_stages"]
+            self.batch,
+            self.heads,
+            self.dim_k,
+            self.dim_v,
+            cfg["num_stages"],
+            target.smem_budget,
+            target.sm_count,
         )
         return gla_state_walk_kernel(
             self.batch,
@@ -835,10 +835,10 @@ class GLAChunkFwdKernel(GLAChunkedFwdKernel, GLAChunkFwdInterface):
         k: torch.Tensor,
         v: torch.Tensor,
         g: torch.Tensor,
-        initial_state: Optional[torch.Tensor] = None,
+        initial_state: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         dtype = getattr(torch, self.dtype_name)
-        q, k, v, g = (t.to(dtype) for t in (q, k, v, g))
+        q, k, v, g = (tensor.to(dtype).contiguous() for tensor in (q, k, v, g))
         update_fn, output_fn = self.program(self._programs)
         update, g_last = update_fn(k, v, g)
         if initial_state is None:
@@ -849,13 +849,13 @@ class GLAChunkFwdKernel(GLAChunkedFwdKernel, GLAChunkFwdInterface):
             )
         else:
             h, final_state = self.program(self._walk_program, True)(
-                update, g_last, initial_state.to(torch.float32)
+                update, g_last, initial_state.to(torch.float32).contiguous()
             )
         o = output_fn(q, k, v, g, h)
         return o, final_state, h
 
     @classmethod
-    def refusal(cls, call: GLAChunkCall) -> Optional[str]:
+    def refusal(cls, call: GLAChunkCall) -> str | None:
         """Why no program serves this call, or ``None``.
 
         Refuses a call whose launches need more shared memory at once than the device gives.
@@ -864,11 +864,11 @@ class GLAChunkFwdKernel(GLAChunkedFwdKernel, GLAChunkFwdInterface):
             call.dim_k, call.dim_v, call.chunk_size
         )
         if reason is not None or not call.smem_budget:
-            return reason
+            return reason or super().refusal(call)
         c, k, v = call.chunk_size, call.dim_k, call.dim_v
         need = cls._shared_bytes(c, k, v, call.dtype.itemsize)
         if need <= call.smem_budget:
-            return None
+            return super().refusal(call)
         return (
             f"needs at least {need} bytes of shared memory per block at chunk {c}, head dims "
             f"{k} / {v} in {call.dtype}; the device gives {call.smem_budget}"
@@ -890,7 +890,7 @@ class GLAChunkFwdKernel(GLAChunkedFwdKernel, GLAChunkFwdInterface):
             call.chunk_size,
             call.scale,
         )
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         return (*arguments, call.dtype, index), lambda: cls(
             *arguments, output_final_state=True, dtype=call.dtype
         )

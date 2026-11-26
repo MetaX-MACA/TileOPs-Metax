@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import dataclasses
 import functools
 import math
 from dataclasses import dataclass, field
@@ -17,12 +18,15 @@ from tileops.manifest._kinds import (
     BOOL,
     INT,
     NONE,
+    STR,
+    TENSOR,
     VALUE,
     Kind,
     common,
     comparable,
     exclude,
     fits,
+    flat_members,
     join,
     literals,
     ordered,
@@ -48,6 +52,7 @@ __all__ = [
     "fold",
     "infer_kinds",
     "language_errors",
+    "member_kind",
     "names",
     "parse",
     "value_at",
@@ -152,12 +157,28 @@ def names(node: ast.AST) -> set[str]:
 
 
 class Unpresent(ast.NodeTransformer):
-    """Drop `present(x)`, which reads `x`'s presence and not its value."""
+    """Drop `present(x)` and `member(x)`, which read the member `x` holds and not its value."""
 
     def visit_Call(self, node):
-        if callee(node.func) == "present":
+        if callee(node.func) in ("present", "member"):
             return ast.Constant(True)
         return self.generic_visit(node)
+
+
+def value_names(node: ast.AST) -> set[str]:
+    """The names an expression reads the values of, leaving out `present(x)` and `member(x)`."""
+    return names(Unpresent().visit(copy.deepcopy(node)))
+
+
+def discriminant_names(node: ast.AST) -> set[str]:
+    """The names an expression reads through `present(x)` or `member(x)`."""
+    return {
+        a.id
+        for sub in ast.walk(node)
+        if isinstance(sub, ast.Call) and callee(sub.func) in ("present", "member")
+        for a in sub.args
+        if isinstance(a, ast.Name)
+    }
 
 
 class Substitute(ast.NodeTransformer):
@@ -208,7 +229,7 @@ def language_errors(node: ast.expr, shape: bool) -> list[str]:
             errors.append("a comprehension is `f(x) for x in s`: one name, no `if`, no `async`")
         elif (
             isinstance(sub, ast.Call)
-            and callee(sub.func) != "present"
+            and callee(sub.func) not in ("present", "member")
             and callee(sub.func) not in PRIMITIVE_KINDS
         ):
             errors.append(
@@ -232,25 +253,29 @@ class KindEnv:
     families: frozenset = frozenset()
     # Names `present(...)` may take besides a `Maybe` value: tensors and `out`.
     presence: frozenset = frozenset()
-    # Parameters declared `Maybe`, whose `v.value` is legal where `present(v)` holds.
+    # Parameters declared `Maybe`, read as their payload where `present(v)` narrows them.
     maybes: frozenset = frozenset()
-    # What a branch fixes: the constructor an ADT-valued name holds, keyed by the name (or
-    # `v.value` for a payload), and each finite field it fixes, keyed `name.field`.
+    # What a branch fixes: the constructor an ADT-valued name holds, keyed by the name, and
+    # each finite field it fixes, keyed `name.field`.
     facts: dict = field(default_factory=dict)
     # On one discriminant point a field read its constructor lacks is reported by the
     # point's read check instead.
     point: bool = False
+    # Each call-time argument's members, which `member(x)` takes.
+    tags: dict = field(default_factory=dict)
 
     def narrowed(self, kinds: dict) -> KindEnv:
-        return KindEnv(
-            {**self.kinds, **kinds},
-            self.adts,
-            self.families,
-            self.presence,
-            self.maybes,
-            self.facts,
-            self.point,
-        )
+        return dataclasses.replace(self, kinds={**self.kinds, **kinds})
+
+
+# The kind each argument member holds, as a value.
+_MEMBER_KINDS = {"Tensor": TENSOR, "list[Tensor]": TENSOR, "int": INT, "float": VALUE}
+_MEMBER_KINDS |= {"Number": VALUE, "bool": BOOL, "None": NONE}
+
+
+def member_kind(tags) -> Kind:
+    """The kind of an argument holding one of the members `tags`."""
+    return union(*(_MEMBER_KINDS[t] for t in tags))
 
 
 def infer_kinds(
@@ -278,11 +303,6 @@ def call_errors(node: ast.Call, table: dict, env: KindEnv, where: str) -> list[s
     return infer.errors
 
 
-def _formal(text: object, adts: dict) -> Kind:
-    """A kind as a table, a family formal or a primitive signature writes it."""
-    return parse_spec(str(text), adts)
-
-
 def _guards(node: ast.expr, env: KindEnv) -> tuple[dict, dict]:
     """The kinds a guard narrows names to where it is true, and where it is false."""
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
@@ -303,6 +323,10 @@ def _guards(node: ast.expr, env: KindEnv) -> tuple[dict, dict]:
     ):
         v = node.args[0].id
         kind = env.kinds.get(v)
+        if v in env.tags:
+            held = _alternatives(env, v)
+            present = [t for t in held if t != "None"] or held
+            return {v: member_kind(present)}, {v: NONE}
         if kind is not None and kind.tag == "Maybe":
             return {v: kind.item}, {v: NONE}
         return {}, {}
@@ -310,13 +334,22 @@ def _guards(node: ast.expr, env: KindEnv) -> tuple[dict, dict]:
         left, op, right = node.left, node.ops[0], node.comparators[0]
         if isinstance(left, ast.Constant) and isinstance(op, (ast.Eq, ast.NotEq)):
             left, right = right, left
-        # The subject is a name or its `.value` projection, which narrows the same name's payload.
         if (
-            isinstance(left, ast.Attribute)
-            and left.attr == "value"
-            and isinstance(left.value, ast.Name)
+            isinstance(left, ast.Call)
+            and callee(left.func) == "member"
+            and len(left.args) == 1
+            and isinstance(left.args[0], ast.Name)
+            and left.args[0].id in env.tags
         ):
-            left = left.value if left.value.id in env.maybes else left
+            v = left.args[0].id
+            tags = _alternatives(env, v)
+            chosen = _literal_values(right, many=isinstance(op, (ast.In, ast.NotIn)))
+            if chosen is None:
+                return {}, {}
+            inside = [t for t in tags if t in chosen] or list(tags)
+            outside = [t for t in tags if t not in chosen] or list(tags)
+            facts = ({v: member_kind(inside)}, {v: member_kind(outside)})
+            return facts if isinstance(op, (ast.Eq, ast.In)) else facts[::-1]
         if not isinstance(left, ast.Name):
             return {}, {}
         values = _literal_values(right, many=isinstance(op, (ast.In, ast.NotIn)))
@@ -330,6 +363,15 @@ def _guards(node: ast.expr, env: KindEnv) -> tuple[dict, dict]:
         if isinstance(op, (ast.NotEq, ast.NotIn)):
             return outside, inside
     return {}, {}
+
+
+def _alternatives(env: KindEnv, v: str) -> list[str]:
+    """The members argument *v* may still hold where *env* has narrowed it."""
+    current = env.kinds.get(v)
+    if current is None:
+        return list(env.tags[v])
+    kinds = flat_members(current)
+    return [t for t in env.tags[v] if member_kind([t]) in kinds] or list(env.tags[v])
 
 
 def _literal_values(node: ast.expr, many: bool) -> frozenset | None:
@@ -366,13 +408,13 @@ def _constant_kind(value) -> Kind:
         return NONE
     if isinstance(value, tuple):
         # A folded literal tuple keeps its sequence kind.
-        if not value:
-            return seq(None, 0)
-        item = _constant_kind(value[0])
-        for v in value[1:]:
-            item = join(item, _constant_kind(v))
-        return seq(item, len(value))
+        return _tuple_kind([_constant_kind(v) for v in value])
     return VALUE
+
+
+def _tuple_kind(kinds: list[Kind | None]) -> Kind:
+    """The kind of a tuple whose items have `kinds`: a sequence of their join."""
+    return seq(functools.reduce(join, kinds), len(kinds)) if kinds else seq(None, 0)
 
 
 class _Infer:
@@ -402,7 +444,10 @@ class _Infer:
                 return VALUE
             if node.id in self.env.families:
                 self.error(f"type family {node.id} is not a value")
-            return self.env.kinds.get(node.id)
+            kind = self.env.kinds.get(node.id)
+            if kind is not None and TENSOR in (kind.payload().members or (kind.payload(),)):
+                self.error(f"{node.id} may hold a tensor here; narrow it with member({node.id})")
+            return kind
         if isinstance(node, ast.BinOp):
             left, right = self.of(node.left), self.of(node.right)
             if VALUE in (left, right):
@@ -445,13 +490,7 @@ class _Infer:
                 self.error(f"{ast.unparse(node)} has arms of kinds {body} and {orelse}")
             return kind
         if isinstance(node, ast.Tuple):
-            kinds = [self.of(e) for e in node.elts]
-            if not kinds:
-                return seq(None, 0)
-            item = kinds[0]
-            for k in kinds[1:]:
-                item = join(item, k)
-            return seq(item, len(kinds))
+            return _tuple_kind([self.of(e) for e in node.elts])
         if isinstance(node, ast.Subscript):
             return self._subscript(node)
         if isinstance(node, ast.Attribute):
@@ -526,27 +565,10 @@ class _Infer:
     def _attribute(self, node: ast.Attribute) -> Kind | None:
         receiver = node.value
         env = self.env
-        if (
-            isinstance(receiver, ast.Attribute)
-            and receiver.attr == "value"
-            and isinstance(receiver.value, ast.Name)
-        ):
-            # A field of `v.value` is a field of v's payload; v names the branch facts.
-            receiver = receiver.value
-            kind = self._attribute(node.value)
-        else:
-            kind = env.kinds.get(receiver.id) if isinstance(receiver, ast.Name) else None
-            maybe = isinstance(receiver, ast.Name) and receiver.id in env.maybes
-            if node.attr == "value" and kind is not None and kind.tag == "Maybe":
-                return kind.item
-            if node.attr == "value" and maybe:
-                # Narrowed by `present(v)`; an absent payload's read is the point's read check's.
-                return None if kind == NONE else kind
-        payload = receiver is not node.value
+        kind = env.kinds.get(receiver.id) if isinstance(receiver, ast.Name) else None
         if kind is not None and kind.tag == "ADT":
             ctors = env.adts.get(kind.name, {})
-            # A payload's branch facts are keyed `v.value`.
-            name = f"{receiver.id}.value" if payload else receiver.id
+            name = receiver.id
             chosen = [env.facts[name]] if name in env.facts else list(ctors)
             if node.attr == "kind":
                 return literals(chosen)
@@ -568,6 +590,16 @@ class _Infer:
     def call(self, node: ast.Call, table: dict = PRIMITIVE_KINDS) -> Kind | None:
         """The result kind of a call to an entry of *table*, its arguments bound and checked."""
         name = callee(node.func)
+        if name == "member":
+            if (
+                len(node.args) != 1
+                or node.keywords
+                or not isinstance(node.args[0], ast.Name)
+                or node.args[0].id not in self.env.tags
+            ):
+                self.error(f"{ast.unparse(node)} names no call-time argument")
+                return STR
+            return literals(self.env.tags[node.args[0].id])
         if name == "present":
             known = self.env.presence | {
                 n for n, k in self.env.kinds.items() if k is not None and k.tag == "Maybe"
@@ -601,13 +633,13 @@ class _Infer:
         if missing:
             self.error(f"{name} misses argument {missing[0] + 1} of {len(slots)}")
         kinds = {
-            i: self.argument(arg, _formal(slots[i][1], self.env.adts))
+            i: self.argument(arg, parse_spec(slots[i][1], self.env.adts))
             for i, arg in sorted(bound.items())
             if i < len(slots)
         }
         if name == "ceil_div" and all(k is not None and k.nonneg for k in kinds.values()):
             return Kind("Int", nonneg=True)
-        return _formal(result, self.env.adts)
+        return parse_spec(result, self.env.adts)
 
     def argument(self, arg: ast.expr, expected: Kind) -> Kind | None:
         kind = self.of(arg)

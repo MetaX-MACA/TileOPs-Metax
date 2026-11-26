@@ -1,11 +1,9 @@
 import itertools
 import re
-from typing import Optional
 
 import tilelang
 import tilelang.language as T
 import torch
-import tvm_ffi
 
 from tileops._csrc import csrc_include
 from tileops._kernels.attention.call_spec import (
@@ -17,10 +15,9 @@ from tileops._kernels.attention.mla.seesaw import (
     _mla_seesaw_combine_kernel,
     _mla_seesaw_dense_kernel,
 )
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, chain_cuda_postproc, target_cache
 from tileops._kernels.constants import LOG2E
 from tileops._kernels.kernel_base import CompiledProgram, Entry, Kernel
-from tileops._utils import get_shared_memory_optin, get_sm_count, get_sm_version
 
 __all__ = ["MLADecodeMMAKernel", "MLADecodeSeesawKernel", "MLADecodeWSKernel"]
 
@@ -96,19 +93,7 @@ def _uniform_wgmma_bases(code: str) -> str:
     return _DESCRIPTOR_BASE.sub(r"\1tileops::warp_uniform_ptr\2);", code)
 
 
-def _register_uniform_wgmma_bases() -> None:
-    """Chain the rewrite after whatever holds TileLang's one CUDA post-processing slot."""
-    previous = tvm_ffi.get_global_func("tilelang_callback_cuda_postproc", allow_missing=True)
-
-    def postproc(code, target):
-        if previous is not None:
-            code = previous(code, target)
-        return _uniform_wgmma_bases(code)
-
-    tilelang.register_cuda_postproc(postproc)
-
-
-_register_uniform_wgmma_bases()
+chain_cuda_postproc(_uniform_wgmma_bases)
 
 
 @target_cache(maxsize=32)
@@ -123,27 +108,18 @@ def _mla_decode_ws_kernel(batch, heads, kv_head_num, seqlen_kv, dim, pe_dim, dty
             tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
         },
         compile_flags=[
-            "-O3",
-            "-Wno-deprecated-declarations",
-            "-U__CUDA_NO_HALF_OPERATORS__",
-            "-U__CUDA_NO_HALF_CONVERSIONS__",
-            "-U__CUDA_NO_HALF2_OPERATORS__",
-            "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-            "--expt-relaxed-constexpr",
-            "--expt-extended-lambda",
+            *CUDA_COMPILE_FLAGS,
             "--ptxas-options=-v,--register-usage-level=10",
-            "-DNDEBUG",
             *csrc_include("warp_uniform.h"),
         ],
     )
-    def _mla_decode_ws_func(block_H, block_N, num_split, num_stages, threads=384):
+    def _mla_decode_ws_func(block_H, block_N, num_split):
         # A head count block_H does not divide leaves the last block partly filled; its
         # loads past the heads read zero and its stores there are dropped.
         VALID_BLOCK_H = min(block_H, kv_group_num)
         # Two 128-thread consumer warpgroups and one producer warpgroup, which gathers
         # KV 8 threads to a row, 16 rows a pass.
-        if threads != 384:
-            raise ValueError(f"the warp-specialized schedule runs 384 threads, threads={threads}")
+        threads = 384
         if block_N % 16 != 0:
             raise ValueError(f"the KV gather copies 16 rows a pass, block_N={block_N}")
         # Each split owns kv_per_split keys and a loop step consumes two tiles. A
@@ -249,11 +225,9 @@ def _mla_decode_ws_kernel(batch, heads, kv_head_num, seqlen_kv, dim, pe_dim, dty
                 tx = T.get_thread_binding()
                 T.evaluate(T.call_extern("handle", _UNIFORM_BASES_CALL))
 
-                # Q/Q_pe -> shared copies must stay inside tx < 128 so that the copy
-                # and the subsequent T.wgmma_gemm share the same 128-thread bounds.
-                # Mixing a 384-thread copy with a 128-thread WGMMA on the same shared
-                # buffer causes TileLang 0.1.9 layout inference to fail with
-                # "no available layout found".
+                # Q/Q_pe -> shared copies stay inside tx < 128, the bounds of the WGMMA that
+                # reads them: TileLang's layout inference finds no layout for a shared buffer
+                # a 384-thread copy writes and a 128-thread WGMMA reads.
                 if tx < 128:
                     T.set_max_nreg(240, 1)
                     T.copy(
@@ -469,11 +443,9 @@ def _mla_decode_ws_kernel(batch, heads, kv_head_num, seqlen_kv, dim, pe_dim, dty
                 tx = T.get_thread_binding()
                 T.evaluate(T.call_extern("handle", _UNIFORM_BASES_CALL))
 
-                # Q/Q_pe -> shared copies must stay inside tx < 128 so that the copy
-                # and the subsequent T.wgmma_gemm share the same 128-thread bounds.
-                # Mixing a 384-thread copy with a 128-thread WGMMA on the same shared
-                # buffer causes TileLang 0.1.9 layout inference to fail with
-                # "no available layout found".
+                # Q/Q_pe -> shared copies stay inside tx < 128, the bounds of the WGMMA that
+                # reads them: TileLang's layout inference finds no layout for a shared buffer
+                # a 384-thread copy writes and a 128-thread WGMMA reads.
                 if tx < 128:
                     T.set_max_nreg(240, 1)
                     T.copy(
@@ -702,7 +674,7 @@ def _mla_decode_mma_kernel(batch, heads, kv_head_num, seqlen_kv, dim, pe_dim, dt
         },
         compile_flags=["-O3", "-DENABLE_BF16"],
     )
-    def _mla_decode_mma_func(block_H, block_N, num_split, num_stages, threads=128):
+    def _mla_decode_mma_func(block_H, block_N, num_split, num_stages, threads):
         # A length that does not fill every tile masks the keys past its split's end; loads
         # past the cache read zero.
         kv_per_split = tilelang.cdiv(seqlen_kv, num_split)
@@ -844,7 +816,7 @@ class MLADecodeWSKernel(Kernel, MLADecodeFwdInterface):
     _build = staticmethod(_mla_decode_ws_kernel)
 
     @classmethod
-    def refusal(cls, call: MLADecodeCall) -> Optional[str]:
+    def refusal(cls, call: MLADecodeCall) -> str | None:
         """Why *call* is outside the shapes the warp-specialized schedule serves."""
         if call.heads_kv != 1:
             return f"serves one KV head, got {call.heads_kv}"
@@ -854,7 +826,7 @@ class MLADecodeWSKernel(Kernel, MLADecodeFwdInterface):
             return f"the KV gather walks dim in 128-column steps, got {call.dim}"
         if call.pe_dim != 64:
             return f"the KV tail gather copies exactly 64 columns, got {call.pe_dim}"
-        return None
+        return super().refusal(call)
 
     @classmethod
     def entry_for(cls, call: MLADecodeCall) -> Entry:
@@ -866,7 +838,7 @@ class MLADecodeWSKernel(Kernel, MLADecodeFwdInterface):
             call.dim,
             call.pe_dim,
             call.dtype,
-            device_index=call.device.index if call.device is not None else None,
+            device_index=call.device_index,
         )
 
     def __init__(
@@ -878,9 +850,9 @@ class MLADecodeWSKernel(Kernel, MLADecodeFwdInterface):
         dim,
         pe_dim,
         dtype,
-        config: Optional[dict] = None,
+        config: dict | None = None,
         *,
-        device_index: Optional[int] = None,
+        device_index: int | None = None,
     ):
         super().__init__(device_index=device_index)
         self.batch = batch
@@ -913,30 +885,20 @@ class MLADecodeWSKernel(Kernel, MLADecodeFwdInterface):
             "block_H": min(64, self.heads // self.kv_head_num),
             "block_N": 64,
             "num_split": 2,
-            "num_stages": 1,
-            "threads": 384,
         }
 
     @property
     def autotune_configs(self) -> list[dict]:
-        block_H = [64, 128]
-        block_N = [64, 128]
-        num_split = [1, 2, 4]
-        num_stages = [1, 2, 3]
-        threads = [384]
-        _configs = list(itertools.product(block_H, block_N, num_split, num_stages, threads))
-
-        configs = [
-            {
-                "block_H": c[0],
-                "block_N": c[1],
-                "num_split": c[2],
-                "num_stages": c[3],
-                "threads": c[4],
-            }
-            for c in _configs
+        # Shared memory TileLang gives one block: the query rows, two KV stages, the score
+        # tile and one fp32 value per head row.
+        budget = self.build_target.smem_budget
+        itemsize = self.dtype.itemsize
+        row_bytes = (self.dim + self.pe_dim) * itemsize
+        return [
+            {"block_H": h, "block_N": n, "num_split": s}
+            for h, n, s in itertools.product((64, 128), (64, 128), (1, 2, 4))
+            if (h + 2 * n) * row_bytes + h * n * itemsize + h * 4 <= budget
         ]
-        return configs
 
     def forward(self, q: torch.Tensor, q_pe: torch.Tensor, k: torch.Tensor, k_pe: torch.Tensor):
         if self.seqlen_kv == 0:
@@ -959,9 +921,7 @@ class MLADecodeWSKernel(Kernel, MLADecodeFwdInterface):
 
     def _compile(self, cfg: dict):
         """The program ``forward`` launches, compiled from *cfg*."""
-        return self.kernel(
-            cfg["block_H"], cfg["block_N"], cfg["num_split"], cfg["num_stages"], cfg["threads"]
-        )
+        return self.kernel(**cfg)
 
 
 class MLADecodeMMAKernel(MLADecodeWSKernel):
@@ -977,7 +937,7 @@ class MLADecodeMMAKernel(MLADecodeWSKernel):
     _NUM_SPLIT = 2
 
     @classmethod
-    def refusal(cls, call: MLADecodeCall) -> Optional[str]:
+    def refusal(cls, call: MLADecodeCall) -> str | None:
         """Why *call* is outside the shapes this schedule serves. An empty cache builds no program;
         otherwise shared memory is read at the narrowest head block."""
         if call.heads_kv != 1:
@@ -1007,7 +967,7 @@ class MLADecodeMMAKernel(MLADecodeWSKernel):
     @property
     def default_config(self) -> dict:
         config = self._default_config_for(
-            get_shared_memory_optin(self.device_index),
+            self.build_target.smem_budget,
             self.dim,
             self.pe_dim,
             self.dtype.itemsize,
@@ -1023,7 +983,7 @@ class MLADecodeMMAKernel(MLADecodeWSKernel):
             self.seqlen_kv < minimum_cache
             or self.dim != latent_dim
             or self.pe_dim != rope_dim
-            or get_sm_version(self.device_index) != 89
+            or self.build_target.arch != 89
         ):
             return self._NUM_SPLIT
         # Avoid extra partial outputs once the batch already supplies enough CTAs.
@@ -1073,7 +1033,7 @@ class MLADecodeMMAKernel(MLADecodeWSKernel):
     def autotune_configs(self) -> list[dict]:
         # Four warps: with eight, or a 16-key tile, the score and output GEMMs split the
         # head rows differently and the row statistics have no common layout.
-        budget = get_shared_memory_optin(self.device_index)
+        budget = self.build_target.smem_budget
         # Query tiles and staged KV tiles coexist; reject only when these alone overflow.
         row_bytes = (self.dim + self.pe_dim) * self.dtype.itemsize
         return [
@@ -1094,7 +1054,7 @@ class MLADecodeSeesawKernel(Kernel, MLADecodeFwdInterface):
     preferred_over = frozenset({"mla_decode_kernel"})
 
     @classmethod
-    def refusal(cls, call: MLADecodeCall) -> Optional[str]:
+    def refusal(cls, call: MLADecodeCall) -> str | None:
         """Why *call* is outside the shapes this schedule serves."""
         if call.dtype not in ATTENTION_DTYPES:
             return f"serves float16 and bfloat16, got {call.dtype}"
@@ -1110,7 +1070,7 @@ class MLADecodeSeesawKernel(Kernel, MLADecodeFwdInterface):
 
     @classmethod
     def entry_for(cls, call: MLADecodeCall) -> Entry:
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         return (call.heads, call.dim, call.pe_dim, call.dtype, index), lambda: cls(
             call.heads, call.dim, call.pe_dim, call.dtype, device_index=index
         )
@@ -1121,9 +1081,9 @@ class MLADecodeSeesawKernel(Kernel, MLADecodeFwdInterface):
         dim: int,
         pe_dim: int,
         dtype: torch.dtype,
-        config: Optional[dict] = None,
+        config: dict | None = None,
         *,
-        device_index: Optional[int] = None,
+        device_index: int | None = None,
     ):
         """Build the program for one model's decode geometry; the batch and length vary.
 
@@ -1137,7 +1097,7 @@ class MLADecodeSeesawKernel(Kernel, MLADecodeFwdInterface):
         """
         super().__init__(device_index=device_index)
         self.heads, self.dim, self.pe_dim, self.dtype = heads, dim, pe_dim, dtype
-        self.sm_count = get_sm_count(device_index)
+        self.sm_count = self.build_target.sm_count
         self.init_config(config)
         self.program(self._compile, 1)
 

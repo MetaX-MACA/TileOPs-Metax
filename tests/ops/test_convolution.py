@@ -65,8 +65,8 @@ class Conv1dFixture(FixtureBase):
                     1,
                     torch.float16,
                     False,
-                    marks=pytest.mark.smoke,
-                    id="smoke-padding-wider-than-row-fp16",
+                    marks=pytest.mark.full,
+                    id="full-padding-wider-than-row-fp16",
                 ),
                 pytest.param(
                     4,
@@ -264,6 +264,86 @@ def test_conv1d(
 
 
 @pytest.mark.smoke
+@pytest.mark.in_tree_kernels
+@pytest.mark.sm90
+@pytest.mark.parametrize(
+    "dtype,bias,length",
+    [(torch.float16, False, 2053), (torch.bfloat16, True, 2052)],
+    ids=["fp16-odd-output", "bf16-bias-even-output"],
+)
+def test_conv1d_short_waveform(dtype, bias, length):
+    from tileops._kernels.convolution import Conv1dDirectKernel
+    from tileops.backend import BUILTIN
+
+    x = torch.randn(1, 1, length, device=run_device(), dtype=dtype)
+    weight = torch.randn(16, 1, 5, device=x.device, dtype=dtype)
+    offset = torch.randn(16, device=x.device, dtype=dtype) if bias else None
+    op = Conv1dFwdOp(target=BUILTIN)
+    args = (x, weight, offset)
+    compare_outputs(op(*args), F.conv1d(*args), convolution_verification(dtype, inputs=args))
+    assert [type(k) for k in op.iter_kernels()] == [Conv1dDirectKernel]
+
+
+@pytest.mark.in_tree_kernels
+@pytest.mark.sm90
+@pytest.mark.parametrize(
+    "x_shape,w_shape,stride,padding,dtype,kernel_name,config",
+    [
+        # k_total = 4 * 5 <= 32 at stride 2: Conv1dKernel's block_k=32 default.
+        pytest.param(
+            (1, 4, 128),
+            (64, 4, 5),
+            2,
+            2,
+            torch.float16,
+            "Conv1dKernel",
+            {"block_k": 32},
+            marks=pytest.mark.smoke,
+            id="short-k-strided",
+        ),
+        # out_l 2048, kernel_l 3, c_out 1024: Conv1dUnitStrideKernel's wide-output default.
+        pytest.param(
+            (1, 16, 2048),
+            (1024, 16, 3),
+            1,
+            1,
+            torch.bfloat16,
+            "Conv1dUnitStrideKernel",
+            {"block_m": 128, "block_n": 128, "block_k": 64, "num_stages": 2, "threads": 256},
+            marks=pytest.mark.smoke,
+            id="unit-stride-wide-k3",
+        ),
+        # out_l 64 <= 640, kernel_l 7, c_in 128: Conv1dUnitStrideKernel's short-row default.
+        pytest.param(
+            (1, 128, 64),
+            (64, 128, 7),
+            1,
+            3,
+            torch.float16,
+            "Conv1dUnitStrideKernel",
+            {"block_m": 64, "block_n": 32, "block_k": 128, "num_stages": 2, "threads": 128},
+            marks=pytest.mark.full,
+            id="unit-stride-short-row-k7",
+        ),
+    ],
+)
+def test_conv1d_sm90_default_configs(x_shape, w_shape, stride, padding, dtype, kernel_name, config):
+    from tileops.backend import BUILTIN
+
+    x = torch.randn(x_shape, device=run_device(), dtype=dtype)
+    weight = torch.randn(w_shape, device=x.device, dtype=dtype)
+    op = Conv1dFwdOp(stride=stride, padding=padding, target=BUILTIN)
+    compare_outputs(
+        op(x, weight),
+        F.conv1d(x, weight, stride=stride, padding=padding),
+        convolution_verification(dtype, inputs=(x, weight)),
+    )
+    (kernel,) = op.iter_kernels()
+    assert type(kernel).__name__ == kernel_name
+    assert {key: kernel.config[key] for key in config} == config, kernel.config
+
+
+@pytest.mark.smoke
 def test_conv1d_no_bias_matches_torch() -> None:
     op = Conv1dFwdOp(stride=2, padding=2)
     x = torch.randn(1, 32, 256, device=run_device(), dtype=torch.float16).contiguous()
@@ -321,10 +401,12 @@ def test_conv1d_dilation_matches_torch(dilation, use_bias: bool) -> None:
     compare_outputs(out, ref, convolution_verification(out.dtype))
 
 
-@pytest.mark.smoke
 @pytest.mark.parametrize(
     "use_bias",
-    [pytest.param(False, id="no-bias"), pytest.param(True, id="bias")],
+    [
+        pytest.param(False, marks=pytest.mark.smoke, id="no-bias"),
+        pytest.param(True, marks=pytest.mark.full, id="bias"),
+    ],
 )
 def test_conv1d_same_padding_even_kernel_matches_torch(use_bias: bool) -> None:
     n, c_in, l_in, c_out, kernel_size = 1, 16, 129, 32, 2
@@ -345,13 +427,12 @@ def test_conv1d_same_padding_even_kernel_matches_torch(use_bias: bool) -> None:
     )
 
 
-@pytest.mark.smoke
 @pytest.mark.parametrize(
     "kernel_size, stride, padding, dilation",
     [
-        pytest.param(3, 1, 1, 1, id="unit-stride"),
-        pytest.param(3, 2, 1, 1, id="generic"),
-        pytest.param(1, 1, 0, 1, id="pointwise"),
+        pytest.param(3, 1, 1, 1, id="unit-stride", marks=pytest.mark.smoke),
+        pytest.param(3, 2, 1, 1, id="generic", marks=pytest.mark.full),
+        pytest.param(1, 1, 0, 1, id="pointwise", marks=pytest.mark.full),
     ],
 )
 def test_conv1d_dispatches_kernel(
@@ -439,7 +520,7 @@ class Conv2dFixture(FixtureBase):
                     marks=pytest.mark.smoke,
                     id="smoke-bf16-3x3",
                 ),
-                # MobileNetV2 depthwise 3x3 block, reduced spatial size for smoke cost.
+                # MobileNetV2 depthwise 3x3 block, reduced spatial size.
                 pytest.param(
                     1,
                     16,
@@ -453,8 +534,8 @@ class Conv2dFixture(FixtureBase):
                     16,
                     torch.float16,
                     False,
-                    marks=pytest.mark.smoke,
-                    id="smoke-mobilenetv2-depthwise-small-fp16",
+                    marks=pytest.mark.full,
+                    id="full-mobilenetv2-depthwise-small-fp16",
                 ),
                 pytest.param(
                     1,
@@ -731,26 +812,6 @@ def test_conv2d_dispatches_1x1_kernel() -> None:
 
 
 @pytest.mark.smoke
-def test_conv2d_dispatches_3x3_kernel() -> None:
-    op = Conv2dFwdOp(padding=1)
-    x = torch.randn(1, 32, 32, 32, device=run_device(), dtype=torch.float16).contiguous()
-    weight = torch.randn(64, 32, 3, 3, device=run_device(), dtype=torch.float16).contiguous()
-    out = op(x, weight)
-    ref = F.conv2d(x, weight, bias=None, padding=1)
-    compare_outputs(out, ref.contiguous(), convolution_verification(out.dtype))
-
-
-@pytest.mark.smoke
-def test_conv2d_dispatches_5x5_kernel() -> None:
-    op = Conv2dFwdOp(padding=2)
-    x = torch.randn(1, 32, 32, 32, device=run_device(), dtype=torch.float16).contiguous()
-    weight = torch.randn(64, 32, 5, 5, device=run_device(), dtype=torch.float16).contiguous()
-    out = op(x, weight)
-    ref = F.conv2d(x, weight, bias=None, padding=2)
-    compare_outputs(out, ref.contiguous(), convolution_verification(out.dtype))
-
-
-@pytest.mark.smoke
 def test_conv2d_batch_with_partial_tile_leaves_the_symmetric_kernel() -> None:
     # out_h * out_w is 49 here, a multiple of no m tile the symmetric kernel builds,
     # so an m tile would span two images and its implicit GEMM would take the wrong
@@ -761,6 +822,54 @@ def test_conv2d_batch_with_partial_tile_leaves_the_symmetric_kernel() -> None:
     out = op(x, weight)
     ref = F.conv2d(x, weight, bias=None)
     compare_outputs(out, ref.contiguous(), convolution_verification(out.dtype))
+
+
+@pytest.mark.in_tree_kernels
+@pytest.mark.sm90
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param((2, 256, 64, 129), marks=pytest.mark.smoke, id="tile-crosses-images"),
+        pytest.param(
+            (1, 288, 64, 128), marks=pytest.mark.full, id="input-channels-not-divisible-by-64"
+        ),
+    ],
+)
+def test_conv2d_highres_default_preserves_tile_constraints(shape):
+    from tileops._kernels.convolution.conv2d import Conv2dSymmetricKernel
+    from tileops.backend import BUILTIN
+
+    x = torch.randn(shape, device=run_device(), dtype=torch.float16) * 0.125
+    weight = torch.randn(256, shape[1], 3, 3, device=x.device, dtype=x.dtype) * 0.125
+    op = Conv2dFwdOp(padding=1, target=BUILTIN)
+    compare_outputs(
+        op(x, weight),
+        F.conv2d(x, weight, padding=1),
+        convolution_verification(x.dtype, inputs=(x, weight)),
+    )
+    (kernel,) = op.iter_kernels()
+    assert type(kernel) is Conv2dSymmetricKernel
+    assert (kernel.config["block_m"], kernel.config["block_k"]) == (64, 32)
+
+
+@pytest.mark.smoke
+@pytest.mark.in_tree_kernels
+@pytest.mark.sm90
+def test_conv2d_depthwise_warp_bf16_bias():
+    from tileops._kernels.convolution.conv2d import DepthwiseConv2dWarpKernel
+    from tileops.backend import BUILTIN
+
+    channels = 2
+    x = torch.randn(1, channels, 16, 32, device=run_device(), dtype=torch.bfloat16)
+    weight = torch.randn(channels, 1, 3, 3, device=x.device, dtype=x.dtype)
+    bias = torch.randn(channels, device=x.device, dtype=x.dtype)
+    op = Conv2dFwdOp(groups=channels, padding=1, target=BUILTIN)
+    compare_outputs(
+        op(x, weight, bias),
+        F.conv2d(x, weight, bias, padding=1, groups=channels),
+        convolution_verification(x.dtype, inputs=(x, weight, bias)),
+    )
+    assert [type(k) for k in op.iter_kernels()] == [DepthwiseConv2dWarpKernel]
 
 
 class Conv3dFixture(FixtureBase):
@@ -837,7 +946,7 @@ class Conv3dFixture(FixtureBase):
                     marks=pytest.mark.smoke,
                     id="smoke-3d-ndhwc-nonsymmetric-dilation-fp16",
                 ),
-                # Video depthwise 3D block, reduced size for smoke cost.
+                # Video depthwise 3D block, reduced size.
                 pytest.param(
                     1,
                     8,
@@ -852,8 +961,8 @@ class Conv3dFixture(FixtureBase):
                     8,
                     torch.float16,
                     False,
-                    marks=pytest.mark.smoke,
-                    id="smoke-video-depthwise3d-small-fp16",
+                    marks=pytest.mark.full,
+                    id="full-video-depthwise3d-small-fp16",
                 ),
                 pytest.param(
                     1,

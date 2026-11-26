@@ -7,7 +7,6 @@ output; more splits write FP32 partials that a combine kernel merges.
 """
 
 import math
-from typing import Optional
 
 import tilelang
 import tilelang.language as T
@@ -17,13 +16,14 @@ from tileops._kernels.attention.call_spec import AttentionCall, GQADenseFwdInter
 from tileops._kernels.attention.gqa.decode import GQADecodeKernel
 from tileops._kernels.attention.gqa.decode_bs1_common import (
     COMPILE_FLAGS,
+    allocate_partials,
+    balanced_split,
     make_gqa_decode_bs1_combine,
 )
 from tileops._kernels.attention.online_softmax import make_apply_softcap, make_dense_sink_scale
 from tileops._kernels.build_target import target_cache
 from tileops._kernels.constants import LOG2E
 from tileops._kernels.kernel_base import Entry, Kernel
-from tileops._utils import get_shared_memory_optin, get_sm_count
 
 __all__ = ["GQADecodeWSKernel"]
 
@@ -214,14 +214,7 @@ def _gqa_decode_ws_kernel(
                 scores_sum = T.alloc_fragment([block_m], accum_dtype)
                 logsum = T.alloc_fragment([block_m], accum_dtype)
 
-                # Whole KV tiles split as evenly as possible: the first ``extra_tiles``
-                # splits take one tile more than the rest.
-                num_tiles = T.ceildiv(seqlen_kv, block_n)
-                base_tiles = num_tiles // num_split
-                extra_tiles = num_tiles % num_split
-                tiles_this_split = base_tiles + T.if_then_else(sid < extra_tiles, 1, 0)
-                base = (sid * base_tiles + T.min(sid, extra_tiles)) * block_n
-                this_len = T.max(T.min(seqlen_kv - base, tiles_this_split * block_n), 0)
+                base, this_len = balanced_split(seqlen_kv, block_n, num_split, sid)
                 loop_range = T.ceildiv(this_len, block_n)
 
                 tx = T.get_thread_binding()
@@ -401,8 +394,8 @@ def _gqa_decode_ws_kernel(
                             if i < rows:
                                 Output[bid, flat_row(hid, tile_row0, i), j] = acc_o[i, j]
                     else:
-                        # An empty split weighs nothing in the combine: its log-sum-exp
-                        # is -inf and its partial output zero.
+                        # An empty split of the serial program weighs nothing in the
+                        # combine: its log-sum-exp is -inf and its partial output zero.
                         for i, j in T.Parallel(block_m, dim):
                             acc_o[i, j] /= T.if_then_else(
                                 saw_keys(tile_row0, i, base, this_len, seqlen_kv), logsum[i], 1.0
@@ -444,7 +437,7 @@ class GQADecodeWSKernel(Kernel, GQADenseFwdInterface):
     _DIMS = (64, 128, 256)
 
     @classmethod
-    def refusal(cls, call: AttentionCall) -> Optional[str]:
+    def refusal(cls, call: AttentionCall) -> str | None:
         """Unrotated 16-bit dense decode, one query position or the packed positions
         :attr:`AttentionCall.dense_decode_program` names, at the head dimensions this plan
         builds for."""
@@ -478,14 +471,14 @@ class GQADecodeWSKernel(Kernel, GQADenseFwdInterface):
         seq_len_kv,
         dim,
         dtype=torch.float16,
-        sm_scale: Optional[float] = None,
+        sm_scale: float | None = None,
         softcap: float = 0.0,
-        config: Optional[dict] = None,
+        config: dict | None = None,
         *,
         seq_len_q: int = 1,
         is_causal: bool = False,
         has_sinks: bool = False,
-        device_index: Optional[int] = None,
+        device_index: int | None = None,
     ):
         super().__init__(device_index=device_index)
         # The program takes the cache length per call.
@@ -503,8 +496,8 @@ class GQADecodeWSKernel(Kernel, GQADenseFwdInterface):
         self.sm_scale = sm_scale
         self.softcap = softcap
         self.has_sinks = has_sinks
-        self._sm_count = get_sm_count(device_index)
-        self._smem_budget = get_shared_memory_optin(device_index)
+        self._sm_count = self.build_target.sm_count
+        self._smem_budget = self.build_target.smem_budget
         self.jit = _gqa_decode_ws_kernel(
             batch,
             seq_len_q,
@@ -535,9 +528,9 @@ class GQADecodeWSKernel(Kernel, GQADenseFwdInterface):
         """Return the split count and whether to overlap softmax with matrix products.
 
         Splits fill resident CTA slots; multiple splits retain at least four KV tiles each.
-        Overlap requires one row tile per KV head, D128, 64-key tiles and no softcap.
-        Its one-CTA-per-SM grid must match the resident split count, or cover at least
-        two thirds of the SMs with at most 64 KV tiles per CTA.
+        Overlap requires one row tile per KV head, D128, 64-key tiles, no softcap and a key
+        tile in every split. Its one-CTA-per-SM grid must match the resident split count, or
+        cover at least two thirds of the SMs with at most 64 KV tiles per CTA.
         """
         c = self.config
         row_tiles = -(-(self.seq_len_q * self.heads // self.groups) // c["block_m"])
@@ -556,7 +549,10 @@ class GQADecodeWSKernel(Kernel, GQADenseFwdInterface):
         if alone:
             limit = max(1, min(self._sm_count // units, tiles // 4))
             lone = 1 << (limit.bit_length() - 1)
-            if lone == split or (3 * units * lone >= 2 * self._sm_count and tiles <= 64 * lone):
+            fills = lone == split or (3 * units * lone >= 2 * self._sm_count and tiles <= 64 * lone)
+            # The overlapped consumer takes its first key tile before its loop, so every split
+            # must hold one.
+            if fills and lone <= tiles:
                 return lone, True
         return split, False
 
@@ -565,22 +561,19 @@ class GQADecodeWSKernel(Kernel, GQADenseFwdInterface):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        q_scale: Optional[torch.Tensor] = None,
-        k_scale: Optional[torch.Tensor] = None,
-        v_scale: Optional[torch.Tensor] = None,
-        rope_cos: Optional[torch.Tensor] = None,
-        rope_sin: Optional[torch.Tensor] = None,
-        sinks: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+        rope_cos: torch.Tensor | None = None,
+        rope_sin: torch.Tensor | None = None,
+        sinks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         self._require_devices(q=q, k=k, v=v)
         del q_scale, k_scale, v_scale, rope_cos, rope_sin
         rows = self.seq_len_q * self.heads
         query = q.view(self.batch, rows, self.dim)
         num_split, overlap = self.plan(k.shape[1])
-        glse = torch.empty((self.batch, rows, num_split), dtype=torch.float32, device=q.device)
-        partial = torch.empty(
-            (self.batch, rows, num_split, self.dim), dtype=torch.float32, device=q.device
-        )
+        glse, partial = allocate_partials(q, self.batch, rows, self.dim, num_split)
         program = self.program(self._compile, num_split, overlap)
         output = program(query, k, v, glse, partial, sinks if self.has_sinks else query)
         return output.view_as(q)
