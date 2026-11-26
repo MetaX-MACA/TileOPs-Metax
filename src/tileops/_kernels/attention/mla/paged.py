@@ -8,8 +8,6 @@ pages. ``MLAPagedFwdKernel`` serves every other call: one block of query rows wa
 tiles in a plain loop, gathering each key row through the block table.
 """
 
-from typing import Optional
-
 import tilelang
 import tilelang.language as T
 import torch
@@ -26,7 +24,6 @@ from tileops._kernels.attention.mla.seesaw import (
 from tileops._kernels.build_target import target_cache
 from tileops._kernels.constants import LOG2E
 from tileops._kernels.kernel_base import CompiledProgram, Entry, Kernel
-from tileops._utils import get_shared_memory_optin, get_sm_count
 
 __all__ = ["MLAPagedFwdKernel", "MLAPagedSeesawKernel"]
 
@@ -169,14 +166,12 @@ class _MLAPagedBase(Kernel, MLAPagedFwdInterface):
             dtype=call.dtype,
             cache_dtype=call.cache_dtype,
         )
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         return (*args.values(), index), lambda: cls(**args, device_index=index)
 
     def _setup(self, heads, s_q, dim, dim_v, page_size, is_causal, sm_scale, dtype, cache_dtype):
         self.heads, self.s_q, self.dim, self.dim_v = heads, s_q, dim, dim_v
-        self.page_size, self.is_causal, self.sm_scale = page_size, is_causal, sm_scale
-        self.dtype, self.cache_dtype = dtype, cache_dtype
-        self.quantized = cache_dtype == torch.float8_e4m3fn
+        self.page_size, self.dtype = page_size, dtype
         # A 16-bit cache passes no scale; the kernel still takes one and multiplies by it.
         device = (
             torch.device("cuda", self.device_index)
@@ -195,7 +190,7 @@ class _MLAPagedBase(Kernel, MLAPagedFwdInterface):
         kv_cache: torch.Tensor,
         block_table: torch.Tensor,
         cache_seqlens: torch.Tensor,
-        kv_scale: Optional[torch.Tensor] = None,
+        kv_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Attend each request's query rows to its cache; see the interface for the contract."""
         batch = q.shape[0]
@@ -220,7 +215,7 @@ class MLAPagedSeesawKernel(_MLAPagedBase):
     supported_archs: list[int] = [90]
 
     @classmethod
-    def refusal(cls, call: MLAPagedCall) -> Optional[str]:
+    def refusal(cls, call: MLAPagedCall) -> str | None:
         """Why *call* is outside the shapes this schedule serves."""
         if call.dtype not in ATTENTION_DTYPES:
             return f"serves float16 and bfloat16 queries, got {call.dtype}"
@@ -241,11 +236,11 @@ class MLAPagedSeesawKernel(_MLAPagedBase):
         dim_v: int,
         page_size: int,
         is_causal: bool,
-        sm_scale: Optional[float],
+        sm_scale: float | None,
         dtype: torch.dtype,
         cache_dtype: torch.dtype,
-        config: Optional[dict] = None,
-        device_index: Optional[int] = None,
+        config: dict | None = None,
+        device_index: int | None = None,
     ):
         """Build the program for one model's decode geometry.
 
@@ -266,7 +261,7 @@ class MLAPagedSeesawKernel(_MLAPagedBase):
         self._args = self._setup(
             heads, s_q, dim, dim_v, page_size, is_causal, sm_scale, dtype, cache_dtype
         )
-        self.sm_count = get_sm_count(device_index)
+        self.sm_count = self.build_target.sm_count
         self.init_config(config)
         self.program(self._compile)
 
@@ -294,7 +289,7 @@ class MLAPagedSeesawKernel(_MLAPagedBase):
         kv_cache: torch.Tensor,
         block_table: torch.Tensor,
         cache_seqlens: torch.Tensor,
-        kv_scale: Optional[torch.Tensor] = None,
+        kv_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Attend each request's query rows to its cache; see the interface for the contract."""
         batch = q.shape[0]
@@ -342,7 +337,7 @@ class MLAPagedFwdKernel(_MLAPagedBase):
         return (block_h * padded + block_n * padded + block_h * block_n) * itemsize
 
     @classmethod
-    def refusal(cls, call: MLAPagedCall) -> Optional[str]:
+    def refusal(cls, call: MLAPagedCall) -> str | None:
         """Why *call* is outside the shapes this schedule serves."""
         if call.dtype not in ATTENTION_DTYPES:
             return f"serves float16 and bfloat16 queries, got {call.dtype}"
@@ -359,11 +354,11 @@ class MLAPagedFwdKernel(_MLAPagedBase):
         dim_v: int,
         page_size: int,
         is_causal: bool,
-        sm_scale: Optional[float],
+        sm_scale: float | None,
         dtype: torch.dtype,
         cache_dtype: torch.dtype,
-        config: Optional[dict] = None,
-        device_index: Optional[int] = None,
+        config: dict | None = None,
+        device_index: int | None = None,
     ):
         """Build the program for one model's decode geometry; arguments as the seesaw's.
 
@@ -389,7 +384,7 @@ class MLAPagedFwdKernel(_MLAPagedBase):
 
     @property
     def default_config(self) -> dict:
-        budget = get_shared_memory_optin(self.device_index)
+        budget = self.build_target.smem_budget
         for config in self._CANDIDATES:
             if self._shared_bytes(self.dim, self.dim_v, self.dtype.itemsize, config) <= budget:
                 break

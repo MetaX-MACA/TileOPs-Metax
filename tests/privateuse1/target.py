@@ -6,7 +6,6 @@ manifest op. An op's kernel runs the reference of the op's call workload, built
 from the manifest call its tensors and params state.
 """
 
-import ast
 import functools
 import inspect
 
@@ -14,6 +13,7 @@ import torch
 
 from tests.conftest import UnservedError
 from tests.privateuse1 import DEVICE_TYPE
+from tileops._ops._signature_codegen import leaves
 from tileops.backend import (
     DeviceFacts,
     register_detector,
@@ -21,12 +21,10 @@ from tileops.backend import (
     register_kernel_builder,
 )
 from tileops.manifest import load_adts, load_manifest
-from tileops.manifest._expr import parse, value_at
 from tileops.manifest._kinds import split_union
 from tileops.manifest._plan import EntryPlan, entry_plan
-from tileops.manifest._signature import unification
 from tileops.manifest._values import ADTValue, convert
-from tileops.manifest._workload import Call, TensorSpec, _apply, _dtype_value, _point, _shape
+from tileops.manifest._workload import Call, TensorSpec, call_from_tensors
 from workloads.calls import call_workload
 
 TARGET = DEVICE_TYPE
@@ -66,72 +64,33 @@ def _manifest_value(value: object, type_text: object, adts: dict) -> object:
     return value
 
 
-def _call(name: str, inputs: dict, params: dict) -> tuple[Call, frozenset]:
-    """The manifest call of op *name* on *inputs* with *params*, and the inputs it writes.
+def _call(name: str, inputs: dict, params: dict) -> Call:
+    """The manifest call of op *name* on *inputs* with *params*.
 
-    The indices are solved from the shapes and dtypes of the call-time inputs and the
-    construction-time tensors among *params*, as a workload row's are. A construction-time
-    tensor's spec carries its values, which the call does not otherwise pass.
+    The indices are solved from the shapes and dtypes of the call-time inputs, as a workload
+    row's are; a call-time scalar is known as passed.
     """
-    plan = _plan(name)
-    sig = plan.sig
-    tensors = {**{t: params.get(t) for t in sig.ctor_tensors}, **inputs}
-    scope = {
+    sig = _plan(name).sig
+    known = {
         p: _manifest_value(params.get(p, decl.get("default")), decl.get("type"), sig.adts)
         for p, decl in sig.params.items()
     }
-    present = {t for t, v in tensors.items() if v is not None}
-    point = _point(sig, scope, present)
-    b = plan.branch(point)
-    for t in present:
-        node = b.dtypes[t]
-        if isinstance(node, ast.Name) and node.id in sig.forall:
-            scope[node.id] = _dtype_name(tensors[t].dtype)
-    nodes = {t: b.shapes[t] for t in present}
-    shapes = {t: tuple(tensors[t].shape) for t in present}
-    _apply(sig, unification(nodes, set(scope), b.lets), nodes, shapes, scope, b.lets)
+
+    def spec(t, tensor):
+        values = tensor.tolist() if t.values is not None else None
+        return TensorSpec(tuple(tensor.shape), _dtype_name(tensor.dtype), values, t.cpu)
+
     specs = {}
-    for t in sig.call_tensors.values():
-        tensor = tensors[t.name]
-        values = t.values is not None or t.name in sig.ctor_tensors
-        specs[t.name] = (
-            None
-            if tensor is None
-            else TensorSpec(
-                shapes[t.name],
-                _dtype_name(tensor.dtype),
-                tensor.tolist() if values else None,
-                t.cpu,
-            )
-        )
-    for t in sig.outputs.values():
-        specs[t.name] = (
-            TensorSpec(
-                _shape(b.shapes[t.name], sig, scope, f"tensor {t.name!r} shape"),
-                _dtype_value(b.dtypes[t.name], scope),
-                None,
-                t.cpu,
-            )
-            if t.name in b.shapes
-            else None
-        )
-    seqs = {n for n, k in sig.forall.items() if k == "Seq[Int]"}
-    indices = {
-        n: v
-        for n, v in scope.items()
-        if n in sig.params or (n in sig.forall and n not in seqs) or n in b.lets
-    }
-    written = frozenset(
-        t.name
-        for t in sig.inputs.values()
-        if t.name in present
-        and (
-            t.write_only
-            or t.mutated is True
-            or (isinstance(t.mutated, str) and value_at(parse(t.mutated), point) is True)
-        )
-    )
-    return Call("", {p: scope[p] for p in sig.params}, specs, indices, sig), written
+    for t in sig.inputs.values():
+        value = inputs[t.name]
+        if isinstance(value, torch.Tensor):
+            specs[t.name] = spec(t, value)
+        elif isinstance(value, (list, tuple)):
+            specs[t.name] = tuple(spec(t, e) for e in value)
+        else:
+            specs[t.name] = None
+            known[t.name] = value
+    return call_from_tensors(_plan(name), known, specs)
 
 
 class _Reference:
@@ -143,7 +102,8 @@ class _Reference:
     def __call__(self, *inputs, **writes):
         name, sig = self.name, _plan(self.name).sig
         named = dict(zip(sig.inputs, inputs, strict=True))
-        call, written = _call(name, named, self.params)
+        call = _call(name, named, self.params)
+        written = call.written
         try:
             workload = call_workload(name)(call)
         except Exception as exc:
@@ -213,7 +173,7 @@ class _Reference:
 
     def _device(self, inputs: tuple, writes: dict) -> torch.device:
         """The call device, by the rule the op's checks place a call by."""
-        tensors = [t for t in (*inputs, *writes.values()) if t is not None]
+        tensors = [t for t in leaves((*inputs, *writes.values())) if isinstance(t, torch.Tensor)]
         devices = {t.device for t in tensors if t.device.type != "cpu"} or {
             t.device for t in tensors
         }

@@ -36,6 +36,7 @@ def _ledger(op_name: str, **tensors: "tuple[tuple[int, ...], torch.dtype] | None
     drop, duplicate or substitute one of them.
     """
     from tileops.manifest import load_manifest
+    from tileops.manifest._signature import members
 
     signature = load_manifest()[op_name]["signature"]
     inputs = signature.get("inputs") or {}
@@ -65,8 +66,8 @@ def _ledger(op_name: str, **tensors: "tuple[tuple[int, ...], torch.dtype] | None
             continue
         if tensors[name] is not None:
             continue
-        assert (spec or {}).get("optional"), (
-            f"{op_name}: {name} is not optional and the case passes None"
+        assert set(members((spec or {}).get("type", "Tensor"))) - {"Tensor", "list[Tensor]"}, (
+            f"{op_name}: {name} holds only tensors and the case passes none"
         )
     return _nbytes(
         *(
@@ -99,7 +100,7 @@ _F16, _BF16, _F16_KV = {"T": "float16"}, {"T": "bfloat16"}, {"T": "float16", "KV
 _VARLEN, _MHA, _DSA = "GQAVarlenFwdOp", "MHAPagedFwdOp", "DSADenseFwdOp"
 _INDEXER, _GG = "FP8LightningIndexerFwdOp", "GroupedGEMMFwdOp"
 _ONE_HEAD = {"H": 1, "H_kv": 1, "D": 64}
-_ROPE = {"pos_encoding_mode": "rope"}
+_ROPE = {"pos_encoding_mode": "rope", "some": ["rope_cos", "rope_sin"]}
 _DENSE_WINDOW = {**_ONE_HEAD, "B": 1, "S_q": 1, "S_kv": 8, "is_causal": True, "window_size_left": 0}
 _PAGED_ROPE = {
     **_ONE_HEAD,
@@ -113,7 +114,7 @@ _PAGED_ROPE = {
     "cache_lens": [3, 4],
     "is_causal": True,
 }
-_NSA = {"H": 16, "H_kv": 1, "D": 64, "SEL": 1, "block_size": 32, "seq_lens": [1]}
+_NSA = {"H": 16, "H_kv": 1, "D": 64, "SEL": 1, "block_size": 32, "seq_lens": [1], "kv_lens": [1]}
 _NSA_CMP = {"C": 3, "H": 16, "H_kv": 1, "DK": 64, "DV": 64, "block_size": 32, "seq_lens": [16, 40]}
 _SENTINEL = {"indices": [[[[1]]]]}
 _INDEXER_ROW = {"B": 1, "S": 2, "H": 1, "D": 64, "S_kv": 2, "G": 1, "seq_lens": [2], "first": 0}
@@ -381,6 +382,15 @@ class TestBytesOracle:
         row = _manifest_rows("NSAVarlenFwdOp")[0]
         for is_causal in (True, False):
             self._nsa_forward_case(_manifest_call("NSAVarlenFwdOp", dict(row, is_causal=is_causal)))
+        # Decode over cached keys: each request's queries are the last of its keys.
+        decode = {
+            "T_kv": 22, "H": 16, "H_kv": 1, "D": 64, "SEL": 2, "block_size": 4,
+            "seq_lens": [1, 2], "kv_lens": [9, 13], "some": ["cu_seqlens_k"],
+            "label": "decode", "dtype_cases": [{"T": "float16"}],
+        }  # fmt: skip
+        for is_causal in (True, False):
+            call = _manifest_call("NSAVarlenFwdOp", dict(decode, is_causal=is_causal))
+            self._nsa_forward_case(call)
 
     @staticmethod
     def _nsa_forward_case(call):
@@ -392,8 +402,16 @@ class TestBytesOracle:
         # Key rows some token scores, per KV head: each kept block cut at the token (causal)
         # or the sequence end; a row several tokens score is read once.
         cu_seqlens = call.metadata_values("cu_seqlens")
+        separate = call.present("cu_seqlens_k")
+        keys = call.metadata_values("cu_seqlens_k") if separate else cu_seqlens
+
+        def bound(request, position):
+            length = keys[request + 1] - keys[request]
+            queries = cu_seqlens[request + 1] - cu_seqlens[request]
+            return length - queries + position + 1 if indices["is_causal"] else length
+
         rows = {
-            (h, cu_seqlens[request] + r)
+            (h, keys[request] + r)
             for (request, position), counts, picks in zip(
                 call.metadata_values("token_indices"),
                 call.metadata_values("block_counts"),
@@ -404,12 +422,7 @@ class TestBytesOracle:
             for start in picks[h][: counts[h]]
             for r in range(
                 start * block_size,
-                min(
-                    (start + 1) * block_size,
-                    position + 1
-                    if indices["is_causal"]
-                    else cu_seqlens[request + 1] - cu_seqlens[request],
-                ),
+                min((start + 1) * block_size, bound(request, position)),
             )
         }
         gathered = len(rows) * dim
@@ -424,6 +437,7 @@ class TestBytesOracle:
             block_counts=((c_seq_len, head_kv), torch.int32),
             cu_seqlens=((len(cu_seqlens),), torch.int32),
             token_indices_unread=True,
+            cu_seqlens_k=((len(keys),), torch.int32) if separate else None,
             o=((c_seq_len, heads, dim), torch.float16),
         )
         assert nsa_fwd_varlen_roofline(call)[1] == oracle
@@ -470,7 +484,9 @@ class TestBytesOracle:
             "is_causal": True,
         }
         plain, _ = _evaluated("GQAVarlenFwdOp", row, {"T": "float16"})
-        sink, _ = _evaluated("GQAVarlenFwdOp", {**row, "some": ["sinks"]}, {"T": "float16"})
+        sink, _ = _evaluated(
+            "GQAVarlenFwdOp", {**row, "some": [*row.get("some", []), "sinks"]}, {"T": "float16"}
+        )
         # Two nonempty rows per head each add subtract/exp/add, and one FP32 logit
         # per head is read. The last request stays zero regardless of its sink.
         assert sink == (plain[0] + 8 * 2 * 3, plain[1] + 8 * 4)
@@ -598,8 +614,8 @@ class TestBytesOracle:
         for row in _manifest_rows(op_name):
             call = _manifest_call(op_name, row)
             indices = call.indices
-            rows = {
-                (b, g, j)
+            selected = [
+                (b, s, g, j)
                 for b, batch in enumerate(call.metadata_values("indices"))
                 for s, heads in enumerate(batch)
                 for g, slots in enumerate(heads)
@@ -609,17 +625,26 @@ class TestBytesOracle:
                     not indices["is_causal"]
                     or (j + 1) * indices["stride_kv"] - 1 <= indices["q_start_index_s"] + s
                 )
-            }
+            ]
+            rows = {(b, g, j) for b, _s, g, j in selected}
             dtype = getattr(torch, call.tensors["q"][1])
             width = indices["D"] + indices["dim_tail"]
+            sink = ((indices["H"],), torch.float32) if call.present("attn_sink") else None
             oracle = _ledger(
                 op_name,
                 q=((indices["B"], indices["S"], indices["H"], width), dtype),
                 kv=((len(rows), width), dtype),
                 indices=((indices["B"], indices["S"], indices["H_kv"], indices["K"]), torch.int32),
+                attn_sink=sink,
                 o=((indices["B"], indices["S"], indices["H"], indices["D"]), dtype),
             )
             assert dsa_decode_roofline(call)[1] == oracle, row["label"]
+            if call.present("attn_sink"):
+                # Per head of a query row with a score: subtract, exponentiate and add.
+                bare = _manifest_call(op_name, {**row, "some": []})
+                scored = len({(b, s, g) for b, s, g, _j in selected})
+                extra = 3 * indices["H"] // indices["H_kv"] * scored
+                assert dsa_decode_roofline(call)[0] == dsa_decode_roofline(bare)[0] + extra
 
     def test_deltanet_bwd_reads_the_strict_lower_triangle_of_aw_and_au(self):
         """Each chunk's C x C block of Aw and Au has a unit diagonal and a zero upper
@@ -707,7 +732,7 @@ def _evaluated(op_name: str, row: dict, case: dict, **values):
     call = dataclasses.replace(call, specs=specs)
     tensors = call.materialize("meta")
     cls = signature_class(op_name, entry)
-    op = cls(**call.arguments(tensors))
+    op = cls(**call.arguments())
     checked = cls._signature.check(op, {t: tensors[t] for t in plan.sig.inputs})
     metadata = {n: torch.tensor(call.metadata_values(n)) for n in checked.metadata}
     op._last_call = dataclasses.replace(checked, metadata=metadata)
@@ -783,13 +808,21 @@ class TestSpecOnlyRecounts:
             heads * rows if fp8 else 0
         )
 
-    def test_dsa_paged_scores_each_valid_slot_and_reads_the_rows_they_name(self):
+    @pytest.mark.parametrize(
+        "extra,case",
+        [
+            ({"DK": 576}, {"KV": "uint8"}),
+            # A bfloat16 row of 8 values, 2 of them past the value; a sink per head.
+            ({"DK": 8, "head_dim_v": 6, "some": ["attn_sink"]}, {"KV": "bfloat16"}),
+        ],
+    )
+    def test_dsa_paged_scores_each_valid_slot_and_reads_the_rows_they_name(self, extra, case):
         name = "DSAPagedFwdOp"
-        row = {"S_q": 2, "H": 2, "K": 4, "NP": 6, "PS": 4, "W": 3, "cache_lens": [5, 10]}
+        row = {"S_q": 2, "H": 2, "K": 4, "NP": 6, "PS": 4, "W": 3, "cache_lens": [5, 10], **extra}
         # Request 0: query 0 selects nothing, query 1 three positions on two pages.
         # Request 1: a repeated slot, then nothing.
         indices = [[[-1, -1, -1, -1], [0, 4, 3, -1]], [[3, 3, -1, -1], [-1, -1, -1, -1]]]
-        (flops, moved), call = _evaluated(name, row, {}, indices=indices)
+        (flops, moved), call = _evaluated(name, row, case, indices=indices)
         table, lengths, page = (
             call.metadata_values("block_table"),
             call.metadata_values("cache_seqlens"),
@@ -808,22 +841,67 @@ class TestSpecOnlyRecounts:
             for j in v
         }
         pages = {(b, j // page) for b, per_q in enumerate(valid) for v in per_q for j in v}
+        fp8 = case["KV"] == "uint8"
+        value, width = row.get("head_dim_v", 512), row["DK"]
+        cache = ((len(cache_rows), 656), torch.uint8) if fp8 else ((len(cache_rows), width), _BF16)
         assert moved == _ledger(
             name,
-            q=((rows, row["H"], 576), _BF16),  # the query rows that score something
-            kv_cache=((len(cache_rows), 656), torch.uint8),
+            q=((rows, row["H"], width), _BF16),  # the query rows that score something
+            kv_cache=cache,
             block_table=((len(pages),), _I32),
             cache_seqlens=((2,), _I32),
             indices=((2, 2, 4), _I32),
-            o=((2, 2, row["H"], 512), _BF16),
+            attn_sink=None if fp8 else ((row["H"],), _F32),
+            o=((2, 2, row["H"], value), _BF16),
             lse=((2, 2, row["H"]), _F32),
         )
-        # Each distinct row's 512 latent values are dequantized once.
-        assert flops == _attention_flops(row["H"], 576, 512, scores, rows) + 512 * len(cache_rows)
+        # Each distinct FP8 row's 512 latent values are dequantized once; a sink adds its
+        # subtract, exponential and add per head of a row with a score.
+        extra_flops = 512 * len(cache_rows) if fp8 else 3 * row["H"] * rows
+        assert flops == _attention_flops(row["H"], width, value, scores, rows) + extra_flops
+
+    @pytest.mark.parametrize(
+        "row,slots,emitted,state_reads,state_writes,ape_rows",
+        [
+            # Request 0 prefills 5 tokens, closing windows 0 (2 slots) and 1 (4 slots);
+            # request 1 resumes at position 5 and closes window 2, reading position 4 from
+            # the state for the current window and positions 2 and 3 for the previous one.
+            ({"T_q": 7, "seq_lens": [5, 2], "positions": [0, 5]}, 2 + 4 + 4, 3, 3, 4 + 2, 2),
+            # One decode token at position 7 takes one ape row and writes one state row.
+            ({"T_q": 1, "seq_lens": [1], "positions": [7]}, 4, 1, 3, 1, 1),
+        ],
+    )
+    def test_gated_pool_compress_moves_the_state_rows_its_windows_use(
+        self, row, slots, emitted, state_reads, state_writes, ape_rows
+    ):
+        name = "GatedPoolCompressFwdOp"
+        tokens, requests = row["T_q"], len(row["seq_lens"])
+        row = {"NS": 4, "D": 2, "ratio": 2, "overlap": True, **row}
+        (flops, moved), _call = _evaluated(name, row, {"T": "float32"})
+        read = ((state_reads, 2), _F32)  # D channels per role
+        write = ((state_writes, 4), _F32)  # whole rows
+        assert moved == _ledger(
+            name,
+            kv=((tokens, 4), _F32),
+            score=((tokens, 4), _F32),
+            ape=((ape_rows, 4), _F32),
+            kv_state=read,
+            kv_state_write=write,
+            score_state=read,
+            score_state_write=write,
+            cu_seqlens=((requests + 1,), _I32),
+            start_pos=((requests,), _I32),
+            state_slots=((requests,), _I32),
+            entries=((emitted, 2), _BF16),
+            valid=((tokens,), torch.bool),
+        )
+        # The ape add per token and channel; per slot and channel max, subtract,
+        # exponential, sum, divide, multiply and add.
+        assert flops == tokens * 4 + 2 * 7 * slots
 
     def test_paged_kv_cache_write_moves_only_the_tokens_with_a_slot(self):
         name = "PagedKVCacheWriteFwdOp"
-        row = {"N": 5, "H_kv": 2, "D": 4, "NP": 4, "PS": 3, "some": ["k_scale"]}
+        row = {"N": 5, "H_kv": 2, "D": 4, "NP": 4, "PS": 3, "some": ["k_scale", "v_scale"]}
         slots = [7, -1, 2, -1, 11]
         (flops, moved), _call = _evaluated(
             name, row, {"T": "bfloat16", "KV": "float8_e4m3fn"}, slot_mapping=slots
@@ -854,7 +932,7 @@ class TestSpecOnlyRecounts:
             "P": 16,
             "seq_lens": [3, 2],
             "fuse_rope": True,
-            "some": ["kv_scale"],
+            "some": ["kv_scale", "cos_sin_cache", "positions"],
         }
         slots = [5, -1, 0, 8, -1]  # tokens 0, 2 and 3, at positions 0, 2 and 0
         case = {"T": "bfloat16", "KV": "float8_e4m3fn", "C": "float32"}
@@ -920,6 +998,485 @@ class TestSpecOnlyRecounts:
             positions=((5,), _I64),
         )
         assert flops == 5 * 4 * (4 * 8 + 3 * 4)
+
+    def test_fused_qk_norm_rope_mrope_reads_each_sections_columns_of_its_rows(self):
+        name = "FusedQKNormRoPEFwdOp"
+        row = {
+            "D": 8,
+            "P": 16,
+            "R": 6,
+            "num_heads": 3,
+            "num_kv_heads": 1,
+            "seq_lens": [3, 2],
+            "image": [],
+            "zero_centered": True,
+            "mrope_section": [1, 1, 1],
+            "mrope_interleaved": True,
+        }
+        # Temporal rows 0, 1, 2; height rows 4, 5; width row 7.
+        positions = [[0, 1, 2, 0, 1], [4, 4, 5, 5, 4], [7, 7, 7, 7, 7]]
+        (flops, moved), _call = _evaluated(
+            name, row, {"T": "bfloat16", "C": "float32"}, positions=positions
+        )
+        qk = ((5, 4 * 8), _BF16)
+        assert moved == _ledger(
+            name,
+            qkv=qk,
+            qkv_write=qk,
+            q_weight=((8,), _BF16),
+            k_weight=((8,), _BF16),
+            # One cos and one sin column a section: 3 + 2 + 1 rows.
+            cos_sin_cache=((6, 2), _F32),
+            positions=((3, 5), _I64),
+        )
+        assert flops == 5 * 4 * (4 * 8 + 3 * 6) + 2 * 8
+
+    @pytest.mark.parametrize("interleaved,widths", [(True, (2, 1, 0)), (False, (0, 3, 0))])
+    def test_fused_qk_norm_rope_mrope_widths_follow_the_assignment(self, interleaved, widths):
+        name = "FusedQKNormRoPEFwdOp"
+        row = {
+            "D": 8,
+            "P": 16,
+            "R": 6,
+            "num_heads": 1,
+            "num_kv_heads": 1,
+            "seq_lens": [2],
+            "image": [],
+            "mrope_section": [0, 3, 0],
+            "mrope_interleaved": interleaved,
+        }
+        # Temporal rows 0, 1; height row 4; width rows 6, 7.
+        positions = [[0, 1], [4, 4], [6, 7]]
+        (_flops, moved), _call = _evaluated(
+            name, row, {"T": "bfloat16", "C": "float32"}, positions=positions
+        )
+        rows = 2 * widths[0] + widths[1] + 2 * widths[2]
+        qk = ((2, 2 * 8), _BF16)
+        assert moved == _ledger(
+            name,
+            qkv=qk,
+            qkv_write=qk,
+            q_weight=((8,), _BF16),
+            k_weight=((8,), _BF16),
+            cos_sin_cache=((rows, 2), _F32),  # a cos and a sin column a frequency
+            positions=((3, 2), _I64),
+        )
+
+    @pytest.mark.parametrize("name", ["GDNFwdOp", "KDAFwdOp"])
+    def test_gated_delta_rule_moves_only_the_pool_slots_its_sequences_name(self, name):
+        row = {"B": 2, "S": 1, "H": 1, "HV": 2, "K": 4, "V": 4, "P": 5}
+        row["some"] = ["initial_state", "state_indices"]
+        (flops, moved), _call = _evaluated(name, row, {"T": "bfloat16"})
+        slots = ((2, 2, 4, 4), _F32)  # one slot of 2 value heads a sequence
+        gate = (2, 1, 2, 4) if name == "KDAFwdOp" else (2, 1, 2)
+        assert moved == _ledger(
+            name,
+            q=((2, 1, 1, 4), _BF16),
+            k=((2, 1, 1, 4), _BF16),
+            v=((2, 1, 2, 4), _BF16),
+            g=(gate, _BF16),
+            beta=((2, 1, 2), _BF16),
+            initial_state=slots,
+            initial_state_write=slots,
+            cu_seqlens=None,
+            cu_seqlens_cpu=None,
+            A_log=None,
+            dt_bias=None,
+            state_indices=((2,), _I32),
+            num_accepted_tokens=None,
+            o=((2, 1, 2, 4), _BF16),
+            final_state=None,  # the pool written above
+        )
+        # Per token and value head: 7 per state value, plus KDA's decay and step terms.
+        per_head = 7 * 16 + (4 + 2 * 4 if name == "KDAFwdOp" else 0)
+        assert flops == 2 * 2 * per_head + (2 * 4 if name == "KDAFwdOp" else 0)
+
+    @pytest.mark.parametrize("name", ["GDNFwdOp", "KDAFwdOp"])
+    def test_gated_delta_rule_rollback_writes_a_slot_a_token(self, name):
+        row = {"B": 1, "S": 6, "H": 1, "HV": 2, "K": 4, "V": 4, "P": 9, "L": 3}
+        row["seq_lens"] = [3, 1, 2]
+        row["some"] = ["initial_state", "cu_seqlens", "state_indices", "num_accepted_tokens"]
+        (_flops, moved), _call = _evaluated(name, row, {"T": "bfloat16"})
+        gate = (1, 6, 2, 4) if name == "KDAFwdOp" else (1, 6, 2)
+        assert moved == _ledger(
+            name,
+            q=((1, 6, 1, 4), _BF16),
+            k=((1, 6, 1, 4), _BF16),
+            v=((1, 6, 2, 4), _BF16),
+            g=(gate, _BF16),
+            beta=((1, 6, 2), _BF16),
+            initial_state=((3, 2, 4, 4), _F32),  # each sequence's accepted slot
+            initial_state_write=((6, 2, 4, 4), _F32),  # one slot a token
+            cu_seqlens=((4,), _I64),
+            cu_seqlens_cpu=None,
+            A_log=None,
+            dt_bias=None,
+            state_indices=((3, 3), _I32),
+            num_accepted_tokens=((3,), _I32),
+            o=((1, 6, 2, 4), _BF16),
+            final_state=None,  # the pool written above
+        )
+
+    def test_causal_conv1d_touches_the_dilated_window_of_each_named_state(self):
+        name = "CausalConv1dFwdOp"
+        row = {
+            "D": 4,
+            "W": 3,
+            "L": 5,
+            "P": 6,
+            "Tt": 5,
+            "seq_lens": [3, 2],
+            "dilation": 2,
+            "bias": None,
+        }
+        row["some"] = ["cache_indices"]
+        (flops, moved), _call = _evaluated(name, row, {"T": "bfloat16", "Tw": "float32"})
+        window = ((2, 4, 4), _BF16)  # 2 sequences, 4 channels, (W - 1) * dilation tokens
+        assert moved == _ledger(
+            name,
+            x=((5, 4), _BF16),
+            weight=((4, 3), _F32),
+            conv_state_unread=True,  # without has_initial_state every sequence starts from zeros
+            conv_state_write=window,
+            cu_seqlens=((3,), _I32),
+            bias=None,
+            has_initial_state=None,
+            cache_indices=((2,), _I32),
+            output=((5, 4), _BF16),
+        )
+        assert flops == 2 * 4 * 5 * 3
+
+    def test_causal_conv1d_update_rollback_rewrites_the_window_and_the_drafts(self):
+        name = "CausalConv1dUpdateFwdOp"
+        row = {"D": 4, "W": 3, "L": 6, "P": 6, "Tt": 5, "seq_lens": [3, 2], "max_query_len": 3}
+        row["some"] = ["conv_state_indices", "num_accepted_tokens", "query_start_loc"]
+        (flops, moved), _call = _evaluated(name, row, {"T": "bfloat16", "Tw": "bfloat16"})
+        assert moved == _ledger(
+            name,
+            x=((5, 4), _BF16),
+            weight=((4, 3), _BF16),
+            conv_state=((2, 4, 2), _BF16),  # each sequence's W - 1 history tokens
+            conv_state_write=((7, 4), _BF16),  # W - 1 + q - 1 tokens a sequence
+            bias=None,
+            conv_state_indices=((2,), _I32),
+            num_accepted_tokens=((2,), _I32),
+            query_start_loc=((3,), _I32),
+            output=((5, 4), _BF16),
+        )
+        assert flops == 2 * 5 * 4 * 3
+
+    @pytest.mark.parametrize(
+        "max_norm,norm_type,flops_per_row",
+        [
+            (None, 2.0, 0),
+            (1.0, 2.0, 2 * 4 + 2),
+            (1.0, 1.0, 2 * 4 + 1),
+            (1.0, 3.0, 3 * 4 + 2),
+        ],
+    )
+    def test_embedding_reads_the_named_rows_once(self, max_norm, norm_type, flops_per_row):
+        name = "EmbeddingFwdOp"
+        row = {"S": [2, 3], "V": 10, "D": 4, "max_norm": max_norm, "norm_type": norm_type}
+        ids = [[1, 7, 1], [7, 2, 2]]  # rows 1, 2 and 7
+        (flops, moved), _call = _evaluated(name, row, {"I": "int64", "T": "float32"}, input=ids)
+        assert moved == _ledger(
+            name,
+            input=((2, 3), _I64),
+            weight=((3, 4), _F32),
+            output=((2, 3, 4), _F32),
+        )
+        # With max_norm, a norm per distinct row; no row is written back at the cheaper outcome.
+        assert flops == 3 * flops_per_row
+
+    def test_embedding_prices_a_scalar_index(self):
+        from types import SimpleNamespace
+
+        from tileops._perf.formulas import embedding_roofline
+
+        sizes = {"input": 8, "weight": 10 * 4 * 4, "output": 4 * 4}
+        call = SimpleNamespace(
+            indices={"D": 4, "norm_type": 2.0, "max_norm": None},
+            tensors={"input": ((), "int64"), "weight": ((10, 4), "float32")},
+            metadata_values=lambda name: 3,
+            bytes=sizes.__getitem__,
+        )
+        assert embedding_roofline(call) == (0, 8 + 4 * 4 + 4 * 4)
+
+    @pytest.mark.parametrize("broadcast", [False, True])
+    def test_masked_scatter_prices_the_cheaper_mask_outcome(self, broadcast):
+        name = "MaskedScatterFwdOp"
+        a = [1, 4] if broadcast else [6, 4]
+        row = {"A": a, "M": [6, 1], "R": [6, 4]}
+        (flops, moved), _call = _evaluated(name, row, {"T": "bfloat16"})
+        assert moved == _ledger(
+            name,
+            input=((*a,), _BF16),  # the cheaper outcome: an all-false mask
+            mask=((6, 1), torch.bool),
+            source_unread=True,
+            output=((6, 4), _BF16),
+        )
+        assert flops == 0
+
+    @pytest.mark.parametrize(
+        "row,case",
+        [
+            (
+                {"B": 2, "S": 3, "H": 2, "D": 8, "P": 6, "Rh": 2},
+                {"T": "bfloat16", "C": "float32", "Cs": "float32"},
+            ),
+            (
+                {
+                    "Tt": 5,
+                    "H": 2,
+                    "D": 8,
+                    "P": 6,
+                    "Rh": 2,
+                    "seq_lens": [3, 2],
+                    "max_seqlen": 3,
+                    "inplace": True,
+                    "some": ["cu_seqlens"],
+                },
+                {"T": "bfloat16", "C": "float32", "Cs": "bfloat16", "I": "int32"},
+            ),
+        ],
+    )
+    def test_rope_cos_sin_reads_the_rows_the_sequences_reach(self, row, case):
+        name = "RoPECosSinFwdOp"
+        (flops, moved), _call = _evaluated(name, row, case)
+        packed = "cu_seqlens" in row.get("some", [])
+        tokens, rows = (5, 3) if packed else (6, 3)
+        x = ((tokens, 2, 4 if packed else 8), _BF16)  # in place, only the 4 rotated columns
+        sin = torch.bfloat16 if packed else _F32
+        assert moved == _ledger(
+            name,
+            x=x,
+            x_write=x if packed else None,
+            cos=((rows, 2), _F32),
+            sin=((rows, 2), sin),
+            cu_seqlens=((3,), _I32) if packed else None,
+            seqlen_offsets=None,
+            output=None if packed else x,  # in place, the output is x
+        )
+        assert flops == 3 * tokens * 2 * 4
+
+    def test_rope_cos_sin_reads_the_union_of_the_rows_each_offset_reaches(self):
+        name = "RoPECosSinFwdOp"
+        row = {"B": 2, "S": 3, "H": 2, "D": 8, "P": 6, "Rh": 2, "some": ["seqlen_offsets"]}
+        case = {"T": "bfloat16", "C": "float32", "Cs": "float32", "O": "int32"}
+        (flops, moved), _call = _evaluated(name, row, case, seqlen_offsets=[0, 2])
+        x = ((2, 3, 2, 8), _BF16)
+        # Rows 0..2 and 2..4: five distinct rows.
+        assert moved == _ledger(
+            name,
+            x=x,
+            cos=((5, 2), _F32),
+            sin=((5, 2), _F32),
+            cu_seqlens=None,
+            seqlen_offsets=((2,), _I32),
+            output=x,
+        )
+        assert flops == 3 * 6 * 2 * 4
+
+    @pytest.mark.parametrize(
+        "name, extra",
+        [
+            ("RoPEFwdOp", {}),
+            (
+                "RoPELlama31FwdOp",
+                {
+                    "scaling_factor": 8.0,
+                    "low_freq_factor": 1.0,
+                    "high_freq_factor": 4.0,
+                    "orig_max_position": 8,
+                },
+            ),
+            ("YaRNFwdOp", {"scaling_factor": 2.0}),
+            (
+                "LongRoPEFwdOp",
+                {"original_max_position_embeddings": 8, "rescale_factors": [1.0, 2.0]},
+            ),
+        ],
+    )
+    def test_rope_reads_only_the_cache_rows_the_positions_name(self, name, extra):
+        tokens = 5
+        row = {
+            "head_size": 8,
+            "rotary_dim": 4,
+            "max_position_embeddings": 16,
+            "base": 10000.0,
+            "is_neox_style": True,
+            "dtype": "bfloat16",
+            "Hq": 2,
+            "Hk": 1,
+            "some": ["key"],
+            **extra,
+            **({"N": tokens} if name == "LongRoPEFwdOp" else {"S": [tokens]}),
+        }
+        case = {"T": "bfloat16", "I": "int64"}
+        positions = [3, 3, 7, 0, 7]
+        (flops, moved), _call = _evaluated(name, row, case, positions=positions)
+        q, k = ((tokens, 16), _BF16), ((tokens, 8), _BF16)
+        ledger = {"offsets": None} if name == "LongRoPEFwdOp" else {}
+        # Three distinct rows of 4 cos/sin values each.
+        assert (
+            moved
+            == _ledger(
+                name,
+                positions=((tokens,), _I64),
+                query=q,
+                key=k,
+                query_out=q,
+                key_out=k,
+                **ledger,
+            )
+            + 3 * 4 * 2
+        )
+        assert flops == 3 * tokens * 3 * 4
+
+    def test_longrope_reads_the_rows_positions_plus_offsets_name(self):
+        name, tokens = "LongRoPEFwdOp", 5
+        row = {
+            "head_size": 8,
+            "rotary_dim": 4,
+            "max_position_embeddings": 16,
+            "original_max_position_embeddings": 8,
+            "base": 10000.0,
+            "is_neox_style": True,
+            "dtype": "bfloat16",
+            "rescale_factors": None,
+            "N": tokens,
+            "Hq": 2,
+            "Hk": 1,
+            "some": ["key", "offsets"],
+        }
+        case = {"T": "bfloat16", "I": "int64", "O": "int32"}
+        # Rows 3, 4, 7, 0, 9: five distinct, where the positions alone name three.
+        positions, offsets = [3, 3, 7, 0, 7], [0, 1, 0, 0, 2]
+        (flops, moved), _call = _evaluated(name, row, case, positions=positions, offsets=offsets)
+        q, k = ((tokens, 16), _BF16), ((tokens, 8), _BF16)
+        assert (
+            moved
+            == _ledger(
+                name,
+                positions=((tokens,), _I64),
+                query=q,
+                key=k,
+                offsets=((tokens,), _I32),
+                query_out=q,
+                key_out=k,
+            )
+            + 5 * 4 * 2
+        )
+        assert flops == 3 * tokens * 3 * 4
+
+    def test_rope_cos_sin_reads_no_table_row_when_nothing_rotates(self):
+        name = "RoPECosSinFwdOp"
+        row = {"B": 0, "S": 3, "H": 2, "D": 8, "P": 6, "Rh": 2}
+        case = {"T": "bfloat16", "C": "float32", "Cs": "float32"}
+        assert _evaluated(name, row, case)[0] == (0, 0)
+
+    @pytest.mark.parametrize(
+        "scoring_func,renormalize,read",
+        [
+            ("sqrtsoftplus", True, 2),
+            ("softmax", True, 2),
+            ("softmax", False, 16),
+        ],
+    )
+    def test_fused_topk_with_given_experts_reads_their_logits(
+        self, scoring_func, renormalize, read
+    ):
+        name = "FusedTopKFwdOp"
+        row = {
+            "T": 4,
+            "E": 16,
+            "top_k": 2,
+            "scoring_func": scoring_func,
+            "renormalize": renormalize,
+            "some": ["correction_bias", "expert_ids"],
+        }
+        (_flops, moved), _call = _evaluated(name, row, {"G": "float32"})
+        # Only an unrenormalized softmax needs the whole row; the bias selects nothing.
+        assert moved == _ledger(
+            name,
+            gating_output=((4, read), _F32),
+            correction_bias_unread=True,
+            expert_ids=((4, 2), _I32),
+            topk_weights=((4, 2), _F32),
+            topk_ids=((4, 2), _I32),
+        )
+
+    @pytest.mark.parametrize("renormalize", [False, True])
+    def test_fused_topk_softmax_selecting_with_a_bias_normalizes_the_whole_row(self, renormalize):
+        row = {"T": 4, "E": 16, "top_k": 2, "scoring_func": "softmax", "renormalize": renormalize}
+        (flops, _moved), _call = _evaluated(
+            "FusedTopKFwdOp", {**row, "some": ["correction_bias"]}, {"G": "float32"}
+        )
+        # Softmax (3 per logit) and its row sum and divide (2 per logit), the bias add, top_k
+        # compare-and-selects per logit, and 2 per kept weight to renormalize.
+        assert flops == 4 * (16 * 5 + 16 + 2 * 16 + (4 if renormalize else 0))
+
+    def test_moe_post_permute_adds_the_residual_once_per_output_element(self):
+        from tileops._perf.formulas import moe_post_permute_roofline
+
+        name = "MoEPostPermuteFwdOp"
+        row = next(r for r in _manifest_rows(name) if "residual" in r.get("some", ()))
+        call = _manifest_call(name, row)
+        bare = _manifest_call(name, {**row, "some": []})
+        extra = moe_post_permute_roofline(call)[0] - moe_post_permute_roofline(bare)[0]
+        assert extra == call.indices["T"] * call.indices["H"]
+
+    def test_ngram_hash_leaves_an_empty_sequence_untouched(self):
+        name = "NGramHashFwdOp"
+        row = {
+            "Tt": 3,
+            "seq_lens": [0, 3],
+            "N": 3,
+            "Hd": 4,
+            "S": 5,
+            "W": 4,
+            "eos_token_id": 0,
+            "some": ["cu_seqlens", "context_indices", "num_accepted_tokens"],
+        }
+        (flops, moved), _call = _evaluated(name, row, {})
+        # Only the second sequence reads its 2 history columns and rewrites 1 + 3.
+        assert moved == _ledger(
+            name,
+            input_ids=((3,), _I64),
+            context=((1, 2), _I64),
+            context_write=((1, 4), _I64),
+            multipliers=((3,), _I64),
+            primes=((4,), _I64),
+            offsets=((4,), _I64),
+            cu_seqlens=((3,), _I32),
+            context_indices=((2,), _I32),
+            num_accepted_tokens=((2,), _I32),
+            ngram_ids=((3, 4), _I64),
+        )
+        assert flops == 0
+
+    @pytest.mark.parametrize("verify", [False, True])
+    def test_ngram_hash_moves_the_context_columns_each_sequence_reaches(self, verify):
+        name = "NGramHashFwdOp"
+        some = ["context_indices", *(["num_accepted_tokens"] if verify else [])]
+        row = {"B": 2, "L": 3, "N": 3, "Hd": 4, "S": 5, "W": 4, "eos_token_id": 0, "some": some}
+        (flops, moved), _call = _evaluated(name, row, {})
+        # Each sequence reads its N - 1 = 2 history columns of the pool's 5 x 4, and rewrites
+        # 2, or under verification the history after its first column and its 3 tokens.
+        assert moved == _ledger(
+            name,
+            input_ids=((2, 3), _I64),
+            context=((2, 2), _I64),
+            context_write=((2, 4 if verify else 2), _I64),
+            multipliers=((3,), _I64),
+            primes=((4,), _I64),
+            offsets=((4,), _I64),
+            cu_seqlens=None,
+            context_indices=((2,), _I32),
+            num_accepted_tokens=((2,), _I32) if verify else None,
+            ngram_ids=((2, 3, 4), _I64),
+        )
+        assert flops == 0
 
     def test_chain_speculative_sampling_prices_the_cheaper_outcome(self):
         name = "ChainSpeculativeSamplingFwdOp"
@@ -991,7 +1548,9 @@ class TestSpecOnlyRecounts:
         }
         dtypes = {"T": "float16", "KV": "float16"}
         plain, _ = _evaluated("GQAPagedFwdOp", row, dtypes)
-        sink, _ = _evaluated("GQAPagedFwdOp", {**row, "some": ["sinks"]}, dtypes)
+        sink, _ = _evaluated(
+            "GQAPagedFwdOp", {**row, "some": [*row.get("some", []), "sinks"]}, dtypes
+        )
         assert sink == (plain[0] + 8 * 3 * 3, plain[1] + 8 * 4)
 
 
@@ -1030,7 +1589,21 @@ HAND_WRITTEN = {
     "MLAKVCacheWriteFwdOp": "only the tokens `slot_mapping` gives a slot are read and written",
     "PagedKVCacheGatherFwdOp": "it reads the cache rows each request's range reaches, not the pool",
     "FusedQKNormRoPEFwdOp": "it leaves the v columns untouched and reads only the named cos/sin rows",
+    "GDNFwdOp": "it reads and writes only the pool slots its indices name",
+    "KDAFwdOp": "it reads and writes only the pool slots its indices name",
+    "CausalConv1dFwdOp": "it touches the dilated window of the states its sequences name",
+    "CausalConv1dUpdateFwdOp": "it touches the dilated window of the states its sequences name",
+    "EmbeddingFwdOp": "it reads the weight rows its indices name, not the table",
+    "MaskedScatterFwdOp": "each output element reads input or source, as the mask decides",
+    "RoPECosSinFwdOp": "it reads the cos/sin rows the sequences reach, and in place only the rotated columns",
+    "RoPEFwdOp": "it reads only the cos/sin cache rows the positions name",
+    "RoPELlama31FwdOp": "it reads only the cos/sin cache rows the positions name",
+    "YaRNFwdOp": "it reads only the cos/sin cache rows the positions name",
+    "LongRoPEFwdOp": "it reads only the cos/sin cache rows the positions and offsets name",
     "ChainSpeculativeSamplingFwdOp": "where the chain stops is drawn at run time, so it prices the cheaper outcome",
+    "GatedPoolCompressFwdOp": "the state rows it reads and the entries it writes follow the positions",
+    "NGramHashFwdOp": "it reads and rewrites only the context columns each sequence's slot reaches",
+    "FusedTopKFwdOp": "with caller-given experts it reads only their logits and no bias",
 }
 
 
@@ -1079,32 +1652,22 @@ def _binder_agrees(op_name: str) -> bool:
 class TestCoverageLevels:
     """Every op sits at exactly one level, and the level is the truth."""
 
-    def test_a_generated_case_equals_its_op(self):
+    def test_a_generated_case_equals_its_op_on_both_halves(self):
+        """The audit judges the read side alone, and an op derives it by taking the write
+        side the signature settles off its `bytes`. Where the binder recounts the op, the
+        total and the read half both have to agree."""
         from tests.roofline_binder import manifest_cases
 
         checked = 0
         for op_name in _entries():
             if op_name in HAND_WRITTEN:
                 continue
-            for label, dtype, op, oracle, _reads in manifest_cases(op_name):
-                assert op.eval_roofline()[1] == oracle, f"{op_name} {label} {dtype}"
-                checked += 1
-        assert checked > 0
-
-    def test_a_generated_case_agrees_on_the_read_half(self):
-        """The audit judges the read side alone, and an op derives it by taking the
-        write side the signature settles off its `bytes`. Where the
-        binder recounts the op, the two halves have to be the same halves."""
-        from tests.roofline_binder import manifest_cases
-
-        checked = 0
-        for op_name in _entries():
-            if op_name in HAND_WRITTEN:
-                continue
-            for label, dtype, op, _oracle, reads in manifest_cases(op_name):
+            for label, dtype, op, oracle, reads in manifest_cases(op_name):
+                where = f"{op_name} {label} {dtype}"
+                assert op.eval_roofline()[1] == oracle, where
                 declared = op.eval_roofline_read_bytes()
-                assert declared is not None, f"{op_name} {label} {dtype}"
-                assert declared == reads, f"{op_name} {label} {dtype}"
+                assert declared is not None, where
+                assert declared == reads, where
                 checked += 1
         assert checked > 0
 

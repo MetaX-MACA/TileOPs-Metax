@@ -4,22 +4,21 @@ Inputs:
   expert_output    [materialized_rows, H] bf16/fp16 expert output
   inverse_indices  [T*K]                  int32 flat route → materialized row
   topk_weights     [T, K]                 float32 routing weights
+  residual         [T, H]                 bf16/fp16, optional, added before the cast
 
 Output:
   output           [T, H]                 bf16/fp16
 """
 
-from typing import Optional
-
 import tilelang
 import tilelang.language as T
 import torch
 
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.constants import MAX_BLOCK_THREADS, VECTOR_ACCESS_BYTES
 from tileops._kernels.kernel_base import Entry, Kernel
 from tileops._kernels.moe.call_spec import PostPermuteCall, PostPermuteFwdInterface
-from tileops._utils import get_sm_count
+from tileops._kernels.moe.layout import row_threads
 
 __all__ = ["MoEUnpermuteKernel"]
 
@@ -32,23 +31,26 @@ def _make_unpermute_kernel(
     materialized_rows: int,
     dtype: str,
     threads: int,
-    scaling: float = 1.0,
+    scaling: float,
+    has_residual: bool,
 ):
-    """Build one block per output token with an fp32 reduction."""
+    """Build one block per output token with an fp32 reduction.
+
+    With *has_residual* the program takes a ``(num_tokens, hidden_size)`` residual after the
+    routing weights and adds it to the scaled reduction before the cast.
+    """
     numel = num_tokens * top_k
 
-    @tilelang.jit(out_idx=[], compile_flags=["-O3", "-DENABLE_BF16"])
+    @tilelang.jit(out_idx=[], compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"])
     def _unpermute():
-        @T.prim_func
-        def _unpermute_main(
-            expert_output: T.Tensor([materialized_rows, hidden_size], dtype),
-            inverse_indices: T.Tensor([numel], "int32"),
-            topk_weights: T.Tensor([num_tokens, top_k], "float32"),
-            output: T.Tensor([num_tokens, hidden_size], dtype),
-        ):
+        @T.macro
+        def reduce_tokens(expert_output, inverse_indices, topk_weights, residual, output):
             with T.Kernel(num_tokens, threads=threads) as (token_idx,):
                 acc = T.alloc_fragment([hidden_size], "float32")
                 src = T.alloc_fragment([hidden_size], dtype)
+                if residual is not None:
+                    res = T.alloc_fragment([hidden_size], dtype)
+                    T.copy(residual[token_idx, 0:hidden_size], res)
 
                 T.fill(acc, 0.0)
 
@@ -63,13 +65,41 @@ def _make_unpermute_kernel(
                         acc[j] = acc[j] + T.Cast("float32", src[j]) * weight
 
                 out_frag = T.alloc_fragment([hidden_size], dtype)
-                if scaling != 1.0:
+                if residual is not None:
+                    for j in T.Parallel(hidden_size):
+                        out_frag[j] = T.Cast(
+                            dtype, acc[j] * T.float32(scaling) + T.Cast("float32", res[j])
+                        )
+                elif scaling != 1.0:
                     for j in T.Parallel(hidden_size):
                         out_frag[j] = T.Cast(dtype, acc[j] * T.float32(scaling))
                 else:
                     for j in T.Parallel(hidden_size):
                         out_frag[j] = T.Cast(dtype, acc[j])
                 T.copy(out_frag, output[token_idx, 0:hidden_size])
+
+        if has_residual:
+
+            @T.prim_func
+            def _unpermute_residual_main(
+                expert_output: T.Tensor([materialized_rows, hidden_size], dtype),
+                inverse_indices: T.Tensor([numel], "int32"),
+                topk_weights: T.Tensor([num_tokens, top_k], "float32"),
+                residual: T.Tensor([num_tokens, hidden_size], dtype),
+                output: T.Tensor([num_tokens, hidden_size], dtype),
+            ):
+                reduce_tokens(expert_output, inverse_indices, topk_weights, residual, output)
+
+            return _unpermute_residual_main
+
+        @T.prim_func
+        def _unpermute_main(
+            expert_output: T.Tensor([materialized_rows, hidden_size], dtype),
+            inverse_indices: T.Tensor([numel], "int32"),
+            topk_weights: T.Tensor([num_tokens, top_k], "float32"),
+            output: T.Tensor([num_tokens, hidden_size], dtype),
+        ):
+            reduce_tokens(expert_output, inverse_indices, topk_weights, None, output)
 
         return _unpermute_main
 
@@ -92,6 +122,8 @@ class MoEUnpermuteKernel(Kernel, PostPermuteFwdInterface):
         dtype: Data type of expert output and final output (bf16 or fp16).
         config: Optional config dict with ``threads``.
         sm_count: Device SM count used to choose the low-token launch width.
+        has_residual: Whether each call passes a residual added to the scaled reduction
+            before the cast.
 
     Example:
         ```python linenums="1"
@@ -115,8 +147,9 @@ class MoEUnpermuteKernel(Kernel, PostPermuteFwdInterface):
 
     @classmethod
     def entry_for(cls, call: PostPermuteCall) -> Entry:
-        """One build per route extents, hidden width, routing scale, dtype and device."""
-        index = call.device.index if call.device is not None else None
+        """One build per route extents, hidden width, routing scale, residual presence, dtype
+        and device."""
+        index = call.device_index
         scaling = call.epilogue.routed_scaling_factor
         identity = (
             call.num_tokens,
@@ -124,6 +157,7 @@ class MoEUnpermuteKernel(Kernel, PostPermuteFwdInterface):
             call.hidden_size,
             call.materialized_rows,
             scaling,
+            call.has_residual,
             call.input_dtype,
             index,
         )
@@ -136,6 +170,7 @@ class MoEUnpermuteKernel(Kernel, PostPermuteFwdInterface):
             dtype=call.input_dtype,
             sm_count=call.sm_count,
             device_index=index,
+            has_residual=call.has_residual,
         )
 
     def __init__(
@@ -146,10 +181,11 @@ class MoEUnpermuteKernel(Kernel, PostPermuteFwdInterface):
         materialized_rows: int,
         scaling: float = 1.0,
         dtype: torch.dtype = torch.bfloat16,
-        config: Optional[dict] = None,
-        sm_count: Optional[int] = None,
+        config: dict | None = None,
+        sm_count: int | None = None,
         *,
-        device_index: Optional[int] = None,
+        device_index: int | None = None,
+        has_residual: bool = False,
     ):
         super().__init__(device_index=device_index)
         self.num_tokens = num_tokens
@@ -157,11 +193,11 @@ class MoEUnpermuteKernel(Kernel, PostPermuteFwdInterface):
         self.hidden_size = hidden_size
         self.materialized_rows = materialized_rows
         self.dtype = dtype
-        self.numel = num_tokens * top_k
-        self.sm_count = get_sm_count(device_index) if sm_count is None else sm_count
+        self.sm_count = self.build_target.sm_count if sm_count is None else sm_count
         if self.sm_count <= 0:
             raise ValueError("sm_count must be positive")
         self.scaling = scaling
+        self.has_residual = has_residual
         self.init_config(config)
 
     @property
@@ -170,17 +206,16 @@ class MoEUnpermuteKernel(Kernel, PostPermuteFwdInterface):
         # threads, at one vector access a thread: up to a block's thread limit with no more
         # tokens than SMs, up to 256 otherwise so several blocks share an SM.
         cap = MAX_BLOCK_THREADS if self.num_tokens <= self.sm_count else 256
-        threads = min(cap, self.hidden_size // (VECTOR_ACCESS_BYTES // self.dtype.itemsize))
-        while threads > 0 and self.hidden_size % threads != 0:
-            threads -= 1
-        return {"threads": max(threads, 1)}
+        vector = VECTOR_ACCESS_BYTES // self.dtype.itemsize
+        return {"threads": row_threads(self.hidden_size, vector, cap)}
 
     def forward(
         self,
         expert_output: torch.Tensor,
         inverse_indices: torch.Tensor,
         topk_weights: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
+        out: torch.Tensor | None = None,
+        residual: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run moe_unpermute.
 
@@ -191,13 +226,15 @@ class MoEUnpermuteKernel(Kernel, PostPermuteFwdInterface):
             out: optional [T, H] output buffer to write into and reuse across
                 calls. Must not overlap any input. Allocated internally with
                 ``torch.empty`` if omitted.
+            residual: [T, H] bf16/fp16, added to the scaled reduction before the cast;
+                passed exactly when the kernel was built with ``has_residual``.
 
         Returns:
             output: [T, H] bf16/fp16 (``out`` if provided).
         """
         assert inverse_indices.dtype == torch.int32
         assert topk_weights.dtype == torch.float32
-        self._require_devices(expert_output=expert_output)
+        self._require_devices(expert_output=expert_output, residual=residual)
 
         dev = expert_output.device
         if out is None:
@@ -217,7 +254,10 @@ class MoEUnpermuteKernel(Kernel, PostPermuteFwdInterface):
                 raise ValueError("out must be contiguous")
             output = out
 
-        self.program(self._compile)(expert_output, inverse_indices, topk_weights, output)
+        inputs = (expert_output, inverse_indices, topk_weights)
+        if self.has_residual:
+            inputs += (residual,)
+        self.program(self._compile)(*inputs, output)
 
         return output
 
@@ -231,4 +271,5 @@ class MoEUnpermuteKernel(Kernel, PostPermuteFwdInterface):
             self.dtype_str,
             cfg["threads"],
             self.scaling,
+            self.has_residual,
         )()

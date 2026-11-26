@@ -1,7 +1,7 @@
 """SM90 DeltaNet prefill with its own dense partition orchestration."""
 
 import math
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 import torch
 
@@ -34,7 +34,6 @@ from tileops._kernels.linear_attention.gdn.prefill_prepare import (
     prefill_blocksolve_A_bthd,
     prefill_blocksolve_A_bthd_tl,
 )
-from tileops._utils import get_sm_count
 
 __all__ = ["DeltaNetDensePrefillFwdKernel"]
 
@@ -45,7 +44,7 @@ class DeltaNetDensePrefillFwdKernel(Kernel, DeltaNetFwdInterface):
     supported_archs = [90]
 
     @classmethod
-    def refusal(cls, call: DeltaNetCall) -> Optional[str]:
+    def refusal(cls, call: DeltaNetCall) -> str | None:
         """Why this kernel does not serve *call*, or ``None`` when it does.
 
         The pipeline runs chunks of 64 tokens over a square 16-bit state, equal-length or
@@ -70,11 +69,13 @@ class DeltaNetDensePrefillFwdKernel(Kernel, DeltaNetFwdInterface):
             )
             if present
         ]
-        return "does not support " + ", ".join(unsupported) if unsupported else None
+        if unsupported:
+            return "does not support " + ", ".join(unsupported)
+        return super().refusal(call)
 
     @classmethod
     def entry_for(cls, call: DeltaNetCall) -> Entry:
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         arguments = dict(
             batch=call.batch,
             heads=call.heads,
@@ -100,7 +101,7 @@ class DeltaNetDensePrefillFwdKernel(Kernel, DeltaNetFwdInterface):
         scale: float,
         dtype: torch.dtype,
         l2norm: bool = False,
-        config: Optional[Dict[str, Any]] = None,
+        config: dict[str, Any] | None = None,
         *,
         device_index: int | None = None,
     ) -> None:
@@ -123,11 +124,8 @@ class DeltaNetDensePrefillFwdKernel(Kernel, DeltaNetFwdInterface):
             raise ValueError(
                 f"max_local_chunks must be at least 4, got {self.config['max_local_chunks']}"
             )
-        # A zero gate is the ungated delta rule. Keep it across calls so the
-        # measured path does not include an extra GPU memset per invocation.
-        device = (
-            torch.device("cuda", device_index) if device_index is not None else torch.device("cuda")
-        )
+        # A zero gate is the ungated delta rule; held across calls so no call pays a memset.
+        device = self._build_device
         self.zero_gate = torch.zeros(
             (1, batch * seq_len, heads), dtype=torch.float32, device=device
         )
@@ -194,9 +192,8 @@ class DeltaNetDensePrefillFwdKernel(Kernel, DeltaNetFwdInterface):
         )
 
     @staticmethod
-    def _local_chunks(num_chunks: int, heads: int, device_index: int | None) -> int:
-        """The partition width the device's SM count fits."""
-        sm_count = get_sm_count(device_index)
+    def _local_chunks(num_chunks: int, heads: int, sm_count: int) -> int:
+        """The partition width the device's *sm_count* SMs fit."""
         local_chunks = 2 ** round(math.log2(math.sqrt(heads * num_chunks / sm_count) * 3))
         if heads >= 64 and num_chunks >= 512:
             local_chunks = max(local_chunks, 256)
@@ -246,7 +243,7 @@ class DeltaNetDensePrefillFwdKernel(Kernel, DeltaNetFwdInterface):
         k_rnorm: torch.Tensor,
         initial_state: torch.Tensor | None,
         split: tuple[torch.Tensor, ...],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Partitioned prefill on the GDN programs with a zero gate."""
         _, states_program, scan_program, forward_program = programs
         raw_cu, offsets, sequence_of, first_of, _, replay_per_head = split
@@ -284,12 +281,11 @@ class DeltaNetDensePrefillFwdKernel(Kernel, DeltaNetFwdInterface):
 
     def _programs(
         self,
-        cfg: Dict[str, Any],
+        cfg: dict[str, Any],
         offsets_dtype: torch.dtype,
         beta_dtype: torch.dtype,
         state_dtype: torch.dtype | None,
         partitions: int,
-        device_index: int | None,
     ) -> tuple:
         """The block solve, the partition pass, the partition scan and the forward a launch
         runs, ``None`` for a pass it skips.
@@ -339,7 +335,7 @@ class DeltaNetDensePrefillFwdKernel(Kernel, DeltaNetFwdInterface):
                 is_varlen=True,
                 is_cp=True,
                 l2norm=self.l2norm,
-                device_index=device_index,
+                sm_count=self.build_target.sm_count,
             )
             return tuple(CompiledProgram(p) for p in (solve, states, scan, forward))
         states = None
@@ -361,10 +357,14 @@ class DeltaNetDensePrefillFwdKernel(Kernel, DeltaNetFwdInterface):
         return CompiledProgram(solve), states, None, CompiledProgram(forward)
 
     @property
-    def default_config(self) -> Dict[str, Any]:
+    def default_config(self) -> dict[str, Any]:
         # A partition holds at most this many 64-token chunks; a longer sequence is split.
         num_chunks = -(-self.batch * self.seq_len // 64)
-        return {"max_local_chunks": self._local_chunks(num_chunks, self.heads, self.device_index)}
+        return {
+            "max_local_chunks": self._local_chunks(
+                num_chunks, self.heads, self.build_target.sm_count
+            )
+        }
 
     def forward(
         self,
@@ -375,7 +375,7 @@ class DeltaNetDensePrefillFwdKernel(Kernel, DeltaNetFwdInterface):
         initial_state: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor | None = None,
         cu_seqlens_cpu: torch.Tensor | None = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         self._require_devices(q=q, k=k, v=v, beta=beta)
         batch, seq_len, heads, dim = q.shape
         q_flat, k_flat, v_flat, beta_flat = (
@@ -401,7 +401,6 @@ class DeltaNetDensePrefillFwdKernel(Kernel, DeltaNetFwdInterface):
             beta.dtype,
             None if initial_state is None else initial_state.dtype,
             0 if split is None else split[1].shape[0] - 1,
-            q.device.index,
         )
         solve_program, states_program, _, forward_program = programs
         inverse, k_rnorm = prefill_blocksolve_A_bthd(

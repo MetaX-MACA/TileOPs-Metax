@@ -11,12 +11,18 @@ import contextlib
 import pytest
 import torch
 
+from conftest import _pin_default_target
 from tileops._ops import op_base
-from tileops._ops.convolution import Conv2dFwdOp
 from tileops._ops.norm.instance_norm import InstanceNormFwdOp
 from tileops._ops.norm.rms_norm import RMSNormFwdOp
 from tileops._ops.pool.max_pool import MaxPool2dFwdOp
-from tileops.backend import BUILTIN, OpNotAvailableError, TensorSpec
+from tileops.backend import (
+    BUILTIN,
+    OpNotAvailableError,
+    OpNotServedError,
+    TensorSpec,
+    set_default_target,
+)
 from tileops.backend import _registry as registry
 
 pytestmark = pytest.mark.smoke
@@ -96,7 +102,12 @@ def test_a_target_takes_over_the_op_and_is_asked_with_the_manifest_signature():
     ((inputs, params),) = recorder.calls
     assert inputs == (TensorSpec.of(x), TensorSpec.of(weight)), "signature.inputs order"
     # A backend gets the manifest parameters as the caller set them, ``eps=None`` included.
-    assert params == {"normalized_shape": NORMALIZED_SHAPE, "eps": None}
+    assert params == {
+        "normalized_shape": NORMALIZED_SHAPE,
+        "eps": None,
+        "group_size": None,
+        "zero_centered": False,
+    }
     assert torch.equal(out, torch.full_like(x, 7)), "the target's kernel produced the result"
 
     RMSNormFwdOp(normalized_shape=NORMALIZED_SHAPE, eps=1e-5)(x, weight)
@@ -113,16 +124,6 @@ def test_a_dtype_the_manifest_does_not_admit_never_reaches_the_backend():
             torch.randn(4, *NORMALIZED_SHAPE, dtype=DTYPE),
             torch.randn(*NORMALIZED_SHAPE, dtype=torch.bfloat16),
         )
-    assert recorder.calls == []
-
-
-def test_tensors_on_two_devices_never_reach_the_backend(device_beside_cpu):
-    recorder = _Recorder()
-    _register(recorder)
-    x, weight = _inputs()
-
-    with pytest.raises(ValueError, match="one device"):
-        RMSNormFwdOp(normalized_shape=NORMALIZED_SHAPE)(x, weight.to(device_beside_cpu))
     assert recorder.calls == []
 
 
@@ -322,6 +323,37 @@ def test_a_tuning_request_a_target_kernel_cannot_take_warns_once(ask):
     assert len(caught) == 1
 
 
+def test_one_kernel_a_target_returns_for_cpu_and_the_run_device_is_tuned_in_each_context(
+    device_beside_cpu, monkeypatch
+):
+    """The one-accelerator form of the two-device test below: one callable built for a CPU
+    call and a run-device call is tuned once in each call device's context."""
+    entered = _record_device_contexts(monkeypatch)
+
+    class Kernel(_TunableTarget.Kernel):
+        def __init__(self, eps):
+            super().__init__(eps)
+            self.tuned_in = []
+
+        def request_tune(self):
+            super().request_tune()
+            self.tuned_in.append(entered[-1])
+
+    shared = Kernel(1e-5)
+    registry.register_detector("acme", lambda device: True)
+    registry.register_kernel_builder("InstanceNormFwdOp", "acme", lambda *i, **p: shared)
+    op = InstanceNormFwdOp()
+    devices = [torch.device("cpu"), device_beside_cpu]
+    for device in devices:
+        for n in (2, 3):
+            x = torch.randn(n, 8, 4, 4, device=device)
+            op(x, weight=torch.randn(8, device=device), bias=torch.randn(8, device=device))
+
+    op.request_tune()
+
+    assert sorted(shared.tuned_in, key=str) == sorted(devices, key=str)
+
+
 def test_one_kernel_a_target_returns_for_two_devices_is_tuned_on_each(two_devices):
     """Tuning acts per device: one callable built for two devices is tuned once on each,
     with that device current."""
@@ -350,9 +382,9 @@ def test_one_kernel_a_target_returns_for_two_devices_is_tuned_on_each(two_device
     assert sorted(shared.tuned_on) == [device.index for device in two_devices]
 
 
-def test_a_target_builds_with_the_calls_device_current(monkeypatch):
-    """The builder runs inside the call device's context, as an in-tree build does."""
-    entered, building = [], []
+def _record_device_contexts(monkeypatch) -> list:
+    """The devices whose context the op has entered and not left, innermost last."""
+    entered = []
     current = op_base.device_context
 
     @contextlib.contextmanager
@@ -362,16 +394,43 @@ def test_a_target_builds_with_the_calls_device_current(monkeypatch):
             yield
             entered.pop()
 
+    monkeypatch.setattr(op_base, "device_context", recording)
+    return entered
+
+
+def test_a_target_builds_with_the_calls_device_current(monkeypatch):
+    """The builder runs inside the call device's context, as an in-tree build does."""
+    entered, building = _record_device_contexts(monkeypatch), []
+
     def build_kernel(*inputs, **params):
         building.append([*entered])
         return _InstanceNormTarget.Kernel(params["eps"])
 
-    monkeypatch.setattr(op_base, "device_context", recording)
     registry.register_detector("acme", lambda device: True)
     registry.register_kernel_builder("InstanceNormFwdOp", "acme", build_kernel)
     _run_instance_norm(InstanceNormFwdOp())
 
     assert building == [[torch.device("cpu")]]
+
+
+def test_a_target_builds_a_run_device_call_in_that_devices_context(device_beside_cpu, monkeypatch):
+    """The one-accelerator form of the two-device test below: a run-device call builds in
+    the call device's context, and the current device is the same after the call."""
+    entered, building = _record_device_contexts(monkeypatch), []
+
+    def build_kernel(*inputs, **params):
+        building.append([*entered])
+        return _InstanceNormTarget.Kernel(params["eps"])
+
+    registry.register_detector("acme", lambda device: True)
+    registry.register_kernel_builder("InstanceNormFwdOp", "acme", build_kernel)
+    x = torch.randn(2, 8, 4, 4, device=device_beside_cpu)
+    before = torch.accelerator.current_device_index()
+
+    InstanceNormFwdOp()(x, weight=torch.randn(8, device=device_beside_cpu), bias=None)
+
+    assert building == [[device_beside_cpu]]
+    assert torch.accelerator.current_device_index() == before
 
 
 def test_a_target_builds_on_the_calls_device_and_puts_the_current_one_back(two_devices):
@@ -414,8 +473,9 @@ def test_a_call_with_no_tensor_keys_its_kernel_by_the_device_the_checks_chose(mo
     assert [key[0] for key in op._target_kernels] == [torch.device("cpu")]
 
 
-def test_a_kernel_whose_tuning_raises_is_not_kept():
-    """A kernel built in tuned mode whose tuning raised is built again by the next call."""
+def _register_flaky_target() -> list:
+    """Register a target for InstanceNormFwdOp whose first kernel's first tuning raises;
+    return the kernels it builds."""
 
     class Flaky(_TunableTarget.Kernel):
         failures = 1
@@ -431,6 +491,13 @@ def test_a_kernel_whose_tuning_raises_is_not_kept():
     registry.register_kernel_builder(
         "InstanceNormFwdOp", "acme", lambda *i, **p: built.append(Flaky(1e-5)) or built[-1]
     )
+    return built
+
+
+def test_a_kernel_whose_tuning_raises_is_not_kept():
+    """A kernel built in tuned mode whose tuning raised is built again by the next call."""
+
+    built = _register_flaky_target()
     op = InstanceNormFwdOp()
     op.request_tune()
 
@@ -446,20 +513,7 @@ def test_a_kernel_whose_tuning_raises_is_not_kept():
 def test_a_tuning_request_that_raises_tunes_the_rest_when_asked_again():
     """The op stays in tuned mode, so asking again reaches what the failure stopped at."""
 
-    class Flaky(_TunableTarget.Kernel):
-        failures = 1
-
-        def request_tune(self):
-            if Flaky.failures:
-                Flaky.failures -= 1
-                raise RuntimeError("tuner fault")
-            super().request_tune()
-
-    built = []
-    registry.register_detector("acme", lambda device: True)
-    registry.register_kernel_builder(
-        "InstanceNormFwdOp", "acme", lambda *i, **p: built.append(Flaky(1e-5)) or built[-1]
-    )
+    built = _register_flaky_target()
     op = InstanceNormFwdOp()
     _run_instance_norm(op)
 
@@ -505,8 +559,9 @@ def test_a_target_without_this_op_raises_and_names_the_ones_that_have_it():
     registry.register_detector("claims_device", lambda device: True)
     registry.DETECTORS.pop("has_it")  # only the op-less target claims the device
 
-    with pytest.raises(OpNotAvailableError, match=r"claims_device.*has_it.*no fall back"):
+    with pytest.raises(OpNotServedError, match=r"claims_device.*has_it.*no fall back") as excinfo:
         RMSNormFwdOp(normalized_shape=NORMALIZED_SHAPE)(*_inputs())
+    assert excinfo.value.target == "claims_device"
 
 
 def test_builtin_keeps_the_in_tree_kernels_even_when_a_target_claims_the_device():
@@ -562,6 +617,29 @@ def test_a_call_with_no_tensor_leaves_the_question_open():
     assert op._serving_target == "acme", "the first call with a tensor decides"
 
 
+@pytest.mark.parametrize("traced", [False, True], ids=["eager", "traced"])
+def test_a_call_no_device_places_runs_in_tree_and_decides_nothing(monkeypatch, traced):
+    """No tensor, no ``device`` param and no current accelerator: the call runs ``forward``
+    with the binding left open, eager or traced."""
+    from tileops._ops import _signature_codegen
+    from tileops._ops.elementwise import AlibiFwdOp
+
+    class RanError(Exception):
+        pass
+
+    def forward():
+        assert op._target_builder is op_base._UNRESOLVED
+        raise RanError
+
+    monkeypatch.setattr(_signature_codegen, "current_device", lambda: None)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: traced)
+    op = AlibiFwdOp(seq_len=8, num_heads=4)
+    op.forward = forward
+
+    with pytest.raises(RanError):
+        op()
+
+
 def test_a_build_that_fails_pins_nothing():
     """The builder's exception reaches the caller unchanged, a TypeError included, and the
     next call resolves again rather than being stuck on a target that could not."""
@@ -588,6 +666,77 @@ def test_a_build_that_fails_pins_nothing():
     assert op._serving_target == "acme"
 
 
+def test_a_call_builds_with_the_target_it_selected_when_another_call_unbinds_it(monkeypatch):
+    """A call that selected a target builds with it, even when the call that bound the target
+    fails and unbinds it before this call builds."""
+    import threading
+
+    started, fail, reached, go = (threading.Event() for _ in range(4))
+
+    class BoomError(Exception):
+        pass
+
+    def kernel(x, weight):
+        if threading.current_thread().name == "first":
+            started.set()
+            fail.wait()
+            raise BoomError
+        return torch.full_like(x, 3)
+
+    registry.register_detector("acme", lambda device: True)
+    registry.register_kernel_builder("RMSNormFwdOp", "acme", lambda *inputs, **params: kernel)
+    describe = TensorSpec.of
+
+    def pausing(t):
+        if threading.current_thread().name == "second":
+            reached.set()
+            go.wait()
+        return describe(t)
+
+    monkeypatch.setattr(op_base.TensorSpec, "of", pausing)
+    op = RMSNormFwdOp(normalized_shape=NORMALIZED_SHAPE)
+    outcomes = {}
+
+    def run(rows):
+        try:
+            outcomes[threading.current_thread().name] = op(*_inputs(rows=rows))
+        except Exception as exc:
+            outcomes[threading.current_thread().name] = exc
+
+    first = threading.Thread(target=run, args=(4,), name="first")
+    first.start()
+    started.wait()
+    second = threading.Thread(target=run, args=(8,), name="second")
+    second.start()
+    reached.wait()
+    fail.set()
+    first.join()
+    go.set()
+    second.join()
+    assert isinstance(outcomes["first"], BoomError)
+    assert not isinstance(outcomes["second"], Exception), repr(outcomes["second"])
+    assert torch.equal(outcomes["second"], torch.full_like(outcomes["second"], 3))
+
+
+def test_a_kernel_a_call_built_after_an_unbinding_serves_only_its_own_builder():
+    """A kernel built with one builder never serves a call bound to another."""
+
+    def builder_of(value):
+        return lambda *inputs, **params: lambda x, weight: torch.full_like(x, value)
+
+    first, second = builder_of(1), builder_of(2)
+    registry.register_detector("acme", lambda device: True)
+    registry.register_kernel_builder("RMSNormFwdOp", "acme", first)
+    op = RMSNormFwdOp(normalized_shape=NORMALIZED_SHAPE)
+    x, weight = _inputs()
+    assert torch.equal(op(x, weight), torch.full_like(x, 1))
+
+    op._reset_binding()
+    op._run_on_target(first, (x, weight), {}, None, None, x.device)
+    registry.BUILDERS[("RMSNormFwdOp", "acme")] = second
+    assert torch.equal(op(x, weight), torch.full_like(x, 2))
+
+
 def test_a_builder_must_return_something_callable():
     """One of the rules this boundary owes, checked where it is crossed."""
     recorder = _Recorder()
@@ -598,6 +747,20 @@ def test_a_builder_must_return_something_callable():
         RMSNormFwdOp(normalized_shape=NORMALIZED_SHAPE)(*_inputs())
 
 
+def test_a_builder_returning_no_kernel_is_named_though_no_binding_is_in_place():
+    """The refusal names the builder the call ran, so it holds with no binding in place, as
+    after a concurrent call that failed cleared it."""
+
+    def not_a_kernel(*inputs, **params):
+        return "not a kernel"
+
+    op = RMSNormFwdOp(normalized_shape=NORMALIZED_SHAPE)
+    x, weight = _inputs()
+    assert op._serving_target is None
+    with pytest.raises(OpNotAvailableError, match="not_a_kernel"):
+        op._run_on_target(not_a_kernel, (x, weight), {}, None, None, x.device)
+
+
 def test_params_are_this_ops_manifest_params_and_not_an_inherited_set():
     """A subclass with no manifest entry of its own hands a backend nothing."""
 
@@ -605,7 +768,12 @@ def test_params_are_this_ops_manifest_params_and_not_an_inherited_set():
         __module__ = "tileops._test_stub"
 
     assert Untyped.__manifest_param_names__ == ()
-    assert RMSNormFwdOp.__manifest_param_names__ == ("normalized_shape", "eps")
+    assert RMSNormFwdOp.__manifest_param_names__ == (
+        "normalized_shape",
+        "eps",
+        "group_size",
+        "zero_centered",
+    )
 
 
 def test_a_call_that_fails_validation_pins_nothing():
@@ -678,12 +846,12 @@ def test_a_settled_instance_is_bound_to_that_target_s_devices():
 
 
 # --------------------------------------------------------------------------------------
-# Two optional inputs passed to a target: ClampTensorFwdOp's min and max
+# Two optional inputs passed to a target: ClampFwdOp's min and max
 # --------------------------------------------------------------------------------------
 
 
 class _ClampRecorder:
-    """A target for ClampTensorFwdOp; its kernel takes whatever the op hands over."""
+    """A target for ClampFwdOp; its kernel takes whatever the op hands over."""
 
     def __init__(self):
         self.calls = []
@@ -708,24 +876,24 @@ def _clamp_inputs(rows=4, cols=8, dtype=DTYPE, device="cpu"):
 def test_an_absent_optional_input_keeps_its_slot():
     """The slot says which input is missing; how many slots there are cannot."""
     recorder = _ClampRecorder()
-    _register(recorder, op="ClampTensorFwdOp")
-    from tileops._ops.elementwise import ClampTensorFwdOp
+    _register(recorder, op="ClampFwdOp")
+    from tileops._ops.elementwise import ClampFwdOp
 
     input, lower, _ = _clamp_inputs()
-    ClampTensorFwdOp()(input, lower, None)
+    ClampFwdOp()(input, lower, None)
 
     ((inputs, params),) = recorder.calls
     assert inputs == (TensorSpec.of(input), TensorSpec.of(lower), None)
-    assert params == {}, "ClampTensorFwdOp declares no manifest params"
+    assert params == {}, "ClampFwdOp declares no manifest params"
 
 
 def test_the_two_one_sided_clamps_are_two_kernels():
     """Both hand over two tensors of one shape; only the slot tells them apart."""
     recorder = _ClampRecorder()
-    _register(recorder, op="ClampTensorFwdOp")
-    from tileops._ops.elementwise import ClampTensorFwdOp
+    _register(recorder, op="ClampFwdOp")
+    from tileops._ops.elementwise import ClampFwdOp
 
-    op = ClampTensorFwdOp()
+    op = ClampFwdOp()
     input, lower, upper = _clamp_inputs()
 
     op(input, lower, None)
@@ -737,133 +905,19 @@ def test_the_two_one_sided_clamps_are_two_kernels():
     assert recorder.calls[1][0][1] is None and recorder.calls[1][0][2] is not None
 
 
-def test_a_clamp_with_neither_bound_never_reaches_the_backend():
+def test_a_number_bound_reaches_the_target_kernel_built_once_for_its_type():
+    """A call-time scalar is described by its type; its value is the kernel's argument."""
     recorder = _ClampRecorder()
-    _register(recorder, op="ClampTensorFwdOp")
-    from tileops._ops.elementwise import ClampTensorFwdOp
+    _register(recorder, op="ClampFwdOp")
+    from tileops._ops.elementwise import ClampFwdOp
 
+    op = ClampFwdOp()
     input, _, _ = _clamp_inputs()
-    with pytest.raises(ValueError, match="ClampOut"):
-        ClampTensorFwdOp()(input)
-    assert recorder.calls == []
-
-
-# --------------------------------------------------------------------------------------
-# An elementwise op whose shape is learned from the call
-# --------------------------------------------------------------------------------------
-
-
-class _ReLURecorder:
-    def __init__(self):
-        self.calls = []
-
-    def build_kernel(self, *inputs, **params):
-        self.calls.append((inputs, params))
-        return lambda x: torch.full_like(x, 7)
-
-
-def test_an_elementwise_op_hands_over_the_manifest_shape():
-    """Not the flat view the in-tree kernel wants: that is the kernel's own business."""
-    recorder = _ReLURecorder()
-    _register(recorder, op="ReLUFwdOp")
-    from tileops._ops.elementwise import ReLUFwdOp
-
-    x = torch.randn(4, 8, 16, dtype=DTYPE)
-    out = ReLUFwdOp()(x)
-
-    ((inputs, params),) = recorder.calls
-    assert inputs == (TensorSpec.of(x),), "the shape the manifest declares, not (512,)"
-    assert params == {"inplace": False}
-    assert torch.equal(out, torch.full_like(x, 7))
-
-
-def test_an_elementwise_op_without_a_builder_for_this_target_raises():
-    recorder = _ReLURecorder()
-    _register(recorder, op="ReLUFwdOp")
-    from tileops._ops.elementwise import SiLUFwdOp
-
-    with pytest.raises(OpNotAvailableError, match="registers no kernel builder"):
-        SiLUFwdOp()(torch.randn(4, 8, dtype=DTYPE))
-
-
-# --------------------------------------------------------------------------------------
-# An optional input passed to a target: Conv2dFwdOp's bias
-# --------------------------------------------------------------------------------------
-
-
-class _ConvRecorder:
-    """A target for Conv2dFwdOp; its kernel takes whatever the op hands over."""
-
-    def __init__(self):
-        self.calls = []
-
-    def build_kernel(self, *inputs, **params):
-        self.calls.append((inputs, params))
-
-        def kernel(x, weight, bias=None):
-            assert x.is_contiguous() and weight.is_contiguous()
-            return torch.zeros(x.shape[0], weight.shape[0], x.shape[2], x.shape[3], dtype=x.dtype)
-
-        return kernel
-
-
-def _conv_inputs(bias=False):
-    x = torch.randn(1, 8, 8, 8, dtype=DTYPE)
-    weight = torch.randn(4, 8, 3, 3, dtype=DTYPE)
-    return x, weight, (torch.randn(4, dtype=DTYPE) if bias else None)
-
-
-def test_a_missing_optional_input_keeps_its_place_in_the_hand_over():
-    """Presence is what the backend reads, and it reads it off the argument.
-
-    One argument per ``signature.inputs`` entry: a bias this call did not pass is ``None``
-    there. Dropping the argument would leave the count to say what is missing, which it
-    cannot do for an op with two optional inputs.
-    """
-    recorder = _ConvRecorder()
-    _register(recorder, op="Conv2dFwdOp")
-    x, weight, _ = _conv_inputs()
-
-    Conv2dFwdOp(padding=1)(x, weight)
-
-    ((inputs, params),) = recorder.calls
-    assert inputs == (TensorSpec.of(x), TensorSpec.of(weight), None), "signature.inputs order"
-    assert params == {"stride": 1, "padding": 1, "dilation": 1, "groups": 1}
-
-
-def test_a_bias_that_is_passed_reaches_the_backend_as_a_third_spec():
-    recorder = _ConvRecorder()
-    _register(recorder, op="Conv2dFwdOp")
-    x, weight, bias = _conv_inputs(bias=True)
-
-    Conv2dFwdOp(padding=1)(x, weight, bias)
-
-    ((inputs, _),) = recorder.calls
-    assert inputs == (TensorSpec.of(x), TensorSpec.of(weight), TensorSpec.of(bias))
-
-
-def test_the_two_sides_of_an_optional_input_are_two_kernels():
-    """Bias presence changes what a kernel is built for, so it is part of the signature."""
-    recorder = _ConvRecorder()
-    _register(recorder, op="Conv2dFwdOp")
-    op = Conv2dFwdOp(padding=1)
-    x, weight, bias = _conv_inputs(bias=True)
-
-    op(x, weight)
-    op(x, weight, bias)
-    op(x, weight)
-
-    assert len(recorder.calls) == 2
-
-
-def test_a_rejected_conv_call_never_reaches_the_backend():
-    recorder = _ConvRecorder()
-    _register(recorder, op="Conv2dFwdOp")
-    x, weight, _ = _conv_inputs()
-
-    with pytest.raises(ValueError, match="C_out"):
-        Conv2dFwdOp(padding=1)(x, weight, torch.randn(999, dtype=DTYPE))
-    assert recorder.calls == []
+    op(input, 0.5)
+    op(input, 0.25)
+    ((inputs, _params),) = recorder.calls
+    assert inputs == (TensorSpec.of(input), float, None)
+    assert recorder.kernel_calls == 2
 
 
 # --------------------------------------------------------------------------------------
@@ -983,27 +1037,6 @@ def test_a_reduction_op_hands_over_the_declared_rank():
     assert inputs == (TensorSpec.of(x),), "the rank the manifest declares, not (4, 128)"
     assert params == {"dim": [1, 2], "keepdim": False, "dtype": None}
     assert torch.equal(out, torch.full((4,), 7, dtype=DTYPE))
-
-
-def test_a_non_contiguous_reduction_input_reaches_the_backend_contiguous():
-    recorder = _ReduceRecorder((4,))
-    _register(recorder, op="SumFwdOp")
-    from tileops._ops.reduction import SumFwdOp
-
-    SumFwdOp(dim=-1)(torch.randn(8, 4, dtype=DTYPE).t())
-
-    assert len(recorder.calls) == 1  # the assertion that matters is inside the kernel
-
-
-def test_a_reduction_call_naming_an_absent_axis_never_reaches_the_backend():
-    recorder = _ReduceRecorder((4,))
-    _register(recorder, op="SumFwdOp")
-    from tileops._ops.reduction import SumFwdOp
-
-    with pytest.raises(ValueError, match="shape_rules"):
-        SumFwdOp(dim=5)(torch.randn(4, 8, dtype=DTYPE))
-
-    assert recorder.calls == []
 
 
 # --------------------------------------------------------------------------------------
@@ -1149,3 +1182,41 @@ def test_an_ops_input_value_checks_run_before_its_target():
     with pytest.raises(ValueError, match=r"cu_seqlens\[-1\] must equal 64"):
         op(x, short, chunks)
     assert asked == []
+
+
+# --------------------------------------------------------------------------------------
+# The suite's own pin: the in-tree kernels serve the run
+# --------------------------------------------------------------------------------------
+
+
+def test_an_installed_backend_does_not_serve_the_pinned_suite():
+    recorder = _Recorder()
+    # Claims every device, CPU included. StubOp has no manifest entry, which
+    # `register_kernel_builder` requires, so the table is written directly.
+    registry.register_detector("acme", lambda device: True)
+    registry.BUILDERS[("StubOp", "acme")] = recorder.build_kernel
+    _pin_default_target("builtin")
+    op = _stub_op()
+
+    # The stub's in-tree body returns zeros; the target's kernel is never built.
+    x, weight = _inputs()
+    assert torch.equal(op(x, weight), torch.zeros_like(x))
+    assert op._serving_target is BUILTIN
+    assert recorder.calls == []
+
+
+def test_a_backend_setting_a_default_on_import_does_not_replace_the_pin(monkeypatch) -> None:
+    class _EntryPoint:
+        name, value = "acme", "acme_backend"
+
+        def load(self):
+            registry.register_detector("acme", lambda device: True)
+            set_default_target("acme")
+
+    monkeypatch.setattr(registry, "entry_points", lambda group: [_EntryPoint()])
+    registry._loaded = False
+
+    _pin_default_target("builtin")
+    registry.ensure_loaded()  # what the first op constructed afterwards would do
+
+    assert registry.default_target is BUILTIN

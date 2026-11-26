@@ -1,23 +1,23 @@
 import functools
-from typing import Tuple
 
 import tilelang
 import tilelang.language as T
 import torch
 
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.pool.call_spec import (
     AdaptiveMaxPool2dFwdInterface,
     AdaptiveMaxPool2dIndicesFwdInterface,
     AdaptivePool2dCall,
 )
 from tileops._kernels.pool.common import (
+    ACCUM_DTYPE,
     AdaptivePool2dKernelBase,
     adaptive_bin,
-    dtype_itemsize,
     fits_static_shared,
     max_adaptive_bin_extent,
 )
+from tileops._kernels.warp_reduce import warp_reduce
 from tileops._utils import WARP_LANES
 
 __all__ = [
@@ -37,7 +37,7 @@ class _PlaneStaging:
     _THREAD_CHOICES = (128, 256, 512)
 
     @staticmethod
-    def _divisors(value: int) -> Tuple[int, ...]:
+    def _divisors(value: int) -> tuple[int, ...]:
         return tuple(d for d in range(1, value + 1) if value % d == 0)
 
     def __init__(self, rows: int, h_in: int, w_in: int, dtype: str) -> None:
@@ -46,9 +46,9 @@ class _PlaneStaging:
         self._dtype = dtype
 
     def _tile_bytes(self, planes: int) -> int:
-        return planes * self._plane * dtype_itemsize(self._dtype)
+        return planes * self._plane * getattr(torch, self._dtype).itemsize
 
-    def counts(self) -> Tuple[int, ...]:
+    def counts(self) -> tuple[int, ...]:
         """Plane counts a block may take: divisors of ``rows`` whose tile fits shared.
 
         A run of planes is contiguous in the flat ``(rows, h_in, w_in)`` view for every
@@ -100,7 +100,7 @@ def _bin_lanes(threads: int, outputs: int) -> int:
     return lanes
 
 
-def _bin_extent(size_in: int, size_out: int) -> Tuple[int, bool]:
+def _bin_extent(size_in: int, size_out: int) -> tuple[int, bool]:
     """The widest bin on this axis, and whether every bin on it is that wide."""
     extent = max_adaptive_bin_extent(size_in, size_out)
     return extent, all(
@@ -116,10 +116,9 @@ def _adaptive_max_pool2d_kernel(
     w_in: int,
     out_h: int,
     out_w: int,
-    dtype: str = "float16",
+    dtype: str,
     stage_planes: bool = True,
 ):
-    accum_dtype = "float"
     rows = n * c_in
     out_plane = out_h * out_w
     max_kh, uniform_h = _bin_extent(h_in, out_h)
@@ -128,7 +127,7 @@ def _adaptive_max_pool2d_kernel(
 
     # The autotuner reads this builder's free variables and accepts only int, float,
     # str, bool and None, so every value the jit function closes over is a scalar.
-    @tilelang.jit(out_idx=[1], compile_flags=["-O3", "-DENABLE_BF16"])
+    @tilelang.jit(out_idx=[1], compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"])
     def _adaptive_max_pool2d_func(planes: int, threads: int):
         _check_planes(rows, planes)
         # A global pool has one bin a plane; finer bins keep a thread each, where the
@@ -156,9 +155,9 @@ def _adaptive_max_pool2d_kernel(
             """
             ih_start, ih_end = adaptive_bin(oh, h_in, out_h)
             iw_start, iw_end = adaptive_bin(ow, w_in, out_w)
-            run = T.alloc_local([1], accum_dtype)
-            other = T.alloc_local([1], accum_dtype)
-            run[0] = -T.infinity(accum_dtype)
+            run = T.alloc_local([1], ACCUM_DTYPE)
+            other = T.alloc_local([1], ACCUM_DTYPE)
+            run[0] = -T.infinity(ACCUM_DTYPE)
             # Capped at 128 taps: a plane past the shared budget unrolled whole takes
             # seconds to compile.
             for step in T.unroll(run_taps, unroll_factor=128):
@@ -171,10 +170,8 @@ def _adaptive_max_pool2d_kernel(
                     and (uniform_h or ih < ih_end)
                     and (uniform_w or iw < iw_end)
                 ):
-                    _keep(run, T.cast(src[src_plane, ih, iw], accum_dtype))
-            for level in T.unroll(lanes.bit_length() - 1):
-                other[0] = T.shfl_xor(run[0], T.shift_left(1, level))
-                _keep(run, other[0])
+                    _keep(run, T.cast(src[src_plane, ih, iw], ACCUM_DTYPE))
+            warp_reduce(run, lambda run, other: _keep(run, other[0]), lanes=lanes, peer=other)
             if active and lane == 0:
                 dst[dst_plane, oh, ow] = T.cast(run[0], dtype)
 
@@ -184,7 +181,7 @@ def _adaptive_max_pool2d_kernel(
             ih_start, ih_end = adaptive_bin(oh, h_in, out_h)
             iw_start, iw_end = adaptive_bin(ow, w_in, out_w)
             run = T.alloc_var(T.float32)
-            run = -T.infinity(accum_dtype)
+            run = -T.infinity(ACCUM_DTYPE)
             # Static-bound loops: TileLang rejects a dynamic T.serial bound, so the
             # widest bin sets the trip count and a short bin skips its missing taps.
             for kh in T.serial(max_kh):
@@ -193,7 +190,7 @@ def _adaptive_max_pool2d_kernel(
                     for kw in T.serial(max_kw):
                         iw = iw_start + kw
                         if uniform_w or iw < iw_end:
-                            v = T.cast(src[src_plane, ih, iw], accum_dtype)
+                            v = T.cast(src[src_plane, ih, iw], ACCUM_DTYPE)
                             # NaN enters `run` and never leaves, since a later value
                             # fails `v > NaN`.
                             run = T.if_then_else(T.isnan(v) or (v > run), v, run)
@@ -248,9 +245,8 @@ def _adaptive_max_pool2d_with_indices_kernel(
     w_in: int,
     out_h: int,
     out_w: int,
-    dtype: str = "float16",
+    dtype: str,
 ):
-    accum_dtype = "float"
     rows = n * c_in
     plane = h_in * w_in
     out_plane = out_h * out_w
@@ -261,7 +257,7 @@ def _adaptive_max_pool2d_with_indices_kernel(
     idx_dtype = "int32" if plane < 2**31 else "int64"
 
     # Scalar free variables only, as the autotuner requires.
-    @tilelang.jit(out_idx=[1, 2], compile_flags=["-O3", "-DENABLE_BF16"])
+    @tilelang.jit(out_idx=[1, 2], compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"])
     def _adaptive_max_pool2d_with_indices_func(planes: int, threads: int):
         _check_planes(rows, planes)
         staged = fits_static_shared(planes * plane, dtype)
@@ -273,7 +269,7 @@ def _adaptive_max_pool2d_with_indices_kernel(
             iw_start, iw_end = adaptive_bin(ow, w_in, out_w)
             run = T.alloc_var(T.float32)
             best = T.alloc_var(idx_dtype)
-            run = -T.infinity(accum_dtype)
+            run = -T.infinity(ACCUM_DTYPE)
             # Bins are never empty, so the first tap is in range and seeds the
             # position: a bin holding nothing but -inf reports that tap.
             best = T.cast(ih_start * w_in + iw_start, idx_dtype)
@@ -283,7 +279,7 @@ def _adaptive_max_pool2d_with_indices_kernel(
                     for kw in T.serial(max_kw):
                         iw = iw_start + kw
                         if uniform_w or iw < iw_end:
-                            v = T.cast(src[src_plane, ih, iw], accum_dtype)
+                            v = T.cast(src[src_plane, ih, iw], ACCUM_DTYPE)
                             # Strict > keeps the first maximum; a NaN takes the position
                             # and holds it, so the last NaN in the bin wins.
                             take = T.isnan(v) or (v > run)
@@ -354,13 +350,14 @@ class AdaptiveMaxPool2dRegisterKernel(AdaptiveMaxPool2dKernel):
     preferred_over = frozenset({"adaptive_max_pool2d_kernel"})
 
     @classmethod
-    def refusal(cls, call: AdaptivePool2dCall) -> "str | None":
+    def refusal(cls, call: AdaptivePool2dCall) -> str | None:
         if call.dtype not in (torch.float16, torch.bfloat16):
             return f"requires float16 or bfloat16, got {call.dtype}"
         if (call.out_h, call.out_w) != (1, 1):
             return f"serves a 1x1 output, got {call.out_h}x{call.out_w}"
-        dtype = str(call.dtype).removeprefix("torch.")
-        config = _PlaneStaging(call.n * call.c_in, call.h_in, call.w_in, dtype).default()
+        config = _PlaneStaging(
+            call.n * call.c_in, call.h_in, call.w_in, cls.dtype_to_str(call.dtype)
+        ).default()
         lanes = _bin_lanes(config["threads"], config["planes"])
         if lanes == 1:
             return "the plan gives a plane one lane"
@@ -380,7 +377,7 @@ class AdaptiveMaxPool2dWithIndicesKernel(
 ):
     """Adaptive max pooling forward kernel returning values and int64 indices."""
 
-    def _launch(self, program, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _launch(self, program, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         values, indices = program(x.reshape(self.n * self.c_in, self.h_in, self.w_in))
         shape = (self.n, self.c_in, self.out_h, self.out_w)
         return values.view(shape), indices.view(shape)

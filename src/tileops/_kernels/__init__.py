@@ -8,13 +8,13 @@ if TYPE_CHECKING:  # type checkers and IDEs do not run __getattr__
         GQABwdWGMMAPipelinedKernel,
         GQABwdWSKernel,
         GQADecodeKernel,
-        GQADecodePagedKernel,
         GQADenseFP8Kernel,
         GQADensePersistentWSKernel,
         GQADenseSlidingWindowBandKernel,
         GQADenseSlidingWindowKernel,
         GQADenseWSKernel,
         GQASlidingWindowVarlenFwdWGMMAPipelinedKernel,
+        MHADecodePagedKernel,
         MLADecodeWSKernel,
         NSACompressedFwdVarlenKernel,
         NSAFwdVarlenKernel,
@@ -98,18 +98,24 @@ if TYPE_CHECKING:  # type checkers and IDEs do not run __getattr__
         MaxPool3dWithIndicesKernel,
         MeanPoolingFwdKernel,
     )
+    from tileops._kernels.quantization.fp4_quant import FP4QuantKernel
     from tileops._kernels.quantization.fp8_quant import FP8QuantKernel
     from tileops._kernels.rope import (
-        RoPENeoxKernel,
         RoPENeoxPositionIdsKernel,
+        RoPENeoxStagedRowsKernel,
         RoPENonNeoxKernel,
+        RoPENonNeoxStagedRowsKernel,
     )
     from tileops._kernels.sequence_modeling.engram import (
         EngramDecodeKernel,
         EngramGateConvBwdKernel,
         EngramGateConvFwdKernel,
     )
-    from tileops._kernels.sequence_modeling.mhc import MHCPostKernel, MHCPreKernel
+    from tileops._kernels.sequence_modeling.hyper_connection import (
+        HyperConnectionHeadKernel,
+        HyperConnectionPostKernel,
+        HyperConnectionPreKernel,
+    )
     from tileops._kernels.transform import (
         HadamardBaseExchangeKernel,
         HadamardExchangeKernel,
@@ -158,6 +164,7 @@ _LAZY = {
     "FFTC2COneCTAKernel": ".fft",
     "FP8LightningIndexerKernel": ".attention.fp8_lightning_indexer",
     "FP8LightningIndexerWSKernel": ".attention.fp8_lightning_indexer",
+    "FP4QuantKernel": ".quantization.fp4_quant",
     "FP8QuantKernel": ".quantization.fp8_quant",
     "GQABwdPreprocessKernel": ".attention",
     "FusedGatedKernel": ".elementwise",
@@ -168,7 +175,7 @@ _LAZY = {
     "GQABwdWGMMAPipelinedKernel": ".attention",
     "GQABwdWSKernel": ".attention",
     "GQADecodeKernel": ".attention",
-    "GQADecodePagedKernel": ".attention",
+    "MHADecodePagedKernel": ".attention",
     "GQADenseFP8Kernel": ".attention",
     "GQADensePersistentWSKernel": ".attention",
     "GQADenseWSKernel": ".attention",
@@ -189,6 +196,9 @@ _LAZY = {
     "HadamardMultiPassKernel": ".transform",
     "HadamardSharedRowsKernel": ".transform",
     "HadamardWarpRowsKernel": ".transform",
+    "HyperConnectionHeadKernel": ".sequence_modeling.hyper_connection",
+    "HyperConnectionPostKernel": ".sequence_modeling.hyper_connection",
+    "HyperConnectionPreKernel": ".sequence_modeling.hyper_connection",
     "GemvKernel": ".gemm",
     "GroupConv1dKernel": ".convolution",
     "GroupConv2dKernel": ".convolution",
@@ -199,8 +209,6 @@ _LAZY = {
     "Kernel": ".kernel_base",
     "LayerNormKernel": ".norm",
     "LayerNormWarpRowKernel": ".norm",
-    "MHCPostKernel": ".sequence_modeling.mhc",
-    "MHCPreKernel": ".sequence_modeling.mhc",
     "MLADecodeWSKernel": ".attention",
     "MaxPool1dKernel": ".pool",
     "MaxPool1dWithIndicesKernel": ".pool",
@@ -214,9 +222,10 @@ _LAZY = {
     "NSAFwdVarlenKernel": ".attention",
     "NSATopKVarlenKernel": ".attention",
     "RMSNormKernel": ".norm",
-    "RoPENeoxKernel": ".rope",
     "RoPENeoxPositionIdsKernel": ".rope",
+    "RoPENeoxStagedRowsKernel": ".rope",
     "RoPENonNeoxKernel": ".rope",
+    "RoPENonNeoxStagedRowsKernel": ".rope",
     "DSADecodeBasicKernel": ".attention",
     "DSADecodeKernel": ".attention",
     "TopKSelectKernel": ".attention.topk_select",

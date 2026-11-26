@@ -37,7 +37,7 @@ Rationale and the interface / entry vocabulary: [ops-design.md § Kernel caching
 | `kernel_for(interface, call)`   | The in-tree entry serving this call; *call* is a function building the call spec, which the Op plan holds. The only way an op's in-tree implementation reaches a kernel; a target serves the whole op |
 | `call_spec(interface, call)`    | The call spec *call* builds, held by the Op plan; for a `forward` that reads the spec itself                                                                                                          |
 | `key_for(interface, call)`      | The key of the interface's implementation that serves the call. Introspection and tests; `kernel_for` asks it on a miss                                                                               |
-| `_entries_built(interface)`     | Read-only view of an interface's entries, whoever built them; empty before its first build. Introspection only, never dispatch                                                                        |
+| `_entries_built(interface)`     | Read-only mapping of an interface's entries, whoever built them; empty before its first build. Introspection only, never dispatch                                                                     |
 | `delegate_for(stage, identity)` | The sub-op held for a stage and identity, built once on a miss with the op's `target`, or the injected one. The only way an op holds a sub-op                                                         |
 | `_held_delegates()`             | The sub-ops `delegate_for` holds, in stage order. Derived; never overridden                                                                                                                           |
 | `iter_kernels()`                | The TileOPs `Kernel` instances the entries hold, deduplicated: the op's interface entries and those of its held sub-ops; a target's kernels are not among them                                        |
@@ -49,17 +49,17 @@ Rationale and the interface / entry vocabulary: [ops-design.md § Kernel caching
 
 Unlike `Op`, a `Kernel` **is** constructed for one element type — it compiles a dtype-specialized program, so `dtype` is a ctor argument here. The op supplies it from the tensors at `forward()`.
 
-| Attribute                            | Type                    | Purpose                                                             |
-| ------------------------------------ | ----------------------- | ------------------------------------------------------------------- |
-| `dtype`                              | `Optional[torch.dtype]` | Element type this kernel is specialized for                         |
-| `config`                             | `Dict[str, Any]`        | Tile configuration of the published generation; assigning publishes |
-| `autotune_configs`                   | `Optional[list[dict]]`  | Search space for autotuning; the untuned config is timed with it    |
-| `supported_archs`                    | `Optional[list[int]]`   | Architectures of its one device type, e.g. SM `[80, 86, 89, 90]`    |
-| `kernel`                             | `Callable`              | Compiled TileLang kernel function                                   |
-| `autotune_accepts_random_int_inputs` | `bool`                  | Whether autotuning may generate the integer tensor inputs at random |
-| `devices`                            | `frozenset[str]`        | Device types the implementation runs on; default `{"cuda"}`         |
-| `general`                            | `bool`                  | Below every other implementation of its interface; at most one      |
-| `preferred_over`                     | `frozenset[str]`        | Keys of the implementations it wins over, transitively              |
+| Attribute                            | Type                  | Purpose                                                             |
+| ------------------------------------ | --------------------- | ------------------------------------------------------------------- |
+| `dtype`                              | `torch.dtype \| None` | Element type this kernel is specialized for                         |
+| `config`                             | `dict[str, Any]`      | Tile configuration of the published generation; assigning publishes |
+| `autotune_configs`                   | `list[dict] \| None`  | Search space for autotuning; the untuned config is timed with it    |
+| `supported_archs`                    | `list[int] \| None`   | Architectures of its one device type, e.g. SM `[80, 86, 89, 90]`    |
+| `kernel`                             | `Callable`            | Compiled TileLang kernel function                                   |
+| `autotune_accepts_random_int_inputs` | `bool`                | Whether autotuning may generate the integer tensor inputs at random |
+| `devices`                            | `frozenset[str]`      | Device types the implementation runs on; default `{"cuda"}`         |
+| `general`                            | `bool`                | Below every other implementation of its interface; at most one      |
+| `preferred_over`                     | `frozenset[str]`      | Keys of the implementations it wins over, transitively              |
 
 Abstract interface: `forward()`. Key methods: `init_config(config)`, `request_tune()`, `autotune(warmup, rep)`, and `tuning_candidates(configs, untuned)`, which every tuning loop times, so tuning never keeps a config it measured slower than the one the kernel runs untuned.
 
@@ -68,6 +68,7 @@ A kernel publishes its configuration in generations: assigning `config` publishe
 - A config field left `None` is resolved per launch by the program builder; a stated value overrides it. Why: some best values depend on a launch fact, such as the row count.
 - A tuning publishes one configuration for the whole kernel. Why: tuning per launch fact costs more than it gains.
 - A requested tuning that raises leaves tuned mode, and a build that raises puts back the kernel handle it found. Why: a failure must not decide a later request or launch.
+- CUDA autotuning and benchmarks use the same ranking metric, median device-busy time, and flush L2 the same way before each timed call. Why: tuning should select the configuration that performs best under the reported metric and cache state.
 - A candidate config key names a parameter of the builder being tuned; a parameter spelled `<key>_arg` has `<key>` in `_AUTOTUNE_PARAM_ALIASES`. Why: TileLang binds candidates by parameter name and raises on a key that names none.
 - A kernel whose integer tensor inputs decide how much work it runs supplies them through `autotune_supply_prog`; one whose integer inputs are data or masks sets `autotune_accepts_random_int_inputs = True`. `tune_jit_kernel` refuses a kernel that does neither. Why: TileLang fills an unsupplied integer tensor from `randint(-2, 3)`, so every candidate times a collapsed kernel.
 
@@ -101,7 +102,7 @@ The manifest ([`src/tileops/manifest/`](../../src/tileops/manifest/)) is the sol
 
 ### Parameter design <a id="parameter-design"></a>
 
-Two time points: `__init__` takes `signature.params`, construction-time tensors among them. At each call, parameters and presence seed inference, construction-time tensors and call-time inputs are unified together, and `let` derives the rest; generators determine indices only when a workload row is instantiated. An input dtype belongs to the call, never to construction: the tensors carry it, so restating it at construction only creates a second source that can disagree with the first. An output dtype the inputs do not determine is a dtype parameter ([manifest.md § Dtypes](manifest.md#dtypes)). Kernels are built at the first `forward` for a specialization, keyed opaquely by every input that changes what is built.
+Two time points: `__init__` takes `signature.params`. At each call, parameters and the member each call-time argument holds seed inference, the call-time tensors are unified, and `let` derives the rest; generators determine indices only when a workload row is instantiated. An input dtype belongs to the call, never to construction: the tensors carry it, so restating it at construction only creates a second source that can disagree with the first. An output dtype the inputs do not determine is a dtype parameter ([manifest.md § Dtypes](manifest.md#dtypes)). Kernels are built at the first `forward` for a specialization, keyed opaquely by every input that changes what is built.
 
 ### Calling conventions
 

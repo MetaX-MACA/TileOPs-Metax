@@ -8,13 +8,21 @@ from tileops._kernels.sequence_modeling.engram import (
     EngramGateConvFwdInterface,
     EngramGateConvFwdKernel,
 )
-from tileops._kernels.sequence_modeling.mhc import (
-    MHCPostCall,
-    MHCPostFwdInterface,
-    MHCPostKernel,
-    MHCPreCall,
-    MHCPreFwdInterface,
-    MHCPreKernel,
+from tileops._kernels.sequence_modeling.hyper_connection import (
+    HyperConnectionHeadCall,
+    HyperConnectionHeadFwdInterface,
+    HyperConnectionHeadKernel,
+    HyperConnectionPostCall,
+    HyperConnectionPostFwdInterface,
+    HyperConnectionPostKernel,
+    HyperConnectionPreCall,
+    HyperConnectionPreFwdInterface,
+    HyperConnectionPreKernel,
+)
+from tileops._kernels.sequence_modeling.ngram_hash import (
+    NGramHashCall,
+    NGramHashFwdInterface,
+    NGramHashKernel,
 )
 
 __all__ = [
@@ -26,10 +34,16 @@ __all__ = [
     "EngramGateConvCall",
     "EngramGateConvFwdInterface",
     "EngramGateConvFwdKernel",
-    "MHCPostCall",
-    "MHCPostFwdInterface",
-    "MHCPostKernel",
-    "MHCPreCall",
-    "MHCPreFwdInterface",
-    "MHCPreKernel",
+    "HyperConnectionHeadCall",
+    "HyperConnectionHeadFwdInterface",
+    "HyperConnectionHeadKernel",
+    "HyperConnectionPostCall",
+    "HyperConnectionPostFwdInterface",
+    "HyperConnectionPostKernel",
+    "HyperConnectionPreCall",
+    "HyperConnectionPreFwdInterface",
+    "HyperConnectionPreKernel",
+    "NGramHashCall",
+    "NGramHashFwdInterface",
+    "NGramHashKernel",
 ]

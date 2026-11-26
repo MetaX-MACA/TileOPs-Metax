@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from tests.workload_test_base import FixtureBase, TestBase
+from tileops._kernels.elementwise import UnaryKernel
 from tileops._ops.elementwise import LogicalAndFwdOp, LogicalNotFwdOp, LogicalOrFwdOp
 from workloads.device import run_device
 from workloads.elementwise import LogicalCase, LogicalNotWorkload
@@ -110,6 +111,30 @@ def test_logical_broadcast(
     test.check(op, a, b)
 
 
+@pytest.mark.parametrize(
+    "op_cls, dtype",
+    [
+        pytest.param(LogicalOrFwdOp, torch.float16, id="or-float16", marks=pytest.mark.smoke),
+        pytest.param(LogicalOrFwdOp, torch.bfloat16, id="or-bfloat16", marks=pytest.mark.smoke),
+        pytest.param(LogicalOrFwdOp, torch.float32, id="or-float32", marks=pytest.mark.smoke),
+        pytest.param(LogicalAndFwdOp, torch.float16, id="and-float16", marks=pytest.mark.full),
+    ],
+)
+def test_logical_nan_is_true(op_cls, dtype: torch.dtype) -> None:
+    """A NaN operand is nonzero and reads as true; -0.0 reads as false.
+
+    Equal or negated nonzero pairs, infinities and the smallest subnormal read as true.
+    """
+    nan, inf = float("nan"), float("inf")
+    tiny = torch.finfo(dtype).smallest_normal * torch.finfo(dtype).eps
+    a = [nan, nan, nan, 0.0, -0.0, 1.0, 0.0, nan, 1.0, -1.0, inf, -inf, tiny, -tiny, 0.0]
+    b = [nan, 0.0, 1.0, nan, 0.0, 0.0, -0.0, -0.0, 1.0, 1.0, inf, inf, -tiny, 0.0, tiny]
+    a = torch.tensor(a, device=run_device(), dtype=dtype)
+    b = torch.tensor(b, device=run_device(), dtype=dtype)
+    test = LogicalTest(a.numel(), a.dtype, op_cls.__name__)
+    test.check(op_cls(), a, b)
+
+
 @pytest.mark.smoke
 def test_logical_and_bool_broadcast() -> None:
     """Bool-input binary broadcast path uses uint8 storage internally."""
@@ -163,18 +188,13 @@ def test_logical_not_near_one_wave(tail: int, dtype: torch.dtype) -> None:
     resident = props.multi_processor_count * props.max_threads_per_multi_processor
     run = 256 * 64
     n_total = 20 * resident // run * run
-    if 4 * n_total * 2 > 3 * props.L2_cache_size:
+    if not UnaryKernel.fits_l2_budget(n_total, 2, props.L2_cache_size):
         pytest.skip("twenty elements per resident thread exceed three quarters of this L2")
     test = LogicalNotTest(n_total + tail, dtype)
     test.check(LogicalNotFwdOp(), *test.gen_inputs())
 
 
-# Per-dtype correctness across the manifest dtype union for binary logical
-# ops. The manifest declares
-# ``bool | uint8 | int8 | int16 | int32 | int64 | float16 | bfloat16 | float32``
-# for both LogicalAndFwdOp and LogicalOrFwdOp; the float path is covered
-# above. The int / bool cells exercise the kernel's non-zero truthiness
-# path on every manifest-declared integral dtype.
+# The integral and bool dtypes of the binary logical ops; the float ones are covered above.
 
 _INT_DTYPES = [torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64]
 _LOGICAL_OP_CASES = [

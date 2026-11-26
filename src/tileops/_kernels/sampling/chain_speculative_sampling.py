@@ -1,6 +1,7 @@
 """Chain speculative sampling: verify a draft chain, then draw once from the residual row."""
 
-from typing import ClassVar, Optional
+import operator
+from typing import ClassVar
 
 import tilelang
 import tilelang.language as T
@@ -11,10 +12,17 @@ from tileops._kernels.build_target import target_cache
 from tileops._kernels.constants import BLOCK_SHARED_BYTES_OPT_IN
 from tileops._kernels.kernel_base import Kernel
 from tileops._kernels.sampling.call_spec import ChainSpeculativeSamplingFwdInterface, SamplingCall
-from tileops._kernels.sampling.philox import UNIFORM_BITS, mix
-from tileops._kernels.sampling.row_tiles import load_vector, vector_width
+from tileops._kernels.sampling.philox import draw, uniform_of
+from tileops._kernels.sampling.row_tiles import (
+    gather_part_totals,
+    load_vector,
+    pick_entry,
+    row_split,
+    vector_width,
+)
 from tileops._kernels.tiling import align_up
-from tileops._utils import WARP_LANES, WARP_SHUFFLE_STAGES, is_maca
+from tileops._kernels.warp_reduce import warp_reduce
+from tileops._utils import WARP_LANES, is_maca
 
 __all__ = ["ChainSpeculativeSamplingFwdKernel"]
 
@@ -121,12 +129,7 @@ def _chain_speculative_sampling_kernel(
                             if (idx[0] == n) & (acc[0] + src[tx * span + i] > acc[1]):
                                 idx[0] = tx * span + i
                         acc[0] = acc[0] + src[tx * span + i]
-                for stage in T.unroll(WARP_SHUFFLE_STAGES):
-                    reach = T.int32(WARP_LANES // 2) >> stage
-                    idx[0] = T.min(idx[0], T.shfl_xor(idx[0], reach, width=WARP_LANES))
-                    idx[1] = T.max(idx[1], T.shfl_xor(idx[1], reach, width=WARP_LANES))
-                if tx == 0:
-                    pick[0] = T.if_then_else(idx[0] < n, idx[0], T.max(idx[1], 0))
+                pick_entry(idx, pick, n)
             T.sync_threads()
             if tx == 0:
                 acc[1] = T.max(frac * total[0] + base, T.cast(0, "float64"))
@@ -185,23 +188,13 @@ def _chain_speculative_sampling_kernel(
                 line = bx // parts
                 head = bx % parts * chunk
 
-                # Philox4x32-10 keyed by the seed and counted by the draw and the row
-                # alone, so a uniform is the same value however the launch splits the row.
+                # Counted by the draw and the row alone, so a uniform is the same value
+                # however the launch splits the row.
                 for d in T.serial(draw_rounds):
                     draw_index[0] = d * threads + tx
                     if draw_index[0] < num_draft + 1:
-                        key[0] = T.cast(seed[0] & T.int64(0xFFFFFFFF), "uint32")
-                        key[1] = T.cast((seed[0] >> T.int64(32)) & T.int64(0xFFFFFFFF), "uint32")
-                        counter[0] = T.cast(draw_index[0], "uint32")
-                        counter[1] = T.cast(line, "uint32")
-                        counter[2] = T.cast(offset[0] & T.int64(0xFFFFFFFF), "uint32")
-                        counter[3] = T.cast(
-                            (offset[0] >> T.int64(32)) & T.int64(0xFFFFFFFF), "uint32"
-                        )
-                        mix(counter, key, bump)
-                        warp[0] = T.cast(
-                            counter[0] >> T.uint32(32 - UNIFORM_BITS), "float32"
-                        ) * T.float32(2.0**-UNIFORM_BITS)
+                        draw(counter, key, bump, seed, offset, draw_index[0], line)
+                        warp[0] = uniform_of(counter[0])
                         if draw_index[0] == num_draft:
                             token_uniform[0] = warp[0]
                         else:
@@ -242,9 +235,7 @@ def _chain_speculative_sampling_kernel(
                         )
                     for j in T.unroll(pace):
                         fold(warp, held, other, j)
-                        for step in T.unroll(WARP_SHUFFLE_STAGES):
-                            reach = T.int32(WARP_LANES // 2) >> step
-                            warp[0] = warp[0] + T.shfl_xor(warp[0], reach, width=WARP_LANES)
+                        warp_reduce(warp, operator.add, high_first=True)
                         if (tx % WARP_LANES == 0) & (r * pace + j < chunk):
                             seg[(r * pace + j) * warps + tx // WARP_LANES] = T.cast(
                                 warp[0], "float64"
@@ -256,26 +247,9 @@ def _chain_speculative_sampling_kernel(
                         owner_part[0] = 0
                     remainder[0] = T.cast(0, "float64")
                 else:
-                    # The chunk total, summed exactly as ``locate`` sums the same entries,
-                    # so the prefix a block takes from the barrier and the prefix it then
-                    # descends agree entry for entry.
-                    if tx < WARP_LANES:
-                        acc[0] = T.cast(0, "float64")
-                        for i in T.serial(leaf_span):
-                            if tx * leaf_span + i < leaves:
-                                acc[0] = acc[0] + seg[tx * leaf_span + i]
-                        lane[tx] = acc[0]
-                    T.sync_threads()
-                    if tx == 0:
-                        acc[0] = T.cast(0, "float64")
-                        for l in T.serial(WARP_LANES):
-                            acc[0] = acc[0] + lane[l]
-                        partial[bx] = acc[0]
-                    T.sync_grid()
-                    for i in T.serial(-(-parts // threads)):
-                        if i * threads + tx < parts:
-                            chunks[i * threads + tx] = partial[line * parts + i * threads + tx]
-                    T.sync_threads()
+                    gather_part_totals(
+                        seg, lane, partial, chunks, acc, bx, line, leaves, leaf_span, parts, threads
+                    )
                     locate(
                         chunks,
                         parts,
@@ -417,37 +391,27 @@ class ChainSpeculativeSamplingFwdKernel(Kernel, ChainSpeculativeSamplingFwdInter
     # Threads of a block, and the narrower block a crowded batch takes. A thread stages
     # ``_PACE`` vectors of each row in registers, and a 512-thread block of them leaves an SM
     # room for one resident block; a batch that already gives the device more blocks than it
-    # has SMs wants a second block resident instead, and gets it from the narrower one:
-    # llama2-7b-b256-n1 runs 19.1 us at 256 threads against 22.0 at 512 and 25.6 at 128,
-    # where every other row is slower at 256. Re-fit by timing the manifest rows at 128, 256,
-    # 512 and 1024.
+    # has SMs wants a second block resident instead, and gets it from the narrower one.
     _THREADS: ClassVar[int] = 512
     _CROWDED_THREADS: ClassVar[int] = 256
-    # Vectors of each row a thread stages before folding any of them. Re-fit by timing the
-    # manifest rows at 1, 2, 4, 8 and 16.
+    # Vectors of each row a thread stages before folding any of them.
     _PACE: ClassVar[int] = 4
 
     @classmethod
     def _plan(cls, vocab: int, batch: int, sm_count: int) -> tuple[int, int, int, int]:
         """A row's vector width, a block's threads, how many blocks share a row, and its leaves.
 
-        A row whose bytes are a whole number of 16-byte vectors is folded a vector at a time;
-        any other row is folded weight by weight. A row is split only while the batch leaves
-        blocks idle, and never past its own vectors: the grid barrier a split takes needs the
-        whole grid resident. The leaves are the ``seg`` entries a block's chunk folds into,
-        one per (slot, warp).
+        The leaves are the ``seg`` entries a block's chunk folds into, one per (slot, warp).
         """
         vec = vector_width(vocab, torch.float32.itemsize)
         threads = cls._CROWDED_THREADS if batch >= sm_count else cls._THREADS
         row_tiles = max(1, -(-(vocab // vec) // threads))
-        # MACA currently traps in TileLang's cooperative grid barrier when a row is split
-        # across multiple blocks. Keep one block per row there; this preserves correctness
-        # while avoiding the device-side assert for production vocabularies.
-        parts = 1 if is_maca() else max(1, min(row_tiles, sm_count // max(batch, 1)))
+        # MACA does not support the grid-wide barrier used to combine split rows.
+        parts = 1 if is_maca() else row_split(row_tiles, batch, sm_count)
         return vec, threads, parts, -(-row_tiles // parts) * (threads // WARP_LANES)
 
     @classmethod
-    def refusal(cls, call: SamplingCall) -> Optional[str]:
+    def refusal(cls, call: SamplingCall) -> str | None:
         reason = super().refusal(call)
         if reason is not None:
             return reason
@@ -469,8 +433,8 @@ class ChainSpeculativeSamplingFwdKernel(Kernel, ChainSpeculativeSamplingFwdInter
             return f"folds a row into {leaves} shared float64 entries, past {budget // 8}"
         return None
 
-    def __init__(self, call: SamplingCall, config: Optional[dict] = None) -> None:
-        super().__init__(device_index=call.device.index if call.device is not None else None)
+    def __init__(self, call: SamplingCall, config: dict | None = None) -> None:
+        super().__init__(device_index=call.device_index)
         self.call = call
         self.dtype = call.dtype
         vec, threads, self._parts, _leaves = self._plan(call.vocab, call.batch, call.sm_count)

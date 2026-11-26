@@ -3,7 +3,7 @@ interfaces the implementations serving it inherit."""
 
 import dataclasses
 from abc import abstractmethod
-from typing import Literal, Optional
+from typing import Literal
 
 import torch
 
@@ -36,14 +36,17 @@ __all__ = [
 
 @dataclasses.dataclass(frozen=True)
 class GEMMCall(CallSpec):
-    """One dense matmul, as the op knows it after inferring ``(m, n, k)``."""
+    """One dense matmul, as the op knows it after inferring ``(m, n, k)``, whether it adds a
+    bias, and its output dtype: ``None`` for the operands' dtype."""
 
     m: int = 0
     n: int = 0
     k: int = 0
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
     trans_a: bool = False
     trans_b: bool = False
+    has_bias: bool = False
+    out_dtype: torch.dtype | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -56,10 +59,10 @@ class GEMMFP8Call(CallSpec):
     m: int = 0
     n: int = 0
     k: int = 0
-    dtype: Optional[torch.dtype] = None
-    scale_a_shape: Optional[tuple] = None
-    scale_b_shape: Optional[tuple] = None
-    out_dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
+    scale_a_shape: tuple | None = None
+    scale_b_shape: tuple | None = None
+    out_dtype: torch.dtype | None = None
     has_bias: bool = False
 
 
@@ -77,7 +80,7 @@ class GEMMINT8W8A8Call(CallSpec):
     k: int = 0
     per_token: bool = False
     per_channel: bool = False
-    out_dtype: Optional[torch.dtype] = None
+    out_dtype: torch.dtype | None = None
     has_bias: bool = False
 
 
@@ -88,7 +91,7 @@ class GEMMW4A16Call(CallSpec):
     m: int = 0
     n: int = 0
     k: int = 0
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
     # The dequantization group along K its kernels are compiled for.
     group_size: int = 0
 
@@ -129,7 +132,7 @@ class BMMCall(CallSpec):
     m: int = 0
     n: int = 0
     k: int = 0
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -140,8 +143,8 @@ class BMMFP8Call(CallSpec):
     m: int = 0
     n: int = 0
     k: int = 0
-    dtype: Optional[torch.dtype] = None
-    out_dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
+    out_dtype: torch.dtype | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -151,24 +154,30 @@ class BMMFP8TransposeCall(CallSpec):
     batch: int = 0
     rows: int = 0
     cols: int = 0
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
 
 
 class GEMMFwdInterface(KernelInterface):
-    """Dense matmul under the ``(trans_a, trans_b)`` layout the call states."""
+    """Dense matmul under the ``(trans_a, trans_b)`` layout the call states, plus a bias."""
 
     request = GEMMCall
 
     @abstractmethod
-    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        """Multiply the two matrices; nothing is written in place.
+    def forward(
+        self, a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Multiply the two matrices and add the bias; nothing is written in place.
 
-        Both operands are contiguous on ``call.device`` in ``call.dtype``, which is
-        ``float16`` or ``bfloat16``; the contraction accumulates in ``float32``.
+        Every tensor is contiguous on ``call.device`` in ``call.dtype``, which is
+        ``float16`` or ``bfloat16``. The contraction accumulates in ``float32``, the
+        bias is added to the ``float32`` sum, and the result is rounded once. A call
+        passes a bias exactly where ``call.has_bias`` says it does; the in-tree dense
+        kernels serve both from one entry and choose the biased program from ``bias``.
 
         Args:
             a: ``(call.m, call.k)``, or ``(call.k, call.m)`` when ``call.trans_a``.
             b: ``(call.n, call.k)`` when ``call.trans_b``, else ``(call.k, call.n)``.
+            bias: ``(call.n,)``, added to every row, or ``None``.
 
         Returns:
             A new ``(call.m, call.n)`` tensor in ``call.dtype``.
@@ -187,7 +196,7 @@ class GEMMFP8FwdInterface(KernelInterface):
         b: torch.Tensor,
         scale_a: torch.Tensor,
         scale_b: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Multiply, apply both scales and add the bias; nothing is written in place.
 
@@ -210,7 +219,7 @@ class GEMMFP8FwdInterface(KernelInterface):
         """
 
     @classmethod
-    def block_scale_grid(cls, call: GEMMFP8Call) -> Optional[Literal["1d1d", "1d2d"]]:
+    def block_scale_grid(cls, call: GEMMFP8Call) -> Literal["1d1d", "1d2d"] | None:
         """Which block128 grid the scales form, or ``None`` for any other pair.
 
         Both grids take ``scale_a`` per 1x128 block, ``[m, ceil(k / 128)]``. ``"1d1d"``
@@ -240,7 +249,7 @@ class GEMMINT8W8A8FwdInterface(KernelInterface):
         b: torch.Tensor,
         scale_a: torch.Tensor,
         scale_b: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Multiply exactly in int32, scale in fp32, add the bias; nothing is written in place.
 

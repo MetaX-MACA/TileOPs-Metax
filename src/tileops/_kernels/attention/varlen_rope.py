@@ -11,13 +11,13 @@ Query token ``i`` of request ``b`` sits at position ``kv_len_b - q_len_b + i`` a
 token ``j`` at position ``j``.
 """
 
-from typing import Callable, Optional
+from collections.abc import Callable
 
 import tilelang
 import tilelang.language as T
 import torch
 
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.constants import MAX_BLOCK_THREADS, VECTOR_ACCESS_BYTES, WARPGROUP_THREADS
 from tileops._kernels.grouped_tiling import GroupTiling
 from tileops._kernels.kernel_base import Kernel
@@ -42,11 +42,11 @@ def make_varlen_query_rope(
     rope_layout: str,
     max_position: int,
     dtype: str,
-    rope_dtype: str = "",
     tile_axes: int = 0,
     positions: int = 0,
     threads: int = WARPGROUP_THREADS,
     rows_per_position: int = 0,
+    split_reads: bool = False,
 ) -> Callable:
     """A macro rotating a ``[rows, dim]`` shared query tile in place.
 
@@ -59,8 +59,6 @@ def make_varlen_query_rope(
         rope_layout: ``"neox"`` or ``"interleaved"``.
         max_position: Rows of the table, which bounds the position an index may take.
         dtype: Element type of the tile.
-        rope_dtype: Element type of the table, which an FP8 call carries at 16 bits while
-            the tile it rotates is 8. Empty means the tile's.
         positions: Query positions the tile spans, which is fewer than its rows when a
             KV group's query heads are packed into it: row ``i`` then carries position
             ``i % positions``. Zero means one position per row.
@@ -72,12 +70,17 @@ def make_varlen_query_rope(
             kernel whose tile is the whole buffer passes 0.
         threads: Threads of the branch that runs the macro: a warpgroup, unless the
             whole block rotates the tile.
+        split_reads: Read every pair of a padded tile before writing any, when the padded
+            chunk count does not divide *threads*. A kernel that leaves its barriers to
+            TileLang passes True. Only a whole buffer tile (``tile_axes == 0``) takes it.
     """
+    if split_reads and tile_axes:
+        raise ValueError("split_reads rotates a whole buffer tile; tile_axes must be 0")
     half = rotary_dim // 2
     span = positions or rows
     accum = "float"
     # Frequencies one thread owns: enough that the two channel runs the pair indexing
-    # selects form one widest access together. Re-fit by changing the divisor.
+    # selects form one widest access together.
     itemsize = torch.empty(0, dtype=getattr(torch, dtype)).element_size()
     run = max(1, VECTOR_ACCESS_BYTES // (2 * itemsize))
     while half % run:
@@ -89,13 +92,16 @@ def make_varlen_query_rope(
     while rows * padded % threads:
         padded += 1
 
+    def position(i, base):
+        # Query positions may be negative when q_len exceeds kv_len.
+        offset = i // rows_per_position if rows_per_position else i % span
+        return T.max(0, T.min(base + offset, max_position - 1))
+
     @T.macro
     def rotate_query_tile(q_shared, rope_cos, rope_sin, base, slot=0, warpgroup=0):
         for i, chunk in T.Parallel(rows, padded):
             if chunk < chunks:
-                offset = i // rows_per_position if rows_per_position else i % span
-                # Query positions may be negative when q_len exceeds kv_len.
-                pos = T.max(0, T.min(base + offset, max_position - 1))
+                pos = position(i, base)
                 for step in T.serial(run):
                     freq = chunk * run + step
                     d0, d1 = rope_channel_pair(rope_layout, half, freq)
@@ -112,7 +118,40 @@ def make_varlen_query_rope(
                         q_shared[i, d0] = T.Cast(dtype, x0 * c - x1 * s)
                         q_shared[i, d1] = T.Cast(dtype, x1 * c + x0 * s)
 
-    return rotate_query_tile
+    # A padded chunk count that divides the threads keeps each thread on one chunk for the
+    # whole loop, so the padding guard reads the thread index alone.
+    if padded == chunks or not split_reads or threads % padded == 0:
+        return rotate_query_tile
+
+    # Otherwise a thread's chunk changes between iterations, and a barrier TileLang places
+    # inside the padding guard is skipped by the threads on a padding chunk. Every pair is
+    # read in one loop and written in the next, so a barrier between the reads and the
+    # writes falls between the loops.
+    padded_half = half
+    while rows * padded_half % threads:
+        padded_half += 1
+
+    @T.macro
+    def rotate_padded_tile(q_shared, rope_cos, rope_sin, base):
+        first = T.alloc_fragment((rows, padded_half), accum)
+        second = T.alloc_fragment((rows, padded_half), accum)
+        for i, freq in T.Parallel(rows, padded_half):
+            if freq < half:
+                pos = position(i, base)
+                d0, d1 = rope_channel_pair(rope_layout, half, freq)
+                c = T.Cast(accum, rope_cos[pos, freq])
+                s = T.Cast(accum, rope_sin[pos, freq])
+                x0 = T.Cast(accum, q_shared[i, d0])
+                x1 = T.Cast(accum, q_shared[i, d1])
+                first[i, freq] = x0 * c - x1 * s
+                second[i, freq] = x1 * c + x0 * s
+        for i, freq in T.Parallel(rows, padded_half):
+            if freq < half:
+                d0, d1 = rope_channel_pair(rope_layout, half, freq)
+                q_shared[i, d0] = T.Cast(dtype, first[i, freq])
+                q_shared[i, d1] = T.Cast(dtype, second[i, freq])
+
+    return rotate_padded_tile
 
 
 @target_cache(maxsize=32)
@@ -136,13 +175,39 @@ def _varlen_rope_keys_kernel(
     @tilelang.jit(
         out_idx=[4],
         pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
     )
     def _varlen_rope_keys_func() -> Callable:
         total_kv = T.dynamic("total_kv")
         kv_shape = (total_kv, heads_kv, dim)
         tiling = GroupTiling(batch, block_t)
         num_tiles = tiling.tile_upper_bound(total_kv)
+
+        def live(row, kv_len, guarded):
+            return row < kv_len if guarded else True
+
+        @T.macro
+        def rotate_rows(k, k_rot, rope_cos, rope_sin, kv_start, base, head, kv_len, guarded):
+            for i, freq in T.Parallel(block_t, half):
+                if live(base + i, kv_len, guarded):
+                    d0, d1 = rope_channel_pair(rope_layout, half, freq)
+                    # Key token j of a request sits at position j.
+                    pos = T.min(base + i, max_position - 1)
+                    c = T.Cast(accum, rope_cos[pos, freq])
+                    s = T.Cast(accum, rope_sin[pos, freq])
+                    x0 = T.Cast(accum, k[kv_start + base + i, head, d0])
+                    x1 = T.Cast(accum, k[kv_start + base + i, head, d1])
+                    k_rot[kv_start + base + i, head, d0] = T.Cast(dtype, x0 * c - x1 * s)
+                    k_rot[kv_start + base + i, head, d1] = T.Cast(dtype, x1 * c + x0 * s)
+
+        @T.macro
+        def copy_tail(k, k_rot, kv_start, base, head, kv_len, guarded):
+            """The channels past the rotated width, unchanged."""
+            for i, channel in T.Parallel(block_t, tail):
+                if live(base + i, kv_len, guarded):
+                    k_rot[kv_start + base + i, head, rotary_dim + channel] = k[
+                        kv_start + base + i, head, rotary_dim + channel
+                    ]
 
         @T.prim_func
         def _varlen_rope_keys_main(
@@ -200,45 +265,17 @@ def _varlen_rope_keys_kernel(
                                     xa[2 * p + 1] = T.Cast(dtype, x1 * c + x0 * s)
                                 for v in T.vectorized(8):
                                     k_rot[kv_start + base + i, head, u * 8 + v] = xa[v]
-                        for i, channel in T.Parallel(block_t, tail):
-                            k_rot[kv_start + base + i, head, rotary_dim + channel] = k[
-                                kv_start + base + i, head, rotary_dim + channel
-                            ]
+                        copy_tail(k, k_rot, kv_start, base, head, kv_len, False)
                     elif base + block_t <= kv_len:
-                        for i, freq in T.Parallel(block_t, half):
-                            d0, d1 = rope_channel_pair(rope_layout, half, freq)
-                            # Key token j of a request sits at position j.
-                            pos = T.min(base + i, max_position - 1)
-                            c = T.Cast(accum, rope_cos[pos, freq])
-                            s = T.Cast(accum, rope_sin[pos, freq])
-                            x0 = T.Cast(accum, k[kv_start + base + i, head, d0])
-                            x1 = T.Cast(accum, k[kv_start + base + i, head, d1])
-                            k_rot[kv_start + base + i, head, d0] = T.Cast(dtype, x0 * c - x1 * s)
-                            k_rot[kv_start + base + i, head, d1] = T.Cast(dtype, x1 * c + x0 * s)
-                        for i, channel in T.Parallel(block_t, tail):
-                            k_rot[kv_start + base + i, head, rotary_dim + channel] = k[
-                                kv_start + base + i, head, rotary_dim + channel
-                            ]
+                        rotate_rows(
+                            k, k_rot, rope_cos, rope_sin, kv_start, base, head, kv_len, False
+                        )
+                        copy_tail(k, k_rot, kv_start, base, head, kv_len, False)
                     else:
-                        for i, freq in T.Parallel(block_t, half):
-                            if base + i < kv_len:
-                                d0, d1 = rope_channel_pair(rope_layout, half, freq)
-                                pos = T.min(base + i, max_position - 1)
-                                c = T.Cast(accum, rope_cos[pos, freq])
-                                s = T.Cast(accum, rope_sin[pos, freq])
-                                x0 = T.Cast(accum, k[kv_start + base + i, head, d0])
-                                x1 = T.Cast(accum, k[kv_start + base + i, head, d1])
-                                k_rot[kv_start + base + i, head, d0] = T.Cast(
-                                    dtype, x0 * c - x1 * s
-                                )
-                                k_rot[kv_start + base + i, head, d1] = T.Cast(
-                                    dtype, x1 * c + x0 * s
-                                )
-                        for i, channel in T.Parallel(block_t, tail):
-                            if base + i < kv_len:
-                                k_rot[kv_start + base + i, head, rotary_dim + channel] = k[
-                                    kv_start + base + i, head, rotary_dim + channel
-                                ]
+                        rotate_rows(
+                            k, k_rot, rope_cos, rope_sin, kv_start, base, head, kv_len, True
+                        )
+                        copy_tail(k, k_rot, kv_start, base, head, kv_len, True)
 
         return _varlen_rope_keys_main
 
@@ -252,8 +289,7 @@ class VarlenKeyRoPE:
     generation.
     """
 
-    # Key rows a CTA rotates. Fitted by sweeping it against the launch's device_busy on
-    # the manifest's packed shapes; re-run that sweep to change it.
+    # Key rows a CTA rotates, fitted to the manifest's packed shapes.
     _KEY_ROWS_PER_CTA: int = 16
 
     def __init__(
@@ -266,7 +302,7 @@ class VarlenKeyRoPE:
         rotary_dim: int,
         rope_layout: str,
         dtype: str,
-        rope_dtype: str = "",
+        rope_dtype: str,
     ) -> None:
         self.kernel = _varlen_rope_keys_kernel(
             batch,
@@ -276,7 +312,7 @@ class VarlenKeyRoPE:
             rotary_dim,
             rope_layout,
             dtype,
-            rope_dtype or dtype,
+            rope_dtype,
             self._KEY_ROWS_PER_CTA,
             self._thread_count(rotary_dim, dtype),
         )
@@ -298,8 +334,8 @@ class VarlenKeyRoPE:
         self,
         k: torch.Tensor,
         cu_seqlens_kv: torch.Tensor,
-        rope_cos: Optional[torch.Tensor],
-        rope_sin: Optional[torch.Tensor],
+        rope_cos: torch.Tensor | None,
+        rope_sin: torch.Tensor | None,
     ) -> torch.Tensor:
         if rope_cos is None or rope_sin is None:
             raise ValueError("fused RoPE requires rope_cos and rope_sin")

@@ -11,17 +11,17 @@ import dataclasses
 import functools
 import math
 from abc import abstractmethod
-from typing import Any, Callable, Dict, Optional
+from collections.abc import Callable
+from typing import Any
 
 import tilelang
 import tilelang.language as T
 import torch
 
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.call_spec import CallSpec
 from tileops._kernels.constants import BLOCK_SHARED_BYTES_OPT_IN, MAX_BLOCK_THREADS
 from tileops._kernels.kernel_base import CompiledProgram, Entry, Kernel, KernelInterface
-from tileops._utils import get_sm_version
 
 __all__ = [
     "FFTC2CCall",
@@ -419,7 +419,7 @@ def _build_tiny(n: int, ept: int, real_dtype: str) -> Any:
 
     @tilelang.jit(
         pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
-        compile_flags=["-O3"],
+        compile_flags=[*CUDA_COMPILE_FLAGS],
     )
     def _func(row: int, grp: int):
         def _bit_reverse(position, bits: int):
@@ -549,7 +549,7 @@ def _build_warp8(n: int, real_dtype: str) -> Any:
 
     @tilelang.jit(
         pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
-        compile_flags=["-O3"],
+        compile_flags=[*CUDA_COMPILE_FLAGS],
     )
     def _func(row: int, grp: int):
         @T.macro
@@ -643,7 +643,7 @@ def _build_packed_256(real_dtype: str) -> Any:
 
     @tilelang.jit(
         pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
-        compile_flags=["-O3"],
+        compile_flags=[*CUDA_COMPILE_FLAGS],
     )
     def _func(row: int, grp: int):
         batch = T.dynamic("batch")
@@ -693,7 +693,7 @@ def _build_packed_512(table_limit: int, real_dtype: str) -> Any:
 
     @tilelang.jit(
         pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
-        compile_flags=["-O3"],
+        compile_flags=[*CUDA_COMPILE_FLAGS],
     )
     def _func(row: int, grp: int):
         batch = T.dynamic("batch")
@@ -783,7 +783,7 @@ def _build_three_pass(n: int, real_dtype: str) -> Any:
     # No out_idx on any builder: a symbolic output shape would resolve on every call.
     @tilelang.jit(
         pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
-        compile_flags=["-O3"],
+        compile_flags=[*CUDA_COMPILE_FLAGS],
     )
     def _func(row: int, grp: int):
         """Build for S1 row stride *row* and S2 group stride *grp*, in reals."""
@@ -855,7 +855,7 @@ def _build_four_pass(n: int, real_dtype: str) -> Any:
 
     @tilelang.jit(
         pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
-        compile_flags=["-O3"],
+        compile_flags=[*CUDA_COMPILE_FLAGS],
     )
     def _func(row: int, grp: int):
         @T.macro
@@ -995,7 +995,7 @@ def _build_four_step_a(factors: tuple, level: int, real_dtype: str) -> Any:
 
     @tilelang.jit(
         pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
-        compile_flags=["-O3"],
+        compile_flags=[*CUDA_COMPILE_FLAGS],
     )
     def _func(tw: int, row: int, grp: int = 0):
         """Build for *tw* columns per CTA and strides *row*, *grp*; two passes ignore grp."""
@@ -1201,7 +1201,7 @@ def _build_four_step_b(factors: tuple, real_dtype: str) -> Any:
 
     @tilelang.jit(
         pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
-        compile_flags=["-O3"],
+        compile_flags=[*CUDA_COMPILE_FLAGS],
     )
     def _func(tw: int, row: int, grp: int = 0):
         """Build for *tw* transforms per CTA and strides *row*, *grp*; two passes ignore grp."""
@@ -1347,7 +1347,7 @@ def _four_step_record(factors: tuple, tile: tuple, dtype: str) -> _FFTPlan:
     )
 
 
-def _plan_table() -> Dict[tuple, _FFTPlan]:
+def _plan_table() -> dict[tuple, _FFTPlan]:
     """One record per served (length, dtype); every one-CTA builder takes (row, grp)."""
 
     radix_plan = {
@@ -1482,7 +1482,7 @@ def _plan_table() -> Dict[tuple, _FFTPlan]:
     return dict(sorted(records.items(), key=lambda kv: (kv[0][0], kv[0][1] != "complex64")))
 
 
-def _narrow_plan_table() -> Dict[tuple, _FFTPlan]:
+def _narrow_plan_table() -> dict[tuple, _FFTPlan]:
     """One decomposed record per ``narrow_plan`` key, naming the architectures it alone serves."""
 
     narrow_plan = {
@@ -1510,11 +1510,11 @@ def _narrow_plan_table() -> Dict[tuple, _FFTPlan]:
     return records
 
 
-FFT_PLANS: Dict[tuple, _FFTPlan] = _plan_table()
-FFT_NARROW_PLANS: Dict[tuple, _FFTPlan] = _narrow_plan_table()
+FFT_PLANS: dict[tuple, _FFTPlan] = _plan_table()
+FFT_NARROW_PLANS: dict[tuple, _FFTPlan] = _narrow_plan_table()
 
 
-def _plan_for(n: int, dtype: str, arch: int, decomposed: bool) -> Optional[_FFTPlan]:
+def _plan_for(n: int, dtype: str, arch: int, decomposed: bool) -> _FFTPlan | None:
     """The record serving (n, dtype) on *arch* with *decomposed* launches, if one does."""
     narrow = FFT_NARROW_PLANS.get((n, dtype))
     plan = narrow if narrow is not None and arch in narrow.archs else FFT_PLANS.get((n, dtype))
@@ -1523,14 +1523,13 @@ def _plan_for(n: int, dtype: str, arch: int, decomposed: bool) -> Optional[_FFTP
     return plan
 
 
-def _plan_on_device(n: int, dtype: str, device_index: Optional[int], decomposed: bool) -> _FFTPlan:
-    """The record a kernel built for *device_index* runs, by :func:`_plan_for`'s rules.
+def _plan_on_device(n: int, dtype: str, arch: int, decomposed: bool) -> _FFTPlan:
+    """The record a kernel built for architecture *arch* runs, by :func:`_plan_for`'s rules.
 
     Raises:
         ValueError: No such record, so construction refuses rather than building a kernel the
             device cannot launch.
     """
-    arch = get_sm_version(device_index)
     plan = _plan_for(n, dtype, arch, decomposed)
     if plan is None:
         kind = "decomposed" if decomposed else "one-CTA"
@@ -1547,7 +1546,7 @@ def _fft_builders(plan: _FFTPlan) -> tuple:
 
 def _pass_tables(n: int, dtype: torch.dtype, device: torch.device) -> tuple:
     """Length n's full-circle table and pass-2 bases, built in float64 and cast once."""
-    real = torch.float32 if dtype == torch.complex64 else torch.float64
+    real = dtype.to_real()
     ang = -2.0 * math.pi * torch.arange(n, dtype=torch.float64) / n
     ang2 = -2.0 * math.pi * torch.arange(max(1, n // 256), dtype=torch.float64) / max(1, n // 16)
     circle = torch.stack([torch.cos(ang), torch.sin(ang)], dim=1)
@@ -1555,16 +1554,82 @@ def _pass_tables(n: int, dtype: torch.dtype, device: torch.device) -> tuple:
     return circle.to(real).to(device), base2.to(real).to(device)
 
 
-def _on_interleaved(transform, x: torch.Tensor, n: int) -> torch.Tensor:
-    """Run *transform* on ``x`` viewed as rows of interleaved (real, imaginary) pairs.
+class _FFTC2CKernel(Kernel, FFTC2CFwdInterface):
+    """The plan lookup, identity, tables and interleaved view both C2C kernels share."""
 
-    The kernels read the pair directly, so the batch axes flatten into one row axis.
-    """
-    x_pair = torch.view_as_real(x.resolve_conj().contiguous()).reshape(x.numel() // n, n, 2)
-    return torch.view_as_complex(transform(x_pair).reshape(*x.shape, 2))
+    supported_archs: list[int] = list(BLOCK_SHARED_BYTES_OPT_IN)
+    general = False
+    # Whether the kernel runs the plans of more than one factor, one launch per factor.
+    decomposed: bool
+
+    @classmethod
+    def refusal(cls, call: FFTC2CCall) -> "str | None":
+        """Refuse a call no plan of this kernel's launch count serves."""
+        dtype = cls.dtype_to_str(call.dtype)
+        if _plan_for(call.n, dtype, call.arch, cls.decomposed) is None:
+            kind = "decomposed" if cls.decomposed else "single-CTA"
+            return f"no {kind} plan covers n={call.n} in {dtype} on sm{call.arch}"
+        return super().refusal(call)
+
+    @classmethod
+    def entry_for(cls, call: FFTC2CCall) -> Entry:
+        """Identity without the batch extent, which every kernel takes symbolically."""
+        index = call.device_index
+        identity = (call.n, call.dtype, index)
+        return identity, lambda: cls(call.n, call.dtype, device_index=index)
+
+    def __init__(
+        self,
+        n: int,
+        dtype: torch.dtype = torch.complex64,
+        config: dict[str, Any] | None = None,
+        device_index: int | None = None,
+    ) -> None:
+        super().__init__(device_index=device_index)
+        self.n = n
+        self.dtype = dtype
+        self.plan = _plan_on_device(n, self.dtype_str, self.build_target.arch, self.decomposed)
+        if config is not None:
+            self._check_config(config)
+        builders = _fft_builders(self.plan)
+        self.kernel = builders if self.decomposed else builders[0]
+        self._tables: dict = {}
+        self.init_config(config)
+
+    @abstractmethod
+    def _check_config(self, config: dict[str, Any]) -> None:
+        """Refuse a *config* the plan cannot run.
+
+        Raises:
+            ValueError: A key is missing or unknown, or a value is out of bounds.
+        """
+
+    @abstractmethod
+    def _build_tables(self, device: torch.device) -> tuple:
+        """The constant tables the kernels read, on *device*."""
+
+    @abstractmethod
+    def _transform(self, x_pair: torch.Tensor) -> torch.Tensor:
+        """Transform interleaved input, $[B \\times n \\times 2]$, into a new tensor."""
+
+    def _tables_on(self, device: torch.device) -> tuple:
+        """:meth:`_build_tables` on *device*, built once per device."""
+        if device.index not in self._tables:
+            self._tables[device.index] = self._build_tables(device)
+        return self._tables[device.index]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Transform the last axis of complex ``x``, $[\\ldots \\times n]$; same shape out.
+
+        The kernels read interleaved (real, imaginary) pairs, so the batch axes flatten into
+        one row axis.
+        """
+        rows = x.numel() // self.n
+        x_pair = torch.view_as_real(x.resolve_conj().contiguous()).reshape(rows, self.n, 2)
+        return torch.view_as_complex(self._transform(x_pair).reshape(*x.shape, 2))
 
 
-class FFTC2COneCTAKernel(Kernel, FFTC2CFwdInterface):
+class FFTC2COneCTAKernel(_FFTC2CKernel):
     """One-launch C2C FFT for the plans of a single factor.
 
     Args:
@@ -1574,42 +1639,9 @@ class FFTC2COneCTAKernel(Kernel, FFTC2CFwdInterface):
         device_index: The device the kernel runs on.
     """
 
-    supported_archs: list[int] = list(BLOCK_SHARED_BYTES_OPT_IN)
-    general = False
+    decomposed = False
 
-    @classmethod
-    def refusal(cls, call: FFTC2CCall) -> "str | None":
-        """Refuse a call whose plan is not one a single CTA runs in one launch."""
-        dtype = cls.dtype_to_str(call.dtype)
-        if _plan_for(call.n, dtype, call.arch, decomposed=False) is None:
-            return f"no single-CTA plan covers n={call.n} in {dtype} on sm{call.arch}"
-        return super().refusal(call)
-
-    @classmethod
-    def entry_for(cls, call: FFTC2CCall) -> Entry:
-        """Identity without the batch extent, which every kernel takes symbolically."""
-        index = call.device.index if call.device is not None else None
-        identity = (call.n, call.dtype, index)
-        return identity, lambda: cls(call.n, call.dtype, device_index=index)
-
-    def __init__(
-        self,
-        n: int,
-        dtype: torch.dtype = torch.complex64,
-        config: Optional[Dict[str, Any]] = None,
-        device_index: Optional[int] = None,
-    ) -> None:
-        super().__init__(device_index=device_index)
-        self.n = n
-        self.dtype = dtype
-        self.plan = _plan_on_device(n, self.dtype_str, device_index, decomposed=False)
-        if config is not None:
-            self._check_config(config)
-        (self.kernel,) = _fft_builders(self.plan)
-        self._tables: dict = {}
-        self.init_config(config)
-
-    def _check_config(self, config: Dict[str, Any]) -> None:
+    def _check_config(self, config: dict[str, Any]) -> None:
         """Refuse strides below the record's floor or past the shared-memory limit.
 
         Raises:
@@ -1638,7 +1670,7 @@ class FFTC2COneCTAKernel(Kernel, FFTC2CFwdInterface):
             )
 
     @property
-    def default_config(self) -> Dict[str, Any]:
+    def default_config(self) -> dict[str, Any]:
         row, grp = self.plan.pad[0]
         return {"row": row, "grp": grp}
 
@@ -1647,7 +1679,7 @@ class FFTC2COneCTAKernel(Kernel, FFTC2CFwdInterface):
         """Supply a full-device batch for the shared-memory padding sweep."""
 
         def supply(params: list) -> list:
-            real = torch.float32 if self.dtype == torch.complex64 else torch.float64
+            real = self.dtype.to_real()
             device = (
                 self.device_index if self.device_index is not None else torch.cuda.current_device()
             )
@@ -1677,25 +1709,22 @@ class FFTC2COneCTAKernel(Kernel, FFTC2CFwdInterface):
             return
         super().autotune(warmup=warmup, rep=rep)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Transform the last axis of complex ``x``, $[\\ldots \\times n]$; same shape out."""
-        return _on_interleaved(self._transform, x, self.n)
+    def _build_tables(self, device: torch.device) -> tuple:
+        """``(circle, base2)`` of :func:`_pass_tables`."""
+        return _pass_tables(self.n, self.dtype, device)
 
     def _transform(self, x_pair: torch.Tensor) -> torch.Tensor:
         """Transform interleaved input, $[B \\times n \\times 2]$, into its own shape."""
-        index = x_pair.device.index
-        if index not in self._tables:
-            self._tables[index] = _pass_tables(self.n, self.dtype, x_pair.device)
         y_pair = torch.empty_like(x_pair)
-        self.program(self._compile)(x_pair, *self._tables[index], y_pair)
+        self.program(self._compile)(x_pair, *self._tables_on(x_pair.device), y_pair)
         return y_pair
 
-    def _compile(self, cfg: Dict[str, Any]) -> Callable:
+    def _compile(self, cfg: dict[str, Any]) -> Callable:
         """The program ``_transform`` launches, compiled at *cfg*'s padding."""
         return self.kernel(cfg["row"], cfg["grp"])
 
 
-class FFTC2CFourStepKernel(Kernel, FFTC2CFwdInterface):
+class FFTC2CFourStepKernel(_FFTC2CKernel):
     """Four-step C2C FFT for the plans of two or three factors, one launch per factor.
 
     Args:
@@ -1705,40 +1734,7 @@ class FFTC2CFourStepKernel(Kernel, FFTC2CFwdInterface):
         device_index: The device the kernel runs on.
     """
 
-    supported_archs: list[int] = list(BLOCK_SHARED_BYTES_OPT_IN)
-    general = False
-
-    @classmethod
-    def refusal(cls, call: FFTC2CCall) -> "str | None":
-        """Refuse a call whose plan does not name more than one factor."""
-        dtype = cls.dtype_to_str(call.dtype)
-        if _plan_for(call.n, dtype, call.arch, decomposed=True) is None:
-            return f"no decomposed plan covers n={call.n} in {dtype} on sm{call.arch}"
-        return super().refusal(call)
-
-    @classmethod
-    def entry_for(cls, call: FFTC2CCall) -> Entry:
-        """Identity without the batch extent, which every kernel takes symbolically."""
-        index = call.device.index if call.device is not None else None
-        identity = (call.n, call.dtype, index)
-        return identity, lambda: cls(call.n, call.dtype, device_index=index)
-
-    def __init__(
-        self,
-        n: int,
-        dtype: torch.dtype = torch.complex64,
-        config: Optional[Dict[str, Any]] = None,
-        device_index: Optional[int] = None,
-    ) -> None:
-        super().__init__(device_index=device_index)
-        self.n = n
-        self.dtype = dtype
-        self.plan = _plan_on_device(n, self.dtype_str, device_index, decomposed=True)
-        if config is not None:
-            self._check_config(config)
-        self.kernel = _fft_builders(self.plan)
-        self._tables: dict = {}
-        self.init_config(config)
+    decomposed = True
 
     def _fits(self, index: int, tw: int, strides: tuple) -> bool:
         """Whether kernel *index* at width *tw* and *strides* fits a block."""
@@ -1747,7 +1743,7 @@ class FFTC2CFourStepKernel(Kernel, FFTC2CFwdInterface):
             return False
         return self.plan.four_step_smem_bytes(index, tw, strides) <= self.plan.smem_cap
 
-    def _check_config(self, config: Dict[str, Any]) -> None:
+    def _check_config(self, config: dict[str, Any]) -> None:
         """Refuse a tile or stride set that breaks a kernel's structural bounds.
 
         Raises:
@@ -1780,7 +1776,7 @@ class FFTC2CFourStepKernel(Kernel, FFTC2CFwdInterface):
                 )
 
     @property
-    def default_config(self) -> Dict[str, Any]:
+    def default_config(self) -> dict[str, Any]:
         return {"tile": self.plan.tile, "pad": self.plan.pad}
 
     @property
@@ -1793,8 +1789,8 @@ class FFTC2CFourStepKernel(Kernel, FFTC2CFwdInterface):
         plan = self.plan
         nf, _lanes, extent, twrows, r_last = plan.geometry(index)
         passes = len(plan.radix[index])
-        real = torch.float32 if self.dtype == torch.complex64 else torch.float64
-        batch = max(1, (256 << 20) // (self.n * (8 if real is torch.float32 else 16)))
+        real = self.dtype.to_real()
+        batch = max(1, (256 << 20) // (self.n * self.dtype.itemsize))
 
         def supply(params: list) -> list:
             device = (
@@ -1843,9 +1839,9 @@ class FFTC2CFourStepKernel(Kernel, FFTC2CFwdInterface):
             pad.append(tuple(won[name] for name in ("row", "grp") if name in seed))
         self._publish_tuned({"tile": tuple(tile), "pad": tuple(pad)})
 
-    def _four_step_tables(self, device: torch.device) -> tuple:
+    def _build_tables(self, device: torch.device) -> tuple:
         """``(w1, w2, twlut)``; twiddle-table row r is ``W_m^(twiddle_exp[r] * j_a)``."""
-        real = torch.float32 if self.dtype == torch.complex64 else torch.float64
+        real = self.dtype.to_real()
         factors = self.plan.factors
         passes = [_pass_tables(f, self.dtype, device) for f in factors]
         twlut = []
@@ -1873,16 +1869,9 @@ class FFTC2CFourStepKernel(Kernel, FFTC2CFwdInterface):
             twlut.append(torch.stack(rows, dim=0).to(real).to(device).contiguous())
         return tuple(p[0] for p in passes), tuple(p[1] for p in passes), tuple(twlut)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Transform the last axis of complex ``x``, $[\\ldots \\times n]$; same shape out."""
-        return _on_interleaved(self._transform, x, self.n)
-
     def _transform(self, x_pair: torch.Tensor) -> torch.Tensor:
         """Transform interleaved input, $[B \\times n \\times 2]$, one launch per factor."""
-        index = x_pair.device.index
-        if index not in self._tables:
-            self._tables[index] = self._four_step_tables(x_pair.device)
-        w1, w2, twlut = self._tables[index]
+        w1, w2, twlut = self._tables_on(x_pair.device)
         # x -> t -> y, or x -> t -> y -> t with three kernels; per-call buffers
         # keep one kernel object safe across streams.
         t_pair = torch.empty_like(x_pair)
@@ -1897,7 +1886,7 @@ class FFTC2CFourStepKernel(Kernel, FFTC2CFwdInterface):
             program(chain[i], *tables, chain[i + 1])
         return chain[-1]
 
-    def _compile(self, cfg: Dict[str, Any]) -> tuple:
+    def _compile(self, cfg: dict[str, Any]) -> tuple:
         """The factor programs, in launch order, compiled at *cfg*'s tiles and strides."""
         tile, pad = cfg["tile"], cfg["pad"]
         return tuple(

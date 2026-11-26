@@ -11,21 +11,19 @@ This kernel fuses the remaining memory-bound operations:
     conv_out = CausalDWConv1D(v_hat_norm, conv_w, kernel=4)     # (M, T, d)
     Y = SiLU(conv_out) + v_hat                                  # (M, T, d)
 
-Saved for backward (strategy B):
+Saved for backward:
     alpha, rrms_h, rrms_k, rrms_v  — all (M, T) scalars per position
 
 Grid: (T, M) — one thread block per (batch, position).
 Uses 2D fragments (1, d_padded) to leverage T.reduce_sum for safe reductions.
 """
 
-from typing import Optional
-
 import tilelang
 import tilelang.language as T
 import torch
 import torch.nn.functional as F
 
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.kernel_base import Entry, Kernel
 from tileops._kernels.sequence_modeling.engram.call_spec import (
     CONV_KERNEL_SIZE,
@@ -37,6 +35,32 @@ from tileops._kernels.tiling import ALIGNMENT, align_up
 __all__ = ["EngramGateConvFwdKernel"]
 
 
+@T.macro
+def causal_conv(conv_out, vhat, rrms_v, rms_w_v, conv_w, bid, tid, d_padded):
+    """``conv_out``: the causal depthwise convolution of ``RMSNorm(vhat, rms_w_v)`` at position
+    ``tid`` of sequence ``bid``, a position before the sequence reading as zero.
+
+    As PyTorch's left-padded conv1d, ``conv_w[p]`` multiplies position ``tid - (K - 1) + p``.
+    """
+    for j in T.Parallel(d_padded):
+        conv_out[j] = 0.0
+    for p in T.serial(CONV_KERNEL_SIZE):
+        src_t = tid - (CONV_KERNEL_SIZE - 1) + p
+        for j in T.Parallel(d_padded):
+            raw_val = T.if_then_else(
+                src_t >= 0,
+                T.cast(vhat[bid, src_t, j], conv_out.dtype),
+                0.0,
+            )
+            src_rrms = T.if_then_else(
+                src_t >= 0,
+                rrms_v[bid, src_t],
+                0.0,
+            )
+            normed = raw_val * src_rrms * T.cast(rms_w_v[j], conv_out.dtype)
+            conv_out[j] += T.cast(conv_w[p, j], conv_out.dtype) * normed
+
+
 @target_cache(maxsize=32)
 def _engram_gate_conv_fwd_kernel(M, seq_len, d, eps, dtype):
     accum_dtype = "float"
@@ -44,11 +68,11 @@ def _engram_gate_conv_fwd_kernel(M, seq_len, d, eps, dtype):
 
     @tilelang.jit(
         out_idx=[6, 7, 8, 9, 10, 11],
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
     )
     def _func(threads):
-        @T.macro
-        def _gate_fwd(
+        @T.prim_func
+        def main(
             H: T.Tensor((M, seq_len, d_padded), dtype),
             k: T.Tensor((M, seq_len, d_padded), dtype),
             v: T.Tensor((M, seq_len, d_padded), dtype),
@@ -124,60 +148,11 @@ def _engram_gate_conv_fwd_kernel(M, seq_len, d, eps, dtype):
                 for j in T.Parallel(d_padded):
                     vhat_cur[j] = T.cast(vhat_buf[bid, tid, j], accum_dtype)
 
-                for j in T.Parallel(d_padded):
-                    conv_out[j] = 0.0
-
-                # PyTorch conv1d with left-padding: output[t] = sum_p w[p] * input[t - (K-1) + p]
-                # So conv_w[p] multiplies vhat_norm at position t - (K-1) + p
-                for p in T.serial(CONV_KERNEL_SIZE):
-                    src_t = tid - (CONV_KERNEL_SIZE - 1) + p
-                    for j in T.Parallel(d_padded):
-                        raw_val = T.if_then_else(
-                            src_t >= 0,
-                            T.cast(vhat_buf[bid, src_t, j], accum_dtype),
-                            0.0,
-                        )
-                        src_rrms = T.if_then_else(
-                            src_t >= 0,
-                            rrms_v_buf[bid, src_t],
-                            0.0,
-                        )
-                        normed = raw_val * src_rrms * T.cast(rms_w_v[j], accum_dtype)
-                        conv_out[j] += T.cast(conv_w[p, j], accum_dtype) * normed
+                causal_conv(conv_out, vhat_buf, rrms_v_buf, rms_w_v, conv_w, bid, tid, d_padded)
 
                 for j in T.Parallel(d_padded):
                     sig = 1.0 / (1.0 + T.exp(-conv_out[j]))
                     Y[bid, tid, j] = T.cast(conv_out[j] * sig + vhat_cur[j], dtype)
-
-        @T.prim_func
-        def main(
-            H: T.Tensor((M, seq_len, d_padded), dtype),
-            k: T.Tensor((M, seq_len, d_padded), dtype),
-            v: T.Tensor((M, seq_len, d_padded), dtype),
-            rms_w_h: T.Tensor((d_padded,), dtype),
-            rms_w_v: T.Tensor((d_padded,), dtype),
-            conv_w: T.Tensor((CONV_KERNEL_SIZE, d_padded), dtype),
-            Y: T.Tensor((M, seq_len, d_padded), dtype),
-            vhat_buf: T.Tensor((M, seq_len, d_padded), dtype),
-            alpha_buf: T.Tensor((M, seq_len), accum_dtype),
-            rrms_h_buf: T.Tensor((M, seq_len), accum_dtype),
-            rrms_k_buf: T.Tensor((M, seq_len), accum_dtype),
-            rrms_v_buf: T.Tensor((M, seq_len), accum_dtype),
-        ):
-            _gate_fwd(
-                H,
-                k,
-                v,
-                rms_w_h,
-                rms_w_v,
-                conv_w,
-                Y,
-                vhat_buf,
-                alpha_buf,
-                rrms_h_buf,
-                rrms_k_buf,
-                rrms_v_buf,
-            )
 
         return main
 
@@ -185,14 +160,7 @@ def _engram_gate_conv_fwd_kernel(M, seq_len, d, eps, dtype):
 
 
 class EngramGateConvFwdKernel(Kernel, EngramGateConvFwdInterface):
-    """Engram GateConv forward kernel.
-
-    Fuses RMSNorm-based scalar gating and depthwise causal Conv1D
-    with SiLU activation. Projection (GEMM) is done externally.
-
-    Inputs:  H (M,T,d), k (M,T,d), v (M,T,d), rms_w_h, rms_w_v, conv_w
-    Outputs: Y (M,T,d), vhat (M,T,d), alpha (M,T), rrms_h/k/v (M,T)
-    """
+    """Engram GateConv forward kernel; the module docstring states the fusion."""
 
     supported_archs: list[int] = [80, 86, 89, 90]
 
@@ -207,13 +175,10 @@ class EngramGateConvFwdKernel(Kernel, EngramGateConvFwdInterface):
         d: int,
         eps: float,
         dtype: torch.dtype,
-        config: Optional[dict] = None,
+        config: dict | None = None,
     ):
         super().__init__()
-        self.M = M
-        self.seq_len = seq_len
         self.d = d
-        self.eps = eps
         self.dtype = dtype
         self.d_padded = align_up(d, ALIGNMENT)
         self.kernel = _engram_gate_conv_fwd_kernel(
@@ -246,21 +211,8 @@ class EngramGateConvFwdKernel(Kernel, EngramGateConvFwdInterface):
         rms_w_v: torch.Tensor,
         conv_w: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
-        """Run the fused gate + conv forward pass.
-
-        Args:
-            H: Hidden states of shape $[M \\times seq\\_len \\times d]$.
-            k: Key projection of shape $[M \\times seq\\_len \\times d]$.
-            v: Value projection of shape $[M \\times seq\\_len \\times d]$.
-            rms_w_h: RMSNorm weight of shape $[d]$ for ``H`` and ``k``.
-            rms_w_v: RMSNorm weight of shape $[d]$ for the gated value.
-            conv_w: Depthwise conv weights of shape $[4 \\times d]$.
-
-        Returns:
-            ``(Y, vhat, alpha, rrms_h, rrms_k, rrms_v)``. ``Y`` and ``vhat``
-            are ``(M, seq_len, d)``; the alignment padding the prim_func
-            requires is applied and trimmed here.
-        """
+        """Run the fused gate + conv forward pass, applying and trimming the alignment padding
+        the prim_func requires."""
         pad = self.d_padded - self.d
         if pad:
             H = F.pad(H, (0, pad))

@@ -5,18 +5,17 @@
 "Measured on H200: ..." beside a tuned value states a contract and passes.
 
 Exempt: ``lint: narration allow: <reason>`` on the line. Default scan: ``src/tileops/``,
-``tests/``, ``benchmarks/``, ``workloads/``.
+``tests/``, ``benchmarks/``, ``workloads/``, ``models/``.
 """
 
-import argparse
 import re
 import sys
 from pathlib import Path
 
 from comment_lines import allowed_lines, prose_lines
-from common import files, relative, report
+from common import lint_files, relative
 
-SCANNED = ("src/tileops", "tests", "benchmarks", "workloads")
+SCANNED = ("src/tileops", "tests", "benchmarks", "workloads", "models")
 
 _NARRATION = re.compile(
     r"\b(?:we|i)\s+(?:have\s+)?(?:tried|measured)\b"
@@ -49,10 +48,7 @@ def findings(path: Path) -> list[str]:
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("files", nargs="*", type=Path)
-    args = parser.parse_args(argv)
-    return report(e for p in files(args.files, SCANNED, (".py",)) for e in findings(p))
+    return lint_files(argv, __doc__, SCANNED, (".py",), findings)
 
 
 if __name__ == "__main__":

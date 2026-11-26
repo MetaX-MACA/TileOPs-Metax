@@ -1,37 +1,80 @@
-"""Target identity and target-aware kernel builder caching."""
+"""Target identity, target-aware kernel builder caching, and shared CUDA build options."""
 
 import contextlib
 import functools
-from typing import Any, Callable, Iterator, NamedTuple, Optional
+from collections.abc import Callable, Iterator
+from typing import Any, NamedTuple
 
 import torch
 
 from tileops._utils import is_maca
 from tileops._utils.device import current_device, device_context, on_current_index
 
-__all__ = ["BuildTarget", "building_on", "current_target", "target_cache", "target_of"]
+__all__ = [
+    "CUDA_COMPILE_FLAGS",
+    "BuildTarget",
+    "building_on",
+    "chain_cuda_postproc",
+    "current_target",
+    "target_cache",
+    "target_of",
+]
+
+# CUDA flags for generated kernels that use the half and bfloat16 operators and conversions,
+# constexpr functions on the device and extended lambdas, with asserts compiled out.
+_CUDA_COMPILE_FLAGS: tuple[str, ...] = (
+    "-O3",
+    "-Wno-deprecated-declarations",
+    "-U__CUDA_NO_HALF_OPERATORS__",
+    "-U__CUDA_NO_HALF_CONVERSIONS__",
+    "-U__CUDA_NO_HALF2_OPERATORS__",
+    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+    "-DNDEBUG",
+)
+_NVCC_ONLY_COMPILE_FLAGS = frozenset(("--expt-relaxed-constexpr", "--expt-extended-lambda"))
+
+
+def _compile_flags_for_target(kind: str | None) -> tuple[str, ...]:
+    """Return shared kernel flags accepted by the target's device compiler.
+
+    The CUDA kernels use NVCC's extended-lambda and relaxed-constexpr switches. MACA's
+    ``mxcc`` supports the corresponding C++ features directly but rejects those NVCC-only
+    command-line options.
+    """
+    if kind == "maca":
+        return tuple(flag for flag in _CUDA_COMPILE_FLAGS if flag not in _NVCC_ONLY_COMPILE_FLAGS)
+    return _CUDA_COMPILE_FLAGS
+
+
+# Many kernels share these flags on both backends. Keep the public name for their existing
+# call sites, but select the compatible set for the installed runtime.
+CUDA_COMPILE_FLAGS: tuple[str, ...] = _compile_flags_for_target("maca" if is_maca() else "cuda")
 
 
 class BuildTarget(NamedTuple):
     """The device facts a build compiles for, with their device type."""
 
-    kind: Optional[str]
+    kind: str | None
     arch: int
     sm_count: int
     smem_budget: int
-    calibration: Optional[str]
+    calibration: str | None
+    threads_per_sm: int
+    regs_per_sm: int
+    smem_per_sm: int
+    l2_bytes: int
 
 
-def target_of(device: Optional[torch.device]) -> BuildTarget:
+def target_of(device: torch.device | None) -> BuildTarget:
     """The build target of *device*; ``None`` names the current device."""
-    from tileops.backend._dispatch import device_facts_and_calibration
+    from tileops.backend._dispatch import device_facts_and_tuning
 
     device = current_device() if device is None else on_current_index(device)
-    facts, calibration = device_facts_and_calibration(device)
-    # MACA's PyTorch intentionally exposes its device as ``cuda`` for tensor and
-    # stream compatibility, but TileLang must compile against the MACA target.
+    facts, tuning = device_facts_and_tuning(device)
     kind = None if device is None else ("maca" if is_maca() else device.type)
-    return BuildTarget(kind, facts.arch, facts.sm_count, facts.smem_budget, calibration)
+    return BuildTarget(kind, facts.arch, facts.sm_count, facts.smem_budget, *tuning)
 
 
 def current_target() -> BuildTarget:
@@ -40,7 +83,7 @@ def current_target() -> BuildTarget:
 
 
 @contextlib.contextmanager
-def building_on(device: Optional[torch.device]) -> Iterator[None]:
+def building_on(device: torch.device | None) -> Iterator[None]:
     """Make *device* current and set its compilation target.
 
     Match TileLang's architecture spelling so explicit and detected targets share cache entries.
@@ -59,15 +102,17 @@ def building_on(device: Optional[torch.device]) -> Iterator[None]:
         from tilelang.contrib.nvcc import get_target_arch
         from tvm.target import Target
 
+        unroll_pipelined_waits()
         sm = get_target_arch((target.arch // 10, target.arch % 10))
         with Target({"kind": "cuda", "arch": f"sm_{sm}"}):
             yield
 
 
-def target_cache(maxsize: Optional[int] = 128) -> Callable[[Callable], Callable]:
+def target_cache(maxsize: int | None = 128) -> Callable[[Callable], Callable]:
     """LRU cache keyed by arguments and the current build target.
 
-    Compile JIT objects directly to bypass their argument-only cache.
+    Compile JIT objects directly to bypass their argument-only cache. Every argument of the
+    builder, a ``target`` keyword included, passes to it unchanged.
     """
 
     def decorate(fn: Callable) -> Callable:
@@ -75,11 +120,10 @@ def target_cache(maxsize: Optional[int] = 128) -> Callable[[Callable], Callable]
 
         jit = isinstance(fn, JITImpl)
 
-        @functools.lru_cache(  # lint: target-cache allow: MACA kernel builder is selected by the backend target
-            maxsize=maxsize
-        )
-        def cached(target: BuildTarget, *args: Any, **kwargs: Any) -> Any:
+        @functools.lru_cache(maxsize=maxsize)
+        def cached(target: BuildTarget, /, *args: Any, **kwargs: Any) -> Any:
             with building_on(None):
+                unroll_pipelined_waits()
                 return fn.compile(*args, **kwargs) if jit else fn(*args, **kwargs)
 
         @functools.wraps(fn, updated=())
@@ -91,3 +135,88 @@ def target_cache(maxsize: Optional[int] = 128) -> Callable[[Callable], Callable]
         return keyed
 
     return decorate
+
+
+def chain_cuda_postproc(rewrite: Callable[[str], str]) -> None:
+    """Run *rewrite* on generated CUDA after whatever holds TileLang's one post-processing slot.
+
+    TileLang keeps a single CUDA post-processing callback, so each rewrite wraps the one
+    registered before it instead of replacing it.
+    """
+    import tilelang
+    import tvm_ffi
+
+    previous = tvm_ffi.get_global_func("tilelang_callback_cuda_postproc", allow_missing=True)
+
+    def postproc(code: str, target: Any) -> str:
+        if previous is not None:
+            code = previous(code, target)
+        return rewrite(code)
+
+    tilelang.register_cuda_postproc(postproc)
+
+
+def unroll_pipelined_waits() -> None:
+    """Unroll each constant-extent unrolled loop holding a cp.async wait on a loop variable.
+
+    TileLang's CUDA codegen rejects the variable ``ptx_wait_group`` count a pipelined
+    epilogue leaves; per-iteration copies let Simplify fold each count to a constant.
+    Cleanup: drop this hook once tile-ai/tilelang#4424 is fixed.
+    """
+    import importlib
+    import sys
+
+    from tilelang import tvm
+
+    tirx = tvm.tirx
+    importlib.import_module("tilelang.engine.lower")
+    lower = sys.modules["tilelang.engine.lower"]
+    prepare = lower._prepare_device_codegen_mod
+    if getattr(prepare, "unrolls_pipelined_waits", False):
+        return
+    wait = tvm.ir.Op.get("tirx.ptx_wait_group")
+
+    def waits_on_a_variable(stmt: Any) -> bool:
+        found = []
+
+        def visit(node: Any) -> None:
+            if (
+                isinstance(node, tirx.Call)
+                and node.op.same_as(wait)
+                and not isinstance(node.args[0], tirx.IntImm)
+            ):
+                found.append(node)
+
+        tirx.stmt_functor.post_order_visit(stmt, visit)
+        return bool(found)
+
+    def unroll(node: Any) -> Any:
+        if (
+            isinstance(node, tirx.For)
+            and node.kind == tirx.ForKind.UNROLLED
+            and isinstance(node.extent, tirx.IntImm)
+            and waits_on_a_variable(node.body)
+        ):
+            var = node.loop_var
+            return tirx.SeqStmt(
+                [
+                    tirx.stmt_functor.substitute(
+                        node.body, {var: node.min + tirx.const(i, var.dtype)}
+                    )
+                    for i in range(node.extent.value)
+                ]
+            )
+        return None
+
+    def prepare_unrolled(device_mod: Any) -> Any:
+        functions = {}
+        for gvar, func in device_mod.functions.items():
+            if isinstance(func, tirx.PrimFunc) and waits_on_a_variable(func.body):
+                func = func.with_body(tirx.stmt_functor.ir_transform(func.body, None, unroll))
+            functions[gvar] = func
+        # Each unrolled copy redefines the loops it holds; ConvertSSA renames them apart.
+        unrolled = tirx.transform.ConvertSSA()(tvm.IRModule(functions, attrs=device_mod.attrs))
+        return prepare(unrolled)
+
+    prepare_unrolled.unrolls_pipelined_waits = True
+    lower._prepare_device_codegen_mod = prepare_unrolled

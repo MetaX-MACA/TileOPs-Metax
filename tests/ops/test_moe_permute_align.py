@@ -36,10 +36,8 @@ class MoEPermuteAlignFixture(FixtureBase):
                 pytest.param(16, 2, 8, 16, marks=pytest.mark.full, id="small-bs16"),
                 pytest.param(1024, 8, 64, 128, marks=pytest.mark.full, id="large-bs128"),
                 pytest.param(1, 2, 4, 4, marks=pytest.mark.full, id="single-token"),
-                # top_k=1: each token is routed to exactly one expert
-                pytest.param(8, 1, 4, 4, marks=pytest.mark.full, id="top-k-1"),
-                # A few hundred routes over 8, 32 and 33 experts.
-                pytest.param(100, 2, 8, 16, marks=pytest.mark.full, id="sb-numel200"),
+                # A few hundred routes over 32 and 33 experts, either side of the one-warp
+                # small-batch limit.
                 pytest.param(100, 6, 32, 64, marks=pytest.mark.full, id="sb-numel600-maxexp"),
                 pytest.param(100, 6, 33, 64, marks=pytest.mark.full, id="experts-33"),
                 # dispatch boundary: numel=1023 (last small-batch) vs numel=1024 (first large-batch)
@@ -82,6 +80,33 @@ def test_permute_align_op(total_tokens: int, top_k: int, num_experts: int, block
     inputs = test.gen_inputs()
 
     TestBase.check(test, op, *inputs)
+
+
+@pytest.mark.in_tree_kernels
+@pytest.mark.sm90
+@pytest.mark.parametrize(
+    "num_experts",
+    [pytest.param(128, marks=pytest.mark.smoke), pytest.param(384, marks=pytest.mark.full)],
+)
+def test_sparse_routes_across_expert_blocks(num_experts) -> None:
+    from tileops._kernels.build_target import building_on
+    from tileops._kernels.moe.permute_align import _make_sparse_routes_kernel
+    from tileops.backend import BUILTIN
+
+    # The first expert spans two blocks. Other active experts belong to different CTAs.
+    ids = torch.tensor(
+        [1] * 65 + [num_experts // 2] * 33 + [num_experts - 1] * 31,
+        dtype=torch.int32,
+        device=run_device(),
+    )
+    workload = MoEPermuteAlignWorkload(
+        manifest_call("MoEPermuteAlignFwdOp", T=129, K=1, num_experts=num_experts, block_size=64)
+    )
+    op = MoEPermuteAlignFwdOp(num_experts, 64, target=BUILTIN)
+    TestBase.check(workload, op, ids.view(-1, 1))
+    (kernel,) = op.iter_kernels()
+    with building_on(ids.device):
+        assert kernel._fused_fn is _make_sparse_routes_kernel(129, num_experts)
 
 
 @pytest.mark.parametrize(

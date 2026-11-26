@@ -3,7 +3,7 @@
 Separate copy groups allow the first row's stores to overlap the second row's loads.
 """
 
-from typing import Optional
+import operator
 
 import tilelang
 import tilelang.language as T
@@ -12,9 +12,10 @@ import torch
 from tileops._csrc import csrc_include
 from tileops._kernels.build_target import target_cache
 from tileops._kernels.constants import VECTOR_ACCESS_BYTES
-from tileops._kernels.kernel_base import Entry, Kernel
-from tileops._kernels.norm.call_spec import LayerNormCall, RMSNormFwdInterface
-from tileops._utils import WARP_LANES, WARP_SHUFFLE_STAGES
+from tileops._kernels.norm.call_spec import LayerNormCall
+from tileops._kernels.norm.rms_norm import _RMSNormRowsKernel
+from tileops._kernels.warp_reduce import warp_reduce
+from tileops._utils import WARP_LANES
 
 __all__ = ["RMSNormStagedKernel"]
 
@@ -43,10 +44,7 @@ def _rms_norm_staged_kernel(M, N, eps, dtype, has_weight):
                     piece[c] = tile[g, (k * _THREADS + tx) * vec + c]
                 for c in T.unroll(vec):
                     total[0] += T.cast(piece[c], "float32") * T.cast(piece[c], "float32")
-            for stage in T.unroll(WARP_SHUFFLE_STAGES):
-                total[0] += T.shfl_xor(
-                    total[0], T.int32(WARP_LANES // 2) >> stage, width=WARP_LANES
-                )
+            warp_reduce(total, operator.add, high_first=True)
             if tx % WARP_LANES == 0:
                 sums[g, tx // WARP_LANES] = total[0]
             T.sync_threads()
@@ -107,18 +105,20 @@ def _rms_norm_staged_kernel(M, N, eps, dtype, has_weight):
     return build
 
 
-class RMSNormStagedKernel(Kernel, RMSNormFwdInterface):
+class RMSNormStagedKernel(_RMSNormRowsKernel):
     """RMS normalization of a launch whose rows, two a CTA, fill one wave.
 
     Serves launches that leave less than a sixteenth of one wave of two rows a CTA free and do
     not exceed it, of rows of at least three whole vectors a thread.
     """
 
-    supported_archs: list[int] = [80, 86, 89, 90]
-    preferred_over = frozenset({"rms_norm"})
+    # SM86 and SM89 hold 100 KB of shared memory an SM: eight CTAs of the shortest row this
+    # kernel takes do not fit there, so the shared-memory refusal turns down every call.
+    supported_archs: list[int] = [80, 90]
+    _builder = staticmethod(_rms_norm_staged_kernel)
 
     @classmethod
-    def refusal(cls, call: LayerNormCall) -> Optional[str]:
+    def refusal(cls, call: LayerNormCall) -> str | None:
         vec = VECTOR_ACCESS_BYTES // call.dtype.itemsize
         wave = _CTAS_PER_SM * call.sm_count
         # At least three vectors a thread amortize the shared-memory staging and its barriers.
@@ -130,62 +130,11 @@ class RMSNormStagedKernel(Kernel, RMSNormFwdInterface):
         # fraction is a conservative performance cutoff.
         if not rows - rows // 16 < call.rows <= rows:
             return f"{call.rows} rows do not fill one wave of {_ROWS} rows a CTA"
-        props = torch.cuda.get_device_properties(call.device)
         # The SM keeps the difference from the per-block opt-in limit for each resident CTA.
-        reserved = props.shared_memory_per_multiprocessor - props.shared_memory_per_block_optin
+        reserved = call.smem_per_sm - call.smem_budget
         footprint = _ROWS * (call.n * call.dtype.itemsize + _THREADS // WARP_LANES * 4) + reserved
-        if _CTAS_PER_SM * footprint > props.shared_memory_per_multiprocessor:
+        if _CTAS_PER_SM * footprint > call.smem_per_sm:
             return (
                 f"{_CTAS_PER_SM} CTAs of {_ROWS} rows of {call.n} do not fit an SM's shared memory"
             )
         return super().refusal(call)
-
-    @classmethod
-    def entry_for(cls, call: LayerNormCall) -> Entry:
-        identity = (call.n, call.eps, call.dtype)
-        return identity, lambda: cls(*identity)
-
-    def __init__(self, N: int, eps: float, dtype: torch.dtype, config: Optional[dict] = None):
-        """Build for a hidden size and dtype; ``forward`` resolves the program per row count."""
-        super().__init__()
-        self.N = N
-        self.eps = eps
-        self.dtype = dtype
-        self.init_config(config)
-
-    @property
-    def default_config(self) -> dict:
-        return {}
-
-    @property
-    def autotune_configs(self) -> list[dict]:
-        return [self.default_config]
-
-    def forward(self, x: torch.Tensor, weight: Optional[torch.Tensor]) -> torch.Tensor:
-        """Normalize ``x`` over its trailing ``N`` elements.
-
-        Args:
-            x: Input whose trailing axes multiply to ``N``, contiguous, on a CUDA device.
-            weight: Affine scale holding ``N`` elements, contiguous, on the same device,
-                or ``None`` to scale by one.
-
-        Returns:
-            Tensor shaped like *x*.
-
-        Raises:
-            ValueError: Either input is not on a device this kernel's ``devices`` names.
-        """
-        self._require_devices(x=x, weight=weight)
-        rows = x.reshape(-1, self.N)
-        has_weight = weight is not None
-        # The prim_func keeps its weight parameter without one; it reads nothing from it.
-        weight = weight.reshape(self.N) if has_weight else rows.new_empty(1)
-        program = self.program(self._compile, rows.shape[0], has_weight)
-        return program(rows, weight).reshape(x.shape)
-
-    def _compile(self, cfg: dict, m: int, has_weight: bool):
-        """The program for *m* rows, with or without a weight."""
-        self.kernel = kernel = _rms_norm_staged_kernel(
-            m, self.N, self.eps, self.dtype_str, has_weight
-        )
-        return kernel()

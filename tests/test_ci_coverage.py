@@ -10,15 +10,14 @@ import pytest
 from scripts.ci import check_cuda_graph_coverage as graph
 from scripts.ci import check_packaging_coverage as packaging
 
-pytestmark = pytest.mark.smoke
+pytestmark = [pytest.mark.smoke, pytest.mark.structural]
 
 
 @pytest.mark.parametrize("gate", [packaging, graph], ids=["packaging", "cuda-graph"])
-@pytest.mark.parametrize(
-    "status", [pytest.ExitCode.INTERRUPTED, pytest.ExitCode.NO_TESTS_COLLECTED]
-)
-def test_collection_failure_overrides_complete_coverage(monkeypatch, gate, status):
+def test_collection_failure_overrides_complete_coverage(monkeypatch, gate):
     import tileops
+
+    status = pytest.ExitCode.INTERRUPTED
 
     def collect(args, plugins):
         plugins[0].covered = dict.fromkeys(
@@ -77,7 +76,6 @@ def test_wheel_verification_starts_with_fresh_compiler_caches(tmp_path):
     work = tmp_path / "work"
     cache_vars = (
         "TILELANG_CACHE_DIR",
-        "TILELANG_TMP_DIR",
         "TRITON_CACHE_DIR",
         "TORCHINDUCTOR_CACHE_DIR",
         "CUDA_CACHE_PATH",

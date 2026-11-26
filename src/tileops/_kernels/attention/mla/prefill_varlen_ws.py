@@ -16,8 +16,6 @@ own 64 query rows each and overlap the QK of tile ``k`` with the PV of tile
 ``k - 1``.
 """
 
-from typing import Optional
-
 import tilelang
 import tilelang.language as T
 import torch
@@ -28,11 +26,11 @@ from tileops._kernels.attention.call_spec import (
     MLAVarlenCall,
     MLAVarlenFwdInterface,
 )
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.attention.stream_counter import stream_counter
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.constants import LOG2E
 from tileops._kernels.grouped_tiling import GroupTiling
 from tileops._kernels.kernel_base import Entry, Kernel
-from tileops._utils import get_sm_count
 
 __all__ = ["MLAVarlenPrefillWSFwdKernel"]
 
@@ -45,15 +43,7 @@ __all__ = ["MLAVarlenPrefillWSFwdKernel"]
         tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
     },
     compile_flags=[
-        "-O3",
-        "-Wno-deprecated-declarations",
-        "-U__CUDA_NO_HALF_OPERATORS__",
-        "-U__CUDA_NO_HALF_CONVERSIONS__",
-        "-U__CUDA_NO_HALF2_OPERATORS__",
-        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-        "--expt-relaxed-constexpr",
-        "--expt-extended-lambda",
-        "-DNDEBUG",
+        *CUDA_COMPILE_FLAGS,
     ],
 )
 def _mla_varlen_ws_kernel(
@@ -455,14 +445,12 @@ class MLAVarlenPrefillWSFwdKernel(Kernel, MLAVarlenFwdInterface):
     _Q_SLOTS: int = 1
     # The shared buffers hold the Q slot, both key halves and V: at block_n 128 and
     # two stages that is 208 KB of the 227 KB an SM90 block may use, leaving the
-    # per-request prefix room. A second Q slot would need 256 KB and does not fit,
-    # and measured against it a wider key tile is worth more than prefetching the
-    # next item's Q: 10.91 ms against 12.10 ms on ds-v3-8x4k. Re-measure if any
-    # buffer grows.
+    # per-request prefix room. A second Q slot would need 256 KB and does not fit, and a
+    # wider key tile is worth more than prefetching the next item's Q.
     _MAX_BATCH: int = 256
 
     @classmethod
-    def refusal(cls, call: MLAVarlenCall) -> Optional[str]:
+    def refusal(cls, call: MLAVarlenCall) -> str | None:
         """Why *call* is outside the shapes this schedule serves."""
         if call.dtype not in ATTENTION_DTYPES:
             return f"serves float16 and bfloat16, got {call.dtype}"
@@ -473,7 +461,7 @@ class MLAVarlenPrefillWSFwdKernel(Kernel, MLAVarlenFwdInterface):
             )
         if call.batch > cls._MAX_BATCH:
             return f"the per-request prefix is held in shared memory, got batch {call.batch}"
-        return None
+        return super().refusal(call)
 
     @classmethod
     def entry_for(cls, call: MLAVarlenCall) -> Entry:
@@ -486,7 +474,7 @@ class MLAVarlenPrefillWSFwdKernel(Kernel, MLAVarlenFwdInterface):
             is_causal=call.is_causal,
             sm_scale=call.sm_scale,
             dtype=call.dtype,
-            device_index=call.device.index if call.device is not None else None,
+            device_index=call.device_index,
         )
         return tuple(args.items()), lambda: cls(**args)
 
@@ -499,10 +487,10 @@ class MLAVarlenPrefillWSFwdKernel(Kernel, MLAVarlenFwdInterface):
         dim_v: int,
         is_causal: bool,
         dtype: torch.dtype,
-        sm_scale: Optional[float] = None,
-        config: Optional[dict] = None,
+        sm_scale: float | None = None,
+        config: dict | None = None,
         *,
-        device_index: Optional[int] = None,
+        device_index: int | None = None,
     ) -> None:
         """Build the program for one call shape.
 
@@ -546,7 +534,7 @@ class MLAVarlenPrefillWSFwdKernel(Kernel, MLAVarlenFwdInterface):
             self._BLOCK_N,
             self._STAGES,
             self._Q_SLOTS,
-            get_sm_count(self.device_index),
+            self.build_target.sm_count,
         )
         return kernel
 
@@ -576,15 +564,7 @@ class MLAVarlenPrefillWSFwdKernel(Kernel, MLAVarlenFwdInterface):
             ``(heads, total_tokens)`` log-sum-exp.
         """
         self._require_devices(q=q, k_nope=k_nope, k_pe=k_pe, v=v)
-        if torch.cuda.is_current_stream_capturing():
-            # Each captured graph owns a counter from its private pool.
-            counter = torch.zeros(2, dtype=torch.int32, device=q.device)
-        else:
-            stream = torch.cuda.current_stream(q.device).cuda_stream
-            counter = self._counters.get(stream)
-            if counter is None:
-                counter = torch.zeros(2, dtype=torch.int32, device=q.device)
-                self._counters[stream] = counter
+        counter = stream_counter(self._counters, q.device)
         out = torch.empty((q.shape[0], self.heads, self.dim_v), dtype=q.dtype, device=q.device)
         lse = torch.empty((self.heads, q.shape[0]), dtype=torch.float32, device=q.device)
         self.program(self._compile)(q, k_nope, k_pe, v, cu_seqlens, out, lse, counter)

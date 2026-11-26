@@ -1,4 +1,5 @@
-from typing import ClassVar, Mapping, Optional
+from collections.abc import Mapping
+from typing import ClassVar
 
 import torch
 
@@ -14,7 +15,11 @@ from tileops._kernels.attention.call_spec import (
     GQAPagedFwdInterface,
 )
 from tileops._kernels.kernel_base import Kernel, KernelInterface
-from tileops._ops.attention.gqa.parameters import attention_scale, score_softcap
+from tileops._ops.attention.gqa.parameters import (
+    attention_scale,
+    attention_window,
+    score_softcap,
+)
 from tileops._ops.op_base import Op
 from tileops._perf.profile import tensor_core_roof
 from tileops.backend import Target
@@ -53,17 +58,18 @@ class GQAPagedFwdOp(Op):
     live replay inputs; choosing and preparing this path requires no host readback.
 
     Append with ``PagedKVCacheWriteFwdOp`` using physical slots, then read with
-    post-append lengths. For rotated caches, apply ``RoPENeoxPositionIdsFwdOp`` to
+    post-append lengths. For rotated caches, apply ``RoPEFwdOp`` at the token positions to
     new Q/K before writing and use ``pos_encoding_mode="none"`` to avoid double
-    rotation. FP8 writes quantize new K/V before attention; the retired fused append
-    op attended those tokens at their original 16-bit precision.
+    rotation. FP8 writes quantize new K/V before attention, so attention reads those
+    tokens at FP8 precision.
 
     The Hopper FP8-query prefill path keeps up to 64 MiB per call geometry and stream for
     the partial outputs of short requests whose keys it splits across work items; a
     captured graph takes its own copy from the graph pool.
 
-    The caller guarantees well-formed ``cu_seqlens_q``, or passes ``validate_inputs=True``, which
-    checks it on the CPU on every call.
+    The caller guarantees well-formed ``cu_seqlens_q`` and in-range ``block_table`` and
+    ``cache_seqlens``, or passes ``validate_inputs=True``, which checks them on the CPU on
+    every call.
     """
 
     kernel_types: ClassVar[Mapping[str, type[Kernel]]] = {
@@ -76,14 +82,14 @@ class GQAPagedFwdOp(Op):
     interfaces: ClassVar[Mapping[str, type[KernelInterface]]] = {"gqa_paged": GQAPagedFwdInterface}
 
     def roofline_data_terms(self) -> "dict[str, int]":
-        """The cached tokens this call's lengths name and the distinct pool rows it reads,
-        which its flops and cache reads follow."""
-        from tileops._perf.formulas import gqa_paged_cache_rows
+        """The cached tokens this call's lengths name, which its flops follow, and the
+        counts its bytes follow (``gqa_paged_read_terms``)."""
+        from tileops._perf.formulas import gqa_paged_read_terms
 
         call = self.last_call
         return {
             "cached_tokens": sum(call.metadata_values("cache_seqlens")),
-            "cache_rows": gqa_paged_cache_rows(call),
+            **gqa_paged_read_terms(call),
         }
 
     def __init__(
@@ -91,11 +97,11 @@ class GQAPagedFwdOp(Op):
         is_causal: bool = False,
         window_size_left: int = -1,
         window_size_right: int = -1,
-        sm_scale: Optional[float] = None,
-        softcap: Optional[float] = None,
-        out_dtype: Optional[torch.dtype] = None,
+        sm_scale: float | None = None,
+        softcap: float | None = None,
+        out_dtype: torch.dtype | None = None,
         pos_encoding_mode: str = "none",
-        rotary_dim: Optional[int] = None,
+        rotary_dim: int | None = None,
         rope_layout: str = "neox",
         *,
         validate_inputs: bool = False,
@@ -116,7 +122,8 @@ class GQAPagedFwdOp(Op):
             rotary_dim: Even rotated width; ``None`` uses the full head dimension.
             rope_layout: ``"neox"`` or ``"interleaved"``.
             validate_inputs: Check on the CPU that ``cu_seqlens_q`` starts at 0, never decreases
-                and ends at the query token count.
+                and ends at the query token count, and that ``block_table`` and
+                ``cache_seqlens`` lie in their manifest ranges.
             target: Backend target, or ``None`` to resolve from the input device.
         """
         self.is_causal = is_causal
@@ -140,9 +147,9 @@ class GQAPagedFwdOp(Op):
         q: torch.Tensor,
         k_cache: torch.Tensor,
         block_table: torch.Tensor,
-        k_scale: Optional[torch.Tensor] = None,
-        rope_cos: Optional[torch.Tensor] = None,
-        sinks: Optional[torch.Tensor] = None,
+        k_scale: torch.Tensor | None = None,
+        rope_cos: torch.Tensor | None = None,
+        sinks: torch.Tensor | None = None,
     ) -> AttentionCall:
         """State what one paged call is, for selection to filter against.
 
@@ -152,6 +159,8 @@ class GQAPagedFwdOp(Op):
         _, heads, dim = q.shape
         num_pages, page_size, heads_kv, _ = k_cache.shape
         batch, max_pages_per_req = block_table.shape
+        # A request caches its queries, and at most the pages its table row holds.
+        positions = max_pages_per_req * page_size
         return AttentionCall(
             # The type the call computes and returns in: an FP8 query names it.
             dtype=self.out_dtype or q.dtype,
@@ -166,8 +175,8 @@ class GQAPagedFwdOp(Op):
             is_causal=self.is_causal,
             sm_scale=attention_scale(dim, self.sm_scale),
             softcap=self.softcap,
-            window_size_left=self.window_size_left,
-            window_size_right=self.window_size_right,
+            window_size_left=attention_window(self.window_size_left, positions),
+            window_size_right=attention_window(self.window_size_right, positions),
             is_fp8=torch.float8_e4m3fn in (q.dtype, k_cache.dtype),
             is_uniform=batch == 1,
             cache_dtype=k_cache.dtype,
@@ -189,12 +198,12 @@ class GQAPagedFwdOp(Op):
         block_table: torch.Tensor,
         cache_seqlens: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
-        q_scale: Optional[torch.Tensor] = None,
-        k_scale: Optional[torch.Tensor] = None,
-        v_scale: Optional[torch.Tensor] = None,
-        rope_cos: Optional[torch.Tensor] = None,
-        rope_sin: Optional[torch.Tensor] = None,
-        sinks: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+        rope_cos: torch.Tensor | None = None,
+        rope_sin: torch.Tensor | None = None,
+        sinks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run read-only paged GQA over packed Q and rank-4 KV pages.
 

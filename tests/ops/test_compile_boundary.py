@@ -23,6 +23,7 @@ from tests.compile_contract import (
 )
 from tileops._ops.attention.dsa import DSADenseFwdOp, DSAPagedFwdOp
 from tileops._ops.attention.fp8_lightning_indexer import FP8LightningIndexerFwdOp
+from tileops._ops.attention.gated_pool_compress import GatedPoolCompressFwdOp
 from tileops._ops.attention.gqa.bwd import GQADenseBwdOp
 from tileops._ops.attention.gqa.dense import GQADenseFwdOp, GQADenseWithLSEFwdOp
 from tileops._ops.attention.gqa.paged import GQAPagedFwdOp
@@ -52,6 +53,7 @@ from tileops._ops.gemm.gemm import (
     GEMMW4A16FwdOp,
 )
 from tileops._ops.gemm.grouped_gemm import GroupedGEMMFwdOp
+from tileops._ops.indexing import EmbeddingFwdOp, MaskedScatterFwdOp
 from tileops._ops.linear_attention.deltanet.chunk import DeltaNetChunkBwdOp, DeltaNetChunkFwdOp
 from tileops._ops.linear_attention.deltanet.fwd import DeltaNetFwdOp
 from tileops._ops.linear_attention.deltanet.recurrent import DeltaNetRecurrentFwdOp
@@ -80,12 +82,13 @@ from tileops._ops.quantization import (
     INT8QuantPerTokenGroupFwdOp,
     SmoothQuantFwdOp,
 )
+from tileops._ops.quantization.fp4_quant import FP4QuantPerGroupFwdOp
 from tileops._ops.quantization.fp8_quant import FP8QuantPerTokenGroupFwdOp
 from tileops._ops.rope import (
     LongRoPEFwdOp,
+    RoPECosSinFwdOp,
     RoPEFwdOp,
     RoPELlama31FwdOp,
-    RoPENeoxPositionIdsFwdOp,
     YaRNFwdOp,
 )
 from tileops._ops.sampling.chain_speculative_sampling import ChainSpeculativeSamplingFwdOp
@@ -96,17 +99,18 @@ from tileops._ops.sampling.top_k_top_p_mask import TopKTopPMaskFwdOp
 from tileops._ops.sampling.top_p_mask import TopPMaskFwdOp
 from tileops._ops.sequence_modeling.engram import EngramGateConvBwdOp, EngramGateConvFwdOp
 from tileops._ops.sequence_modeling.engram_decode import EngramDecodeFwdOp
-from tileops._ops.sequence_modeling.mhc import MHCPostFwdOp, MHCPreFwdOp
+from tileops._ops.sequence_modeling.hyper_connection import (
+    HyperConnectionHeadFwdOp,
+    HyperConnectionPostFwdOp,
+    HyperConnectionPreFwdOp,
+)
 from tileops._ops.transform import HadamardTransformFwdOp
 from workloads.attention.dsa import DSADecodeWorkload, DSAPagedCall
 from workloads.attention.fp8_lightning_indexer import FP8LightningIndexerWorkload
 from workloads.attention.gqa.bwd import GQABwdWorkload
 from workloads.attention.gqa.dense import GQADenseDecodeWorkload, GQADenseWithLSECall
 from workloads.attention.gqa.paged import GQAPagedFwdWorkload
-from workloads.attention.gqa.varlen import (
-    GQAPrefillVarlenFwdWorkload,
-    GQASlidingWindowVarlenFwdWorkload,
-)
+from workloads.attention.gqa.varlen import GQAPrefillVarlenFwdWorkload, GQAVarlenFwdWorkload
 from workloads.attention.mha import MHADecodePagedWorkload
 from workloads.attention.mla import (
     MLADecodeWorkload,
@@ -159,9 +163,7 @@ def _attention_cases():
 
     def gqa_sliding_window_varlen():
         lens = [128, 128]
-        case = GQASlidingWindowVarlenFwdWorkload(
-            2, lens, lens, _HEADS, _HEADS_KV, _DIM, True, 64, -1, _DTYPE
-        )
+        case = GQAVarlenFwdWorkload(2, lens, lens, _HEADS, _HEADS_KV, _DIM, True, 64, -1, _DTYPE)
         op = GQAVarlenFwdOp(is_causal=True, window_size_left=64)
         return op, case.gen_inputs()
 
@@ -220,9 +222,18 @@ def _attention_cases():
 
     def dsa_paged():
         call = manifest_call(
-            "DSAPagedFwdOp", S_q=1, H=64, K=128, NP=8, PS=64, W=2, cache_lens="repeat(128, 2)"
+            "DSAPagedFwdOp",
+            {"KV": "uint8"},
+            DK=576,
+            S_q=1,
+            H=64,
+            K=128,
+            NP=8,
+            PS=64,
+            W=2,
+            cache_lens="repeat(128, 2)",
         )
-        return DSAPagedFwdOp(), DSAPagedCall(call).gen_inputs()
+        return DSAPagedFwdOp(), DSAPagedCall(call).gen_inputs()[:5]
 
     def fp8_lightning_indexer():
         case = FP8LightningIndexerWorkload(1, 2048, 8, 64, 4096, 1)
@@ -233,6 +244,26 @@ def _attention_cases():
         starts = torch.zeros(1, 256, dtype=torch.int32, device=run_device())
         ends = torch.full((1, 256), 512, dtype=torch.int32, device=run_device())
         return TopKSelectFwdOp(top_k=64), (score, starts, ends)
+
+    def gated_pool_compress():
+        kv = torch.randn(33, 256, dtype=torch.float32, device=run_device())
+        score = torch.randn(33, 256, dtype=torch.float32, device=run_device())
+        ape = torch.randn(4, 256, dtype=torch.float32, device=run_device())
+        kv_state = torch.randn(4, 8, 256, dtype=torch.float32, device=run_device())
+        score_state = torch.randn(4, 8, 256, dtype=torch.float32, device=run_device())
+        cu_seqlens = torch.tensor([0, 1, 33], dtype=torch.int32, device=run_device())
+        start_pos = torch.tensor([11, 0], dtype=torch.int32, device=run_device())
+        state_slots = torch.tensor([2, 0], dtype=torch.int32, device=run_device())
+        return GatedPoolCompressFwdOp(4, True), (
+            kv,
+            score,
+            ape,
+            kv_state,
+            score_state,
+            cu_seqlens,
+            start_pos,
+            state_slots,
+        )
 
     return (
         ("gqa-dense", gqa_dense),
@@ -246,9 +277,10 @@ def _attention_cases():
         ("mha-decode-paged", mha_decode_paged),
         ("mla-decode", mla_decode),
         ("mla-varlen", mla_varlen),
-        # dQ lands through float32 atomic adds, whose order differs from run to run.
-        ("mla-dense-bwd", mla_dense_bwd, False),
-        ("mla-varlen-bwd", mla_varlen_bwd, False),
+        # dQ lands through float32 atomic adds, whose order differs from run to run. Only the
+        # SM90 kernels serve them.
+        ("mla-dense-bwd", mla_dense_bwd, False, (pytest.mark.sm90,)),
+        ("mla-varlen-bwd", mla_varlen_bwd, False, (pytest.mark.sm90,)),
         ("nsa-fwd", nsa_fwd),
         ("nsa-cmp-fwd", nsa_compressed_fwd),
         ("nsa-topk", nsa_topk),
@@ -258,6 +290,8 @@ def _attention_cases():
         # Picks the same set every time, but the atomic increments that claim the slots
         # decide which index lands where.
         ("topk-selector", topk_select, False),
+        # Entries are defined at the closing tokens only; the rest of the tensor is unwritten.
+        ("gated-pool-compress", gated_pool_compress, False),
     )
 
 
@@ -347,7 +381,8 @@ def _gemm_cases():
         ("gemm-fp8", gemm_fp8),
         ("gemm-int8-w8a8", gemm_int8_w8a8),
         ("gemm-w4a16", gemm_w4a16),
-        ("gemm-w4a8", gemm_w4a8),
+        # Only the SM90 kernels serve it.
+        ("gemm-w4a8", gemm_w4a8, True, (pytest.mark.sm90,)),
         ("grouped-gemm", grouped_gemm),
         ("bmm", bmm),
         ("bmm-fp8", bmm_fp8),
@@ -586,7 +621,7 @@ def _linear_attention_cases():
 
 
 def _other_cases():
-    """The FFT, Hadamard, quantization and mean pooling ops, with the inputs they are built for."""
+    """The FFT, Hadamard, embedding, masked scatter, quantization and mean pooling ops, with the inputs they are built for."""
 
     def fft_c2c():
         x = torch.randn(2, 64, dtype=torch.complex64, device=run_device())
@@ -596,9 +631,32 @@ def _other_cases():
         x = torch.randn(2, 128, dtype=torch.bfloat16, device=run_device())
         return HadamardTransformFwdOp(), (x,)
 
+    def embedding():
+        weight = torch.randn(100, 64, dtype=torch.bfloat16, device=run_device())
+        index = torch.randint(0, 100, (3, 5), device=run_device())
+        return EmbeddingFwdOp(), (index, weight)
+
+    def masked_scatter():
+        x = torch.randn(6, 64, dtype=torch.bfloat16, device=run_device())
+        mask = torch.rand(6, 1, device=run_device()) < 0.5
+        source = torch.randn(6, 64, dtype=torch.bfloat16, device=run_device())
+        return MaskedScatterFwdOp(), (x, mask, source)
+
     def fp8_quant():
-        x = torch.randn(1, 64, 1, 64, dtype=torch.float16, device=run_device())
-        return FP8QuantPerTokenGroupFwdOp(), (x,)
+        x = torch.randn(64, 256, dtype=torch.float16, device=run_device())
+        return FP8QuantPerTokenGroupFwdOp(128), (x,)
+
+    def fp8_quant_ue8m0_inplace():
+        x = torch.randn(64, 448, dtype=torch.bfloat16, device=run_device())
+        return FP8QuantPerTokenGroupFwdOp(64, 1e-4, use_ue8m0=True, inplace=True), (x,)
+
+    def fp4_quant():
+        x = torch.randn(4, 64, 128, dtype=torch.bfloat16, device=run_device())
+        return FP4QuantPerGroupFwdOp(), (x,)
+
+    def fp4_quant_inplace():
+        x = torch.randn(4, 64, 128, dtype=torch.bfloat16, device=run_device())
+        return FP4QuantPerGroupFwdOp(inplace=True), (x,)
 
     def fp8_quant_per_block():
         return FP8QuantPerBlockFwdOp(), FP8QuantPerBlockWorkload(
@@ -653,7 +711,12 @@ def _other_cases():
     return (
         ("fft-c2c", fft_c2c),
         ("hadamard-transform", hadamard_transform),
+        ("embedding", embedding),
+        ("masked-scatter", masked_scatter),
         ("fp8-quant", fp8_quant),
+        ("fp8-quant-ue8m0-inplace", fp8_quant_ue8m0_inplace),
+        ("fp4-quant", fp4_quant),
+        ("fp4-quant-inplace", fp4_quant_inplace),
         ("fp8-quant-per-block", fp8_quant_per_block),
         ("int4-quant-per-group", int4_quant_per_group),
         ("int8-dequant-per-block", int8_dequant_per_block),
@@ -761,69 +824,104 @@ def _sequence_modeling_cases():
             _x(_CONV_TAPS, _D),
         )
 
-    def mhc_pre():
-        n_expand, c_x, batch = 4, 1280, 1
-        op = MHCPreFwdOp(0.5, 0.25, 0.125, sinkhorn_repeat=4)
-        phi_dim = n_expand * n_expand + 2 * n_expand
+    def hyper_connection_pre():
+        n, c = 4, 256
+        op = HyperConnectionPreFwdOp(1e-6, 1e-6, 1e-6, 2.0, 20)
+        q = n * n + 2 * n
         return op, (
-            _x(n_expand * c_x, phi_dim, dtype=torch.float32),
-            _x(batch, n_expand * c_x),
-            _x(phi_dim, dtype=torch.float32),
+            _x(3, n, c),
+            _x(q, n * c, dtype=torch.float32) / (n * c) ** 0.5,
+            _x(3, dtype=torch.float32),
+            _x(q, dtype=torch.float32),
         )
 
-    def mhc_post():
-        n_expand, c_x, batch = 4, 1280, 1
-        return MHCPostFwdOp(), (
-            _x(batch, c_x),
-            _x(batch, n_expand, dtype=torch.float32),
-            _x(batch, n_expand * c_x),
+    def hyper_connection_post():
+        streams = 4
+        f32 = dict(dtype=torch.float32)
+        return HyperConnectionPostFwdOp(), (
+            _x(_M, _SEQ_LEN, _D),
+            _x(_M, _SEQ_LEN, streams, _D),
+            _x(_M, _SEQ_LEN, streams, 1, **f32),
+            _x(_M, _SEQ_LEN, streams, streams, **f32),
+        )
+
+    def hyper_connection_head():
+        streams = 4
+        f32 = dict(dtype=torch.float32)
+        return HyperConnectionHeadFwdOp(1e-6, 1e-6), (
+            _x(_M, _SEQ_LEN, streams, _D),
+            _x(streams, streams * _D, **f32),
+            _x(1, **f32),
+            _x(streams, **f32),
         )
 
     return (
         ("engram-gate-conv-fwd", engram_gate_conv_fwd),
         ("engram-gate-conv-bwd", engram_gate_conv_bwd),
         ("engram-decode", engram_decode),
-        ("mhc-pre", mhc_pre),
-        ("mhc-post", mhc_post),
+        ("hyper-connection-pre", hyper_connection_pre),
+        ("hyper-connection-post", hyper_connection_post),
+        ("hyper-connection-head", hyper_connection_head),
     )
 
 
 def _rope_cases():
-    """The RoPE ops, one layout each, with the inputs they are built for."""
+    """The RoPE ops, each with positions past 0, a query and a key."""
     _DTYPE = torch.float16
-    _SEQ_LEN, _HEADS, _D = 64, 4, 64
+    _TOKENS, _HEADS, _D = 64, 4, 64
+    common = {"head_size": _D, "rotary_dim": _D, "max_position_embeddings": 4096, "base": 1e4}
 
-    def _x(*shape):
-        return torch.randn(*shape, dtype=_DTYPE, device=run_device())
+    def _inputs():
+        positions = torch.arange(100, 100 + _TOKENS, device=run_device())
+        q = torch.randn(_TOKENS, _HEADS * _D, dtype=_DTYPE, device=run_device())
+        k = torch.randn(_TOKENS, _D, dtype=_DTYPE, device=run_device())
+        return positions, q, k
 
-    def one_d(op_cls):
-        return lambda: (op_cls(input_layout="1d"), (_x(_SEQ_LEN, _D),))
+    def rope(neox):
+        return lambda: (RoPEFwdOp(**common, is_neox_style=neox, dtype=_DTYPE), _inputs())
 
-    def two_d(op_cls):
-        return lambda: (op_cls(input_layout="2d"), (_x(2, _SEQ_LEN, _HEADS, _D),))
+    def llama31():
+        op = RoPELlama31FwdOp(
+            **common,
+            is_neox_style=True,
+            dtype=_DTYPE,
+            scaling_factor=8.0,
+            low_freq_factor=1.0,
+            high_freq_factor=4.0,
+            orig_max_position=1024,
+        )
+        return op, _inputs()
+
+    def yarn():
+        return YaRNFwdOp(**common, is_neox_style=True, scaling_factor=2.0, dtype=_DTYPE), _inputs()
 
     def longrope():
-        rescale = torch.linspace(1.0, 2.0, _D // 2, device=run_device())
-        return LongRoPEFwdOp(rescale_factors=rescale), (_x(_SEQ_LEN, _D),)
+        rescale = torch.linspace(1.0, 2.0, _D // 2).tolist()
+        op = LongRoPEFwdOp(_D, _D, 8192, 4096, 1e4, True, _DTYPE, rescale)
+        return op, _inputs()
 
-    def position_ids():
-        op = RoPENeoxPositionIdsFwdOp(max_position=128)
-        positions = torch.arange(_SEQ_LEN, device=run_device(), dtype=torch.int32)
-        return op, (_x(_SEQ_LEN, _HEADS, _D), positions)
+    def cos_sin():
+        x = torch.randn(2, _TOKENS, _HEADS, _D, dtype=_DTYPE, device=run_device())
+        cos, sin = torch.randn(2, 128, _D // 2, device=run_device()).unbind(0)
+        return RoPECosSinFwdOp(), (x, cos, sin)
+
+    def cos_sin_packed_inplace():
+        # Packed, in place, each sequence at its own offset.
+        x = torch.randn(_TOKENS, _HEADS, _D, dtype=_DTYPE, device=run_device())
+        cos, sin = torch.randn(2, 128, _D // 2, device=run_device()).unbind(0)
+        cu_seqlens = torch.tensor([0, 20, _TOKENS], dtype=torch.int32, device=run_device())
+        offsets = torch.tensor([3, 50], device=run_device())
+        op = RoPECosSinFwdOp(interleaved=True, inplace=True, max_seqlen=_TOKENS - 20)
+        return op, (x, cos, sin, cu_seqlens, offsets)
 
     return (
-        ("rope-neox", one_d(RoPEFwdOp)),
-        (
-            "rope-interleaved",
-            lambda: (
-                RoPEFwdOp(rope_layout="interleaved", input_layout="2d"),
-                (_x(2, _SEQ_LEN, _HEADS, _D),),
-            ),
-        ),
-        ("rope-llama31", one_d(RoPELlama31FwdOp)),
-        ("rope-yarn", two_d(YaRNFwdOp)),
+        ("rope-neox", rope(True)),
+        ("rope-gptj", rope(False)),
+        ("rope-llama31", llama31),
+        ("rope-yarn", yarn),
         ("rope-longrope", longrope),
-        ("rope-neox-position-ids", position_ids),
+        ("rope-cos-sin", cos_sin),
+        ("rope-cos-sin-packed-inplace", cos_sin_packed_inplace),
     )
 
 
@@ -881,6 +979,7 @@ for _op_cls in (
     DSADenseFwdOp,
     DSAPagedFwdOp,
     FP8LightningIndexerFwdOp,
+    GatedPoolCompressFwdOp,
     TopKSelectFwdOp,
     GEMMFwdOp,
     GEMMFP8FwdOp,
@@ -911,7 +1010,10 @@ for _op_cls in (
     KDAFwdOp,
     FFTC2CFwdOp,
     HadamardTransformFwdOp,
+    EmbeddingFwdOp,
+    MaskedScatterFwdOp,
     FP8QuantPerTokenGroupFwdOp,
+    FP4QuantPerGroupFwdOp,
     ChainSpeculativeSamplingFwdOp,
     FP8QuantPerBlockFwdOp,
     INT4QuantPerGroupFwdOp,
@@ -929,13 +1031,14 @@ for _op_cls in (
     EngramGateConvFwdOp,
     EngramGateConvBwdOp,
     EngramDecodeFwdOp,
-    MHCPreFwdOp,
-    MHCPostFwdOp,
+    HyperConnectionPreFwdOp,
+    HyperConnectionPostFwdOp,
+    HyperConnectionHeadFwdOp,
     RoPEFwdOp,
     RoPELlama31FwdOp,
     YaRNFwdOp,
     LongRoPEFwdOp,
-    RoPENeoxPositionIdsFwdOp,
+    RoPECosSinFwdOp,
     TopKMaskFwdOp,
     TopKTopPMaskFwdOp,
 ):

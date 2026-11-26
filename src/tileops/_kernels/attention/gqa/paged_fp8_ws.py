@@ -8,8 +8,6 @@ With an FP8 query, 128-key tiles take row sums from a product with ones beside
 the value product; narrower tiles keep per-thread partial sums.
 """
 
-from typing import Optional
-
 import tilelang
 import tilelang.language as T
 import torch
@@ -21,12 +19,13 @@ from tileops._kernels.attention.call_spec import (
     AttentionCall,
     GQAPagedFwdInterface,
 )
-from tileops._kernels.attention.gqa.paged_ws import scheduler_counter
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.attention.gqa.paged_ws import claim_work
+from tileops._kernels.attention.online_softmax import make_apply_softcap
+from tileops._kernels.attention.stream_counter import stream_counter
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.constants import LOG2E
 from tileops._kernels.grouped_tiling import GroupTiling
 from tileops._kernels.kernel_base import Entry, Kernel
-from tileops._utils import get_shared_memory_optin, get_sm_count
 
 __all__ = ["GQAPagedFP8WSKernel"]
 
@@ -44,15 +43,7 @@ __all__ = ["GQAPagedFP8WSKernel"]
         tilelang.PassConfigKey.TL_DISABLE_SHARED_MEMORY_REUSE: True,
     },
     compile_flags=[
-        "-O3",
-        "-Wno-deprecated-declarations",
-        "-U__CUDA_NO_HALF_OPERATORS__",
-        "-U__CUDA_NO_HALF_CONVERSIONS__",
-        "-U__CUDA_NO_HALF2_OPERATORS__",
-        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-        "--expt-relaxed-constexpr",
-        "--expt-extended-lambda",
-        "-DNDEBUG",
+        *CUDA_COMPILE_FLAGS,
         *csrc_include("fp8_paged_helper.h", "value_wait_anchor.h", "warp_uniform.h"),
     ],
 )
@@ -124,15 +115,9 @@ def _gqa_paged_fp8_ws_kernel(
     # Keys come from the stored ring (`stages`) with an FP8 query, else the converted (`cstages`).
     kstages = stages if q_fp8 else cstages
 
-    @T.macro
-    def apply_softcap(acc_s):
-        for i, j in T.Parallel(half, block_n):
-            capped = T.cast(softcap, accum) * T.tanh(
-                acc_s[i, j] * T.cast(sm_scale / softcap, accum)
-            )
-            acc_s[i, j] = T.if_then_else(
-                acc_s[i, j] == -T.infinity(accum), -T.infinity(accum), capped
-            )
+    apply_softcap = (
+        make_apply_softcap(sm_scale, softcap, accum, half, block_n) if use_softcap else None
+    )
 
     @T.macro
     def mask(acc_s, key0, q0, wg, align, kv_len):
@@ -269,13 +254,6 @@ def _gqa_paged_fp8_ws_kernel(
                 meta[9] = chunk
 
     @T.macro
-    def fetch(Sched, lane, work):
-        """Claim the next work item into work[0]: lane 0 claims, the warp shares it."""
-        if lane == 0:
-            work[0] = T.atomic_add(Sched[0], 1, return_prev=True)
-        work[0] = T.tvm_warp_shuffle(T.uint32(0xFFFFFFFF), work[0], 0, 32, 32)
-
-    @T.macro
     def tile_rows(page_table, rows, request, key0, kv_len):
         """The pool row each box of the key tile at *key0* starts at; a page past the cache
         end repeats the last one, whose rows the mask and the value zeroing discard."""
@@ -324,7 +302,7 @@ def _gqa_paged_fp8_ws_kernel(
         loaded = T.alloc_var("int32", init=0)
         work = T.alloc_local([1], "int32")
         rows = T.alloc_local([boxes], "int32")
-        fetch(Sched, lane, work)
+        claim_work(Sched, lane, work)
         while work[0] < total:
             locate(work[0], CuQ, cache_seqlens, tile_cum, lo, hi, request, q_row, meta)
             cv = meta[0]
@@ -363,7 +341,7 @@ def _gqa_paged_fp8_ws_kernel(
                 T.mbarrier_arrive(vr_ready[s])
             issued += meta[6]
             loaded += 1
-            fetch(Sched, lane, work)
+            claim_work(Sched, lane, work)
         # Stop the converters and the consumers, then leave the counters zeroed.
         s_end = issued % stages
         T.mbarrier_wait_parity(vr_free[s_end], ((issued // stages) % 2) ^ 1)
@@ -889,7 +867,7 @@ class GQAPagedFP8WSKernel(Kernel, GQAPagedFwdInterface):
     _SPLIT_WORKSPACE: int = 64 << 20
 
     @staticmethod
-    def block_n_for(page_size: int) -> Optional[int]:
+    def block_n_for(page_size: int) -> int | None:
         """The widest key tile up to 128 rows that is part of one page or a run of whole
         pages, a multiple of the 16 rows one WGMMA step reduces over; ``None`` when none is."""
         for block_n in (128, 112, 96, 80, 64, 48, 32, 16):
@@ -950,7 +928,7 @@ class GQAPagedFP8WSKernel(Kernel, GQAPagedFwdInterface):
         if block_n is None:
             return None
         q_fp8 = call.query_dtype == torch.float8_e4m3fn
-        cap = get_shared_memory_optin(call.device.index if call.device is not None else None)
+        cap = call.smem_budget
 
         def fits(block_n: int, stages: int, cstages: int, row_sums: bool) -> bool:
             need = cls.shared_bytes(call.dim, block_n, stages, cstages, q_fp8, call.batch, row_sums)
@@ -970,7 +948,7 @@ class GQAPagedFP8WSKernel(Kernel, GQAPagedFwdInterface):
             block_n //= 2
 
     @classmethod
-    def refusal(cls, call: AttentionCall) -> Optional[str]:
+    def refusal(cls, call: AttentionCall) -> str | None:
         """Why *call* is outside this implementation's region, or ``None`` when it is inside."""
         if call.dtype not in ATTENTION_DTYPES:
             return "requires a float16 or bfloat16 output"
@@ -998,7 +976,7 @@ class GQAPagedFP8WSKernel(Kernel, GQAPagedFwdInterface):
     def entry_for(cls, call: AttentionCall) -> Entry:
         """The packed totals are read from the tensors, so one object serves every packing of
         these call facts; the device index is in the identity, as the SM count is."""
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         args = dict(
             batch=call.batch,
             heads=call.heads,
@@ -1026,13 +1004,13 @@ class GQAPagedFP8WSKernel(Kernel, GQAPagedFwdInterface):
         max_pages_per_req: int,
         is_causal: bool,
         dtype: torch.dtype = torch.float16,
-        query_dtype: Optional[torch.dtype] = None,
+        query_dtype: torch.dtype | None = None,
         per_request_kv_scale: bool = False,
-        sm_scale: Optional[float] = None,
+        sm_scale: float | None = None,
         softcap: float = 0.0,
         tiling: "tuple[int, int, int, bool]" = (128, 2, 2, False),
-        config: Optional[dict] = None,
-        device_index: Optional[int] = None,
+        config: dict | None = None,
+        device_index: int | None = None,
     ) -> None:
         super().__init__(device_index=device_index)
         self.batch = batch
@@ -1084,7 +1062,7 @@ class GQAPagedFP8WSKernel(Kernel, GQAPagedFwdInterface):
         query_dtype: str,
         per_request_kv_scale: bool,
         tiling: "tuple[int, int, int, bool]",
-        device_index: Optional[int],
+        sm_count: int,
     ):
         """The persistent program for one geometry; a request's key tiles split between the
         warpgroups where the table holds _SPLIT_MIN_TILES tiles."""
@@ -1105,7 +1083,7 @@ class GQAPagedFP8WSKernel(Kernel, GQAPagedFwdInterface):
             block_n,
             stages,
             cstages,
-            get_sm_count(device_index),
+            sm_count,
             max_pages_per_req * page_size >= cls._SPLIT_MIN_TILES * block_n,
             cls.split_chunks_for(
                 batch,
@@ -1198,7 +1176,7 @@ class GQAPagedFP8WSKernel(Kernel, GQAPagedFwdInterface):
             k_scale,
             v_scale,
             out,
-            scheduler_counter(counters, q.device),
+            stream_counter(counters, q.device),
             *GQAPagedFP8WSKernel.split_workspace(
                 counters,
                 split_chunks,
@@ -1232,7 +1210,7 @@ class GQAPagedFP8WSKernel(Kernel, GQAPagedFwdInterface):
             str(self.query_dtype).removeprefix("torch."),
             self.per_request_kv_scale,
             (self.block_n, self.stages, self.cstages, self.row_sums),
-            self.device_index,
+            self.build_target.sm_count,
         )
 
     def forward(
@@ -1242,13 +1220,13 @@ class GQAPagedFP8WSKernel(Kernel, GQAPagedFwdInterface):
         v_pool: torch.Tensor,
         cache_seqlens: torch.Tensor,
         page_table: torch.Tensor,
-        cu_seqlens_q: Optional[torch.Tensor] = None,
-        q_scale: Optional[torch.Tensor] = None,
-        k_scale: Optional[torch.Tensor] = None,
-        v_scale: Optional[torch.Tensor] = None,
-        rope_cos: Optional[torch.Tensor] = None,
-        rope_sin: Optional[torch.Tensor] = None,
-        sinks: Optional[torch.Tensor] = None,
+        cu_seqlens_q: torch.Tensor | None = None,
+        q_scale: torch.Tensor | None = None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+        rope_cos: torch.Tensor | None = None,
+        rope_sin: torch.Tensor | None = None,
+        sinks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if q.shape[0] == 0:
             return torch.empty(q.shape, dtype=self.dtype, device=q.device)

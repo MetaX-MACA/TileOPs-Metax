@@ -1,4 +1,5 @@
-from typing import ClassVar, Mapping, Optional, Tuple
+from collections.abc import Mapping
+from typing import ClassVar
 
 import torch
 
@@ -19,9 +20,7 @@ class SSDChunkCumsumFwdOp(Op):
 
     Applies optional per-head bias, optional softplus activation, and clamping to
     raw dt values, then computes the chunk-local inclusive prefix sum of dA = dt * A.
-
-    Note: dt_out is cast to the target dtype for storage efficiency, but dA_cumsum
-    is computed from the fp32 dt values before casting, ensuring numerical precision.
+    dA_cumsum is computed from the float32 dt before dt_out is cast to ``out_dtype``.
     """
 
     kernel_types: ClassVar[Mapping[str, type[Kernel]]] = {
@@ -63,8 +62,8 @@ class SSDChunkCumsumFwdOp(Op):
         self,
         dt: torch.Tensor,
         A: torch.Tensor,
-        dt_bias: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        dt_bias: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run the dA_cumsum forward pass.
 
         Args:

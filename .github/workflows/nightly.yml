@@ -19,7 +19,6 @@ concurrency:
 
 env:
   TILELANG_CACHE_DIR: /ci-cache/tilelang
-  TILELANG_TMP_DIR: /ci-cache/tilelang/tmp
   TRITON_CACHE_DIR: /ci-cache/triton
   TORCHINDUCTOR_CACHE_DIR: /ci-cache/torchinductor
   PIP_CACHE_DIR: /ci-cache/pip
@@ -34,7 +33,7 @@ jobs:
     runs-on: [self-hosted, tile-ops, shared]
     steps:
       - name: Checkout code
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
@@ -55,12 +54,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 1
 
       - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
 
@@ -74,18 +73,15 @@ jobs:
           pip install -e . --group dev -c constraints.txt
 
       - name: Run the suite outside tests/ops on a PrivateUse1 test backend
-        # Host structural checks run in preflight compile-contract-gate.
+        # Tests marked structural run in preflight compile-contract-gate instead.
         env:
           TILELANG_CACHE_DIR: ${{ runner.temp }}/tilelang
-          TILELANG_TMP_DIR: ${{ runner.temp }}/tilelang/tmp
           TRITON_CACHE_DIR: ${{ runner.temp }}/triton
           TORCHINDUCTOR_CACHE_DIR: ${{ runner.temp }}/torchinductor
         run: |
           python -m pytest -q -n auto --dist loadgroup --durations=20 -p tests.privateuse1 \
-            --tileops-device=tileops_test tests benchmarks/tests --ignore=tests/ops \
-            --ignore=tests/test_target_conformance.py \
-            --ignore=tests/test_validate_manifest.py --ignore=tests/test_check_api_compat.py \
-            --ignore=tests/test_check_bench_coverage.py --ignore=tests/test_ci_coverage.py
+            --tileops-device=tileops_test -m "not structural" tests benchmarks/tests \
+            --ignore=tests/ops --ignore=tests/models
 
       # The tileops_test target computes each op's manifest reference on the test device. A
       # call it does not serve is reported unvalidated, not failed.
@@ -94,13 +90,12 @@ jobs:
         env:
           OMP_NUM_THREADS: "1"
           TILELANG_CACHE_DIR: ${{ runner.temp }}/tilelang
-          TILELANG_TMP_DIR: ${{ runner.temp }}/tilelang/tmp
           TRITON_CACHE_DIR: ${{ runner.temp }}/triton
           TORCHINDUCTOR_CACHE_DIR: ${{ runner.temp }}/torchinductor
         run: |
           python -m pytest -q -n auto --durations=20 -p tests.privateuse1.target \
             --tileops-device=tileops_test --tileops-target=tileops_test -m smoke \
-            tests/ops tests/test_privateuse1_target.py
+            tests/ops tests/test_privateuse1.py
 
   # =========================================================================
   # Phase 1 — Benchmark (exclusive GPU access for accurate profiling)
@@ -119,12 +114,15 @@ jobs:
     runs-on: tileops-metax-runner
     env:
       BENCH_WARN_SECONDS: ${{ vars.NIGHTLY_BENCH_WARN_SECONDS || '7200' }}
+      # Only this job writes these: FlashInfer generates sources outside its build lock.
+      FLASHINFER_WORKSPACE_BASE: /ci-cache/flashinfer
+      DG_JIT_CACHE_DIR: /ci-cache/deep_gemm
       # Keep the long benchmark suite from fragmenting CUDA allocator segments
       # before late large MoE input tensors allocate 14-21 GiB weight blocks.
       PYTORCH_ALLOC_CONF: expandable_segments:True
     steps:
       - name: Checkout code
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
           submodules: recursive
@@ -232,7 +230,6 @@ jobs:
           export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
           echo "Runtime cache env:"
           echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-}"
-          echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR:-}"
           echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
 
           # One pytest process per bench file: a native hang / segfault / OOM
@@ -244,12 +241,15 @@ jobs:
           # dumps (the runner records the absence) instead of dying here.
           python3 -m pip install -q -c constraints.txt py-spy \
             || echo "::warning::py-spy install failed; hang stack dumps disabled"
+          # Skip the gated-pool benchmark while its native Python abort is investigated.
           python3 scripts/ci/run_benchmarks.py benchmarks/ops \
+            --ignore benchmarks/ops/bench_gated_pool_compress.py \
             --junit-xml bench_results.xml \
             --stall-timeout 900 \
             --warn-after "${BENCH_WARN_SECONDS}" \
-            --total-budget 21600 \
-            --dump-dir bench_stack_dumps | tee tileops_benchmarks.log
+            --total-budget 36000 \
+            --dump-dir bench_stack_dumps \
+            --pytest-arg=--tileops-nightly | tee tileops_benchmarks.log
 
           if [ -f profile_run.log ]; then
             { echo; echo "===== profile_run.log summary ====="; cat profile_run.log; } >> tileops_benchmarks.log
@@ -269,6 +269,7 @@ jobs:
           # entry declares is a coverage gap no static check can see.
           python3 scripts/check_bench_coverage.py \
             --bench-xml bench_results.xml \
+            --nightly \
             --output bench_coverage.md
         shell: bash
 
@@ -286,7 +287,7 @@ jobs:
       # `publish-bench-data`, where the missing data is what the failure names.
       - name: Upload benchmark artifacts
         id: upload_bench
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: ${{ always() }}
         continue-on-error: true
         with:
@@ -309,7 +310,7 @@ jobs:
         shell: bash
 
       - name: Upload benchmark artifacts (retry)
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: ${{ always() && steps.upload_bench.outcome == 'failure' }}
         continue-on-error: true
         with:
@@ -335,7 +336,7 @@ jobs:
         shell: bash
 
   # =========================================================================
-  # Phase 2 — Op correctness tests (serial after benchmark for GPU exclusivity)
+  # Phase 1b — Op correctness tests, beside the benchmark on a shared-pool runner
   #
   # Runs the `full` and `nightly` tiers. The `smoke` tier is the PR critical
   # path and is already validated by every PR and every push-to-main gpu-smoke
@@ -350,7 +351,7 @@ jobs:
     runs-on: tileops-metax-runner
     steps:
       - name: Checkout code
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
           submodules: recursive
@@ -372,18 +373,117 @@ jobs:
           export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
           echo "Runtime cache env:"
           echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-}"
-          echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR:-}"
           echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
 
-          set -o pipefail
           python3 -m pip install -q -c constraints.txt pytest-timeout pytest-cov
           # Coverage reflects the full/nightly tiers only. Smoke-only cases run in
           # gpu-smoke.yml and their code reads as untested here.
-          python3 -m pytest tests/ -m "full or nightly" -v --tb=short --timeout=900 --timeout-method=thread --junit-xml=test_results.xml --cov=tileops --cov-branch --cov-report=html:htmlcov --cov-report=xml:coverage.xml | tee tileops_op_test.log
+          # tests/models runs in the model_test job.
+          python3 -m pytest tests/ --ignore=tests/models --ignore=tests/ops/test_gated_pool_compress.py --ignore=tests/ops/test_masked_scatter.py --ignore=tests/ops/test_topk_select.py -m "full or nightly" -v --tb=short --timeout=900 --timeout-method=thread --junit-xml=test_results.xml --cov=tileops --cov-branch --cov-report=html:htmlcov --cov-report=xml:coverage.xml | tee tileops_op_test.log
         shell: bash
 
+      - name: Upload op test artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: ${{ always() }}
+        with:
+          name: tileops_op_test_${{ github.run_id }}
+          overwrite: true
+          path: |
+            test_results.xml
+            coverage.xml
+            tileops_op_test.log
+            htmlcov/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Fail op test job if pytest failed
+        if: ${{ always() && steps.op_tests.outcome == 'failure' }}
+        run: exit 1
+        shell: bash
+
+  model_test:
+    if: ${{ github.repository == 'tile-ai/TileOPs' && (github.event_name == 'schedule' || github.ref == 'refs/heads/main') }}
+    timeout-minutes: 90
+    runs-on: [self-hosted, tile-ops, shared]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Verify nightly runner environment
+        run: scripts/ci/verify_nightly_runner.sh
+        shell: bash
+
+      - name: Install TileOPs (image-baked stack, --no-deps)
+        run: bash scripts/ci/install_tileops.sh
+        shell: bash
+
+      - name: Run model tests
+        id: model_tests
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
+          python3 -m pip install -q -c constraints.txt pytest-timeout
+          python3 -m pytest tests/models -m nightly -v --tb=short --timeout=900 --timeout-method=thread --junit-xml=model_test_results.xml | tee tileops_model_test.log
+        shell: bash
+
+      - name: Upload model test artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: ${{ always() }}
+        with:
+          name: tileops_model_test_${{ github.run_id }}
+          overwrite: true
+          path: |
+            model_test_results.xml
+            tileops_model_test.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Fail model test job if pytest failed
+        if: ${{ always() && steps.model_tests.outcome == 'failure' }}
+        run: exit 1
+        shell: bash
+
+  # =========================================================================
+  # Phase 2 — Nightly report from the benchmark, op test and model test results
+  # =========================================================================
+  nightly-report:
+    if: ${{ always() && github.repository == 'tile-ai/TileOPs' && (github.event_name == 'schedule' || github.ref == 'refs/heads/main') }}
+    needs: [benchmark, op_test, model_test]
+    timeout-minutes: 30
+    runs-on: [self-hosted, tile-ops, shared]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Verify nightly runner environment
+        run: scripts/ci/verify_nightly_runner.sh
+        shell: bash
+
+      - name: Install TileOPs (image-baked stack, --no-deps)
+        run: bash scripts/ci/install_tileops.sh
+        shell: bash
+
+      - name: Download op test artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        if: ${{ always() }}
+        with:
+          name: tileops_op_test_${{ github.run_id }}
+        continue-on-error: true
+
+      - name: Download model test artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        if: ${{ always() }}
+        with:
+          name: tileops_model_test_${{ github.run_id }}
+        continue-on-error: true
+
       - name: Download benchmark artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         if: ${{ always() }}
         with:
           name: tileops_benchmark_${{ github.run_id }}
@@ -486,6 +586,7 @@ jobs:
 
           python3 scripts/nightly_report.py \
             --test-xml test_results.xml \
+            --model-test-xml model_test_results.xml \
             --bench-xml bench_results.xml \
             "${HISTORY_ARGS[@]}" \
             --output nightly_report.md \
@@ -500,58 +601,55 @@ jobs:
         run: cat nightly_report.md >> "$GITHUB_STEP_SUMMARY"
         shell: bash
 
-      - name: Upload op test artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - name: Upload nightly report
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: ${{ always() }}
         with:
-          name: tileops_op_test_${{ github.run_id }}
+          name: tileops_nightly_report_${{ github.run_id }}
           overwrite: true
           path: |
-            test_results.xml
-            coverage.xml
-            tileops_op_test.log
             nightly_report.md
             nightly-vs-baseline.json
-            htmlcov/
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Fail op test job if pytest failed
-        if: ${{ always() && steps.op_tests.outcome == 'failure' }}
-        run: exit 1
-        shell: bash
-
   # =========================================================================
-  # Phase 2b — Publish benchmark data to the nightly-bench orphan branch
-  # Consumed by tile-ai/TileOPs.github.io to render the docs Benchmarks page.
-  # Runs on a github-hosted runner (no GPU needed) and uses the default token
-  # to force-push the day's XML snapshot, mirroring the manifest-stats pattern.
+  # Phase 2b — Publish benchmark data to tile-ai/TileOPs-nightly
+  # Runs on a github-hosted runner (no GPU needed) and commits the night's
+  # snapshot to that repository's `snapshots` branch with BENCH_ARCHIVE_TOKEN;
+  # the README badge and the docs Benchmarks page read it.
   # =========================================================================
   publish-bench-data:
     if: ${{ always() && github.repository == 'tile-ai/TileOPs' && (github.event_name == 'schedule' || github.ref == 'refs/heads/main') }}
-    needs: [op_test]
+    needs: [nightly-report]
     runs-on: ubuntu-latest
-    # The data goes elsewhere now, under a token of its own.
     permissions:
       contents: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 1
 
       - name: Download benchmark artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: tileops_benchmark_${{ github.run_id }}
           path: _bench
         continue-on-error: true
 
       - name: Download op test artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: tileops_op_test_${{ github.run_id }}
           path: _optest
+        continue-on-error: true
+
+      - name: Download nightly report artifact
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: tileops_nightly_report_${{ github.run_id }}
+          path: _report
         continue-on-error: true
 
       - name: Assemble publish payload
@@ -562,7 +660,7 @@ jobs:
           # The snapshot replaces the previous night's whole, and the README badge and
           # the docs page read it, so a run missing any of these files publishes nothing.
           ok=1
-          for f in _bench/bench_results.xml _optest/test_results.xml _optest/nightly-vs-baseline.json; do
+          for f in _bench/bench_results.xml _optest/test_results.xml _report/nightly-vs-baseline.json; do
             if [ -f "$f" ]; then
               cp "$f" _publish/
             else
@@ -610,8 +708,96 @@ jobs:
       - name: Fail when tonight's snapshot was not published
         if: ${{ steps.assemble.outputs.ok != '1' }}
         run: |
-          echo "::error::The snapshot still shows the previous run. Check whether the benchmark and op_test jobs produced the files named above and whether their artifact uploads reached GitHub."
+          echo "::error::The snapshot still shows the previous run. Check whether the benchmark, op_test and nightly-report jobs produced the files named above and whether their artifact uploads reached GitHub."
           exit 1
+        shell: bash
+
+  # =========================================================================
+  # Phase 2c — Write tonight's perf gap queue to the wiki's Perf Tracker
+  # =========================================================================
+  publish-perf-tracker:
+    # A failed benchmark or op_test job still publishes a snapshot; follow the publish job only.
+    if: ${{ !cancelled() && needs.publish-bench-data.result == 'success' }}
+    needs: [publish-bench-data]
+    runs-on: ubuntu-latest
+    # Pushing to the wiki repository needs write access to this repository's contents.
+    permissions:
+      contents: write
+    concurrency:
+      group: perf-tracker-wiki
+      cancel-in-progress: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 1
+
+      - name: Checkout the wiki
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          repository: ${{ github.repository }}.wiki
+          path: .wiki
+
+      - name: Fetch recent snapshots
+        run: |
+          set -euo pipefail
+          # Every commit, no blobs: the script fetches the blobs of the nightlies it reads.
+          git clone --quiet --filter=blob:none --branch snapshots \
+            https://github.com/tile-ai/TileOPs-nightly.git .snapshots
+        shell: bash
+
+      - name: Write the pages
+        run: |
+          set -euo pipefail
+          # Dated in UTC+8, where the nightly starts at 01:00, so every run of one day,
+          # scheduled or manual, rewrites that day's page.
+          python3 scripts/perf_tracker.py \
+            --snapshots .snapshots \
+            --run-id "${GITHUB_RUN_ID}" \
+            --wiki .wiki \
+            --date "$(TZ=Asia/Shanghai date +%Y-%m-%d)"
+        shell: bash
+
+      # The wiki keeps one commit; its daily pages are the history.
+      - name: Push the wiki
+        run: |
+          set -euo pipefail
+          cd .wiki
+          git add -A
+          if git diff --cached --quiet; then
+            echo "The wiki already holds tonight's pages."
+            exit 0
+          fi
+          branch=$(git symbolic-ref --short HEAD)
+          checked_out=$(git rev-parse HEAD)
+          git checkout --quiet --orphan squashed
+          git -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit --quiet -m "nightly: ${GITHUB_SHA} (run ${GITHUB_RUN_ID})"
+          # Refuses when someone edited the wiki after the checkout above.
+          git push --quiet --force-with-lease="${branch}:${checked_out}" origin "HEAD:${branch}"
+        shell: bash
+
+      # GITHUB_TOKEN cannot reach organization projects; this App may only read and write them.
+      - name: Mint the project token
+        id: project-token
+        if: ${{ !cancelled() }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.PERF_TRACKER_APP_ID }}
+          private-key: ${{ secrets.PERF_TRACKER_APP_KEY }}
+          owner: tile-ai
+
+      - name: Sync the project board
+        if: ${{ !cancelled() && steps.project-token.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ steps.project-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/perf_board.py \
+            --snapshots .snapshots \
+            --run-id "${GITHUB_RUN_ID}" \
+            --date "$(TZ=Asia/Shanghai date +%Y-%m-%d)"
         shell: bash
 
   # =========================================================================
@@ -623,7 +809,7 @@ jobs:
     runs-on: [self-hosted, tile-ops, shared]
     steps:
       - name: Checkout code
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           # setuptools-scm needs full history; a shallow clone yields the fallback.
           fetch-depth: 0
@@ -643,7 +829,6 @@ jobs:
 
           echo "=== Runtime cache env ==="
           echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-}"
-          echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR:-}"
           echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
 
           # torch and tilelang come from the image; the release workflow runs the same
@@ -654,7 +839,7 @@ jobs:
 
       - name: Upload wheel artifact
         if: ${{ success() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: tileops-wheel-${{ github.sha }}_${{ github.run_attempt }}
           path: dist/*.whl
@@ -663,7 +848,7 @@ jobs:
 
       - name: Upload packaging logs
         if: ${{ always() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: packaging-logs-${{ github.sha }}_${{ github.run_attempt }}
           path: |

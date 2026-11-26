@@ -1,13 +1,15 @@
 """Tests for unary activation elementwise ops.
 
-Covers L1 smoke correctness, multi-dtype coverage, and L4 edge cases.
+Covers correctness on every supported dtype and edge values.
 """
 
 import pytest
 import torch
 import torch.nn.functional as F
 
+from tests.launch_bounds import elementwise_launch_bounds, full_occupancy_bounds
 from tests.workload_test_base import FixtureBase, TestBase
+from tileops._kernels.elementwise import UnaryKernel
 from tileops._ops.elementwise import ReLUFwdOp
 from workloads.device import run_device
 from workloads.elementwise import (
@@ -57,22 +59,40 @@ def test_relu_op(n_total: int, dtype: torch.dtype) -> None:
 
 
 @pytest.mark.smoke
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_relu_every_input(dtype: torch.dtype) -> None:
-    """ReLU matches all 16-bit patterns, including NaN payloads and signed zeros."""
-    workload = Exhaustive16BitWorkload("ReLUFwdOp", dtype)
-    TestBase.check(workload, ReLUFwdOp(), *workload.gen_inputs())
+@pytest.mark.parametrize(
+    "op_name, dtype",
+    [
+        # NaN payloads and signed zeros.
+        ("ReLUFwdOp", torch.float16),
+        ("ReLUFwdOp", torch.bfloat16),
+        # x near -88, where the divisor passes 2**126.
+        ("SiLUFwdOp", torch.bfloat16),
+        # A two-ulp float32 divide alone moves two float16 results by one ulp, so float16
+        # refines its reciprocal by one Newton step; bfloat16 rounds the fast divide to
+        # torch's value everywhere.
+        ("SigmoidFwdOp", torch.float16),
+        ("SigmoidFwdOp", torch.bfloat16),
+    ],
+)
+def test_matches_torch_bit_for_bit_at_every_16bit_input(op_name: str, dtype: torch.dtype) -> None:
+    """The op gives torch's result bit for bit at every 16-bit input."""
+    import tileops._ops.elementwise as ops
+
+    workload = Exhaustive16BitWorkload(op_name, dtype)
+    TestBase.check(workload, getattr(ops, op_name)(), *workload.gen_inputs())
 
 
 @pytest.mark.smoke
-@pytest.mark.parametrize("inplace", [False, True])
-def test_float32_relu_special_values(inplace: bool) -> None:
-    """Float32 special values match torch, except NaN payloads may differ."""
+def test_float32_relu_special_values_in_place() -> None:
+    """Float32 special values match torch, except NaN payloads may differ.
+
+    In place, because the out-of-place call returns the same kernel's result uncopied.
+    """
     workload = Float32SpecialValuesWorkload("ReLUFwdOp", repeats=256)
     (x,) = workload.gen_inputs()
     expected = workload.ref_program(x.clone())
-    y = ReLUFwdOp(inplace=inplace)(x)
-    assert (y is x) == inplace
+    y = ReLUFwdOp(inplace=True)(x)
+    assert y is x
     compare_outputs(y, expected, workload.verification(x))
 
 
@@ -82,7 +102,9 @@ def _launch_size(launch: str, dtype: torch.dtype) -> int:
     resident = props.multi_processor_count * props.max_threads_per_multi_processor
     run = 256 * 64 // dtype.itemsize
     wave = 20 * resident // run * run
-    if launch in ("wave", "ragged") and 4 * wave * 2 * dtype.itemsize > 3 * props.L2_cache_size:
+    if launch in ("wave", "ragged") and not UnaryKernel.fits_l2_budget(
+        wave, 2 * dtype.itemsize, props.L2_cache_size
+    ):
         pytest.skip("twenty elements per resident thread exceed three quarters of this L2")
     return {
         "tiny": 2048,
@@ -93,17 +115,16 @@ def _launch_size(launch: str, dtype: torch.dtype) -> int:
     }[launch]
 
 
-@pytest.mark.smoke
 @pytest.mark.in_tree_kernels
 @pytest.mark.parametrize(
     "launch,dtype",
     [
-        ("tiny", torch.bfloat16),
-        ("few-blocks", torch.bfloat16),
-        ("wave", torch.bfloat16),
-        ("wave", torch.float32),
-        ("ragged", torch.float32),
-        ("past-l2", torch.float32),
+        pytest.param("tiny", torch.bfloat16, marks=pytest.mark.smoke),
+        pytest.param("ragged", torch.float32, marks=pytest.mark.smoke),
+        pytest.param("few-blocks", torch.bfloat16, marks=pytest.mark.full),
+        pytest.param("wave", torch.bfloat16, marks=pytest.mark.full),
+        pytest.param("wave", torch.float32, marks=pytest.mark.full),
+        pytest.param("past-l2", torch.float32, marks=pytest.mark.full),
     ],
 )
 def test_relu_launch_sizes(launch: str, dtype: torch.dtype) -> None:
@@ -131,7 +152,7 @@ class ActivationFixture(FixtureBase):
 
 
 class ActivationEdgeFixture(FixtureBase):
-    """L4 edge-case fixture: fp32, 4K elements."""
+    """Edge values: fp32, 4K elements."""
 
     PARAMS = [
         (
@@ -172,20 +193,28 @@ def test_gelu(n_total: int, dtype: torch.dtype, approximate: str) -> None:
     )
 
 
+def _launch_bounds(op, dtype: torch.dtype) -> tuple[int, list[tuple[str, str]]]:
+    """*op* run on 1M elements of *dtype*, and its program's threads and launch bounds."""
+    op(_randn(1_048_576, dtype))
+    return elementwise_launch_bounds(op)
+
+
+@pytest.mark.smoke
+@pytest.mark.in_tree_kernels
+@pytest.mark.parametrize("approximate", ["none", "tanh"])
+def test_gelu_keeps_an_sm_of_threads_resident(approximate: str) -> None:
+    """Both GELU forms ask for an SM's full thread count at 32 registers a thread."""
+    from tileops._ops.elementwise import GELUFwdOp
+
+    threads, bounds = _launch_bounds(GELUFwdOp(approximate=approximate), torch.float16)
+    assert bounds == full_occupancy_bounds(threads)
+
+
 @ActivationFixture
 def test_silu(n_total: int, dtype: torch.dtype) -> None:
     from tileops._ops.elementwise import SiLUFwdOp
 
     _make_activation_test(n_total, dtype, _randn, SiLUFwdOp)
-
-
-@pytest.mark.smoke
-def test_bfloat16_silu_matches_torch_bit_for_bit() -> None:
-    """Every bfloat16 input, x near -88 included, where the divisor passes 2**126."""
-    from tileops._ops.elementwise import SiLUFwdOp
-
-    workload = Exhaustive16BitWorkload("SiLUFwdOp", torch.bfloat16)
-    TestBase.check(workload, SiLUFwdOp(), *workload.gen_inputs())
 
 
 @pytest.mark.smoke
@@ -209,6 +238,29 @@ def test_tanh(n_total: int, dtype: torch.dtype) -> None:
     from tileops._ops.elementwise import TanhFwdOp
 
     _make_activation_test(n_total, dtype, _randn, TanhFwdOp)
+
+
+@pytest.mark.smoke
+@pytest.mark.in_tree_kernels
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_tanh_keeps_an_sm_of_threads_resident_for_16bit_inputs(dtype: torch.dtype) -> None:
+    """A 16-bit input asks the compiler to fit as many blocks on an SM as the register file
+    holds threads at 32 registers each; nvcc left alone gives that body more, and fewer
+    resident threads keep fewer loads in flight. ``test_tanh`` checks the values."""
+    from tileops._ops.elementwise import TanhFwdOp
+
+    threads, bounds = _launch_bounds(TanhFwdOp(), dtype)
+    assert bounds == full_occupancy_bounds(threads)
+
+
+@pytest.mark.smoke
+@pytest.mark.in_tree_kernels
+def test_float32_tanh_leaves_the_register_budget_to_nvcc() -> None:
+    """A float32 input asks for one resident block, nvcc's default budget."""
+    from tileops._ops.elementwise import TanhFwdOp
+
+    threads, bounds = _launch_bounds(TanhFwdOp(), torch.float32)
+    assert bounds == [(str(threads), "1")]
 
 
 @ActivationFixture
@@ -239,7 +291,7 @@ def test_selu(n_total: int, dtype: torch.dtype) -> None:
     _make_activation_test(n_total, dtype, _randn, SELUFwdOp)
 
 
-# L4 edge-case tests (fp32, 4K)
+# Edge values
 
 
 @ActivationEdgeFixture
@@ -248,21 +300,6 @@ def test_sigmoid_edge(n_total: int, dtype: torch.dtype) -> None:
     from tileops._ops.elementwise import SigmoidFwdOp
 
     workload = SigmoidEdgeWorkload(n_total, dtype)
-    TestBase.check(workload, SigmoidFwdOp(), *workload.gen_inputs())
-
-
-@pytest.mark.smoke
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_16bit_sigmoid_matches_torch_bit_for_bit(dtype: torch.dtype) -> None:
-    """Sigmoid gives torch's result bit for bit at every 16-bit input.
-
-    A two-ulp float32 divide alone moves two float16 results by one ulp, so float16
-    refines its reciprocal by one Newton step; bfloat16 rounds the fast divide to
-    torch's value everywhere.
-    """
-    from tileops._ops.elementwise import SigmoidFwdOp
-
-    workload = Exhaustive16BitWorkload("SigmoidFwdOp", dtype)
     TestBase.check(workload, SigmoidFwdOp(), *workload.gen_inputs())
 
 

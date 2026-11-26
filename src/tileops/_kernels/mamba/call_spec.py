@@ -3,7 +3,6 @@ interfaces their implementations inherit."""
 
 import dataclasses
 from abc import abstractmethod
-from typing import Optional
 
 import torch
 
@@ -34,25 +33,46 @@ __all__ = [
 
 @dataclasses.dataclass(frozen=True)
 class CausalConv1dCall(CallSpec):
-    """One prefill convolution over packed sequences; their count and lengths are runtime data."""
+    """One prefill convolution over packed sequences; their count and lengths are runtime data.
+
+    ``weight_dtype`` is that of the weight and bias, ``state_len`` the token columns of a
+    state, ``dilation`` the token spacing of the filter taps, and ``pooled`` whether
+    ``cache_indices`` maps each sequence to its state.
+    """
 
     dim: int = 0
     width: int = 0
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
     has_bias: bool = False
     has_init: bool = False
     silu: bool = True
+    weight_dtype: torch.dtype | None = None
+    state_len: int = 0
+    dilation: int = 1
+    pooled: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
 class CausalConv1dUpdateCall(CallSpec):
-    """One decode step of the convolution, one token a sequence; the batch is runtime data."""
+    """One decode step of the convolution, one token a sequence; the batch is runtime data.
+
+    ``weight_dtype``, ``state_len``, ``dilation`` and ``pooled`` are those of
+    ``CausalConv1dCall``, ``pooled`` following ``conv_state_indices``; ``varlen`` is whether
+    ``query_start_loc`` packs several tokens a sequence, and ``rollback`` whether
+    ``num_accepted_tokens`` is passed.
+    """
 
     dim: int = 0
     width: int = 0
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
     has_bias: bool = False
     silu: bool = True
+    weight_dtype: torch.dtype | None = None
+    state_len: int = 0
+    dilation: int = 1
+    pooled: bool = False
+    varlen: bool = False
+    rollback: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -64,7 +84,7 @@ class SSDChunkCouplingCall(CallSpec):
     n_groups: int = 0
     d_state: int = 0
     chunk_len: int = 0
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -79,7 +99,7 @@ class SSDChunkCumsumCall(CallSpec):
     dt_softplus: bool = False
     dt_min: float = 0.0
     dt_max: float = float("inf")
-    out_dtype: Optional[torch.dtype] = None
+    out_dtype: torch.dtype | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -93,7 +113,7 @@ class SSDChunkScanCall(CallSpec):
     d_head: int = 0
     d_state: int = 0
     n_groups: int = 0
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -107,8 +127,8 @@ class SSDChunkStateCall(CallSpec):
     d_head: int = 0
     d_state: int = 0
     n_groups: int = 0
-    dtype: Optional[torch.dtype] = None
-    dt_dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
+    dt_dtype: torch.dtype | None = None
     has_seq_idx: bool = False
 
 
@@ -121,7 +141,7 @@ class SSDDecodeCall(CallSpec):
     d_head: int = 0
     d_state: int = 0
     n_groups: int = 0
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -133,7 +153,7 @@ class SSDStatePassingCall(CallSpec):
     n_heads: int = 0
     d_state: int = 0
     has_initial_states: bool = False
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -144,7 +164,7 @@ class SelectiveScanCall(CallSpec):
     seqlen: int = 0
     dstate: int = 0
     groups: int = 1
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
     has_skip: bool = False
     has_gate: bool = False
     has_bias: bool = False
@@ -165,23 +185,29 @@ class CausalConv1dFwdInterface(KernelInterface):
         weight: torch.Tensor,
         conv_state: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-        has_initial_state: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
+        has_initial_state: torch.Tensor | None = None,
+        cache_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Convolve each sequence along the token axis and leave its last W-1 tokens in its state.
 
-        A sequence's first output reads the W-1 tokens before it from ``conv_state`` where
+        A sequence's first output reads the W-1 tokens before it from its state where
         ``has_initial_state`` is set, and zeros otherwise. Every tensor is on ``call.device``
         and contiguous; *conv_state* is written in place, no other input is.
 
         Args:
             x: ``(total, call.dim)`` in ``call.dtype``, the sequences packed token-major.
             weight: ``(call.dim, call.width)`` in ``call.dtype``.
-            conv_state: ``(batch, call.dim, call.width - 1)`` in ``call.dtype``; overwritten
-                with each sequence's last ``call.width - 1`` tokens.
+            conv_state: ``(batch, call.dim, call.width - 1)`` in ``call.dtype``, or
+                ``(pool, call.dim, call.width - 1)`` under ``call.pooled``; each sequence's
+                state is overwritten with its last ``call.width - 1`` tokens.
             cu_seqlens: ``int32`` ``(batch + 1,)`` packed offsets, from 0 to ``total``.
             bias: ``(call.dim,)`` in ``call.dtype``, passed exactly when ``call.has_bias``.
             has_initial_state: ``bool`` ``(batch,)``, passed exactly when ``call.has_init``.
+            cache_indices: ``int32`` ``(batch,)``, passed exactly when ``call.pooled``:
+                sequence ``s``'s state is ``conv_state[cache_indices[s]]``, the slots other
+                than -1 distinct across the call. A slot of -1 is never written, and its
+                sequence's outputs are unspecified.
 
         Returns:
             A new ``(total, call.dim)`` output in ``call.dtype``, SiLU applied when ``call.silu``.
@@ -199,22 +225,38 @@ class CausalConv1dUpdateFwdInterface(KernelInterface):
         x: torch.Tensor,
         weight: torch.Tensor,
         conv_state: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
+        conv_state_indices: torch.Tensor | None = None,
+        num_accepted_tokens: torch.Tensor | None = None,
+        query_start_loc: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Convolve each sequence's new token with its state, then shift the token into it.
+        """Convolve each sequence's new tokens with its state, then shift the tokens into it.
 
         Every tensor is on ``call.device`` and contiguous; *conv_state* is written in place,
-        no other input is.
+        no other input is. ``s = (call.width - 1) * call.dilation`` is a state's history.
 
         Args:
-            x: ``(batch, call.dim)`` in ``call.dtype``, one token a sequence.
-            weight: ``(call.dim, call.width)`` in ``call.dtype``.
-            conv_state: ``(batch, call.dim, call.width - 1)`` in ``call.dtype``, the tokens
-                before *x*; advanced by one token.
-            bias: ``(call.dim,)`` in ``call.dtype``, passed exactly when ``call.has_bias``.
+            x: ``(batch, call.dim)`` in ``call.dtype``, one token a sequence; ``(tokens,
+                call.dim)``, the sequences packed, under ``call.varlen``.
+            weight: ``(call.dim, call.width)`` in ``call.weight_dtype``.
+            conv_state: ``(batch, call.dim, call.state_len)`` in ``call.dtype``, or
+                ``(pool, call.dim, call.state_len)`` under ``call.pooled``: its first ``s``
+                columns the tokens before *x*, the history the next call reads.
+            bias: ``(call.dim,)`` in ``call.weight_dtype``, passed exactly when
+                ``call.has_bias``.
+            conv_state_indices: ``int32`` ``(batch,)``, passed exactly when ``call.pooled``:
+                sequence ``b``'s state is ``conv_state[conv_state_indices[b]]``, the slots
+                other than -1 distinct across the call. A slot of -1 is never written, and its
+                sequence's outputs are unspecified.
+            num_accepted_tokens: ``int32`` ``(batch,)``, passed exactly when ``call.rollback``:
+                sequence ``b`` with ``a = num_accepted_tokens[b]`` and ``q`` tokens reads its
+                history from column ``a - 1``, and its first ``s + q - 1`` columns become the
+                last that many of the history and its tokens.
+            query_start_loc: ``int32`` ``(batch + 1,)`` packed offsets, passed exactly when
+                ``call.varlen``.
 
         Returns:
-            A new ``(batch, call.dim)`` output in ``call.dtype``, SiLU applied when ``call.silu``.
+            A new output shaped like *x* in ``call.dtype``, SiLU applied when ``call.silu``.
         """
 
 
@@ -246,7 +288,7 @@ class SSDChunkCumsumFwdInterface(KernelInterface):
 
     @abstractmethod
     def forward(
-        self, dt: torch.Tensor, A: torch.Tensor, dt_bias: Optional[torch.Tensor] = None
+        self, dt: torch.Tensor, A: torch.Tensor, dt_bias: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Transform dt, then scan ``dt * A`` within each chunk; nothing is written in place.
 
@@ -406,11 +448,11 @@ class SelectiveScanFwdInterface(KernelInterface):
         A: torch.Tensor,
         B_in: torch.Tensor,
         C_in: torch.Tensor,
-        D_in: Optional[torch.Tensor] = None,
-        z: Optional[torch.Tensor] = None,
-        delta_bias: Optional[torch.Tensor] = None,
-        seq_idx: Optional[torch.Tensor] = None,
-        initial_states: Optional[torch.Tensor] = None,
+        D_in: torch.Tensor | None = None,
+        z: torch.Tensor | None = None,
+        delta_bias: torch.Tensor | None = None,
+        seq_idx: torch.Tensor | None = None,
+        initial_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run the recurrence over the sequence axis; nothing is written in place.
 

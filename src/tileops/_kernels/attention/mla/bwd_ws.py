@@ -6,14 +6,11 @@ warpgroups accumulate dQ, dK, and dV over 48 keys each. A final launch writes
 dQ in q's layout and dtype. Scheduling keeps longest-request tiles together.
 """
 
-from typing import Callable, Optional
+from collections.abc import Callable
 
 import tilelang
 import tilelang.language as T
 import torch
-from tilelang.cuda.intrinsics.macro.wgmma_macro_generator import (
-    TensorCoreIntrinEmitter as WgmmaEmitter,
-)
 from tilelang.layout import (
     make_quarter_bank_swizzled_layout,
     make_swizzled_layout,
@@ -26,10 +23,9 @@ from tileops._kernels.attention.call_spec import (
     MLADenseBwdInterface,
     MLAVarlenBwdInterface,
 )
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.constants import LOG2E
 from tileops._kernels.kernel_base import CompiledProgram, Entry, Kernel
-from tileops._utils import get_sm_count
 
 __all__ = ["MLADenseBwdWSKernel", "MLAVarlenBwdWSKernel"]
 
@@ -43,7 +39,7 @@ def _prep_kernel(batch: int, heads: int, dim_v: int, dense_seqlen: int, dtype: s
     @tilelang.jit(
         out_idx=[2],
         pass_configs={tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True},
-        compile_flags=["-O3"],
+        compile_flags=[*CUDA_COMPILE_FLAGS],
     )
     def _prep_func() -> Callable:
         total = T.dynamic("total_q")
@@ -87,7 +83,7 @@ def _dq_land_kernel(
     # The race check does not model that ``dq_element`` is a bijection.
     @tilelang.jit(
         pass_configs={tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True},
-        compile_flags=["-O3"],
+        compile_flags=[*CUDA_COMPILE_FLAGS],
     )
     def _dq_land_func() -> Callable:
         total = T.dynamic("total_q")
@@ -177,7 +173,7 @@ def _bwd_ws_kernel(
             tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True,
         },
         compile_flags=[
-            "-O3",
+            *CUDA_COMPILE_FLAGS,
             "-DENABLE_BF16",
             *csrc_include("tile_claim.h", "warp_uniform.h", "mla_bwd_wgmma.h"),
         ],
@@ -188,27 +184,14 @@ def _bwd_ws_kernel(
         q_tiles = T.dynamic("q_tiles")
         stat_shape = (batch, heads, dense_seqlen) if dense else (heads, total_q)
 
-        def acc_layout(buf, rows: int, first_thread: int):
-            """The accumulator layout of a ``rows x hn`` WGMMA over the warpgroup starting at
-            thread ``first_thread``: the registers the n48 helpers write, as TileLang lays out its
-            own."""
-            base = WgmmaEmitter(
-                a_dtype=dtype,
-                b_dtype=dtype,
-                accum_dtype="float32",
-                a_transposed=False,
-                b_transposed=True,
-                block_row_warps=4,
-                block_col_warps=1,
-                warp_row_tiles=rows // 4,
-                warp_col_tiles=hn,
-                chunk=64,
-            ).make_mma_store_layout(buf)
-            return T.Fragment(
-                [rows, hn],
-                forward_thread_fn=lambda i, j: base.map_forward_thread([i, j])[0] + first_thread,
-                forward_index_fn=lambda i, j: base.map_forward_index([i, j]),
-            )
+        def acc_element(r, t):
+            """``(row, column)`` of register ``r`` of warpgroup thread ``t`` in a ``rows x hn``
+            m64 WGMMA accumulator, the registers the n48 helpers write: each 64 rows hold
+            ``hn // 2`` registers a thread, four a column octet."""
+            half = hn // 2
+            row = r // half * 64 + t // 32 * 16 + r % 4 // 2 * 8 + t % 32 // 4
+            col = r % half // 4 * 8 + t % 4 * 2 + r % 2
+            return row, col
 
         def dq_slot(i, d):
             """``(reg, thread)`` of element ``(i, d)`` of a dQ tile in the consumers' WGMMA
@@ -317,11 +300,11 @@ def _bwd_ws_kernel(
         @T.macro
         def ep_chunk(w, ep_s, acc, col0, mul, out, row0, len_kv, key0, h):
             """Stage 64 columns of a transposed accumulator as rows and store them."""
-            # Over the whole fragment: a T.Parallel over a window at a nonzero row offset
-            # of a fragment is dropped by TileLang 0.1.12 without an error.
-            for d, j in T.Parallel(acc.shape[0], hn):
+            t = T.get_thread_binding() - 128 * (w + 1)
+            for r in T.unroll(acc.shape[0]):
+                d, j = acc_element(r, t)
                 if (d >= col0) & (d < col0 + 64):
-                    ep_s[w, j, d - col0] = T.cast(acc[d, j] * mul, dtype)
+                    ep_s[w, j, d - col0] = T.cast(acc[r] * mul, dtype)
             T.fence_proxy_async()
             T.sync_threads(barrier_id=3 + w, arrive_count=128)
             if key0 + hn <= len_kv:
@@ -339,21 +322,15 @@ def _bwd_ws_kernel(
             order, kv_cum, tile_s, tile_full, tile_empty, kv_full, kv_empty, q_full, do_full,
             q_empty, do_empty, ds_ready, ds_free, dq_full, dq_empty, dk, dv,
         ):  # fmt: skip
-            s = T.alloc_fragment([block_m, hn], accum)
-            dp = T.alloc_fragment([block_m, hn], accum)
-            dvt = T.alloc_fragment([dim_v, hn], accum)
-            dkt = T.alloc_fragment([dim_qk, hn], accum)
+            # Plain registers: TileLang cannot invert a fragment layout offset to a later warpgroup.
+            s = T.alloc_local([block_m * hn // 128], accum)
+            dp = T.alloc_local([block_m * hn // 128], accum)
+            dvt = T.alloc_local([dim_v * hn // 128], accum)
+            dkt = T.alloc_local([dim_qk * hn // 128], accum)
             dq_f = T.alloc_fragment([block_m, 64], accum)
             dq_g = T.alloc_fragment([block_m, 64], accum)
             first = 128 * (w + 1)
-            T.annotate_layout(
-                {
-                    s: acc_layout(s, block_m, first),
-                    dp: acc_layout(dp, block_m, first),
-                    dvt: acc_layout(dvt, dim_v, first),
-                    dkt: acc_layout(dkt, dim_qk, first),
-                }
-            )
+            tid = T.get_thread_binding() - first
             ti = T.alloc_var("int32", init=0)
             g = T.alloc_var("int32", init=0)
             run = T.alloc_var("int32", init=1)
@@ -373,8 +350,10 @@ def _bwd_ws_kernel(
                     len_kv = cu_kv[b + 1] - kv_start
                     shift = len_kv - len_q
                     key0 = kb * block_n + w * hn
-                    T.clear(dvt)
-                    T.clear(dkt)
+                    for r in T.unroll(dim_v * hn // 128):
+                        dvt[r] = 0.0
+                    for r in T.unroll(dim_qk * hn // 128):
+                        dkt[r] = 0.0
                     T.barrier_wait(kv_full, ti & 1)
                     for n in T.serial(first_q_block(kb, shift), T.ceildiv(len_q, block_m)):
                         slot = g % 2
@@ -400,22 +379,24 @@ def _bwd_ws_kernel(
                         )
                         T.wait_wgmma(1)
                         T.warpgroup_fence_operand(s, num_regs=24)
-                        for i, j in T.Parallel(block_m, hn):
+                        for r in T.unroll(block_m * hn // 128):
+                            i, j = acc_element(r, tid)
                             key = key0 + j
                             row = q0 + i
                             in_range = (key < len_kv) & (row < len_q)
                             visible = in_range & (key <= row + shift) if is_causal else in_range
-                            s[i, j] = T.if_then_else(
+                            s[r] = T.if_then_else(
                                 visible,
-                                T.exp2(s[i, j] * scale_log2 - lse_s[slot, i] * LOG2E),
+                                T.exp2(s[r] * scale_log2 - lse_s[slot, i] * LOG2E),
                                 0,
                             )
                         T.wait_wgmma(0)
                         T.warpgroup_fence_operand(dp, num_regs=24)
                         # Both warpgroups' previous dQ has read this warpgroup's dS.
                         T.barrier_wait(ds_free[w], (g + 1) & 1)
-                        for i, j in T.Parallel(block_m, hn):
-                            dp[i, j] = s[i, j] * (dp[i, j] - dl_s[slot, i])
+                        for r in T.unroll(block_m * hn // 128):
+                            i, _ = acc_element(r, tid)
+                            dp[r] = s[r] * (dp[r] - dl_s[slot, i])
                         T.call_extern(
                             "handle",
                             f"tileops::mla_bwd_stsm_{tag}",
@@ -689,7 +670,7 @@ class _MLABwdWSKernelBase(Kernel):
     supported_archs: list[int] = [90]
 
     @classmethod
-    def refusal(cls, call: MLABwdCall) -> Optional[str]:
+    def refusal(cls, call: MLABwdCall) -> str | None:
         # mla_bwd_wgmma.h instantiates its WGMMAs for this head only.
         if (call.dim_qk, call.dim_v) != (192, 128):
             return (
@@ -714,7 +695,7 @@ class _MLABwdWSKernelBase(Kernel):
             is_causal=call.is_causal,
             sm_scale=call.sm_scale,
             dtype=call.dtype,
-            device_index=call.device.index if call.device is not None else None,
+            device_index=call.device_index,
         )
         return tuple(args.items()), lambda: cls(**args)
 
@@ -728,10 +709,10 @@ class _MLABwdWSKernelBase(Kernel):
         seqlen_kv: int,
         is_causal: bool,
         dtype: torch.dtype,
-        sm_scale: Optional[float] = None,
-        config: Optional[dict] = None,
+        sm_scale: float | None = None,
+        config: dict | None = None,
         *,
-        device_index: Optional[int] = None,
+        device_index: int | None = None,
     ) -> None:
         super().__init__(device_index=device_index)
         self.batch, self.heads = batch, heads
@@ -740,7 +721,7 @@ class _MLABwdWSKernelBase(Kernel):
         self.is_causal = is_causal
         self.dtype = dtype
         self.scale = dim_qk**-0.5 if sm_scale is None else sm_scale
-        self.num_sms = get_sm_count(device_index)
+        self.num_sms = self.build_target.sm_count
         self.device = torch.device("cuda", device_index) if device_index is not None else None
         # [next tile, CTAs retired]; the kernel returns both to zero.
         self.sched = torch.zeros(2, dtype=torch.int32, device=self.device or "cuda")

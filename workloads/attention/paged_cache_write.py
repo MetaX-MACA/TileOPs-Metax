@@ -46,10 +46,6 @@ class PagedKVCacheWriteWorkload(WorkloadBase):
         self.slots = slots
 
     @property
-    def row_width(self) -> int:
-        return self.heads_kv * self.dim
-
-    @property
     def physical_tokens(self) -> int:
         return self.num_pages * self.page_size
 
@@ -153,11 +149,3 @@ class PagedKVCacheWriteCall(CallWorkload, PagedKVCacheWriteWorkload):
         )
 
     gen_inputs = PagedKVCacheWriteWorkload.gen_inputs
-
-    def arguments(self):
-        """The op is built from no tensors, so a case needs none to construct it.
-
-        The base materializes the call to hand a construction-time tensor over; this entry
-        declares none, and materializing would allocate both page pools for nothing.
-        """
-        return self.call.arguments({})

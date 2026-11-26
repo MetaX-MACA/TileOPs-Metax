@@ -10,8 +10,8 @@ import functools
 import gc
 import statistics
 import warnings
-from collections.abc import Mapping
-from typing import Any, Callable, Optional
+from collections.abc import Callable, Mapping
+from typing import Any, Optional
 
 import torch
 
@@ -21,19 +21,19 @@ from benchmarks.timing import (
     _MIN_ITERS,
     DRY_RUN_MS,
     REPEAT_MS,
-    Sample,
     _capture_bench_meta,
     _sample_spread_ms,
     bench_device,
     bench_kernel,
-    median_busy_ms,
 )
 from tileops._utils import is_maca
 from tileops._utils.device import empty_accelerator_cache
+from tileops._utils.cupti import Sample, median_busy_ms
+from tileops.backend import OpNotAvailableError
 from tileops.manifest import _manifest_key, load_adts, load_manifest, load_workloads
 from tileops.manifest._plan import entry_plan
 from tileops.manifest._values import ADTValue
-from tileops.manifest._workload import Call, instantiate
+from tileops.manifest._workload import Call, Elements, bench_calls, instantiate
 from workloads.calls import call_workload
 from workloads.device import torch_compile_unavailable
 from workloads.numerics import CheckResult, Request, check_inputs_preserved, verify
@@ -70,6 +70,21 @@ def set_verifying(value: bool) -> None:
     _verifying = value
 
 
+# --tileops-nightly runs the nightly sweep's cases.
+_nightly = False
+
+
+def nightly() -> bool:
+    """Whether this run is the nightly sweep."""
+    return _nightly
+
+
+def set_nightly(value: bool) -> None:
+    """Put the run into nightly mode. The benchmark conftest owns this."""
+    global _nightly
+    _nightly = value
+
+
 @dataclasses.dataclass(frozen=True)
 class Implementation:
     """One complete call taking part in a comparison.
@@ -83,9 +98,21 @@ class Implementation:
     """
 
     run: Callable
-    args: Optional[tuple] = None
-    reset: Optional[Callable[[], None]] = None
-    noncomparable_reason: Optional[str] = None
+    args: tuple | None = None
+    reset: Callable[[], None] | None = None
+    noncomparable_reason: str | None = None
+
+
+def _raise_if_unavailable(impl: Implementation, inputs: tuple, cause: Exception) -> None:
+    """Raise the op's ``OpNotAvailableError`` from *cause* where *impl* raises one."""
+    if impl.reset is not None:
+        impl.reset()
+    try:
+        impl.run(*(inputs if impl.args is None else impl.args))
+    except OpNotAvailableError as exc:
+        raise exc from cause
+    except Exception:
+        return
 
 
 def _report_value(value: Any) -> Any:
@@ -129,15 +156,15 @@ class Case:
     def arguments(self) -> dict:
         """The op's constructor arguments."""
         arguments = getattr(self.workload, "arguments", None)
-        return arguments() if arguments is not None else self._call.arguments({})
+        return arguments() if arguments is not None else self._call.arguments()
 
     @functools.cached_property
-    def reference(self) -> Optional[Callable]:
+    def reference(self) -> Callable | None:
         """The callable whose result every implementation is checked against."""
         return getattr(self.workload, "ref_program", None)
 
     @functools.cached_property
-    def torch(self) -> Optional[Callable]:
+    def torch(self) -> Callable | None:
         """The op as torch runs it at the input dtype; the reference where none is declared."""
         return getattr(self.workload, "torch_program", None) or self.reference
 
@@ -150,7 +177,10 @@ class Case:
     def params(self) -> dict:
         """The report parameters: each tensor's shape and dtype, and the manifest parameters."""
         tensors = {
-            name: (tuple(shape), dtype) for name, (shape, dtype) in self._call.tensors.items()
+            name: tuple((tuple(shape), dtype) for shape, dtype in value.items)
+            if isinstance(value, Elements)
+            else (tuple(value[0]), value[1])
+            for name, value in self._call.tensors.items()
         }
         return tensors | {name: _report_value(v) for name, v in self._call.params.items()}
 
@@ -163,7 +193,8 @@ class Case:
 def cases(op: "str | type") -> list[Case]:
     """One :class:`Case` per manifest call of *op*, an Op class or its manifest key.
 
-    Each workload row is instantiated once per dtype case. An op with no call workload in
+    Each workload row is instantiated once per dtype case; in nightly mode, only the calls
+    ``bench_calls`` selects for the nightly sweep. An op with no call workload in
     ``workloads.calls`` fails here, at collection.
     """
     from benchmarks._cases import entry
@@ -176,8 +207,7 @@ def cases(op: "str | type") -> list[Case]:
         Case(call.case_id, call, workload, calling)
         for call in (
             instantiate(plan, row, dtype_case)
-            for row in load_workloads(name)
-            for dtype_case in row.get("dtype_cases") or [{}]
+            for row, dtype_case in bench_calls(plan, load_workloads(name), _nightly)
         )
     ]
 
@@ -201,7 +231,7 @@ class Runner:
             raise ValueError(f"{name} cannot run case {case.id!r} of {case._call.signature.name}")
         self.op = op
         self.case = case
-        self._roofline: Optional[tuple[float, float]] = None
+        self._roofline: tuple[float, float] | None = None
 
     def compare_torch(
         self, *, compiled_noncomparable_reason: Optional[str] = None
@@ -260,15 +290,21 @@ class Runner:
                 )
         try:
             checks = self._verify(plan)
+        except OpNotAvailableError:
+            raise
         except Exception as exc:
             compile_failure = (
                 isinstance(exc, AssertionError) and str(exc).startswith("torch-compile:")
             ) or type(exc).__name__ == "InductorError"
-            if not (is_maca() and TORCH_COMPILE_TAG in plan and compile_failure):
+            if is_maca() and TORCH_COMPILE_TAG in plan and compile_failure:
+                warnings.warn(
+                    f"{TORCH_COMPILE_TAG} omitted for {self.case.id}: {exc}", stacklevel=2
+                )
+                del plan[TORCH_COMPILE_TAG]
+                checks = self._verify(plan)
+            else:
+                _raise_if_unavailable(plan[TILEOPS], self.case.inputs, exc)
                 raise
-            warnings.warn(f"{TORCH_COMPILE_TAG} omitted for {self.case.id}: {exc}", stacklevel=2)
-            del plan[TORCH_COMPILE_TAG]
-            checks = self._verify(plan)
         if verifying():
             return {}
         torch.accelerator.synchronize()
@@ -341,8 +377,12 @@ class Runner:
         passes = 2
         samples: dict[str, list[Sample]] = {name: [] for name in names}
         meta: dict[str, dict] = {}
+        first_pass: dict[str, tuple[float, str]] = {}
         for name in names + names[::-1]:
             impl = plan[name]
+            if _nightly and name in meta and self._slow_reference(name, impl, first_pass):
+                continue
+            previous = meta.get(name)
             with torch.no_grad():
                 samples[name].extend(
                     bench_kernel(
@@ -355,19 +395,57 @@ class Runner:
                         count_copies=self.case.count_copies,
                         reset=impl.reset,
                         device=device,
+                        # The second pass starts from the block size the first settled on:
+                        # the same call on the same inputs fills the launch queue at the same
+                        # sample, so probing again only costs a block that times out.
+                        start_block=previous.get("block_samples") if previous else None,
                     )
                 )
             pass_meta = _capture_bench_meta()
-            previous = meta.get(name)
-            if previous is not None and previous["timing"] != pass_meta["timing"]:
+            # The cache preparation is part of the method: samples drained without the
+            # blocker are another measurement than held ones.
+            methods = [
+                " ".join(m[key] for key in ("timing", "l2_flush") if key in m)
+                for m in (previous, pass_meta)
+                if m is not None
+            ]
+            if previous is None:
+                first_pass[name] = (median_busy_ms(samples[name]), methods[0])
+            if len(set(methods)) > 1:
                 raise RuntimeError(
                     f"{name}: the two passes timed with different methods "
-                    f"({previous['timing']} then {pass_meta['timing']}); pooling "
-                    "them would report one median over two kinds of measurement. "
-                    "Only reachable with --tileops-allow-events-fallback."
+                    f"({methods[0]} then {methods[1]}); pooling "
+                    "them would report one median over two kinds of measurement."
                 )
+            # The pooled row keeps the smallest block either pass fell back to, and the
+            # retries of both passes.
+            held = [m["block_samples"] for m in (previous or {}, pass_meta) if "block_samples" in m]
+            if held:
+                pass_meta["block_samples"] = min(held)
+            retries = sum(m.get("attribution_retries", 0) for m in (previous or {}, pass_meta))
+            if retries:
+                pass_meta["attribution_retries"] = retries
             meta[name] = pass_meta
         return {name: self._result(samples[name], meta[name]) for name in names}
+
+    def _slow_reference(
+        self, name: str, impl: Implementation, first_pass: dict[str, tuple[float, str]]
+    ) -> bool:
+        """Whether *impl* is the case's reference and its first-pass device time is ten times
+        that of a baseline timed by the same method."""
+        # Both passes time the same call on the same inputs and agree to a few percent, so a
+        # second pass would have to cut the reading tenfold to make the reference the row's
+        # fastest comparator.
+        ratio = 10.0
+        if impl.run is not self.case.reference or impl.args is not None or impl.reset is not None:
+            return False
+        busy, method = first_pass[name]
+        baselines = [
+            other_busy
+            for other, (other_busy, other_method) in first_pass.items()
+            if other not in (TILEOPS, name) and other_method == method
+        ]
+        return bool(baselines) and busy >= ratio * min(baselines)
 
     def _roofline_counts(self) -> tuple[float, float]:
         """The op's own count of the work, read once.
@@ -395,7 +473,7 @@ class Runner:
         """Turn per-iteration samples into the row a report records.
 
         ``device_busy_ms`` carries the conclusions; the rest are diagnostics. See
-        :class:`~benchmarks.timing.Sample` for what each one counts.
+        :class:`~tileops._utils.cupti.Sample` for what each one counts.
         """
         if not samples:
             raise ValueError("bench_kernel returned no samples")
@@ -416,6 +494,10 @@ class Runner:
             # The largest count observed: a median would round a call that varies
             # between one and two kernels to a number it never launched.
             result["n_kernels"] = max(counts)
+        clocks = [s.sm_clock_hz for s in samples if s.sm_clock_hz is not None]
+        if clocks:
+            # The mean, as nvbench summarizes a cold measurement's clock.
+            result["sm_clock_mhz"] = statistics.fmean(clocks) * 1e-6
         p10, p90 = _sample_spread_ms([s.device_busy_ms for s in samples])
         if p10 is not None:
             result["device_busy_p10_ms"], result["device_busy_p90_ms"] = p10, p90

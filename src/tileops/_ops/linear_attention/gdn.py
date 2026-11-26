@@ -1,4 +1,5 @@
-from typing import ClassVar, Mapping, Optional, Tuple
+from collections.abc import Mapping
+from typing import ClassVar
 
 import torch
 
@@ -6,6 +7,7 @@ from tileops._kernels.kernel_base import Kernel, KernelInterface
 from tileops._kernels.linear_attention import (
     GDNCall,
     GDNChunkPrefillFwdKernel,
+    GDNColumnDecodeKernel,
     GDNDenseDecodeFwdKernel,
     GDNDensePrefillFwdKernel,
     GDNFwdInterface,
@@ -19,7 +21,7 @@ __all__ = ["GDNFwdOp"]
 
 
 class GDNFwdOp(Op):
-    """Gated DeltaNet (GDN): inference forward for the gated delta rule.
+    """Gated DeltaNet (GDN) inference forward; updates a state pool in place given slot indices.
 
     ``q`` and ``k`` use ``[B, T, H, K]``. ``v``, ``g``, ``beta`` and the
     output use ``HV`` recurrent heads, where ``HV`` is a multiple of ``H``.
@@ -48,13 +50,21 @@ class GDNFwdOp(Op):
     any combination of the three input transforms. Prefill runs on SM89 and
     SM90, equal-length or packed, with a sequence that is not a whole number
     of 64-token chunks. On SM89, shared memory holds the offsets of at most
-    703 packed sequences over a 128-wide state. Decode runs one token per
-    sequence on SM80, SM89 and SM90, and does not take ``cu_seqlens``.
-    Other calls need an external target implementation.
+    703 packed sequences over a 128-wide state. Decode runs on SM80, SM89 and
+    SM90: one token per sequence, which takes no ``cu_seqlens``, or, with
+    ``num_accepted_tokens``, each sequence's tokens, equal-length or packed,
+    one after another on the state it keeps in registers. A state pool
+    (``state_indices``) is served by decode and by SM90 prefill, one state a
+    sequence; with ``num_accepted_tokens``, decode keeps one a token. A
+    packed sequence of more tokens than ``state_indices`` holds slots breaks
+    the call's contract, which no check enforces; the in-tree kernel may then
+    write states outside that sequence's slots and leaves its outputs
+    undefined. Other calls need an external target implementation.
     """
 
     kernel_types: ClassVar[Mapping[str, type[Kernel]]] = {
         "gdn_dense_decode": GDNDenseDecodeFwdKernel,
+        "gdn_column_decode": GDNColumnDecodeKernel,
         "gdn_dense_prefill": GDNDensePrefillFwdKernel,
         "gdn_chunk_prefill": GDNChunkPrefillFwdKernel,
         "gdn_split_prefill": GDNSplitPrefillFwdKernel,
@@ -63,7 +73,7 @@ class GDNFwdOp(Op):
 
     def __init__(
         self,
-        scale: Optional[float] = None,
+        scale: float | None = None,
         use_qk_l2norm_in_kernel: bool = False,
         use_beta_sigmoid_in_kernel: bool = False,
         allow_neg_eigval: bool = False,
@@ -89,7 +99,10 @@ class GDNFwdOp(Op):
                 compute ``-exp(A_log) * softplus(g + dt_bias)``. Otherwise,
                 ``g`` must already contain the log-space decay.
             validate_inputs: Check on the CPU that ``cu_seqlens`` (and
-                ``cu_seqlens_cpu``) start at 0, never decrease and end at ``S``.
+                ``cu_seqlens_cpu``) start at 0, never decrease, end at ``S`` and, with
+                ``num_accepted_tokens``, hold no sequence longer than a ``state_indices`` row,
+                and that ``state_indices`` and ``num_accepted_tokens`` lie in their manifest
+                ranges.
                 It synchronizes the device; leave it off under CUDA Graph capture.
             target: Backend target, or ``None`` to resolve from the input
                 device.
@@ -114,12 +127,15 @@ class GDNFwdOp(Op):
         v: torch.Tensor,
         g: torch.Tensor,
         beta: torch.Tensor,
-        initial_state: Optional[torch.Tensor] = None,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        cu_seqlens_cpu: Optional[torch.Tensor] = None,
-        A_log: Optional[torch.Tensor] = None,
-        dt_bias: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        initial_state: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
+        A_log: torch.Tensor | None = None,
+        dt_bias: torch.Tensor | None = None,
+        *,
+        state_indices: torch.Tensor | None = None,
+        num_accepted_tokens: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run prefill or decode and return ``(o, final_state)``.
 
         Args:
@@ -141,12 +157,22 @@ class GDNFwdOp(Op):
                 ``use_gate_in_kernel``.
             dt_bias: ``float32`` gate bias, $[\\mathit{HV}]$. Required under
                 ``use_gate_in_kernel``.
+            state_indices: ``int32`` slots of a state pool, or ``None``. With it,
+                ``initial_state`` is the pool, $[P \\times \\mathit{HV} \\times \\ldots]$, updated in
+                place: $[N]$, the slot each sequence starts from and ends in; with
+                ``num_accepted_tokens``, $[N \\times L]$, slot ``t`` taking the state after
+                token ``t``. A slot of -1 is never written; a sequence starting
+                from it has unspecified outputs and leaves unspecified states in its other
+                slots.
+            num_accepted_tokens: ``int32`` $[N]$, or ``None``: sequence ``n`` starts from its
+                slot ``num_accepted_tokens[n] - 1``.
 
         Returns:
             ``(o, final_state)``. ``o`` is the output,
             $[B \\times S \\times \\mathit{HV} \\times V]$, in the dtype of ``q``.
             ``final_state`` is the ``float32`` state after the last token, in the layout
-            ``initial_state`` takes. $N = B$ unless ``cu_seqlens`` is given.
+            ``initial_state`` takes, or the pool itself with ``state_indices``.
+            $N = B$ unless ``cu_seqlens`` is given.
         """
         inputs = tuple(
             tensor.contiguous() if tensor is not None else None
@@ -161,11 +187,13 @@ class GDNFwdOp(Op):
                 cu_seqlens_cpu,
                 A_log,
                 dt_bias,
+                state_indices,
+                num_accepted_tokens,
             )
         )
         batch, seq_len, heads, dim_k = q.shape
         value_heads, dim_v = v.shape[2:]
-        return self.kernel_for(
+        o, final_state = self.kernel_for(
             "gdn",
             lambda: GDNCall(
                 batch=batch,
@@ -184,6 +212,14 @@ class GDNFwdOp(Op):
                 gate_in_kernel=self.use_gate_in_kernel,
                 beta_sigmoid=self.use_beta_sigmoid_in_kernel,
                 allow_neg_eigval=self.allow_neg_eigval,
+                pooled=state_indices is not None,
+                rollback=num_accepted_tokens is not None,
+                drafts=0 if num_accepted_tokens is None else state_indices.shape[1],
                 device=q.device,
             ),
         )(*inputs)
+        if state_indices is not None and final_state is not initial_state:
+            # A strided pool was advanced as a contiguous copy; the call updates the caller's.
+            initial_state.copy_(final_state)
+            final_state = initial_state
+        return o, final_state

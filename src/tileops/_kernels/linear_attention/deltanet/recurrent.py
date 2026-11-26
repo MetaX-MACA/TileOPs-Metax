@@ -7,23 +7,17 @@ DeltaNet decode (single-step recurrence, ungated).
     S_new    = S + outer(k, v_new)
 
 Unlike Gated DeltaNet (GDN), there is no gate parameter g and no alpha = exp(g).
-
-Optimization:
-  - T.Pipelined + T.copy: async prefetch state tiles from HBM
-  - fp32 scalar accumulation for the recurrent matvecs
-  - Native dtype: bf16/fp16 halve state bandwidth vs fp32
-  - K-tiling: small shared memory footprint -> high occupancy
 """
 
 import warnings
-from typing import Optional, Tuple
+from collections.abc import Callable
 
 import tilelang
 import tilelang.language as T
 import torch
 
-from tileops._kernels.autotune import TUNING_FATAL
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.autotune import TUNING_FATAL, candidate_busy_ms
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.kernel_base import Entry, Kernel
 from tileops._kernels.linear_attention.call_spec import (
     DeltaNetDecodeCall,
@@ -32,17 +26,191 @@ from tileops._kernels.linear_attention.call_spec import (
 )
 
 __all__ = [
+    "DeltaNetDecodeColumnKernel",
     "DeltaNetDecodeFP32Kernel",
     "DeltaNetDecodeKernel",
     "DeltaNetDecodeWarpKernel",
 ]
 
 
-def _k_tile_refusal(dim_k: int, k_tile: int) -> Optional[str]:
+def k_tile_refusal(dim_k: int, k_tile: int) -> str | None:
     """Why a decode program with this default key tile cannot split this key dim, or ``None``."""
     if dim_k % k_tile != 0:
         return f"requires dim_k a multiple of {k_tile}, got {dim_k}"
     return None
+
+
+def stream_state_configs(dim_k: int) -> list[dict]:
+    """The sweep of a decode program that streams its state through shared memory in
+    ``k_tile``-row tiles: every key tile that divides *dim_k*, by stages and threads."""
+    return [
+        {"num_stages": num_stages, "threads": threads, "k_tile": k_tile}
+        for k_tile in (16, 32, 64)
+        if dim_k % k_tile == 0
+        for num_stages in (1, 2, 3)
+        for threads in (128, 256)
+    ]
+
+
+def tune_decode(
+    kernel: Kernel,
+    configs: list[dict],
+    inputs: tuple,
+    warmup: int,
+    rep: int,
+    read: Callable[..., float],
+) -> None:
+    """Time ``kernel._compile(config)`` on *inputs* by *read* for each candidate, then publish
+    the fastest.
+
+    A candidate that fails to build or launch is skipped with a warning; when every one
+    fails, the published config stays.
+
+    Why *read*: each caller passes its own module's ``candidate_busy_ms``, the name a test
+    replaces to stub that module's readings.
+    """
+    best_time = float("inf")
+    best_config: dict | None = None
+    failures: list[str] = []
+    for config in kernel.tuning_candidates(configs):
+        try:
+            fn = kernel._compile(config)
+            t = read(lambda _fn=fn: _fn(*inputs), warmup, rep)
+        except TUNING_FATAL:
+            raise
+        except Exception as exc:
+            failures.append(f"{config}: {type(exc).__name__}: {exc}")
+            continue
+        if t < best_time:
+            best_time = t
+            best_config = config
+    name = type(kernel).__name__
+    if failures:
+        warnings.warn(
+            f"{name} skipped {len(failures)} autotune candidate(s): {failures}",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    if best_config is None:
+        warnings.warn(
+            f"{name} found no successful autotune candidate; keeping the published config.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        return
+    kernel._publish(best_config, kernel._compile)
+
+
+def _decode_inputs(kernel: Kernel, dtype: torch.dtype) -> tuple[torch.Tensor, ...]:
+    """Random ``(q, k, v, beta, state)`` of *kernel*'s shape to time its candidates on."""
+    B, H, DK, DV = kernel.batch, kernel.head, kernel.dim_k, kernel.dim_v
+    return (
+        torch.randn(B, H, DK, device="cuda", dtype=dtype),
+        torch.randn(B, H, DK, device="cuda", dtype=dtype),
+        torch.randn(B, H, DV, device="cuda", dtype=dtype),
+        torch.rand(B, H, device="cuda", dtype=dtype),
+        torch.randn(B, H, DK, DV, device="cuda", dtype=dtype),
+    )
+
+
+@target_cache(maxsize=32)
+@tilelang.jit(out_idx=[5, 6])
+def _deltanet_decode_column_kernel(heads: int):
+    """Four warps share a 16-column stripe of one 128-row BF16 decode state."""
+    width, columns = 128, 16
+
+    @T.prim_func
+    def main(
+        q: T.Tensor((1, heads, width), "bfloat16"),
+        k: T.Tensor((1, heads, width), "bfloat16"),
+        v: T.Tensor((1, heads, width), "bfloat16"),
+        beta: T.Tensor((1, heads), "bfloat16"),
+        state: T.Tensor((1, heads, width, width), "bfloat16"),
+        out: T.Tensor((1, heads, width), "bfloat16"),
+        new_state: T.Tensor((1, heads, width, width), "bfloat16"),
+    ):
+        with T.Kernel(width // columns, heads, threads=128) as (tile, head):
+            stored = T.alloc_fragment((4, 32, columns), "bfloat16")
+            keys = T.alloc_fragment((4, 32), "bfloat16")
+            queries = T.alloc_fragment((4, 32), "bfloat16")
+            products = T.alloc_fragment((4, 32, columns), "float32")
+            partial = T.alloc_fragment((4, columns), "float32")
+            recall = T.alloc_shared((4, columns), "float32")
+            projection = T.alloc_shared((4, columns), "float32")
+            # Each lane holds eight rows of two adjacent columns, so the state is
+            # read once for both matvecs and the update uses packed BF16 stores.
+            layout = T.Fragment(
+                (4, 32, columns),
+                forward_thread_fn=lambda w, r, c: w * 32 + (r // 8) * 8 + c // 2,
+                forward_index_fn=lambda w, r, c: (r % 8) * 2 + c % 2,
+            )
+            vector_layout = T.Fragment(
+                (4, 32),
+                replicate=8,
+                forward_thread_fn=lambda w, r, replica: w * 32 + (r // 8) * 8 + replica,
+                forward_index_fn=lambda w, r: r % 8,
+            )
+            T.annotate_layout(
+                {stored: layout, products: layout, keys: vector_layout, queries: vector_layout}
+            )
+            for w, r in T.Parallel(4, 32):
+                keys[w, r] = k[0, head, w * 32 + r]
+                queries[w, r] = q[0, head, w * 32 + r]
+            for w, r, c in T.Parallel(4, 32, columns):
+                stored[w, r, c] = state[0, head, w * 32 + r, tile * columns + c]
+                products[w, r, c] = T.cast(stored[w, r, c], "float32") * T.cast(
+                    keys[w, r], "float32"
+                )
+            T.reduce_sum(products, partial, dim=1)
+            T.copy(partial, recall)
+            for w, r, c in T.Parallel(4, 32, columns):
+                total = (recall[0, c] + recall[1, c]) + (recall[2, c] + recall[3, c])
+                delta = T.cast(beta[0, head], "float32") * (
+                    T.cast(v[0, head, tile * columns + c], "float32") - total
+                )
+                updated = T.cast(stored[w, r, c], "float32") + T.cast(keys[w, r], "float32") * delta
+                new_state[0, head, w * 32 + r, tile * columns + c] = T.cast(updated, "bfloat16")
+                products[w, r, c] = updated * T.cast(queries[w, r], "float32")
+            T.reduce_sum(products, partial, dim=1)
+            T.copy(partial, projection)
+            for c in T.Parallel(columns):
+                out[0, head, tile * columns + c] = T.cast(
+                    (projection[0, c] + projection[1, c]) + (projection[2, c] + projection[3, c]),
+                    "bfloat16",
+                )
+
+    return main
+
+
+class DeltaNetDecodeColumnKernel(Kernel, DeltaNetDecodeFwdInterface):
+    """Use a four-warp column reduction for single-request BF16 Hopper decode."""
+
+    supported_archs = [90]
+    preferred_over = frozenset({"deltanet_decode_warp"})
+
+    @classmethod
+    def refusal(cls, call: DeltaNetDecodeCall) -> str | None:
+        if (
+            call.batch != 1
+            or call.dtype != torch.bfloat16
+            or (call.dim_k, call.dim_v) != (128, 128)
+        ):
+            return "requires one BF16 decode request with 128-dimensional keys and values"
+        return head_count_refusal(call.heads) or super().refusal(call)
+
+    @classmethod
+    def entry_for(cls, call: DeltaNetDecodeCall) -> Entry:
+        return call, lambda: cls(call)
+
+    def __init__(self, call: DeltaNetDecodeCall):
+        super().__init__(device_index=call.device_index)
+        self.heads = call.heads
+
+    def _compile(self, cfg):
+        return _deltanet_decode_column_kernel(self.heads)
+
+    def forward(self, q, k, v, beta, state):
+        return self.program(self._compile)(*(t.contiguous() for t in (q, k, v, beta, state)))
 
 
 @target_cache(maxsize=32)
@@ -71,7 +239,7 @@ def _deltanet_decode_warp_tl(
     total_blocks = batch * head * (dim_v // v_tile)
     k_chunk = dim_k // raw_group_size
 
-    raw_compile_flags = ["-O3", "-DENABLE_BF16", "--use_fast_math"]
+    raw_compile_flags = [*CUDA_COMPILE_FLAGS, "-DENABLE_BF16", "--use_fast_math"]
     if raw_maxrregcount > 0:
         raw_compile_flags.append(f"--maxrregcount={raw_maxrregcount}")
 
@@ -170,7 +338,7 @@ def _deltanet_decode_tl(
         pass_configs={
             tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: False,
         },
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
     )
     def _decode_func(num_stages, threads=128):
         @T.macro
@@ -262,20 +430,14 @@ def _decode_entry(cls: type, call: DeltaNetDecodeCall) -> Entry:
     The device index is in the identity because the kernel is compiled for the
     architecture it is built on.
     """
-    index = call.device.index if call.device is not None else None
+    index = call.device_index
     dtype = Kernel.dtype_to_str(call.dtype)
     identity = (call.batch, call.heads, call.dim_k, call.dim_v, dtype, index)
     return identity, lambda: cls(call.batch, call.heads, call.dim_k, call.dim_v, dtype=dtype)
 
 
 class DeltaNetDecodeKernel(Kernel, DeltaNetDecodeFwdInterface):
-    """DeltaNet single-step decode kernel (ungated).
-
-    Uses T.Pipelined + T.copy for async state prefetch and full-fp32
-    scalar accumulation for the recurrent matvecs.  The scalar path avoids
-    TileLang 0.1.9 fragment-copy lowering failures on fp16/bf16 and keeps
-    decode numerics aligned with the fp32 reference.
-    """
+    """DeltaNet single-step decode kernel (ungated): pipelined state prefetch, fp32 matvecs."""
 
     supported_archs: list[int] = [80, 89, 90]
     # The key-dimension tile the untuned decode program splits the state into, so it is
@@ -284,8 +446,12 @@ class DeltaNetDecodeKernel(Kernel, DeltaNetDecodeFwdInterface):
     general = True
 
     @classmethod
-    def refusal(cls, call: DeltaNetDecodeCall) -> Optional[str]:
-        return head_count_refusal(call.heads) or _k_tile_refusal(call.dim_k, cls._DEFAULT_K_TILE)
+    def refusal(cls, call: DeltaNetDecodeCall) -> str | None:
+        return (
+            head_count_refusal(call.heads)
+            or k_tile_refusal(call.dim_k, cls._DEFAULT_K_TILE)
+            or super().refusal(call)
+        )
 
     @classmethod
     def entry_for(cls, call: DeltaNetDecodeCall) -> Entry:
@@ -298,7 +464,7 @@ class DeltaNetDecodeKernel(Kernel, DeltaNetDecodeFwdInterface):
         dim_k: int,
         dim_v: int,
         dtype: str = "float32",
-        config: Optional[dict] = None,
+        config: dict | None = None,
     ):
         super().__init__()
         self.batch = batch
@@ -323,53 +489,8 @@ class DeltaNetDecodeKernel(Kernel, DeltaNetDecodeFwdInterface):
 
     def autotune(self, warmup: int = 10, rep: int = 20) -> None:
         """Sweep k_tile, num_stages and threads, then publish the fastest config."""
-        from tilelang.profiler import do_bench
-
-        best_time = float("inf")
-        best_config = None
-
-        B, H, DK, DV = self.batch, self.head, self.dim_k, self.dim_v
-        torch_dtype = {
-            "float32": torch.float32,
-            "float16": torch.float16,
-            "bfloat16": torch.bfloat16,
-        }[self.dtype_str]
-        q = torch.randn(B, H, DK, device="cuda", dtype=torch_dtype)
-        k = torch.randn(B, H, DK, device="cuda", dtype=torch_dtype)
-        v = torch.randn(B, H, DV, device="cuda", dtype=torch_dtype)
-        beta = torch.rand(B, H, device="cuda", dtype=torch_dtype)
-        state = torch.randn(B, H, DK, DV, device="cuda", dtype=torch_dtype)
-
-        candidates = self.tuning_candidates(
-            [
-                {"num_stages": num_stages, "threads": threads, "k_tile": k_tile}
-                for k_tile in (16, 32, 64)
-                if DK % k_tile == 0
-                for num_stages in (1, 2, 3)
-                for threads in (128, 256)
-            ]
-        )
-        for config in candidates:
-            try:
-                fn = _deltanet_decode_tl(
-                    B,
-                    H,
-                    DK,
-                    DV,
-                    config["k_tile"],
-                    self.dtype_str,
-                )(config["num_stages"], config["threads"])
-                t = do_bench(lambda _fn=fn: _fn(q, k, v, beta, state), warmup=warmup, rep=rep)
-                if t < best_time:
-                    best_time = t
-                    best_config = config
-            except TUNING_FATAL:
-                raise
-            except Exception:
-                continue
-
-        if best_config is not None:
-            self._publish(best_config, self._compile)
+        inputs = _decode_inputs(self, getattr(torch, self.dtype_str))
+        tune_decode(self, stream_state_configs(self.dim_k), inputs, warmup, rep, candidate_busy_ms)
 
     @property
     def default_config(self) -> dict:
@@ -386,8 +507,9 @@ class DeltaNetDecodeKernel(Kernel, DeltaNetDecodeFwdInterface):
         v: torch.Tensor,
         beta: torch.Tensor,
         state: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.program(self._compile)(q, k, v, beta, state)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        tensors = (q, k, v, beta, state)
+        return self.program(self._compile)(*(tensor.contiguous() for tensor in tensors))
 
 
 class DeltaNetDecodeWarpKernel(Kernel, DeltaNetDecodeFwdInterface):
@@ -401,13 +523,15 @@ class DeltaNetDecodeWarpKernel(Kernel, DeltaNetDecodeFwdInterface):
     supported_archs: list[int] = [80, 89, 90]
 
     @classmethod
-    def refusal(cls, call: DeltaNetDecodeCall) -> Optional[str]:
-        return head_count_refusal(call.heads) or cls.shape_refusal(
-            Kernel.dtype_to_str(call.dtype), call.dim_k, call.dim_v
+    def refusal(cls, call: DeltaNetDecodeCall) -> str | None:
+        return (
+            head_count_refusal(call.heads)
+            or cls.shape_refusal(Kernel.dtype_to_str(call.dtype), call.dim_k, call.dim_v)
+            or super().refusal(call)
         )
 
     @staticmethod
-    def shape_refusal(dtype: str, dim_k: int, dim_v: int) -> Optional[str]:
+    def shape_refusal(dtype: str, dim_k: int, dim_v: int) -> str | None:
         """Why this kernel cannot serve this shape, or ``None``.
 
         *dtype* is the TileLang name the builder takes, which the region converts the
@@ -430,7 +554,7 @@ class DeltaNetDecodeWarpKernel(Kernel, DeltaNetDecodeFwdInterface):
         dim_k: int,
         dim_v: int,
         dtype: str = "bfloat16",
-        config: Optional[dict] = None,
+        config: dict | None = None,
     ):
         super().__init__()
         self.batch = batch
@@ -473,58 +597,8 @@ class DeltaNetDecodeWarpKernel(Kernel, DeltaNetDecodeFwdInterface):
 
     def autotune(self, warmup: int = 10, rep: int = 20) -> None:
         """Sweep the register cap, then publish the fastest config."""
-        from tilelang.profiler import do_bench
-
-        best_time = float("inf")
-        best_config: Optional[dict] = None
-        failures: list[str] = []
-
-        B, H, DK, DV = self.batch, self.head, self.dim_k, self.dim_v
-        torch_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[self.dtype_str]
-        q = torch.randn(B, H, DK, device="cuda", dtype=torch_dtype)
-        k = torch.randn(B, H, DK, device="cuda", dtype=torch_dtype)
-        v = torch.randn(B, H, DV, device="cuda", dtype=torch_dtype)
-        beta = torch.rand(B, H, device="cuda", dtype=torch_dtype)
-        state = torch.randn(B, H, DK, DV, device="cuda", dtype=torch_dtype)
-
-        for config in self.tuning_candidates(self.raw_autotune_configs):
-            try:
-                fn = _deltanet_decode_warp_tl(
-                    B,
-                    H,
-                    DK,
-                    DV,
-                    config["v_tile"],
-                    config["raw_group_size"],
-                    config["raw_maxrregcount"],
-                    self.dtype_str,
-                )(config["threads"])
-                t = do_bench(lambda _fn=fn: _fn(q, k, v, beta, state), warmup=warmup, rep=rep)
-                if t < best_time:
-                    best_time = t
-                    best_config = config
-            except TUNING_FATAL:
-                raise
-            except Exception as exc:
-                failures.append(f"{config}: {type(exc).__name__}: {exc}")
-                continue
-
-        if failures:
-            warnings.warn(
-                f"{self.__class__.__name__} skipped {len(failures)} raw autotune "
-                f"candidate(s): {failures}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        if best_config is None:
-            warnings.warn(
-                f"{self.__class__.__name__} found no successful raw autotune "
-                "candidate; keeping the published config.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            return
-        self._publish(best_config, self._compile)
+        inputs = _decode_inputs(self, getattr(torch, self.dtype_str))
+        tune_decode(self, self.raw_autotune_configs, inputs, warmup, rep, candidate_busy_ms)
 
     def forward(
         self,
@@ -533,11 +607,9 @@ class DeltaNetDecodeWarpKernel(Kernel, DeltaNetDecodeFwdInterface):
         v: torch.Tensor,
         beta: torch.Tensor,
         state: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.program(self._compile)(q, k, v, beta, state)
-
-
-# FP32-precision decode kernel (no T.gemm -> avoids TF32 mantissa truncation)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        tensors = (q, k, v, beta, state)
+        return self.program(self._compile)(*(tensor.contiguous() for tensor in tensors))
 
 
 @target_cache(maxsize=32)
@@ -550,10 +622,8 @@ def _deltanet_decode_fp32_tl(
 ):
     """FP32 decode kernel using element-wise matvec instead of T.gemm.
 
-    T.gemm on fp32 inputs uses TF32 tensor cores which truncate the mantissa
-    to 10 bits (~1e-3 error per op).  For multi-step decode the error
-    compounds through the recurrent state.  This kernel avoids T.gemm
-    entirely, computing S@k and S@q via scalar accumulation in full fp32.
+    T.gemm on fp32 inputs rounds to TF32, whose error compounds through the recurrent
+    state over decode steps, so S@k and S@q accumulate in scalar fp32.
     """
     dtype = "float32"
     accum_dtype = "float32"
@@ -574,7 +644,7 @@ def _deltanet_decode_fp32_tl(
         pass_configs={
             tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: False,
         },
-        compile_flags=["-O3"],
+        compile_flags=[*CUDA_COMPILE_FLAGS],
     )
     def _decode_func(num_stages, threads=128):
         @T.prim_func
@@ -636,12 +706,7 @@ def _deltanet_decode_fp32_tl(
 
 
 class DeltaNetDecodeFP32Kernel(Kernel, DeltaNetDecodeFwdInterface):
-    """FP32-precision DeltaNet decode kernel (no TF32 tensor cores).
-
-    Uses element-wise matvec instead of T.gemm to avoid TF32 mantissa
-    truncation that causes ~1e-3 error per step, compounding over multi-step
-    decode.  Intended for fp32 dtype only.
-    """
+    """FP32 DeltaNet decode kernel, for fp32 inputs, with no TF32 tensor-core products."""
 
     supported_archs: list[int] = [80, 89, 90]
     # The key-dimension tile the untuned decode program splits the state into, so it is
@@ -649,10 +714,14 @@ class DeltaNetDecodeFP32Kernel(Kernel, DeltaNetDecodeFwdInterface):
     _DEFAULT_K_TILE = 16
 
     @classmethod
-    def refusal(cls, call: DeltaNetDecodeCall) -> Optional[str]:
+    def refusal(cls, call: DeltaNetDecodeCall) -> str | None:
         if call.dtype != torch.float32:
             return "requires float32"
-        return head_count_refusal(call.heads) or _k_tile_refusal(call.dim_k, cls._DEFAULT_K_TILE)
+        return (
+            head_count_refusal(call.heads)
+            or k_tile_refusal(call.dim_k, cls._DEFAULT_K_TILE)
+            or super().refusal(call)
+        )
 
     @classmethod
     def entry_for(cls, call: DeltaNetDecodeCall) -> Entry:
@@ -665,7 +734,7 @@ class DeltaNetDecodeFP32Kernel(Kernel, DeltaNetDecodeFwdInterface):
         dim_k: int,
         dim_v: int,
         dtype: str = "float32",
-        config: Optional[dict] = None,
+        config: dict | None = None,
     ):
         super().__init__()
         if dtype != "float32":
@@ -690,47 +759,8 @@ class DeltaNetDecodeFP32Kernel(Kernel, DeltaNetDecodeFwdInterface):
 
     def autotune(self, warmup: int = 10, rep: int = 20) -> None:
         """Sweep k_tile, num_stages and threads, then publish the fastest config."""
-        from tilelang.profiler import do_bench
-
-        best_time = float("inf")
-        best_config = None
-        B, H, DK, DV = self.batch, self.head, self.dim_k, self.dim_v
-
-        q = torch.randn(B, H, DK, device="cuda", dtype=torch.float32)
-        k = torch.randn(B, H, DK, device="cuda", dtype=torch.float32)
-        v = torch.randn(B, H, DV, device="cuda", dtype=torch.float32)
-        beta = torch.rand(B, H, device="cuda", dtype=torch.float32)
-        state = torch.randn(B, H, DK, DV, device="cuda", dtype=torch.float32)
-
-        candidates = self.tuning_candidates(
-            [
-                {"num_stages": num_stages, "threads": threads, "k_tile": k_tile}
-                for k_tile in (16, 32, 64)
-                if DK % k_tile == 0
-                for num_stages in (1, 2, 3)
-                for threads in (128, 256)
-            ]
-        )
-        for config in candidates:
-            try:
-                fn = _deltanet_decode_fp32_tl(
-                    B,
-                    H,
-                    DK,
-                    DV,
-                    config["k_tile"],
-                )(config["num_stages"], config["threads"])
-                t = do_bench(lambda _fn=fn: _fn(q, k, v, beta, state), warmup=warmup, rep=rep)
-                if t < best_time:
-                    best_time = t
-                    best_config = config
-            except TUNING_FATAL:
-                raise
-            except Exception:
-                continue
-
-        if best_config is not None:
-            self._publish(best_config, self._compile)
+        inputs = _decode_inputs(self, torch.float32)
+        tune_decode(self, stream_state_configs(self.dim_k), inputs, warmup, rep, candidate_busy_ms)
 
     @property
     def default_config(self) -> dict:
@@ -747,5 +777,6 @@ class DeltaNetDecodeFP32Kernel(Kernel, DeltaNetDecodeFwdInterface):
         v: torch.Tensor,
         beta: torch.Tensor,
         state: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.program(self._compile)(q, k, v, beta, state)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        tensors = (q, k, v, beta, state)
+        return self.program(self._compile)(*(tensor.contiguous() for tensor in tensors))

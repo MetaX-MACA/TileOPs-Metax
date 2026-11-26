@@ -7,9 +7,12 @@ QUALIFIED_OPS = frozenset(
         "GQAPagedFwdOp",
         "GQAVarlenFwdOp",
         "GEMMW4A8FwdOp",
+        "HyperConnectionPreFwdOp",
         "KDAFwdOp",
         "MergeAttentionStatesFwdOp",
+        "NGramHashFwdOp",
         "PagedKVCacheGatherFwdOp",
         "RMSNormFwdOp",
+        "RoPEFwdOp",
     }
 )

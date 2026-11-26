@@ -4,7 +4,13 @@ import pytest
 import torch
 
 from benchmarks import api as bench
-from benchmarks.baselines import VLLM_TAG, flashinfer_op, vllm_op
+from benchmarks.baselines import (
+    TORCH_COMPILE_TAG,
+    VLLM_TAG,
+    compiled_reference,
+    flashinfer_op,
+    vllm_op,
+)
 from tileops._ops.moe import (
     MoEExpertMLPFwdOp,
     MoEGroupedGEMMFwdOp,
@@ -38,11 +44,7 @@ def test_moe_pre_permute_bench(case) -> None:
 
 @pytest.mark.parametrize("case", bench.cases(MoEPostPermuteFwdOp), ids=lambda case: case.id)
 def test_moe_post_permute_bench(case) -> None:
-    if is_maca():
-        op = MoEPostPermuteFwdOp(**case.arguments)
-        bench.Runner(op, case).compare_torch()
-        return
-    expert_output, weights, _ = case.inputs
+    expert_output, weights, _, residual = case.inputs
     op = MoEPostPermuteFwdOp(**case.arguments)
     tokens, hidden = weights.shape[0], expert_output.shape[-1]
     out_vllm = torch.empty(tokens, hidden, dtype=expert_output.dtype, device=expert_output.device)
@@ -50,19 +52,23 @@ def test_moe_post_permute_bench(case) -> None:
         "moe_unpermute", "model_executor.layers.fused_moe.moe_permute_unpermute"
     )
 
-    # moe_unpermute takes no routing scale; the epilogue's is applied to its result.
+    # moe_unpermute takes no routing scale or residual; both apply to its rounded result.
     scale = 1.0 if op.epilogue is None else op.epilogue.routed_scaling_factor
 
     def _vllm_reference(
         output: torch.Tensor,
         routing_weights: torch.Tensor,
         inverse_indices: torch.Tensor,
+        residual: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # The inverse indices address the flat rows of every layout's expert output.
         moe_unpermute(out_vllm, output.reshape(-1, hidden), routing_weights, inverse_indices)
-        return out_vllm if scale == 1.0 else out_vllm * scale
+        result = out_vllm if scale == 1.0 else out_vllm * scale
+        return result if residual is None else result.add_(residual)
 
     implementations = {"torch-ref": case.reference}
+    if residual is not None:
+        implementations[TORCH_COMPILE_TAG] = compiled_reference(case.reference)
     if op.out_dtype in (None, expert_output.dtype):
         implementations[VLLM_TAG] = _vllm_reference
     else:

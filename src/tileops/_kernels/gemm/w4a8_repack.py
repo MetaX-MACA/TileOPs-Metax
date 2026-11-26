@@ -1,7 +1,7 @@
 """Repack a signed INT4 weight into the order the W4A8 GEMM kernels read."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Optional
 
 import tilelang
 import tilelang.language as T
@@ -128,14 +128,14 @@ class W4A8RepackKernel(Kernel, W4A8RepackFwdInterface):
     @classmethod
     def entry_for(cls, call: W4A8RepackCall) -> Entry:
         """The program depends on ``(n, k)`` only; the architecture is validated, not read."""
-        return (call.n, call.k), lambda: cls(call.n, call.k, device_index=call.device.index)
+        return (call.n, call.k), lambda: cls(call.n, call.k, device_index=call.device_index)
 
     def __init__(
         self,
         n: int,
         k: int,
-        config: Optional[dict] = None,
-        device_index: Optional[int] = None,
+        config: dict | None = None,
+        device_index: int | None = None,
     ) -> None:
         super().__init__(device_index=device_index)
         self.n = n

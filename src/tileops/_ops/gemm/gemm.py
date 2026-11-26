@@ -1,5 +1,6 @@
 import warnings
-from typing import ClassVar, Mapping, Optional
+from collections.abc import Mapping
+from typing import ClassVar
 
 import torch
 
@@ -28,6 +29,7 @@ from tileops._kernels.gemm import (
     GEMMW4A16FwdInterface,
     GEMMW4A16Kernel,
     GEMMW4A16MMAKernel,
+    GEMMW4A16TwoGroupKernel,
     GemvKernel,
     W4A8RepackCall,
     W4A8RepackFwdInterface,
@@ -48,8 +50,9 @@ __all__ = ["GEMMFP8FwdOp", "GEMMFwdOp", "GEMMINT8W8A8FwdOp", "GEMMW4A8FwdOp", "G
 
 
 class GEMMFwdOp(Op):
-    """Dense GEMM. Nothing is committed at construction: ``m, n, k`` and the dtype
-    come from the ``forward`` inputs, so ``eval_roofline()`` is valid only after a call.
+    """Dense GEMM with an optional bias. Nothing is committed at construction: ``m, n, k``
+    and the dtype come from the ``forward`` inputs, so ``eval_roofline()`` is valid only
+    after a call.
 
     The ``(trans_a, trans_b)`` pair selects one of four layouts:
 
@@ -59,6 +62,16 @@ class GEMMFwdOp(Op):
     | ``(False, False)`` | NN | $d = a \\mathbin{@} b$ |
     | ``(True, False)`` | TN | $d = a^{\\top} \\mathbin{@} b$ |
     | ``(True, True)`` | TT | $d = a^{\\top} \\mathbin{@} b^{\\top}$ |
+
+    A bias is added to every row of the product: the contraction accumulates in
+    ``float32``, the bias is added to that sum, and the result is rounded once to the
+    input dtype, as ``torch.nn.functional.linear`` rounds it. ``out_dtype=torch.float32``
+    returns that sum unrounded, as ``F.linear(a.float(), b.float())`` computes it.
+
+    Accuracy of a float32 output: the tensor cores add each K step's products to the
+    float32 sum with truncation, as cuBLAS's 16-bit GEMM with a float32 output does, so the
+    error grows as $K^{1.5}$; over standard normal operands it stays below about 2e-3 at
+    $K = 4096$.
     """
 
     kernel_types: ClassVar[Mapping[str, type[Kernel]]] = {
@@ -74,6 +87,7 @@ class GEMMFwdOp(Op):
         trans_a: bool = False,
         trans_b: bool = True,
         *,
+        out_dtype: torch.dtype | None = None,
         target: Target = None,
     ) -> None:
         """Build the op. Shapes and dtypes are taken from the first call.
@@ -81,32 +95,42 @@ class GEMMFwdOp(Op):
         Args:
             trans_a: Whether ``a`` is stored transposed ($[K \\times M]$).
             trans_b: Whether ``b`` is stored transposed ($[N \\times K]$). Default ``True`` (NT).
+            out_dtype: ``torch.float32`` for an unrounded float32 ``d``; ``None`` rounds to
+                the operands' dtype.
             target: Which set of kernels serves this op — a target name, ``BUILTIN``
                 for the in-tree kernels, or ``None`` to decide from the input device.
         """
         self.trans_a = trans_a
         self.trans_b = trans_b
+        self.out_dtype = out_dtype
         super().__init__(target=target)
 
-    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        """Multiply the two matrices under the layout the constructor selected.
+    def forward(
+        self, a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Multiply the two matrices under the layout the constructor selected, and add
+        the bias.
 
         Args:
             a: Left operand, $[M \\times K]$, or $[K \\times M]$ when ``trans_a``.
             b: Right operand, $[N \\times K]$ under the default NT layout, or
                 $[K \\times N]$ when ``trans_b`` is false.
+            bias: Optional bias, $[N]$, in the dtype of the inputs.
 
         Returns:
-            The product, $[M \\times N]$, in the dtype of the inputs.
+            The product plus bias, $[M \\times N]$, in ``out_dtype``, or the dtype of the
+            inputs when it is ``None``.
 
         Example:
             ```python linenums="1"
             op = GEMMFwdOp()                      # NT by default
             d = op(a, b)                          # a=[M,K], b=[N,K] -> d=[M,N]
+            d = op(a, b, bias)                    # bias=[N], added to every row
             flops, nbytes = op.eval_roofline()    # valid after the forward
             ```
         """
         a, b = a.contiguous(), b.contiguous()
+        inputs = (a, b) if bias is None else (a, b, bias.contiguous())
 
         def call() -> GEMMCall:
             m, k = (a.shape[1], a.shape[0]) if self.trans_a else a.shape
@@ -117,10 +141,12 @@ class GEMMFwdOp(Op):
                 dtype=a.dtype,
                 trans_a=self.trans_a,
                 trans_b=self.trans_b,
+                has_bias=bias is not None,
+                out_dtype=self.out_dtype,
                 device=a.device,
             )
 
-        return self.kernel_for("gemm", call)(a, b)
+        return self.kernel_for("gemm", call)(*inputs)
 
     def roof_key(self) -> str:
         return tensor_core_roof(self.last_call.indices["T"])
@@ -168,7 +194,7 @@ class GEMMFP8FwdOp(Op):
         b: torch.Tensor,
         a_scale: torch.Tensor,
         b_scale: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Multiply the two FP8 matrices, apply the scales, and add the bias.
 
@@ -265,7 +291,7 @@ class GEMMINT8W8A8FwdOp(Op):
         b: torch.Tensor,
         a_scale: torch.Tensor,
         b_scale: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Multiply the two INT8 matrices, dequantize, and add the bias.
 
@@ -324,6 +350,7 @@ class GEMMW4A16FwdOp(Op):
 
     kernel_types: ClassVar[Mapping[str, type[Kernel]]] = {
         "gemm_w4a16": GEMMW4A16Kernel,
+        "gemm_w4a16_two_group": GEMMW4A16TwoGroupKernel,
         "gemm_w4a16_mma": GEMMW4A16MMAKernel,
         "w4a16_repack": W4A16RepackKernel,
     }

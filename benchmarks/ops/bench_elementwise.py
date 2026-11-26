@@ -23,8 +23,7 @@ from tileops.elementwise import (
     BitwiseOrFwdOp,
     BitwiseXorFwdOp,
     CeilFwdOp,
-    ClampScalarFwdOp,
-    ClampTensorFwdOp,
+    ClampFwdOp,
     CosFwdOp,
     DivFwdOp,
     DropoutFwdOp,
@@ -46,16 +45,14 @@ from tileops.elementwise import (
     IsnanFwdOp,
     LeakyReLUFwdOp,
     LeFwdOp,
-    LerpScalarFwdOp,
-    LerpTensorFwdOp,
+    LerpFwdOp,
     Log1pFwdOp,
     LogFwdOp,
     LogicalAndFwdOp,
     LogicalNotFwdOp,
     LogicalOrFwdOp,
     LtFwdOp,
-    MaskedFillScalarFwdOp,
-    MaskedFillTensorFwdOp,
+    MaskedFillFwdOp,
     MaximumFwdOp,
     MinimumFwdOp,
     MishFwdOp,
@@ -88,6 +85,9 @@ from tileops.elementwise import (
 def _bench(op_cls, case: bench.Case, *, torch_tag: str = "torch"):
     """Time the op against torch, in eager and through inductor."""
     op = op_cls(**case.arguments)
+    if is_maca():
+        bench.Runner(op, case).compare_torch()
+        return
     bench.Runner(op, case).compare(
         {
             torch_tag: case.torch,
@@ -105,22 +105,9 @@ def test_prelu_bench(case) -> None:
     _bench(PReLUFwdOp, case)
 
 
-@pytest.mark.parametrize("case", bench.cases(MaskedFillTensorFwdOp), ids=lambda case: case.id)
+@pytest.mark.parametrize("case", bench.cases(MaskedFillFwdOp), ids=lambda case: case.id)
 def test_masked_fill_bench(case) -> None:
-    if is_maca():
-        op = MaskedFillTensorFwdOp(**case.arguments)
-        bench.Runner(op, case).compare_torch()
-        return
-    _bench(MaskedFillTensorFwdOp, case)
-
-
-@pytest.mark.parametrize("case", bench.cases(MaskedFillScalarFwdOp), ids=lambda case: case.id)
-def test_masked_fill_scalar_bench(case) -> None:
-    if is_maca():
-        op = MaskedFillScalarFwdOp(**case.arguments)
-        bench.Runner(op, case).compare_torch()
-        return
-    _bench(MaskedFillScalarFwdOp, case)
+    _bench(MaskedFillFwdOp, case)
 
 
 @pytest.mark.parametrize("case", bench.cases(AddFwdOp), ids=lambda case: case.id)
@@ -186,13 +173,9 @@ def test_floor_divide_bench(case) -> None:
     _bench(FloorDivideFwdOp, case)
 
 
-@pytest.mark.parametrize("case", bench.cases(LerpScalarFwdOp), ids=lambda case: case.id)
+@pytest.mark.parametrize("case", bench.cases(LerpFwdOp), ids=lambda case: case.id)
 def test_lerp_bench(case) -> None:
-    if is_maca():
-        op = LerpScalarFwdOp(**case.arguments)
-        bench.Runner(op, case).compare_torch()
-        return
-    _bench(LerpScalarFwdOp, case)
+    _bench(LerpFwdOp, case)
 
 
 @pytest.mark.parametrize("case", bench.cases(MaximumFwdOp), ids=lambda case: case.id)
@@ -339,15 +322,6 @@ def test_where_bench(case) -> None:
     _bench(WhereFwdOp, case)
 
 
-@pytest.mark.parametrize("case", bench.cases(LerpTensorFwdOp), ids=lambda case: case.id)
-def test_lerp_tensor_bench(case) -> None:
-    if is_maca():
-        op = LerpTensorFwdOp(**case.arguments)
-        bench.Runner(op, case).compare_torch()
-        return
-    _bench(LerpTensorFwdOp, case)
-
-
 @pytest.mark.parametrize("case", bench.cases(ReLUFwdOp), ids=lambda case: case.id)
 def test_relu_bench(case) -> None:
     if is_maca():
@@ -447,22 +421,9 @@ def test_softplus_bench(case) -> None:
     _bench(SoftplusFwdOp, case)
 
 
-@pytest.mark.parametrize("case", bench.cases(ClampTensorFwdOp), ids=lambda case: case.id)
+@pytest.mark.parametrize("case", bench.cases(ClampFwdOp), ids=lambda case: case.id)
 def test_clamp_bench(case) -> None:
-    if is_maca():
-        op = ClampTensorFwdOp(**case.arguments)
-        bench.Runner(op, case).compare_torch()
-        return
-    _bench(ClampTensorFwdOp, case)
-
-
-@pytest.mark.parametrize("case", bench.cases(ClampScalarFwdOp), ids=lambda case: case.id)
-def test_clamp_scalar_bench(case) -> None:
-    if is_maca():
-        op = ClampScalarFwdOp(**case.arguments)
-        bench.Runner(op, case).compare_torch()
-        return
-    _bench(ClampScalarFwdOp, case)
+    _bench(ClampFwdOp, case)
 
 
 @pytest.mark.parametrize("case", bench.cases(NanToNumFwdOp), ids=lambda case: case.id)

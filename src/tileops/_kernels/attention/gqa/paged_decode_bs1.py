@@ -8,8 +8,6 @@ Logical KV tiles are translated through the page table before TMA. SM90-only, lo
 ``tma_copy`` / ``mbarrier`` / ``wgmma_gemm``.
 """
 
-from typing import Optional
-
 import tilelang
 import tilelang.language as T
 import torch
@@ -20,6 +18,7 @@ from tileops._kernels.attention.call_spec import (
 )
 from tileops._kernels.attention.gqa.decode_bs1_common import (
     COMPILE_FLAGS,
+    RING_DEPTH,
     allocate_partials,
     make_gqa_decode_bs1_combine,
     make_gqa_decode_bs1_split,
@@ -45,15 +44,11 @@ def _gqa_decode_paged_bs1_ctx_kernel(
     page_size,
     max_pages_per_req,
     sm_scale,
-    softcap,
     dtype,
 ):
-    score_scale = dim**-0.5 if sm_scale is None else sm_scale
-    scale = score_scale * LOG2E
+    scale = sm_scale * LOG2E
     accum_dtype = "float"
     kv_group_num = heads // groups
-    # Barrier parity assumes this double-buffered schedule.
-    ring_depth = 2
 
     @tilelang.jit(
         out_idx=[-1],
@@ -78,13 +73,13 @@ def _gqa_decode_paged_bs1_ctx_kernel(
             physical_block = block_table[bid, page_idx] * blocks_per_page + block_in_page
             T.tma_copy(
                 K[physical_block * block_N : (physical_block + 1) * block_N, hid, :],
-                Ks[k % ring_depth, :, :],
-                barrier=ready[k % ring_depth],
+                Ks[k % RING_DEPTH, :, :],
+                barrier=ready[k % RING_DEPTH],
             )
             T.tma_copy(
                 V[physical_block * block_N : (physical_block + 1) * block_N, hid, :],
-                Vs[k % ring_depth, :, :],
-                barrier=ready[k % ring_depth],
+                Vs[k % RING_DEPTH, :, :],
+                barrier=ready[k % RING_DEPTH],
             )
 
         split = make_gqa_decode_bs1_split(
@@ -99,9 +94,8 @@ def _gqa_decode_paged_bs1_ctx_kernel(
             ctx_splits,
             threads,
             accum_dtype,
-            True,
             load_kv,
-            ring_depth,
+            paged=True,
         )
         combine = make_gqa_decode_bs1_combine(
             batch,
@@ -123,7 +117,7 @@ def _gqa_decode_paged_bs1_ctx_kernel(
             Output_partial: T.Tensor(part_shape, accum_dtype),
             Output: T.Tensor(shape_o, dtype),
         ):
-            split(Q, K, V, block_table, real_seqlen_kv, glse, Output_partial)
+            split(Q, K, V, block_table, real_seqlen_kv, Q, Q, glse, Output_partial)
             combine(glse, Output_partial, Output)
 
         return gqa_decode_paged_bs1_ctx
@@ -163,7 +157,7 @@ class GQADecodePagedBs1Kernel(Kernel, GQAPagedFwdInterface):
         return super().refusal(call)
 
     @staticmethod
-    def block_n_for_page_size(page_size: int) -> Optional[int]:
+    def block_n_for_page_size(page_size: int) -> int | None:
         """Return a page-contained WGMMA N tile, or None when the fast path is unsafe."""
         try:
             block_n = gqa_decode_paged_block_ns(page_size)[0]
@@ -176,7 +170,7 @@ class GQADecodePagedBs1Kernel(Kernel, GQAPagedFwdInterface):
     @classmethod
     def entry_for(cls, call: AttentionCall) -> Entry:
         # The device index is in the identity: the kernel is compiled for its architecture.
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         args = (
             call.batch,
             call.heads,
@@ -187,9 +181,9 @@ class GQADecodePagedBs1Kernel(Kernel, GQAPagedFwdInterface):
             call.max_pages_per_req,
             call.dtype,
         )
-        extra = dict(sm_scale=call.sm_scale, softcap=call.softcap)
-        identity = (*args, *extra.values(), index)
-        return identity, lambda: cls(*args, **extra, device_index=index)
+        return (*args, call.sm_scale, index), lambda: cls(
+            *args, sm_scale=call.sm_scale, device_index=index
+        )
 
     def __init__(
         self,
@@ -201,10 +195,9 @@ class GQADecodePagedBs1Kernel(Kernel, GQAPagedFwdInterface):
         page_size,
         max_pages_per_req,
         dtype="float16",
-        sm_scale: Optional[float] = None,
-        softcap: float = 0.0,
-        config: Optional[dict] = None,
-        device_index: Optional[int] = None,
+        sm_scale: float | None = None,
+        config: dict | None = None,
+        device_index: int | None = None,
     ):
         super().__init__(device_index=device_index)
         self.batch = batch
@@ -216,7 +209,6 @@ class GQADecodePagedBs1Kernel(Kernel, GQAPagedFwdInterface):
         self.max_pages_per_req = max_pages_per_req
         self.dtype = dtype
         self.sm_scale = dim**-0.5 if sm_scale is None else sm_scale
-        self.softcap = softcap
         if self.groups <= 0:
             raise ValueError("groups must be positive")
         if self.heads % self.groups != 0:
@@ -236,10 +228,11 @@ class GQADecodePagedBs1Kernel(Kernel, GQAPagedFwdInterface):
             raise ValueError("batch=1 paged decode requires page_size=64 or a multiple of 128")
         return {"block_M": 64, "block_N": block_n, "threads": 160}
 
-    def _ctx_splits_for(self, real_seqlen_kv: int) -> int:
+    def _ctx_splits_for(self, capacity: int) -> int:
+        """The most splits that divide a table of *capacity* keys into whole key tiles."""
         block_n = self.config["block_N"]
         for ctx_splits in self._CTX_SPLIT_CANDIDATES:
-            if real_seqlen_kv % (ctx_splits * block_n) == 0:
+            if capacity % (ctx_splits * block_n) == 0:
                 return ctx_splits
         return self._CTX_SPLIT_CANDIDATES[-1]
 
@@ -250,13 +243,13 @@ class GQADecodePagedBs1Kernel(Kernel, GQAPagedFwdInterface):
         V: torch.Tensor,
         real_seqlen_kv: torch.Tensor,
         block_table: torch.Tensor,
-        cu_seqlens_q: Optional[torch.Tensor] = None,
-        q_scale: Optional[torch.Tensor] = None,
-        k_scale: Optional[torch.Tensor] = None,
-        v_scale: Optional[torch.Tensor] = None,
-        rope_cos: Optional[torch.Tensor] = None,
-        rope_sin: Optional[torch.Tensor] = None,
-        sinks: Optional[torch.Tensor] = None,
+        cu_seqlens_q: torch.Tensor | None = None,
+        q_scale: torch.Tensor | None = None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+        rope_cos: torch.Tensor | None = None,
+        rope_sin: torch.Tensor | None = None,
+        sinks: torch.Tensor | None = None,
     ):
         """``cu_seqlens_q`` is unread: every request of this region carries one query token."""
         capacity = self.max_pages_per_req * self.page_size
@@ -283,7 +276,7 @@ class GQADecodePagedBs1Kernel(Kernel, GQAPagedFwdInterface):
             self.max_pages_per_req,
             False,
             self.sm_scale,
-            self.softcap,
+            0.0,  # the batch-1 region has no softcap
             self.dtype_str,
         )(64, cfg["block_N"], 2, 128)
 
@@ -298,6 +291,5 @@ class GQADecodePagedBs1Kernel(Kernel, GQAPagedFwdInterface):
             self.page_size,
             self.max_pages_per_req,
             self.sm_scale,
-            self.softcap,
             self.dtype_str,
         )(cfg["block_M"], cfg["block_N"], ctx_splits, cfg["threads"])

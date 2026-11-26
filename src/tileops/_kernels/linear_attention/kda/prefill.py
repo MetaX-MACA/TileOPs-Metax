@@ -1,7 +1,5 @@
 """Chunked Kimi Delta Attention (KDA) prefill: chunk-local work, then one scan."""
 
-from typing import Optional, Tuple
-
 import torch
 
 from tileops._kernels.kernel_base import Entry, Kernel
@@ -9,8 +7,11 @@ from tileops._kernels.linear_attention.call_spec import (
     KDACall,
     KDAFwdInterface,
 )
-from tileops._kernels.linear_attention.chunk_plan import launch_plan
-from tileops._kernels.linear_attention.chunk_prefill import run_chunk_prefill
+from tileops._kernels.linear_attention.chunk_prefill import (
+    chunk_refusal,
+    run_chunk_prefill,
+    staged_bytes,
+)
 
 __all__ = ["KDAChunkPrefillFwdKernel"]
 
@@ -22,33 +23,27 @@ class KDAChunkPrefillFwdKernel(Kernel, KDAFwdInterface):
     CTA per (sequence, value head); the two meet in a workspace holding the WY
     vectors, the gated query and key, the intra-chunk attention and the chunk
     decay. Where shared memory holds less, the chunk-local half takes its lean
-    form and the scan splits the state's value columns across CTAs.
+    form and the scan splits the state's value columns across CTAs. The scan reads
+    and writes the states in either layout, in batch order or in the slots of a pool.
     """
 
-    # CI has no SM80 or SM89 runner; the `sm89` test group covers SM89 on its own hardware.
     supported_archs = [80, 89, 90]
 
     @classmethod
-    def refusal(cls, call: KDACall) -> Optional[str]:
+    def refusal(cls, call: KDACall) -> str | None:
         """Why this kernel does not serve *call*, or ``None`` when it does."""
         chunked = call.chunk_refusal
         if chunked is not None:
             return chunked
         if call.seq_len < 2:
             return "serves a sequence of at least two tokens"
-        plan = launch_plan(
-            call.dim_k, call.dtype.itemsize, call.sequences, call.smem_budget, call.arch
-        )
-        if plan is None:
-            return (
-                f"needs more than {call.smem_budget} bytes of shared memory for "
-                f"{call.sequences} sequences"
-            )
-        return None
+        return chunk_refusal(
+            call, call.sequences, staged=staged_bytes(call), walk=True
+        ) or super().refusal(call)
 
     @classmethod
     def entry_for(cls, call: KDACall) -> Entry:
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         identity = (
             call.batch,
             call.seq_len,
@@ -62,6 +57,8 @@ class KDAChunkPrefillFwdKernel(Kernel, KDAFwdInterface):
             call.has_dt_bias,
             call.lower_bound,
             call.varlen,
+            call.state_v_first,
+            call.pooled,
             call.dtype,
             index,
         )
@@ -79,6 +76,8 @@ class KDAChunkPrefillFwdKernel(Kernel, KDAFwdInterface):
             lower_bound=call.lower_bound,
             dtype=call.dtype,
             device_index=index,
+            state_v_first=call.state_v_first,
+            pooled=call.pooled,
         )
 
     def __init__(
@@ -93,10 +92,12 @@ class KDAChunkPrefillFwdKernel(Kernel, KDAFwdInterface):
         l2norm: bool,
         dtype: torch.dtype,
         *,
-        device_index: Optional[int] = None,
+        device_index: int | None = None,
         gate_in_kernel: bool = False,
         has_dt_bias: bool = False,
-        lower_bound: Optional[float] = None,
+        lower_bound: float | None = None,
+        state_v_first: bool = False,
+        pooled: bool = False,
     ) -> None:
         """Hold the call facts both programs are built from."""
         super().__init__(device_index=device_index)
@@ -112,6 +113,8 @@ class KDAChunkPrefillFwdKernel(Kernel, KDAFwdInterface):
         self.has_dt_bias = has_dt_bias
         self.lower_bound = lower_bound
         self.dtype = dtype
+        self.state_v_first = state_v_first
+        self.pooled = pooled
 
     def forward(
         self,
@@ -120,12 +123,13 @@ class KDAChunkPrefillFwdKernel(Kernel, KDAFwdInterface):
         v: torch.Tensor,
         g: torch.Tensor,
         beta: torch.Tensor,
-        initial_state: Optional[torch.Tensor] = None,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        cu_seqlens_cpu: Optional[torch.Tensor] = None,
-        A_log: Optional[torch.Tensor] = None,
-        dt_bias: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        initial_state: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
+        A_log: torch.Tensor | None = None,
+        dt_bias: torch.Tensor | None = None,
+        state_indices: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run the chunk-local half, then the scan; see the interface for the tensors."""
         del cu_seqlens_cpu
         self._require_devices(q=q, k=k, v=v, g=g, beta=beta)
@@ -134,7 +138,7 @@ class KDAChunkPrefillFwdKernel(Kernel, KDAFwdInterface):
         HV, V = v.shape[2], v.shape[3]
         # One kernel serves every sequence count and initial-state presence its
         # identity leaves open, so the call the driver reads restates them from this
-        # call's tensors; the variants `chunk_refusal` declines stay at their defaults.
+        # call's tensors; the variants `refusal` declines stay at their defaults.
         call = KDACall(
             batch=batch,
             seq_len=seq_len,
@@ -151,7 +155,9 @@ class KDAChunkPrefillFwdKernel(Kernel, KDAFwdInterface):
             gate_in_kernel=self.gate_in_kernel,
             has_dt_bias=self.has_dt_bias,
             lower_bound=self.lower_bound,
+            state_v_first=self.state_v_first,
+            pooled=self.pooled,
             device=q.device,
         )
         inputs = (q, k, v, g, beta, initial_state, cu_seqlens, A_log, dt_bias)
-        return run_chunk_prefill(self, call, inputs, gate_mode="channel")
+        return run_chunk_prefill(self, call, inputs, gate_mode="channel", slots=state_indices)

@@ -6,7 +6,8 @@ they merge here, and an op registered twice fails.
 
 import functools
 import importlib
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 __all__ = ["call_workload", "registered"]
 
@@ -17,10 +18,12 @@ _FAMILIES = (
     "engram",
     "fft",
     "gemm",
+    "hyper_connection",
+    "indexing",
     "linear_attention",
     "mamba",
-    "mhc",
     "moe",
+    "ngram_hash",
     "norm",
     "pool",
     "quantization",

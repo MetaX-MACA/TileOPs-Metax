@@ -1,6 +1,6 @@
 """Per-tensor symmetric INT8 quantization in one cooperative launch."""
 
-from typing import ClassVar, Optional
+from typing import ClassVar
 
 import tilelang
 import tilelang.language as T
@@ -23,7 +23,8 @@ from tileops._kernels.quantization.int8_codes import (
     quantize,
     widen,
 )
-from tileops._utils import WARP_LANES, WARP_SHUFFLE_STAGES
+from tileops._kernels.warp_reduce import warp_reduce
+from tileops._utils import WARP_LANES
 
 __all__ = ["INT8QuantPerTensorFwdKernel"]
 
@@ -37,7 +38,7 @@ def _int8_quant_per_tensor_kernel(n: int, dtype: str, grid: int, threads: int):
     shared memory across the grid barrier, and the rest are read again after it. ``batch``
     is how many vector loads a thread issues before using any.
     """
-    vec = VECTOR_ACCESS_BYTES // torch.empty((), dtype=getattr(torch, dtype)).element_size()
+    vec = VECTOR_ACCESS_BYTES // getattr(torch, dtype).itemsize
     tile = threads * vec
     tiles = n // tile
     tail = n - tiles * tile
@@ -93,10 +94,7 @@ def _int8_quant_per_tensor_kernel(n: int, dtype: str, grid: int, threads: int):
         def block_max(val, warp_max):
             # Leaves the maximum of val[0] over the block in val[0] of every thread.
             tx = T.get_thread_binding()
-            for stage in T.serial(WARP_SHUFFLE_STAGES):
-                val[0] = T.max(
-                    val[0], T.shfl_xor(val[0], T.int32(WARP_LANES // 2) >> stage, width=WARP_LANES)
-                )
+            warp_reduce(val, T.max, high_first=True, serial=True)
             if tx % WARP_LANES == 0:
                 warp_max[tx // WARP_LANES] = val[0]
             T.sync_threads()
@@ -312,8 +310,8 @@ class INT8QuantPerTensorFwdKernel(Kernel, INT8QuantPerTensorFwdInterface):
 
     A grid-wide amax has to finish before any value is quantized, so the launch holds as
     much of ``x`` on chip as shared memory and registers take across a grid barrier and
-    reads only the rest a second time. ``q`` is bit-equal to the torch reference: the scale is the product torch
-    computes, and the quotient is correctly rounded.
+    reads only the rest a second time. ``q`` is bit-equal to the torch reference: the scale
+    is the product torch computes, and the quotient is correctly rounded.
 
     Args:
         call: The call's shape, dtype and device facts.
@@ -338,7 +336,7 @@ class INT8QuantPerTensorFwdKernel(Kernel, INT8QuantPerTensorFwdInterface):
     _BATCH: ClassVar[int] = 8
 
     @classmethod
-    def refusal(cls, call: QuantizeCall) -> Optional[str]:
+    def refusal(cls, call: QuantizeCall) -> str | None:
         reason = super().refusal(call)
         # Offsets are int32 and run up to one tile past M * K.
         largest_tile = cls._THREADS * VECTOR_ACCESS_BYTES
@@ -346,8 +344,8 @@ class INT8QuantPerTensorFwdKernel(Kernel, INT8QuantPerTensorFwdInterface):
             return f"indexes elements with int32, and M * K = {call.rows * call.cols}"
         return reason
 
-    def __init__(self, call: QuantizeCall, config: Optional[dict] = None) -> None:
-        super().__init__(device_index=call.device.index if call.device is not None else None)
+    def __init__(self, call: QuantizeCall, config: dict | None = None) -> None:
+        super().__init__(device_index=call.device_index)
         self.dtype = call.dtype
         self.numel = call.rows * call.cols
         vec = VECTOR_ACCESS_BYTES // call.dtype.itemsize

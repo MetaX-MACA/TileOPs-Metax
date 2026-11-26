@@ -75,7 +75,7 @@ from workloads.attention.gqa.varlen import GQAVarlenSinkWorkload
             [17, 1],
             [33, 17],
             {"rotary_dim": 64, "out_dtype": torch.float16},
-            marks=pytest.mark.full,
+            marks=[pytest.mark.full, pytest.mark.sm90],
             id="fp8-rope",
         ),
         pytest.param(
@@ -99,11 +99,29 @@ from workloads.attention.gqa.varlen import GQAVarlenSinkWorkload
         pytest.param(
             torch.float8_e4m3fn,
             128,
+            [129, 1],
+            [257, 33],
+            {"sm_scale": 0.125, "softcap": 5.0},
+            marks=[pytest.mark.full, pytest.mark.sm89],
+            id="fp8-softcap-sm89",
+        ),
+        pytest.param(
+            torch.float8_e4m3fn,
+            128,
             [1100, 1],
             [1200, 33],
             {"heads": 32},
             marks=[pytest.mark.full, pytest.mark.sm90],
             id="fp8-wide-group",
+        ),
+        pytest.param(
+            torch.float8_e4m3fn,
+            128,
+            [1100, 1],
+            [1200, 33],
+            {"heads": 32},
+            marks=[pytest.mark.full, pytest.mark.sm89],
+            id="fp8-wide-group-sm89",
         ),
         pytest.param(
             torch.float16,
@@ -113,6 +131,17 @@ from workloads.attention.gqa.varlen import GQAVarlenSinkWorkload
             {"window_size_left": 64},
             marks=pytest.mark.full,
             id="fp16-empty-rows-general",
+        ),
+        # A head of 72 channels: the sink scales the edge tile's channels too, in whole and
+        # partial query tiles.
+        pytest.param(
+            torch.bfloat16,
+            72,
+            [129, 1, 0, 17],
+            [257, 33, 0, 17],
+            {},
+            marks=[pytest.mark.full, pytest.mark.sm90],
+            id="bf16-head-edge",
         ),
         pytest.param(
             torch.bfloat16,
@@ -143,6 +172,15 @@ from workloads.attention.gqa.varlen import GQAVarlenSinkWorkload
             marks=[pytest.mark.full, pytest.mark.sm90],
             id="fp8-empty-rows-large-scale",
         ),
+        pytest.param(
+            torch.float8_e4m3fn,
+            128,
+            [300, 5],
+            [1, 1],
+            {"sm_scale": 4.0},
+            marks=[pytest.mark.full, pytest.mark.sm89],
+            id="fp8-empty-rows-large-scale-sm89",
+        ),
     ],
 )
 def test_varlen_sinks(dtype, dim, q_lens, kv_lens, options):
@@ -151,7 +189,10 @@ def test_varlen_sinks(dtype, dim, q_lens, kv_lens, options):
     TestBase.check(w, op, *w.gen_inputs())
 
 
-@pytest.mark.sm90
+@pytest.mark.parametrize(
+    "_architecture",
+    [pytest.param(89, marks=pytest.mark.sm89), pytest.param(90, marks=pytest.mark.sm90)],
+)
 @pytest.mark.parametrize(
     "heads,has_sinks",
     [
@@ -160,8 +201,8 @@ def test_varlen_sinks(dtype, dim, q_lens, kv_lens, options):
         pytest.param(6, True, marks=pytest.mark.full, id="sinks-general"),
     ],
 )
-def test_varlen_fp8_empty_rows(heads, has_sinks):
-    """SM90 FP8 rows with no visible key return zero instead of dividing zero by zero."""
+def test_varlen_fp8_empty_rows(_architecture, heads, has_sinks):
+    """FP8 rows with no visible key return zero instead of dividing zero by zero."""
     w, op = _sink_case(
         torch.float8_e4m3fn, 128, [300, 5], [100, 3], {"window_size_left": 64, "heads": heads}
     )

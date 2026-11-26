@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import dataclasses
 from abc import abstractmethod
-from typing import Optional
 
 import torch
 
@@ -32,7 +31,7 @@ class DequantizeCall(CallSpec):
 
     m: int = 0
     k: int = 0
-    out_dtype: Optional[torch.dtype] = None
+    out_dtype: torch.dtype | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -49,7 +48,7 @@ class QuantizeCall(CallSpec):
     cols: int = 0
     dtype: torch.dtype = torch.float16
     # ``INT4QuantPerGroupFwdOp``'s ``group_size``; ``None`` for an op without one.
-    group_size: "int | None" = None
+    group_size: int | None = None
 
 
 class INT8DequantPerTensorFwdInterface(KernelInterface):
@@ -155,10 +154,14 @@ class INT4QuantPerGroupFwdInterface(KernelInterface):
 
     @abstractmethod
     def forward(self, w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Quantize contiguous float16 ``w[call.rows, call.cols]`` without mutation.
+        """Quantize each group of ``call.group_size`` elements of *w*; nothing is written in place.
 
-        Return int8 packed codes ``[call.rows, call.cols // 2]`` and float32
-        scale/offset pairs ``[call.rows * call.cols // call.group_size, 2]``.
+        Args:
+            w: ``[call.rows, call.cols]``, contiguous, in ``float16`` on ``call.device``.
+
+        Returns:
+            New ``int8`` packed codes ``[call.rows, call.cols // 2]`` and new ``float32``
+            scale and offset pairs ``[call.rows * call.cols // call.group_size, 2]``.
         """
 
 

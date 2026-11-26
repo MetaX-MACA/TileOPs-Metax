@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+from tests.misaligned import misaligned
 from tests.workload_test_base import TestBase
 from tileops._kernels.mamba import SelectiveScanCall
 from tileops.mamba import SelectiveScanFwdOp
@@ -21,7 +22,16 @@ _MAMBA = ["D", "z", "delta_bias"]
 # kernel serves up to 48 steps. One case per path through them.
 _CASES = (
     pytest.param(
-        2, 1024, 64, 16, 1, "bfloat16", _MAMBA, True, marks=_SMOKE, id="chunk-full-runs-bf16"
+        4,
+        1,
+        64,
+        16,
+        1,
+        "bfloat16",
+        [*_MAMBA, "initial_states"],
+        True,
+        marks=_SMOKE,
+        id="step-decode",
     ),
     # 256 steps: one run of 8-step lane segments.
     pytest.param(
@@ -39,12 +49,15 @@ _CASES = (
         marks=_SMOKE,
         id="chunk-tail-run-fp32",
     ),
+    pytest.param(
+        2, 1024, 64, 16, 1, "bfloat16", _MAMBA, True, marks=_FULL, id="chunk-full-runs-bf16"
+    ),
     # 100 steps: rows off the 16-byte vector boundary, one partial run.
     pytest.param(
-        2, 100, 16, 16, 1, "bfloat16", _MAMBA, True, marks=_SMOKE, id="chunk-unaligned-rows"
+        2, 100, 16, 16, 1, "bfloat16", _MAMBA, True, marks=_FULL, id="chunk-unaligned-rows"
     ),
     pytest.param(
-        2, 1024, 32, 16, 1, "bfloat16", [*_MAMBA, "seq_idx"], True, marks=_SMOKE, id="chunk-packed"
+        2, 1024, 32, 16, 1, "bfloat16", [*_MAMBA, "seq_idx"], True, marks=_FULL, id="chunk-packed"
     ),
     pytest.param(
         2,
@@ -55,23 +68,11 @@ _CASES = (
         "bfloat16",
         [*_MAMBA, "initial_states"],
         True,
-        marks=_SMOKE,
+        marks=_FULL,
         id="chunk-carried-state",
     ),
     pytest.param(
-        1, 512, 32, 16, 1, "bfloat16", ["z"], False, marks=_SMOKE, id="chunk-bare-no-softplus"
-    ),
-    pytest.param(
-        4,
-        1,
-        64,
-        16,
-        1,
-        "bfloat16",
-        [*_MAMBA, "initial_states"],
-        True,
-        marks=_SMOKE,
-        id="step-decode",
+        1, 512, 32, 16, 1, "bfloat16", ["z"], False, marks=_FULL, id="chunk-bare-no-softplus"
     ),
     pytest.param(
         2,
@@ -82,7 +83,7 @@ _CASES = (
         "float32",
         ["D", "delta_bias", "initial_states"],
         True,
-        marks=_SMOKE,
+        marks=_FULL,
         id="step-decode-fp32",
     ),
     # 48 states: a second, partial slot of lane-held states; two groups of B and C.
@@ -136,7 +137,7 @@ def test_selective_scan(batch, seqlen, dim, dstate, groups, dtype, some, softplu
         some=some,
     )
     test = SelectiveScanFwdTest(call)
-    op = SelectiveScanFwdOp(**call.arguments({}))
+    op = SelectiveScanFwdOp(**call.arguments())
     test.check(op, *test.gen_inputs())
 
 
@@ -186,7 +187,7 @@ def test_selective_scan_growing_rates(packed, carried, sign, drive, rate) -> Non
         seq_idx[:, : 100 if drive else 1] = 0
     if carried:
         initial_states = torch.full_like(initial_states, 1e-10)
-    op = SelectiveScanFwdOp(**call.arguments({}))
+    op = SelectiveScanFwdOp(**call.arguments())
     test.check(op, u, delta, A, B, C, D, z, delta_bias, seq_idx, initial_states)
 
 
@@ -197,3 +198,15 @@ def test_selective_scan_dispatch_range(seqlen, key) -> None:
     """The step kernel serves sequences up to its length; the chunk kernel serves the rest."""
     call = SelectiveScanCall(dim=64, seqlen=seqlen, dstate=16, groups=1, device=run_device())
     assert SelectiveScanFwdOp().key_for("selective_scan", call) == key
+
+
+@pytest.mark.smoke
+def test_selective_scan_offset_input_runs_as_an_aligned_one() -> None:
+    """A ``u`` whose storage starts off a 16-byte boundary gives the aligned result."""
+    sizes = {"Bsz": 2, "S": 1024, "Di": 64, "N": 16, "G": 1, "delta_softplus": True}
+    call = manifest_call("SelectiveScanFwdOp", {"T": "bfloat16"}, **sizes, some=["D", "z"])
+    op = SelectiveScanFwdOp(**call.arguments())
+    inputs = list(SelectiveScanFwdCall(call).gen_inputs())
+    expected = op(*inputs)
+    inputs[0] = misaligned(inputs[0])
+    torch.testing.assert_close(op(*inputs), expected, rtol=0, atol=0)

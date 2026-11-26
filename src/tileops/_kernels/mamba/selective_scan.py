@@ -14,17 +14,16 @@ lanes of a warp and joins the lanes' segments with a warp scan; ``SelectiveScanS
 walks it in order, one thread a group of states, for sequences too short to fill a warp.
 """
 
-from typing import Optional
-
 import tilelang
 import tilelang.language as T
 import torch
 
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.constants import LOG2E, VECTOR_ACCESS_BYTES
 from tileops._kernels.elementwise._division import approx_fdiv
 from tileops._kernels.kernel_base import Entry, Kernel
 from tileops._kernels.mamba.call_spec import SelectiveScanCall, SelectiveScanFwdInterface
+from tileops._utils import WARP_LANES
 
 __all__ = ["SelectiveScanChunkKernel", "SelectiveScanStepKernel"]
 
@@ -70,12 +69,12 @@ def _selective_scan_chunk_kernel(
     group_dim = dim // groups
     itemsize = torch.empty((), dtype=getattr(torch, dtype)).element_size()
 
-    @tilelang.jit(out_idx=[], compile_flags=["--use_fast_math"])
+    @tilelang.jit(out_idx=[], compile_flags=[*CUDA_COMPILE_FLAGS, "--use_fast_math"])
     def _func(warps: int, items: int):
         batch = T.dynamic("batch")
-        chunk = 32 * items
+        chunk = WARP_LANES * items
         # State n's rate and carried state live in lane n % 32's slot n // 32.
-        slots = (dstate + 31) // 32
+        slots = (dstate + WARP_LANES - 1) // WARP_LANES
         if group_dim % warps:
             raise ValueError(f"{warps} warps do not divide a group's {group_dim} channels")
         # Every row of u / delta / z / y and every lane's items are whole 16-byte vectors.
@@ -119,8 +118,8 @@ def _selective_scan_chunk_kernel(
             pu = T.alloc_var("float32")
             h = T.alloc_var("float32")
             for q in T.unroll(slots):
-                for nl in T.serial(T.min(32, dstate - q * 32)):
-                    n = q * 32 + nl
+                for nl in T.serial(T.min(WARP_LANES, dstate - q * WARP_LANES)):
+                    n = q * WARP_LANES + nl
                     r_n = T.shfl_sync(rate[q], nl)
                     c_n = T.shfl_sync(carry[q], nl)
                     for k in T.vectorized(items):
@@ -140,7 +139,7 @@ def _selective_scan_chunk_kernel(
                                 hl = av[k] * hl + bv[k]
                     if serial:
                         h = c_n
-                        for j in T.serial(32):
+                        for j in T.serial(WARP_LANES):
                             if lane == j:
                                 for k in T.unroll(items):
                                     if masked:
@@ -210,12 +209,12 @@ def _selective_scan_chunk_kernel(
             # A warp is one channel; lane l holds items [l * items, (l + 1) * items) of each
             # chunk-long run of the sequence. The CTA's channels share one group, so B and C
             # of the run are staged once for all its warps.
-            with T.Kernel(dim // warps, batch, threads=32 * warps) as (bc, b):
+            with T.Kernel(dim // warps, batch, threads=WARP_LANES * warps) as (bc, b):
                 # Two CTAs an SM: caps a thread at 128 registers.
                 T.annotate_min_blocks_per_sm(2)
                 tx = T.get_thread_binding()
-                lane = tx % 32
-                c = bc * warps + tx // 32
+                lane = tx % WARP_LANES
+                c = bc * warps + tx // WARP_LANES
                 g = (bc * warps) // group_dim
                 Bs = T.alloc_shared((dstate, chunk), dtype)
                 Cs = T.alloc_shared((dstate, chunk), dtype)
@@ -247,7 +246,7 @@ def _selective_scan_chunk_kernel(
                 rises = 0
                 falls = 0
                 for q in T.unroll(slots):
-                    nq = T.min(q * 32 + lane, dstate - 1)
+                    nq = T.min(q * WARP_LANES + lane, dstate - 1)
                     rate[q] = A[c, nq] * T.float32(LOG2E)
                     carry[q] = initial_states[b, c, nq] if has_init else T.float32(0)
                     rises = rises | T.any_sync(rate[q] > 0)
@@ -336,8 +335,8 @@ def _selective_scan_chunk_kernel(
                             if base + k < seqlen:
                                 y[b, c, base + k] = out[k]
                 for q in T.unroll(slots):
-                    if q * 32 + lane < dstate:
-                        final_states[b, c, q * 32 + lane] = carry[q]
+                    if q * WARP_LANES + lane < dstate:
+                        final_states[b, c, q * WARP_LANES + lane] = carry[q]
 
         return main
 
@@ -360,13 +359,13 @@ def _selective_scan_step_kernel(
 ):
     group_dim = dim // groups
 
-    @tilelang.jit(out_idx=[], compile_flags=["--use_fast_math"])
+    @tilelang.jit(out_idx=[], compile_flags=[*CUDA_COMPILE_FLAGS, "--use_fast_math"])
     def _func(threads: int, states: int):
         batch = T.dynamic("batch")
         # A channel's lanes, each holding `states` of its states; they sum y with shfl_xor.
         lanes = dstate // states
         channels = threads // lanes
-        if dstate % states or 32 % lanes:
+        if dstate % states or WARP_LANES % lanes:
             raise ValueError(
                 f"{states} states a thread do not split {dstate} over a power of two of lanes"
             )
@@ -469,7 +468,7 @@ class _SelectiveScanKernel(Kernel, SelectiveScanFwdInterface):
             call.has_init,
             call.softplus,
         )
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         return (*args, index), lambda: cls(*args, device_index=index)
 
     def __init__(
@@ -485,8 +484,8 @@ class _SelectiveScanKernel(Kernel, SelectiveScanFwdInterface):
         has_seq_idx: bool,
         has_init: bool,
         softplus: bool,
-        config: Optional[dict] = None,
-        device_index: Optional[int] = None,
+        config: dict | None = None,
+        device_index: int | None = None,
     ) -> None:
         super().__init__(device_index=device_index)
         self.dim, self.seqlen, self.dstate, self.groups, self.dtype = (
@@ -522,11 +521,11 @@ class _SelectiveScanKernel(Kernel, SelectiveScanFwdInterface):
         A: torch.Tensor,
         B_in: torch.Tensor,
         C_in: torch.Tensor,
-        D_in: Optional[torch.Tensor] = None,
-        z: Optional[torch.Tensor] = None,
-        delta_bias: Optional[torch.Tensor] = None,
-        seq_idx: Optional[torch.Tensor] = None,
-        initial_states: Optional[torch.Tensor] = None,
+        D_in: torch.Tensor | None = None,
+        z: torch.Tensor | None = None,
+        delta_bias: torch.Tensor | None = None,
+        seq_idx: torch.Tensor | None = None,
+        initial_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch = u.shape[0]
         y = torch.empty_like(u)
@@ -588,7 +587,7 @@ class SelectiveScanChunkKernel(_SelectiveScanKernel):
         # sequence, up to 512 steps: a run computes every step it covers.
         warps = next(w for w in (8, 4, 2, 1) if (self.dim // self.groups) % w == 0)
         items = 1
-        while items < 16 and 32 * items < self.seqlen:
+        while items < 16 and WARP_LANES * items < self.seqlen:
             items *= 2
         return {"warps": warps, "items": items}
 
@@ -608,14 +607,14 @@ class SelectiveScanStepKernel(_SelectiveScanKernel):
     preferred_over = frozenset({"selective_scan_chunk"})
     _builder = staticmethod(_selective_scan_step_kernel)
 
-    # Longest sequence it serves; from 64 steps the chunk kernel is faster.
+    # Longest sequence it serves; longer ones take the chunk kernel.
     max_seqlen = 48
 
     @classmethod
-    def refusal(cls, call: SelectiveScanCall) -> Optional[str]:
+    def refusal(cls, call: SelectiveScanCall) -> str | None:
         if call.seqlen > cls.max_seqlen:
             return f"walks at most {cls.max_seqlen} steps in order, not {call.seqlen}"
-        return None
+        return super().refusal(call)
 
     @property
     def default_config(self) -> dict:
@@ -623,7 +622,7 @@ class SelectiveScanStepKernel(_SelectiveScanKernel):
         # fewest that split, or all of them; 128 threads a CTA.
         splits = (8, 4, 2, 1, 16, 32, 64, 128, 256)
         states = next(
-            (s for s in splits if self.dstate % s == 0 and 32 % (self.dstate // s) == 0),
+            (s for s in splits if self.dstate % s == 0 and WARP_LANES % (self.dstate // s) == 0),
             self.dstate,
         )
         return {"threads": 128, "states": states}

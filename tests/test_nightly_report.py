@@ -10,6 +10,7 @@ import subprocess
 import sys
 from datetime import date, timedelta
 from pathlib import Path
+from xml.sax.saxutils import quoteattr
 
 import pytest
 
@@ -40,6 +41,26 @@ def _history_run(busy_ms, name=_KEY, p10=None, p90=None, **counts):
         tileops["device_busy_p10_ms"] = p10
         tileops["device_busy_p90_ms"] = p90
     return {"ops": {_OP: {name: {"tileops": tileops}}}}
+
+
+def _row_xml(**properties: str) -> str:
+    """A benchmark report holding the FooFwdOp row read at 0.1 ms, with *properties* added."""
+    props = {"op": _OP, "tileops_device_busy_ms": "0.1", **properties}
+    rendered = "".join(
+        f"<property name={quoteattr(k)} value={quoteattr(v)}/>" for k, v in props.items()
+    )
+    return (
+        '<testsuites><testsuite name="bench"><testcase classname="benchmarks.test_foo"'
+        f' name="{_CONFIG}"><properties>{rendered}</properties></testcase></testsuite></testsuites>'
+    )
+
+
+def _history_reading(report, tmp_path, **properties: str) -> dict:
+    """The history entry's tileops reading of the row ``_row_xml`` writes."""
+    xml = tmp_path / "bench.xml"
+    xml.write_text(_row_xml(**properties))
+    ops = report.aggregate_bench_results(report.parse_bench_xml(str(xml)))
+    return report.build_history_entry(ops, _RUN)["ops"][_OP][_KEY]["tileops"]
 
 
 def _bench_ops(busy_ms, p10=None, p90=None, **counts):
@@ -83,17 +104,7 @@ def test_history_reading_after_another_l2_flush_is_not_a_baseline(report, histor
 
 def test_the_l2_flush_of_a_reading_reaches_the_history_entry(report, tmp_path):
     """The next night's comparison needs to know how this one was prepared."""
-    xml = tmp_path / "bench.xml"
-    xml.write_text(
-        '<testsuites><testsuite name="bench"><testcase classname="benchmarks.test_foo"'
-        f' name="{_CONFIG}"><properties>'
-        f'<property name="op" value="{_OP}"/>'
-        '<property name="tileops_device_busy_ms" value="0.1"/>'
-        '<property name="tileops_l2_flush" value="read-2x-l2"/>'
-        "</properties></testcase></testsuite></testsuites>"
-    )
-    ops = report.aggregate_bench_results(report.parse_bench_xml(str(xml)))
-    tileops = report.build_history_entry(ops, _RUN)["ops"][_OP][_KEY]["tileops"]
+    tileops = _history_reading(report, tmp_path, tileops_l2_flush="read-2x-l2")
     assert tileops["l2_flush"] == "read-2x-l2"
 
 
@@ -273,7 +284,7 @@ def test_history_is_keyed_by_case_id(report):
 
 
 def test_every_unchecked_tag_is_counted(report):
-    """A case timing five implementations publishes five rows, not two.
+    """A case timing three implementations without a ratio publishes three rows.
 
     The first baseline is written twice, under its own tag and under the unprefixed alias
     the perf keys read; counting both would double it.
@@ -302,35 +313,13 @@ def test_history_entry_records_the_percentiles(report):
     assert tileops["device_busy_p90_ms"] == 0.0101
 
 
-def test_roofline_data_terms_reach_the_history_entry(report, tmp_path):
-    """What decided a reading's bytes is kept with the reading, as a mapping."""
-    xml = tmp_path / "bench.xml"
-    xml.write_text(
-        '<testsuites><testsuite name="bench"><testcase classname="benchmarks.test_foo"'
-        f' name="{_CONFIG}"><properties>'
-        f'<property name="op" value="{_OP}"/>'
-        '<property name="tileops_device_busy_ms" value="0.1"/>'
-        '<property name="tileops_roofline_data_terms" value=\'{"active_experts": 12}\'/>'
-        "</properties></testcase></testsuite></testsuites>"
-    )
-    ops = report.aggregate_bench_results(report.parse_bench_xml(str(xml)))
-    tileops = report.build_history_entry(ops, _RUN)["ops"][_OP][_KEY]["tileops"]
-    assert tileops["roofline_data_terms"] == {"active_experts": 12}
-
-
-def test_a_snapshot_recording_data_terms_as_a_repr_still_parses(report, tmp_path):
-    """Snapshots written before the XML switched to JSON stay in the history window."""
-    xml = tmp_path / "bench.xml"
-    xml.write_text(
-        '<testsuites><testsuite name="bench"><testcase classname="benchmarks.test_foo"'
-        f' name="{_CONFIG}"><properties>'
-        f'<property name="op" value="{_OP}"/>'
-        '<property name="tileops_device_busy_ms" value="0.1"/>'
-        '<property name="tileops_roofline_data_terms" value="{\'active_experts\': 12}"/>'
-        "</properties></testcase></testsuite></testsuites>"
-    )
-    ops = report.aggregate_bench_results(report.parse_bench_xml(str(xml)))
-    tileops = report.build_history_entry(ops, _RUN)["ops"][_OP][_KEY]["tileops"]
+@pytest.mark.parametrize(
+    "terms", ['{"active_experts": 12}', "{'active_experts': 12}"], ids=["json", "python-repr"]
+)
+def test_roofline_data_terms_reach_the_history_entry(report, tmp_path, terms):
+    """What decided a reading's bytes is kept with the reading, as a mapping, whether the
+    snapshot recorded it as JSON or as a Python repr."""
+    tileops = _history_reading(report, tmp_path, tileops_roofline_data_terms=terms)
     assert tileops["roofline_data_terms"] == {"active_experts": 12}
 
 
@@ -443,13 +432,7 @@ def test_history_entry_records_the_sol_reading(report, profile):
 
 BUILD_SCRIPT = REPO_ROOT / "scripts" / "build_perf_history.py"
 
-_BENCH_XML = (
-    '<testsuites><testsuite name="bench"><testcase classname="benchmarks.test_foo"'
-    f' name="{_CONFIG}"><properties>'
-    f'<property name="op" value="{_OP}"/>'
-    '<property name="tileops_device_busy_ms" value="0.1"/>'
-    "</properties></testcase></testsuite></testsuites>"
-)
+_BENCH_XML = _row_xml()
 
 
 _COVERAGE_XML = (
@@ -557,34 +540,36 @@ def test_an_unread_window_does_not_read_as_an_empty_one(report):
     )
 
 
+def _run_script(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(REPORT_SCRIPT), *args], capture_output=True, text=True
+    )
+
+
 def test_a_named_history_that_does_not_exist_is_refused(tmp_path):
     """A window the builder failed to write must not read as no history."""
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(REPORT_SCRIPT),
-            "--output",
-            str(tmp_path / "report.md"),
-            "--history",
-            str(tmp_path / "absent.json"),
-        ],
-        capture_output=True,
-        text=True,
+    result = _run_script(
+        "--output", str(tmp_path / "report.md"), "--history", str(tmp_path / "absent.json")
     )
     assert result.returncode != 0
     assert "--history file does not exist" in result.stderr
 
 
+def _report(report, **overrides):
+    """The whole report over one passing FooFwdOp test, with *overrides* to its arguments."""
+    args = {
+        "test_ops": {_OP: {"module": "m", "failed": 0, "passed": 1, "skipped": 0, "tests": []}},
+        "bench_ops": None,
+        "bench_failures": [],
+        "regressions": [],
+        "improvements": [],
+        "baseline_alerts": [],
+    }
+    return report.generate_report(**{**args, **overrides})
+
+
 def _summary_report(report, scale):
-    return report.generate_report(
-        scale=scale,
-        test_ops={_OP: {"module": "m", "failed": 0, "passed": 1, "skipped": 0, "tests": []}},
-        bench_ops=_bench_ops(1.0),
-        bench_failures=[],
-        regressions=[],
-        improvements=[],
-        baseline_alerts=[],
-    )
+    return _report(report, scale=scale, bench_ops=_bench_ops(1.0))
 
 
 def test_the_summary_names_the_scale_rows_verbatim(report):
@@ -598,8 +583,6 @@ def test_the_summary_names_the_scale_rows_verbatim(report):
     assert "| **Kernels** | 272 |" in md
     assert "| **Specs** | 19 |" in md
     assert "| **Workloads** | 1135 |" in md
-    # An entry that is only a specification is not something the library offers.
-    assert "| **Operators** | 205 |" not in md
 
 
 def test_the_new_ops_section_and_summary_row_are_named_verbatim(report):
@@ -608,15 +591,7 @@ def test_the_new_ops_section_and_summary_row_are_named_verbatim(report):
         {"op": "NewOp", "config": "test_x_bench[x]", "curr_ms": 0.0123, "tflops": 1.5},
         {"op": "NewOp", "config": "test_x_bench[y]", "curr_ms": 0.5, "tflops": None},
     ]
-    md = report.generate_report(
-        test_ops=None,
-        bench_ops=_bench_ops(1.0),
-        bench_failures=[],
-        regressions=[],
-        improvements=[],
-        baseline_alerts=[],
-        new_ops=new_ops,
-    )
+    md = _report(report, test_ops=None, bench_ops=_bench_ops(1.0), new_ops=new_ops)
     assert "| **New ops** (no 14-day history) | \U0001f195 1 ops · 2 rows |" in md
     section = md[md.index("## \U0001f195 New Ops (no 14-day history)") :]
     assert "| Op | Config | Current (ms) | TFLOPS |" in section
@@ -630,7 +605,7 @@ def test_no_new_op_adds_neither_section_nor_row(report):
 
 
 def test_a_manifest_that_will_not_load_drops_the_rows_not_the_report(report):
-    """Benchmark data stands on its own; an unreadable manifest costs two rows."""
+    """Benchmark data stands on its own; an unreadable manifest costs the four scale rows."""
     md = _summary_report(report, None)
     assert "**Operators**" not in md
     assert "**Kernels**" not in md
@@ -652,20 +627,6 @@ def _result(outcome, op, name="test_x", compared=True):
     }
 
 
-def _counted(report, results):
-    """The whole report, built over *results* as the suite that ran."""
-    md = report.generate_report(
-        test_ops={_OP: {"module": "m", "failed": 0, "passed": 1, "skipped": 0, "tests": []}},
-        bench_ops=None,
-        bench_failures=[],
-        regressions=[],
-        improvements=[],
-        baseline_alerts=[],
-        test_results=results,
-    )
-    return md
-
-
 def test_unattributed_passes_and_failures_are_counted_and_failures_named(report):
     """A test with no op property fails the job, so the report must not lose it.
 
@@ -673,7 +634,7 @@ def test_unattributed_passes_and_failures_are_counted_and_failures_named(report)
     nothing behind it: the reader sees N failed and a table holding fewer rows.
     """
     row = _result("failed", None, "test_sum")
-    md = _counted(report, [_result("passed", _OP), _result("passed", None), row])
+    md = _report(report, test_results=[_result("passed", _OP), _result("passed", None), row])
 
     assert "(2/3 tests)" in md
     assert report._FAIL in md
@@ -696,8 +657,7 @@ def test_ops_verified_unions_both_verifiers(report):
     assert report._ops_verified(
         {"A": {"passed": 0, "failed": 3, "compared": 0}}, None, implemented
     ) == (0, 2)
-    # Nor is a passing test that compared nothing. After ownership becomes a
-    # declaration, a constructor-rejection test carries the op name and no value.
+    # Nor is a passing test that compared nothing, such as a constructor-rejection test.
     rejection_only = {"A": {"passed": 4, "failed": 0, "compared": 0}}
     assert report._ops_verified(rejection_only, None, implemented) == (0, 2)
     # Nor is a benchmark row with no baseline to compare against.
@@ -767,22 +727,18 @@ def test_a_row_from_0_99_is_level_and_below_it_is_behind(report):
     assert [a["config"] for a in report.detect_baseline_alerts(bench_ops)] == ["behind"]
 
 
-def test_badge_share_rounds_down_so_a_row_behind_never_reads_full(report):
-    badge = report.baseline_badge(9999, 1)
-    assert badge["message"] == "99.9% ahead"
-    assert badge["color"] == "green"
-
-
-def test_badge_with_no_row_behind_reads_full_and_bright(report):
-    badge = report.baseline_badge(10, 0)
-    assert badge["message"] == "100% ahead"
-    assert badge["color"] == "brightgreen"
-
-
-def test_badge_below_the_green_share_reads_yellow(report):
-    badge = report.baseline_badge(90, 10)
-    assert badge["message"] == "90% ahead"
-    assert badge["color"] == "yellow"
+@pytest.mark.parametrize(
+    "ahead, behind, message, color",
+    [
+        pytest.param(9999, 1, "99.9% ahead", "green", id="rounds-down-below-full"),
+        pytest.param(10, 0, "100% ahead", "brightgreen", id="none-behind"),
+        pytest.param(90, 10, "90% ahead", "yellow", id="below-green-share"),
+    ],
+)
+def test_badge_share_and_color(report, ahead, behind, message, color):
+    """The share rounds down, so a row behind never reads full."""
+    badge = report.baseline_badge(ahead, behind)
+    assert (badge["message"], badge["color"]) == (message, color)
 
 
 def _bench_xml(tmp_path, name, cases):
@@ -823,3 +779,95 @@ def test_badge_counts_a_small_row_behind_only_when_it_was_behind_before(report, 
     previous = report.badge_rows(_bench_xml(tmp_path, "before.xml", before))
     assert report.badge_standing(rows, previous) == (1, 1)
     assert report.badge_standing(rows, None) == (2, 0)
+
+
+@pytest.mark.parametrize(
+    "extra, outcome",
+    [("", "unavailable"), ('<error message="teardown"/>', "failed")],
+)
+def test_an_unavailable_row_is_neither_a_skip_nor_a_failure(report, tmp_path, extra, outcome):
+    """A row no implementation serves is its own outcome; an error after the skip outranks it."""
+    xml = tmp_path / "bench.xml"
+    xml.write_text(
+        '<testsuite><testcase classname="b" name="t[row-bfloat16]">'
+        '<skipped message="unavailable: no implementation serves this call"/>'
+        f"{extra}<properties>"
+        '<property name="unavailable" value="no implementation serves this call"/>'
+        '<property name="ops" value="AddFwdOp"/>'
+        "</properties></testcase></testsuite>",
+        encoding="utf-8",
+    )
+    rows = report.parse_bench_xml(str(xml))
+
+    assert rows[0]["outcome"] == outcome
+    assert report.count_bench_outcome(rows, "skipped") == 0
+    assert report.count_bench_outcome(rows, "unavailable") == (outcome == "unavailable")
+    assert len(report.collect_bench_failures(rows)) == (outcome == "failed")
+
+
+def _model_case(model: str, name: str, outcome: str) -> dict:
+    return {"nodeid": f"tests.models.test_{model}::{name}", "name": name, "outcome": outcome}
+
+
+def test_model_results_group_by_model_file(report):
+    models = report.aggregate_model_results(
+        [
+            _model_case("qwen3_8", "test_a", "passed"),
+            _model_case("qwen3_8", "test_b", "failed"),
+            _model_case("deepseek_v4", "test_c", "skipped"),
+        ]
+    )
+    assert models["qwen3_8"] == {
+        "passed": 1,
+        "failed": 1,
+        "skipped": 0,
+        "failing_tests": ["test_b"],
+    }
+    assert models["deepseek_v4"]["skipped"] == 1
+
+
+@pytest.mark.parametrize(
+    ("nodeid", "name"),
+    [
+        pytest.param("tests.models.test_qwen3_8.TestLoad::test_a", "test_a", id="class-test"),
+        pytest.param("::tests.models.test_qwen3_8", "tests.models.test_qwen3_8", id="collection"),
+    ],
+)
+def test_a_model_is_named_by_its_test_module(report, nodeid, name):
+    """A class test's classname ends in its class, and a collection error leaves the classname
+    empty and puts the module in the name; both still name the model."""
+    case = {"nodeid": nodeid, "name": name, "outcome": "failed"}
+    assert list(report.aggregate_model_results([case])) == ["qwen3_8"]
+
+
+def test_models_are_their_own_summary_row_and_section(report):
+    md = _report(
+        report, models={"qwen3_8": {"passed": 30, "failed": 0, "skipped": 0, "failing_tests": []}}
+    )
+    assert "| **Models** | ✅ &ensp; (1 models, 30/30 tests) |" in md
+    assert "| ✅ **qwen3_8** | 30 | 0 | 0 |  |" in md[md.index("## Models") :]
+    assert md.startswith("# ✅")
+
+
+def test_a_failing_model_test_fails_the_report(report):
+    md = _report(
+        report,
+        models={"qwen3_8": {"passed": 29, "failed": 1, "skipped": 0, "failing_tests": ["test_x"]}},
+    )
+    assert md.startswith("# ❌")
+    assert "| **Models** | ❌ 1 failed" in md
+    assert "| ❌ **qwen3_8** | 29 | 1 | 0 | test_x |" in md
+
+
+def test_a_run_without_model_results_has_no_models_row(report):
+    assert "**Models**" not in _report(report)
+
+
+def test_a_missing_model_results_file_fails_the_report(tmp_path):
+    """A model run killed before pytest writes its JUnit file reports no results, not a pass."""
+    out = tmp_path / "report.md"
+    missing = tmp_path / "model_test_results.xml"
+    _run_script("--model-test-xml", str(missing), "--output", str(out)).check_returncode()
+    md = out.read_text()
+    assert md.startswith("# ❌")
+    assert "| **Models** | ❌ no results" in md

@@ -1,4 +1,5 @@
-from typing import ClassVar, Mapping, Optional, Tuple
+from collections.abc import Mapping
+from typing import ClassVar
 
 import torch
 
@@ -24,6 +25,7 @@ class GLAChunkFwdOp(Op):
     GLAChunkBwdOp reads, so a forward call's outputs feed the backward directly.
 
     Layout: BTHD (batch, seq_len, heads, dim).
+    The read-only tensor inputs may be non-contiguous.
 
     """
 
@@ -35,7 +37,7 @@ class GLAChunkFwdOp(Op):
     def __init__(
         self,
         chunk_size: int = 64,
-        scale: Optional[float] = None,
+        scale: float | None = None,
         *,
         target: Target = None,
     ) -> None:
@@ -58,8 +60,8 @@ class GLAChunkFwdOp(Op):
         k: torch.Tensor,
         v: torch.Tensor,
         g: torch.Tensor,
-        initial_state: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        initial_state: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run GLA forward.
 
         Args:
@@ -110,6 +112,7 @@ class GLAChunkBwdOp(Op):
     Uses the ``h`` GLAChunkFwdOp returns (no recomputation needed).
 
     Layout: BTHD (batch, seq_len, heads, dim).
+    The read-only tensor inputs may be non-contiguous.
 
     """
 
@@ -121,7 +124,7 @@ class GLAChunkBwdOp(Op):
     def __init__(
         self,
         chunk_size: int = 64,
-        scale: Optional[float] = None,
+        scale: float | None = None,
         has_initial_state: bool = False,
         *,
         target: Target = None,
@@ -151,7 +154,7 @@ class GLAChunkBwdOp(Op):
         v: torch.Tensor,
         g: torch.Tensor,
         h: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Run GLA backward.
 
         Args:

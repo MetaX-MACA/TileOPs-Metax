@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import dataclasses
 from abc import abstractmethod
-from typing import Optional
 
 import torch
 
@@ -52,6 +51,8 @@ __all__ = [
     "ReciprocalFwdInterface",
     "RoundCall",
     "RoundFwdInterface",
+    "SiLUAndMulCall",
+    "SiLUAndMulFwdInterface",
     "SinusoidalCall",
     "SinusoidalFwdInterface",
     "SoftplusCall",
@@ -93,14 +94,14 @@ class DivCall(BroadcastCall):
     """A division call; ``rounding_mode`` is the op's construction parameter, as in
     ``torch.div``: ``None``, ``"trunc"`` or ``"floor"``."""
 
-    rounding_mode: Optional[str] = None
+    rounding_mode: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
 class AlphaScaledCall(BroadcastCall):
     """A binary call whose second operand is scaled by ``alpha`` before combining."""
 
-    alpha: "int | float" = 1
+    alpha: int | float = 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -117,6 +118,15 @@ class FusedGatedCall(CallSpec):
     m: int = 0
     n: int = 0
     dtype: torch.dtype = torch.float16
+
+
+@dataclasses.dataclass(frozen=True)
+class SiLUAndMulCall(FusedGatedCall):
+    """A SiLU-and-Mul call: ``swiglu_limit`` is the op's construction parameter, and
+    ``has_scale`` whether a per-row scale is passed."""
+
+    swiglu_limit: float = 0.0
+    has_scale: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -153,8 +163,8 @@ class ELUCall(ElementwiseCall):
 class BoundsCall(ElementwiseCall):
     """A clamping call; ``None`` on either side leaves that side unbounded."""
 
-    min_val: Optional[float] = None
-    max_val: Optional[float] = None
+    min_val: float | None = None
+    max_val: float | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -175,8 +185,8 @@ class NanToNumCall(ElementwiseCall):
     """
 
     nan: float = 0.0
-    posinf: Optional[float] = None
-    neginf: Optional[float] = None
+    posinf: float | None = None
+    neginf: float | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -190,7 +200,7 @@ class RoundCall(ElementwiseCall):
 class MaskedFillCall(ElementwiseCall):
     """A scalar-value masked_fill call; ``value`` is the op's construction parameter."""
 
-    value: "bool | int | float" = 0.0
+    value: bool | int | float = 0.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -508,6 +518,28 @@ class FusedGatedFwdInterface(KernelInterface):
         """
 
 
+class SiLUAndMulFwdInterface(FusedGatedFwdInterface):
+    """``silu(gate) * value`` of each row, its inputs clamped and its result scaled per row."""
+
+    request = SiLUAndMulCall
+
+    @abstractmethod
+    def forward(self, x: torch.Tensor, scale: torch.Tensor | None = None) -> torch.Tensor:
+        """Return ``silu(g) * u * scale[:, None]`` in float32, rounded once to ``call.dtype``.
+
+        ``g = x[:, :n]`` and ``u = x[:, n:]``; a positive ``call.swiglu_limit`` clamps ``g``
+        to at most it and ``u`` to within plus or minus it first. Nothing is written in place.
+
+        Args:
+            x: ``(call.m, 2 * call.n)`` in ``call.dtype`` on ``call.device``, contiguous
+                and row-major.
+            scale: ``float32`` ``(call.m,)``, passed exactly when ``call.has_scale``.
+
+        Returns:
+            A new contiguous ``(call.m, call.n)`` tensor on ``call.device``, in ``call.dtype``.
+        """
+
+
 class WhereFwdInterface(KernelInterface):
     """Elementwise selection between two operands by a bool condition."""
 
@@ -570,8 +602,8 @@ class ClampTensorFwdInterface(KernelInterface):
     def forward(
         self,
         input: torch.Tensor,
-        min: Optional[torch.Tensor],
-        max: Optional[torch.Tensor],
+        min: torch.Tensor | None,
+        max: torch.Tensor | None,
     ) -> torch.Tensor:
         """Clamp each element between the bounds; nothing is written in place.
 

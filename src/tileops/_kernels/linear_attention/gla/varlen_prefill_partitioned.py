@@ -5,8 +5,6 @@ and the output pass restores every chunk state. This increases parallelism
 without re-reading key, value, or float32 gate tiles.
 """
 
-from typing import Optional
-
 import tilelang
 import tilelang.language as T
 import torch
@@ -23,8 +21,10 @@ from tileops._kernels.linear_attention.gla.call_spec import (
 )
 from tileops._kernels.linear_attention.gla.varlen_prefill import (
     CHUNK_TOKENS,
+    contract_chunk,
     gla_varlen_causal_kernel,
     gla_varlen_cumsum_kernel,
+    stage_chunk_operands,
 )
 from tileops._kernels.linear_attention.v_tile import GEMM_MIN_N
 
@@ -428,22 +428,9 @@ def gla_varlen_partitioned_output_kernel(
                             partitions[0] += (size + partition_tokens - 1) // partition_tokens
                     part = partitions[0]
 
-                    # The query and its gate are each read once, so neither is staged: the
-                    # two tiles they would occupy bound this block's shared footprint.
-                    for i, d in T.Parallel(CHUNK_TOKENS, dim_k):
-                        q_gated[i, d] = T.cast(
-                            T.cast(q[0, T.min(start + i, end - 1), i_h, d], "float32")
-                            * T.exp2(g_cumsum[0, T.min(start + i, end - 1), i_h, d] * LOG2E),
-                            dtype,
-                        )
-                    for i, d in T.Parallel(CHUNK_TOKENS, dim_v):
-                        values[i, d] = v[0, T.min(start + i, end - 1), i_h, d]
-                    # The causal pass launches only the sub-block pairs at or below the
-                    # diagonal, so the product above the diagonal is read as the zero it is.
-                    for i, j in T.Parallel(CHUNK_TOKENS, CHUNK_TOKENS):
-                        weights[i, j] = T.if_then_else(
-                            j <= i, causal[0, T.min(start + i, end - 1), i_h, j], T.cast(0, dtype)
-                        )
+                    stage_chunk_operands(
+                        q, v, g_cumsum, causal, q_gated, values, weights, start, end, i_h
+                    )
                     for d, j in T.Parallel(dim_k, dim_v):
                         state[d, j] = T.cast(
                             start_state[part, i_h, d, j]
@@ -451,14 +438,7 @@ def gla_varlen_partitioned_output_kernel(
                             + T.cast(chunk_state[chunk, i_h, d, j], "float32"),
                             dtype,
                         )
-                    T.fill(acc, 0.0)
-                    T.gemm(q_gated, state, acc)
-                    for i, j in T.Parallel(CHUNK_TOKENS, dim_v):
-                        acc[i, j] *= scale
-                    T.gemm(weights, values, acc)
-                    for i, j in T.Parallel(CHUNK_TOKENS, dim_v):
-                        if start + i < end:
-                            o[0, start + i, i_h, j] = T.cast(acc[i, j], dtype)
+                    contract_chunk(q_gated, state, weights, values, acc, o, start, end, i_h, scale)
 
         return _main
 
@@ -478,25 +458,23 @@ class GLAVarlenPrefillPartitionedFwdKernel(Kernel, GLAFwdInterface):
 
     # Threads per block. The causal product's GEMM tiles a 16-wide operand, which more than
     # two warps cannot split into whole tiles; the walk's key extent bounds its block the same
-    # way. Re-fit by timing the packed manifest rows at 64, 128 and 256.
+    # way.
     _causal_threads = 64
     _state_threads = 128
     _wide_threads = 256
 
-    # Chunks the walk inside a partition prefetches ahead. Re-fit with the packed manifest
-    # rows over 2 to 6; a stage costs shared memory the state tile also needs.
+    # Chunks the walk inside a partition prefetches ahead; a stage costs shared memory the
+    # state tile also needs.
     _state_stages = 2
 
     # Key and value channels of the state tile one block of the walk holds. A key slice reads
     # only its own key channels and its own slice of the float32 gate; a value slice reads the
-    # keys and the gate again, which is why the value extent stays as wide as the head. Re-fit
-    # by timing the packed manifest rows at 16, 32 and 64 against 64 and 128.
+    # keys and the gate again, which is why the value extent stays as wide as the head.
     _state_tile_k = 32
     _state_tile_v = 128
 
     # State tile one block of the scan holds, and the partitions it prefetches. The tile is
-    # what gives a call with few sequences and heads enough blocks. Re-fit by timing the
-    # packed manifest rows.
+    # what gives a call with few sequences and heads enough blocks.
     _scan_tile_k = 32
     _scan_tile_v = 32
     _scan_stages = 2
@@ -505,12 +483,11 @@ class GLAVarlenPrefillPartitionedFwdKernel(Kernel, GLAFwdInterface):
     # summaries and so less traffic; a shorter one gives the device more independent blocks.
     _partition_lengths = (16, 8, 4, 2)
 
-    # Blocks per multiprocessor a walk is sized to launch. Re-fit by timing the packed
-    # manifest rows over the lengths above.
+    # Blocks per multiprocessor a walk is sized to launch.
     _blocks_per_sm = 1
 
     @classmethod
-    def refusal(cls, call: GLACall) -> Optional[str]:
+    def refusal(cls, call: GLACall) -> str | None:
         """A packed or part-chunk call whose sequences the per-sequence walk serves badly.
 
         Two cases reach that, and each is read from the shapes alone. A call whose rows are
@@ -602,7 +579,7 @@ class GLAVarlenPrefillPartitionedFwdKernel(Kernel, GLAFwdInterface):
         scale: float,
         dtype: torch.dtype,
         has_initial_state: bool = False,
-        device_index: Optional[int] = None,
+        device_index: int | None = None,
     ) -> None:
         self.has_initial_state = has_initial_state
         super().__init__(device_index=device_index)
@@ -667,16 +644,15 @@ class GLAVarlenPrefillPartitionedFwdKernel(Kernel, GLAFwdInterface):
         k: torch.Tensor,
         v: torch.Tensor,
         g: torch.Tensor,
-        initial_state: Optional[torch.Tensor] = None,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        cu_seqlens_cpu: Optional[torch.Tensor] = None,
+        initial_state: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # The offsets are read on the device, so the host copy is never needed.
         del cu_seqlens_cpu
         if cu_seqlens is None:
-            # Built per call rather than held: a tensor allocated on one stream and reused
-            # on another is read before its own write unless the second stream is made to
-            # wait, and an equal-length call's offsets cost one launch of ``batch + 1``.
+            # Built per call rather than held: a tensor reused on another stream is read
+            # before its own write unless that stream waits.
             cu_seqlens = torch.arange(
                 0,
                 (self.batch + 1) * self.seq_len,

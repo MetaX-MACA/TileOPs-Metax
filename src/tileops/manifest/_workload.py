@@ -9,12 +9,12 @@ both need torch. `check_workloads` returns the row diagnostics the validator rep
 from __future__ import annotations
 
 import ast
-import copy
 import dataclasses
 import math
 import random
 import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 from zlib import crc32
 
 from tileops.manifest._dtype_rules import DTYPE_BITS
@@ -23,27 +23,35 @@ from tileops.manifest._expr import (
     SignatureError,
     call_errors,
     callee,
+    discriminant_names,
     evaluate,
     fold,
     infer_kinds,
     language_errors,
     names,
     parse,
+    value_names,
 )
 from tileops.manifest._kinds import INT, seq, split_union
-from tileops.manifest._plan import EntryPlan, PlanBranch, entry_plan
+from tileops.manifest._plan import EntryPlan, PlanBranch, entry_plan, parse_call
 from tileops.manifest._signature import (
+    ITEM,
+    REQUIRED,
+    TENSOR_MEMBERS,
     Signature,
+    call_scalar_lets,
     complete_point,
     discriminant_axes,
     expand,
+    items,
     kind_env,
-    param_kind,
+    localized,
+    member_of,
     points,
     rejecting_rule,
     unification,
 )
-from tileops.manifest._values import ADTValue, convert, is_integer, python_class
+from tileops.manifest._values import ADTValue, convert, element_types, is_integer, python_class
 from tileops.manifest.primitives import (
     GENERATOR_KINDS,
     GENERATOR_RANKS,
@@ -58,44 +66,77 @@ from tileops.manifest.primitives import (
     WORKLOAD_SEED,
 )
 
-__all__ = ["Call", "CallView", "RowError", "TensorSpec", "check_workloads", "instantiate"]
+if TYPE_CHECKING:
+    import torch
 
-_ROW_KEYS = frozenset({"some", "dtype_cases", "label"})
-_LABEL = re.compile(r"[A-Za-z0-9._-]+")
-# The integer dtypes generated metadata may take, with their ranges.
-_METADATA_RANGES = {"int32": 2**31, "int64": 2**63}
+__all__ = [
+    "Call",
+    "CallView",
+    "Elements",
+    "RowError",
+    "TensorSpec",
+    "bench_calls",
+    "call_from_tensors",
+    "check_workloads",
+    "instantiate",
+]
 
 
 class RowError(ValueError):
     """A workload row that does not state a call of its entry."""
 
 
+@dataclass(frozen=True)
+class Elements:
+    """A tensor sequence's elements as a call holds them: each `(shape, dtype name)`, in order."""
+
+    items: tuple
+
+
 class CallView:
     """The checked-call view a roofline `func` formula reads (docs/design/roofline.md).
 
     `indices` holds the parameters, the resolved indices and dtype indices, and the reached
-    `let`s; `tensors` maps each present tensor to its `(shape, dtype name)`.
+    `let`s; `tensors` maps each present tensor to its `(shape, dtype name)`, a tensor sequence
+    to its `Elements`; `members` maps each call-time argument to the member it holds.
     """
 
-    indices: dict
-    tensors: dict
+    indices: dict[str, Any]
+    tensors: dict[str, Any]
+    members: dict[str, str | None] | None
     has_out: bool = False
 
     def present(self, name: str) -> bool:
-        """Whether the call passes, holds or returns tensor `name`, or passes `out`."""
+        """`present(name)` of the call.
+
+        A call-time argument is present when it holds a member other than None; any other
+        name, when the call returns that tensor or passes `out`.
+        """
+        members = self.members or {}
+        if name in members:
+            return members[name] != "None"
         return name in self.tensors or (name == "out" and self.has_out)
 
-    def bytes(self, name: str) -> int:
-        """The bytes tensor `name` occupies."""
-        shape, dtype = self.tensors[name]
-        return (math.prod(shape) * DTYPE_BITS[dtype] + 7) // 8
+    def member(self, name: str) -> str:
+        """The member call-time argument `name` holds, as `member(name)` names it."""
+        return self.members[name]
 
-    def metadata_values(self, name: str) -> list:
+    def bytes(self, name: str) -> int:
+        """The bytes tensor `name` occupies; a tensor sequence's, summed over its elements."""
+        value = self.tensors[name]
+        pairs = value.items if isinstance(value, Elements) else (value,)
+        return sum((math.prod(shape) * DTYPE_BITS[dtype] + 7) // 8 for shape, dtype in pairs)
+
+    def metadata_values(self, name: str) -> list[Any]:
         """The contents of metadata tensor `name`, as nested lists."""
         raise NotImplementedError
 
     def derived(self, name: str) -> bool:
-        """Whether a determining predicate fixes input `name` from other inputs."""
+        """Whether the call moves none of input `name`.
+
+        A determining predicate fixes its contents, so it is not read, and the call does not
+        write it.
+        """
         return False
 
 
@@ -109,67 +150,106 @@ class TensorSpec:
 
 @dataclass(frozen=True)
 class Call(CallView):
+    """One workload row instantiated for one dtype case: its parameters and tensor specs."""
+
     case_id: str
     # Parameter values as expressions read them: a dtype by name, an ADT by its fields.
-    params: dict
-    specs: dict[str, TensorSpec | None]
-    indices: dict = dataclasses.field(default_factory=dict)
+    params: dict[str, Any]
+    # A tensor sequence's spec is a tuple of its elements' specs.
+    specs: dict[str, TensorSpec | tuple[TensorSpec, ...] | None]
+    indices: dict[str, Any] = dataclasses.field(default_factory=dict)
     signature: Signature | None = dataclasses.field(default=None, repr=False, compare=False)
+    # The inputs the call writes.
+    written: frozenset[str] = frozenset()
+    # Each call-time argument holding a scalar or None member, by name: what the call passes.
+    scalars: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     @property
-    def tensors(self) -> dict:
-        return {n: (s.shape, s.dtype) for n, s in self.specs.items() if s is not None}
+    def members(self) -> dict[str, str | None]:
+        """The member each call-time argument holds."""
+        out = {}
+        for t in self.signature.inputs.values():
+            found = t.members
+            if self.specs.get(t.name) is not None:
+                out[t.name] = next(m for m in found if m in TENSOR_MEMBERS)
+            else:
+                out[t.name] = member_of(self.scalars.get(t.name), found)
+        return out
 
-    def metadata_values(self, name: str) -> list:
+    @property
+    def tensors(self) -> dict[str, Any]:
+        """Each present tensor's `(shape, dtype name)`, a tensor sequence's `Elements`."""
+        return {
+            n: Elements(tuple((e.shape, e.dtype) for e in s))
+            if isinstance(s, tuple)
+            else (s.shape, s.dtype)
+            for n, s in self.specs.items()
+            if s is not None
+        }
+
+    def metadata_values(self, name: str) -> list[Any]:
+        """The generated contents of metadata tensor `name`, as nested lists."""
         return self.specs[name].values
 
     def derived(self, name: str) -> bool:
+        """Whether a determining predicate fixes input `name` and the call does not write it."""
         tensor = self.signature.inputs.get(name) if self.signature is not None else None
-        return tensor is not None and tensor.derived
+        return tensor is not None and tensor.derived and name not in self.written
 
-    def arguments(self, tensors: dict) -> dict:
-        """The op's constructor arguments, its construction-time
-        tensors taken from *tensors*, as `materialize` returns them.
+    def arguments(self) -> dict[str, Any]:
+        """The op's constructor arguments.
 
         A dtype is a `torch.dtype`; an ADT is its constructor's `python` class called with its
         fields as keyword arguments, an enum field built from its own `python` class.
         """
-        values = {p: _python_value(self.signature, p, v) for p, v in self.params.items()}
-        return values | {t: tensors[t] for t in self.signature.ctor_tensors}
+        return {
+            p: _constructor_value(self.signature, str(self.signature.params[p].get("type")), v)
+            for p, v in self.params.items()
+        }
 
-    def materialize(self, device="cuda"):
+    def materialize(self, device: str | torch.device = "cuda") -> dict[str, torch.Tensor | None]:
         """Build the tensors the call passes: generated values where declared, random data elsewhere.
 
-        A `device` parameter that is set decides where they go; *device* is the fallback.
+        A tensor sequence is a list of its elements, each allocated on its own. A `device`
+        parameter that is set decides where they go; *device* is the fallback.
         """
-        import torch
-
         device = self.params.get("device") or device
         out = {}
         outputs = self.signature.outputs if self.signature is not None else {}
         for name, spec in self.specs.items():
             if name in outputs:
                 continue
-            if spec is None:
-                out[name] = None
-                continue
-            dtype = getattr(torch, spec.dtype)
-            place = "cpu" if spec.cpu else device
-            if spec.values is not None:
-                out[name] = torch.tensor(spec.values, dtype=dtype, device=place).reshape(spec.shape)
-            elif dtype.is_floating_point or dtype.is_complex:
-                out[name] = torch.randn(
-                    spec.shape, device=place, dtype=dtype if dtype.is_complex else None
-                ).to(dtype)
+            if name in self.scalars:
+                out[name] = self.scalars[name]
+            elif isinstance(spec, tuple):
+                out[name] = [_tensor(e, device) for e in spec]
             else:
-                high = 2 if dtype == torch.bool else 8
-                out[name] = torch.randint(0, high, spec.shape, device=place).to(dtype)
+                out[name] = None if spec is None else _tensor(spec, device)
         return out
 
 
-def _python_value(sig: Signature, p: str, value):
-    """One parameter value as its constructor takes it."""
-    members = split_union(str(sig.params[p].get("type")))
+def _tensor(spec: TensorSpec, device: Any) -> Any:
+    """One tensor of *spec*: its generated values where declared, random data elsewhere."""
+    import torch
+
+    dtype = getattr(torch, spec.dtype)
+    place = "cpu" if spec.cpu else device
+    if spec.values is not None:
+        return torch.tensor(spec.values, dtype=dtype, device=place).reshape(spec.shape)
+    if dtype.is_floating_point or dtype.is_complex:
+        return torch.randn(spec.shape, device=place, dtype=dtype if dtype.is_complex else None).to(
+            dtype
+        )
+    high = 2 if dtype == torch.bool else 8
+    return torch.randint(0, high, spec.shape, device=place).to(dtype)
+
+
+def _constructor_value(sig: Signature, type_text: str, value: Any) -> Any:
+    """*value*, of parameter type *type_text*, as a constructor takes it.
+
+    A sequence's elements are converted by their own type.
+    """
+    members = [m.replace(" ", "") for m in split_union(type_text)]
     if isinstance(value, ADTValue):
         spec = sig.adts[value.adt]["sum"][value.kind]
         fields = {}
@@ -189,34 +269,32 @@ def _python_value(sig: Signature, p: str, value):
         import torch
 
         return getattr(torch, value)
+    if isinstance(value, (list, tuple)):
+        container = next(
+            (m for m in members if m.startswith(("list[", "tuple[")) and _holds(value, m, sig)),
+            None,
+        )
+        if container is None:
+            return value
+        items = element_types(container, len(value))
+        converted = [_constructor_value(sig, t, v) for t, v in zip(items, value, strict=True)]
+        return type(value)(converted)
     return value
 
 
-class _Payload(ast.NodeTransformer):
-    """`v.value` of a present `Maybe` parameter is `v` itself."""
-
-    def __init__(self, maybes):
-        self.maybes = maybes
-
-    def visit_Attribute(self, node):
-        self.generic_visit(node)
-        if (
-            node.attr == "value"
-            and isinstance(node.value, ast.Name)
-            and node.value.id in self.maybes
-        ):
-            return node.value
-        return node
-
-
-def _evaluate(sig: Signature, node: ast.expr, scope: dict, where: str):
-    """`node`'s value in `scope`; a failure is a `RowError` naming `where`."""
-    maybes = {
-        p for p in sig.params if param_kind(sig.params[p].get("type"), sig.adts).tag == "Maybe"
-    }
-    tree = _Payload(maybes).visit(copy.deepcopy(node))
+def _holds(value: Any, type_text: str, sig: Signature) -> bool:
+    """Whether parameter type *type_text* takes *value*."""
     try:
-        return evaluate(tree, scope, where, {"present": lambda v: v is not None})
+        convert(value, type_text, sig.adts)
+    except ValueError:
+        return False
+    return True
+
+
+def _evaluate(node: ast.expr, scope: dict, where: str):
+    """`node`'s value in `scope`; a failure is a `RowError` naming `where`."""
+    try:
+        return evaluate(node, scope, where, {"present": lambda v: v is not None})
     except EvaluationError as exc:
         raise RowError(str(exc)) from None
 
@@ -248,25 +326,30 @@ def _convert(sig: Signature, key: str, value):
         kind = sig.forall[key]
         if kind == "Seq[Int]" and isinstance(value, str):
             value = _value_call(key, value)
+        shape = lambda v: isinstance(v, list) and all(is_integer(x, 0) for x in v)  # noqa: E731
         ok = {
             "Dim": lambda v: is_integer(v, 0),
-            "Shape": lambda v: isinstance(v, list) and all(is_integer(x, 0) for x in v),
+            "Shape": shape,
             "Seq[Int]": lambda v: isinstance(v, list) and all(is_integer(x) for x in v),
+            "Seq[Dim]": shape,
+            "Seq[Shape]": lambda v: isinstance(v, list) and all(shape(x) for x in v),
         }.get(kind, lambda v: False)
         if not ok(value):
             raise RowError(f"{key} = {value!r} is not a {kind}")
-        return tuple(value) if kind == "Shape" else value
+        if kind == "Seq[Shape]":
+            return tuple(tuple(x) for x in value)
+        return tuple(value) if kind in ("Shape", "Seq[Dim]") else value
     try:
         return convert(value, sig.params[key].get("type"), sig.adts)
     except ValueError as exc:
         raise RowError(f"{key} = {exc}") from None
 
 
-def _shape(node: ast.List, sig: Signature, scope: dict, where: str) -> tuple[int, ...]:
+def _shape(node: ast.List, scope: dict, where: str) -> tuple[int, ...]:
     out = []
     for axis in node.elts:
         starred = isinstance(axis, ast.Starred)
-        value = _evaluate(sig, axis.value if starred else axis, scope, where)
+        value = _evaluate(axis.value if starred else axis, scope, where)
         for v in value if starred else [value]:
             if not is_integer(v, 0):
                 raise RowError(
@@ -293,34 +376,60 @@ def _within(values, bound: int) -> bool:
 
 def _point(sig: Signature, scope: dict, some: set[str]) -> dict:
     point = {}
-    for p, decl in sig.params.items():
-        kind = param_kind(decl.get("type"), sig.adts)
+    for p in sig.params:
+        kind = sig.kind(p)
         if kind.tag == "Bool" or (kind.tag == "Str" and kind.values):
             point[p] = scope.get(p)
         elif kind.payload().tag == "ADT":
             value = scope.get(p)
-            key = f"{p}.value" if kind.tag == "Maybe" else p
             if kind.tag == "Maybe":
                 point[f"present({p})"] = value is not None
             if value is not None:
-                point[f"{key}.kind"] = value.kind
+                point[f"{p}.kind"] = value.kind
                 for f, v in value.fields.items():
                     if not is_integer(v):
-                        point[f"{key}.{f}"] = v
+                        point[f"{p}.{f}"] = v
         elif kind.tag == "Maybe":
             point[f"present({p})"] = scope.get(p) is not None
-    for t in sig.call_tensors.values():
-        if t.optional is True:
-            point[f"present({t.name})"] = t.name in some
+    for t in sig.inputs.values():
+        if len(t.members) > 1:
+            point[f"member({t.name})"] = _member_of(t, scope, some)
     if any(t.buffer for t in sig.outputs.values()):
         point["present(out)"] = False
     return complete_point(sig, point)
 
 
+def _member_of(t, scope: dict, some: set[str]) -> str:
+    """The member a row's call passes for argument *t*.
+
+    That is its tensor member where `some` names it, else the member holding the row's value
+    for it, else its default's.
+    """
+    if t.name in some:
+        return next(m for m in t.members if m in TENSOR_MEMBERS)
+    if t.name in scope:
+        value = scope[t.name]
+    elif t.default is not REQUIRED:
+        value = t.default
+    else:
+        raise RowError(
+            f"argument {t.name!r} has no value: pass its tensor (a row's `some`) or its value"
+        )
+    found = member_of(value, t.members)
+    if found is None or found in TENSOR_MEMBERS:
+        raise RowError(f"{t.name} = {value!r} is not a non-tensor member of {t.type!r}")
+    return found
+
+
+def _dtype_index(sig: Signature, n: str) -> bool:
+    """Whether index *n* is a `DType` index or an element-wise `Seq[DType[...]]` one."""
+    return sig.forall[n].startswith(("DType", "Seq[DType"))
+
+
 def _relevant(sig: Signature, b: PlanBranch) -> tuple[set[str], set[str]]:
     """Indices the row must give at the branch, and those a generator solves."""
-    tensors = set(sig.call_tensors)
-    free = {n for n, k in sig.forall.items() if not k.startswith("DType")}
+    tensors = set(sig.inputs)
+    free = {n for n in sig.forall if not _dtype_index(sig, n)}
     generated = {t: b.shapes[t] for t in b.generators}
     # What no generated shape reads, the row gives; the rest is solved in dependency order.
     shaped = set().union(set(), *(names(node) for node in generated.values()))
@@ -331,29 +440,52 @@ def _relevant(sig: Signature, b: PlanBranch) -> tuple[set[str], set[str]]:
         before = set(known)
         known |= {n for n, e in b.lets.items() if names(e) <= known}
         for t in generated:
-            reads = set().union(set(), *(names(a) for a in b.generators[t])) - tensors
+            reads = set().union(set(), *(value_names(a) for a in b.generators[t])) - tensors
             if t not in ran and reads <= known:
                 ran[t] = generated[t]
-        known |= {s.name for s in unification(ran, known, {}) if s.name}
+        known |= {n for s in unification(ran, known, {}) for n in s.solved}
         if known == before:
             break
     return need, (known - seed) & free
 
 
-def _apply(sig: Signature, steps: list, nodes: dict, shapes: dict, scope: dict, lets: dict) -> None:
-    """Carry out an inference plan on concrete `shapes`, binding into `scope`."""
+def _apply(
+    steps: list,
+    nodes: dict,
+    shapes: dict,
+    scope: dict,
+    lets: dict,
+    sequences: dict | None = None,
+) -> None:
+    """Carry out an inference plan on concrete `shapes`, binding into `scope`.
+
+    A tensor sequence's shape is the tuple of its elements' shapes; `sequences` maps it to its
+    element-wise indices.
+    """
+    sequences = sequences or {}
+    raw, nodes, shapes = nodes, dict(nodes), dict(shapes)
+    elements = {t: shapes[t] for t in sequences}
 
     def length(parts) -> int:
         return sum(
-            len(_evaluate(sig, p.value, scope, "an axis count"))
-            if isinstance(p, ast.Starred)
-            else 1
+            len(_evaluate(p.value, scope, "an axis count")) if isinstance(p, ast.Starred) else 1
             for p in parts
         )
 
     for step in steps:
         if step.action == "let":
-            scope[step.name] = _evaluate(sig, lets[step.name], scope, f"let {step.name}")
+            scope[step.name] = _evaluate(lets[step.name], scope, f"let {step.name}")
+            continue
+        if step.action in ("first", "each"):
+            t = step.tensor
+            if step.action == "first":
+                pooled = [elements[u] for u in (t, *step.items) if elements[u]]
+                if not pooled:
+                    names_ = " and ".join((t, *step.items))
+                    raise RowError(f"{names_} empty: no element 0 solves {t}'s shared names")
+                shapes[t], nodes[t] = pooled[0][0], localized(raw[t], sequences[t])
+                continue
+            _apply_sequence(step, nodes, shapes, scope, raw[t], sequences[t], elements[t])
             continue
         shape, e = shapes[step.tensor], nodes[step.tensor].elts[step.index]
         where = f"tensor {step.tensor!r} shape"
@@ -363,23 +495,51 @@ def _apply(sig: Signature, steps: list, nodes: dict, shapes: dict, scope: dict, 
             part = tuple(shape[start:end])
             if step.action == "bind":
                 scope[step.name] = part
-            elif part != tuple(_evaluate(sig, e.value, scope, where)):
+            elif part != tuple(_evaluate(e.value, scope, where)):
                 raise RowError(
                     f"{step.tensor} axes {start}:{end} are {part}, not {ast.unparse(e.value)}"
                 )
             continue
         size = shape[start if start is not None else end - 1]
         if step.action == "check":
-            if size != _evaluate(sig, e, scope, where):
+            if size != _evaluate(e, scope, where):
                 raise RowError(f"{step.tensor} axis {step.index} is {size}, not {ast.unparse(e)}")
             continue
-        lo = _evaluate(sig, e, {**scope, step.name: 0}, where)
-        slope = _evaluate(sig, e, {**scope, step.name: 1}, where) - lo
+        lo = _evaluate(e, {**scope, step.name: 0}, where)
+        slope = _evaluate(e, {**scope, step.name: 1}, where) - lo
         if slope <= 0 or (size - lo) % slope or size < lo:
             raise RowError(
                 f"{step.tensor} axis {step.index} = {size} is not {ast.unparse(e)} for a Dim"
             )
         scope[step.name] = (size - lo) // slope
+
+
+def _apply_sequence(
+    step,
+    nodes: dict,
+    shapes: dict,
+    scope: dict,
+    element: ast.List,
+    each: tuple,
+    elements: tuple,
+) -> None:
+    """Carry out one `each` step on tensor sequence `step.tensor`.
+
+    Its element type is `element`, its element-wise indices `each` and its element shapes
+    `elements`.
+    """
+    t, node = step.tensor, localized(element, each)
+    collected = {x: [] for x in step.items}
+    checked = [x for x in items(element, frozenset(each)) if x not in collected]
+    for x in checked:
+        if len(scope[x]) != len(elements):
+            raise RowError(f"{x} has {len(scope[x])} items, {t} has {len(elements)} elements")
+    for k, shape in enumerate(elements):
+        local = {**scope, **{f"{ITEM}{x}": scope[x][k] for x in checked}}
+        _apply(list(step.sub), {t: node}, {t: shape}, local, {})
+        for x in collected:
+            collected[x].append(local[f"{ITEM}{x}"])
+    scope.update({x: tuple(v) for x, v in collected.items()})
 
 
 def _fixed_rank(node: ast.List, length) -> int | None:
@@ -388,7 +548,9 @@ def _fixed_rank(node: ast.List, length) -> int | None:
     return None if None in lengths else sum(lengths)
 
 
-def instantiate(plan: EntryPlan, row: dict, dtype_case: dict, *, metadata: bool = True) -> Call:
+def instantiate(
+    plan: EntryPlan, row: dict[str, Any], dtype_case: dict[str, str], *, metadata: bool = True
+) -> Call:
     """The call one row and one dtype case state; raises `RowError` when they state none.
 
     With `metadata=False`, describe tensor shapes and dtypes without generating or
@@ -397,10 +559,15 @@ def instantiate(plan: EntryPlan, row: dict, dtype_case: dict, *, metadata: bool 
     sig = plan.sig
     scope = {}
     for key, value in row.items():
-        if key in _ROW_KEYS:
+        if key in ("some", "dtype_cases", "label", "nightly"):
+            continue
+        if key in sig.inputs and len(sig.inputs[key].members) > 1:
+            if key in row.get("some", ()):
+                raise RowError(f"{key} is in `some`, which passes its tensor, and has a value")
+            scope[key] = value
             continue
         if key not in sig.forall and key not in sig.params:
-            raise RowError(f"row key {key!r} is neither an index nor a parameter")
+            raise RowError(f"row key {key!r} is neither an index, a parameter nor an argument")
         scope[key] = _convert(sig, key, value)
     for p, decl in sig.params.items():
         if p not in scope:
@@ -409,6 +576,13 @@ def instantiate(plan: EntryPlan, row: dict, dtype_case: dict, *, metadata: bool 
             scope[p] = _convert(sig, p, decl["default"])
     try:
         point = _point(sig, scope, set(row.get("some", [])))
+        scope |= {
+            t.name: t.default
+            for t in sig.inputs.values()
+            if t.name not in scope
+            and len(t.members) > 1
+            and point[f"member({t.name})"] not in TENSOR_MEMBERS
+        }
         rule = rejecting_rule(sig, point)
         if rule:
             raise RowError(f"refinement fails: {rule}")
@@ -423,13 +597,18 @@ def instantiate(plan: EntryPlan, row: dict, dtype_case: dict, *, metadata: bool 
     if given - (need - solved):
         raise RowError(f"row gives irrelevant {sorted(given - (need - solved))}")
 
-    dtype_indices = {n for n in b.relevant if n in sig.forall and sig.kind(n).tag == "DType"}
+    dtype_indices = {n for n in b.relevant if n in sig.forall and _dtype_index(sig, n)}
     if set(dtype_case) != dtype_indices:
         raise RowError(
             f"dtype_cases assign {sorted(dtype_case)}, the entry's DType indices are {sorted(dtype_indices)}"
         )
     for index, dtype in dtype_case.items():
-        if dtype not in sig.kind(index).values:
+        kind = sig.kind(index)
+        if kind.tag == "Seq":
+            if not isinstance(dtype, list) or any(d not in kind.item.values for d in dtype):
+                raise RowError(f"{index} = {dtype} is not a list of {sig.forall[index][4:-1]}")
+            dtype_case = {**dtype_case, index: tuple(dtype)}
+        elif dtype not in kind.values:
             raise RowError(f"{index} = {dtype} is outside {sig.forall[index]}")
     scope.update(dtype_case)
     if sig.dtype_combos:
@@ -444,40 +623,48 @@ def instantiate(plan: EntryPlan, row: dict, dtype_case: dict, *, metadata: bool 
     while True:
         known = set(scope)
         for name in [n for n, e in lets.items() if names(e) <= set(scope)]:
-            scope[name] = _evaluate(sig, lets.pop(name), scope, f"let {name}")
+            scope[name] = _evaluate(lets.pop(name), scope, f"let {name}")
         ready = [
             t
             for t in waiting
-            if set().union(set(), *map(names, b.generators[t])) - set(sig.call_tensors)
-            <= set(scope)
+            if set().union(set(), *map(names, b.generators[t])) - set(sig.inputs) <= set(scope)
         ]
         for t in ready:
             waiting.remove(t)
             generated[t], shapes[t] = _generate(sig, t, b, scope, metadata=metadata)
             nodes[t] = b.shapes[t]
-        _apply(sig, unification(nodes, set(scope), {}), nodes, shapes, scope, {})
+        _apply(unification(nodes, set(scope), {}), nodes, shapes, scope, {})
         if set(scope) == known and not ready:
             break
     if waiting:
         raise RowError(f"generator arguments of {waiting} are never known")
 
     for i, rule in enumerate(b.rules):
-        if not _evaluate(sig, rule, scope, f"shape_rules[{i}]"):
+        if not _evaluate(rule, scope, f"shape_rules[{i}]"):
             raise RowError(f"refinement fails: {sig.rules[i]}")
-    specs: dict[str, TensorSpec | None] = {}
-    for t in (*sig.call_tensors.values(), *sig.outputs.values()):
+    specs: dict = {}
+    for t in (*sig.inputs.values(), *sig.outputs.values()):
         if t.name not in b.shapes:
             specs[t.name] = None
             continue
-        shape = _shape(b.shapes[t.name], sig, scope, f"tensor {t.name!r} shape")
-        specs[t.name] = TensorSpec(
-            shape, _dtype_value(b.dtypes[t.name], scope), generated.get(t.name), t.cpu
-        )
+        where = f"tensor {t.name!r} shape"
+        if t.name in b.sequences:
+            specs[t.name] = tuple(
+                TensorSpec(
+                    _shape(b.shapes[t.name], local, where),
+                    _dtype_value(b.dtypes[t.name], local),
+                )
+                for local in _elements(t.name, b.sequences[t.name], scope)
+            )
+            continue
+        shape = _shape(b.shapes[t.name], scope, where)
+        dtype = _dtype_value(b.dtypes[t.name], scope)
+        specs[t.name] = TensorSpec(shape, dtype, generated.get(t.name), t.cpu)
+    scalars = {t: scope[t] for t in sig.inputs if t in scope and specs[t] is None}
     for t, calls in b.requires.items() if metadata else ():
-        for call, text in zip(calls, sig.call_tensors[t].requires, strict=False):
+        for call, text in zip(calls, sig.inputs[t].requires, strict=False):
             args = [
-                _evaluate(sig, a, {**scope, **generated}, f"tensor {t!r} requires")
-                for a in call.args
+                _evaluate(a, {**scope, **generated}, f"tensor {t!r} requires") for a in call.args
             ]
             try:
                 ok = PREDICATES[callee(call.func)](generated[t], *args)
@@ -485,38 +672,154 @@ def instantiate(plan: EntryPlan, row: dict, dtype_case: dict, *, metadata: bool 
                 raise RowError(f"tensor {t!r}: requires {text} raises {exc}") from None
             if not ok:
                 raise RowError(f"tensor {t!r}: requires {text} fails")
-    mismatch = _reinfer(sig, b, specs, scope)
+    # Solve the indices again from the instantiated inputs alone, as the op's checks do.
+    known = {
+        k: v
+        for k, v in scope.items()
+        if k in sig.params
+        or k in scalars
+        or (k in sig.forall and (_dtype_index(sig, k) or sig.forall[k] == "Seq[Int]"))
+    }
+    solved = call_from_tensors(plan, known, {t: specs[t] for t in sig.inputs}).indices
+    mismatch = {
+        n: (solved[n], scope[n])
+        for n in sig.forall
+        if n in scope and n in solved and solved[n] != scope[n]
+    }
     if mismatch:
         raise RowError(f"inference from the instantiated inputs disagrees: {mismatch}")
     dtype_params = [
         scope[p]
         for p in sig.params
-        if param_kind(sig.params[p].get("type"), sig.adts).payload().tag == "DType"
-        and isinstance(scope[p], str)
+        if sig.kind(p).payload().tag == "DType" and isinstance(scope[p], str)
     ]
     label = row.get("label", "")
     case_id = "-".join(
-        [label, *(dtype_case[i] for i in sig.forall if i in dtype_case), *dtype_params]
+        [
+            label,
+            # A `Seq[DType]` index's dtypes, in element order, joined by `.`.
+            *(
+                ".".join(dtype_case[i]) if isinstance(dtype_case[i], tuple) else dtype_case[i]
+                for i in sig.forall
+                if i in dtype_case
+            ),
+            *dtype_params,
+        ]
     )
+    written = sig.written(point, {n for n, spec in specs.items() if spec is not None})
+    return Call(
+        case_id,
+        {p: scope[p] for p in sig.params},
+        specs,
+        _indices(sig, b, scope),
+        sig,
+        written,
+        scalars,
+    )
+
+
+def _elements(t: str, each: tuple, scope: dict) -> list[dict]:
+    """The scope of each element of tensor sequence *t*.
+
+    Each binds the element-wise indices `each` to that element's items.
+    """
+    counts = {len(scope[x]) for x in each}
+    if len(counts) != 1:
+        raise RowError(f"the element-wise indices {list(each)} of {t} differ in length")
+    return [{**scope, **{x: scope[x][k] for x in each}} for k in range(counts.pop())]
+
+
+def call_from_tensors(plan: EntryPlan, known: dict, inputs: dict) -> Call:
+    """The call of `plan` on the call tensors `inputs`.
+
+    Its indices are solved from their shapes and dtypes as the op's checks solve them.
+
+    `known` holds every signature parameter, as expressions read it, and the value of each
+    argument with several members that the call passes as a scalar or None, which decides the
+    member it holds; it may hold indices the tensors do not determine, such as a generator's
+    arguments. `inputs` maps each call tensor to its `TensorSpec`, each tensor sequence to a
+    tuple of `TensorSpec`, or None where the call does not pass it; a DType index an input's
+    dtype names is that dtype. The outputs' specs follow from the solved indices.
+
+    Raises:
+        RowError: An input's shape disagrees with what is known or with another input.
+    """
+    sig = plan.sig
+    scope = dict(known)
+    # In declaration order, which inference follows.
+    present = [t for t in sig.inputs if inputs.get(t) is not None]
+    point = _point(sig, scope, set(present))
+    b = plan.branch(point)
+    sequences = {t: b.sequences[t] for t in present if t in b.sequences}
+    for t in sorted(present, key=sequences.__contains__):
+        node, leaves = b.dtypes[t], inputs[t] if t in sequences else (inputs[t],)
+        if not (isinstance(node, ast.Name) and node.id in sig.forall):
+            continue
+        if node.id in sequences.get(t, ()):
+            found = tuple(e.dtype for e in leaves)
+            if scope.setdefault(node.id, found) != found:
+                raise RowError(f"the elements of {t} differ in dtype from {node.id}")
+        else:
+            for e in leaves:
+                if scope.setdefault(node.id, e.dtype) != e.dtype:
+                    raise RowError(f"{t} dtype {e.dtype} differs from {node.id}")
+    nodes = {t: b.shapes[t] for t in present}
+    shapes = {
+        t: tuple(tuple(e.shape) for e in inputs[t]) if t in sequences else tuple(inputs[t].shape)
+        for t in present
+    }
+    steps = unification(nodes, set(scope), b.lets, sequences)
+    _apply(steps, nodes, shapes, scope, b.lets, sequences)
+    specs = {t: inputs.get(t) for t in sig.inputs}
+    for t in sig.outputs.values():
+        specs[t.name] = (
+            TensorSpec(
+                _shape(b.shapes[t.name], scope, f"tensor {t.name!r} shape"),
+                _dtype_value(b.dtypes[t.name], scope),
+                None,
+                t.cpu,
+            )
+            if t.name in b.shapes
+            else None
+        )
+    params = {p: scope[p] for p in sig.params}
+    scalars = {t: scope[t] for t in sig.inputs if t in scope and specs[t] is None}
+    return Call(
+        "", params, specs, _indices(sig, b, scope), sig, sig.written(point, present), scalars
+    )
+
+
+def _indices(sig: Signature, b: PlanBranch, scope: dict) -> dict:
+    """The `indices` a call's formulas read, as `scope` binds them.
+
+    They are the parameters, the indices other than a generator's value sequences, and the
+    `let`s.
+    """
     values = {n for n, k in sig.forall.items() if k == "Seq[Int]"}
-    indices = {
+    return {
         n: v
         for n, v in scope.items()
         if n in sig.params or (n in sig.forall and n not in values) or n in b.lets
     }
-    return Call(case_id, {p: scope[p] for p in sig.params}, specs, indices, sig)
 
 
 def _generate(
     sig: Signature, t: str, b: PlanBranch, scope: dict, *, metadata: bool = True
 ) -> tuple[list | None, tuple]:
-    """The values tensor `t`'s generator yields for this row, seeded per op and tensor, and
-    their shape, checked against the rank `t` declares."""
-    fn = callee(parse(sig.call_tensors[t].values).func)
+    """The values tensor `t`'s generator yields for this row, and their shape.
+
+    The generator is seeded per op and tensor, and the shape is checked against the rank `t`
+    declares.
+
+    With `metadata=False`, the values are None and only the shape is computed.
+    """
+    fn = callee(parse(sig.inputs[t].values).func)
     dtype = _dtype_value(b.dtypes[t], scope)
-    if dtype not in _METADATA_RANGES:
+    # The integer dtypes generated values may take, with their ranges.
+    ranges = {"int32": 2**31, "int64": 2**63}
+    if dtype not in ranges:
         raise RowError(f"tensor {t!r}: generated values need an int32 or int64 dtype, not {dtype}")
-    args = [_evaluate(sig, a, scope, f"tensor {t!r} values") for a in b.generators[t]]
+    args = [_evaluate(a, scope, f"tensor {t!r} values") for a in b.generators[t]]
     values = None
     if metadata:
         if fn in RANDOM_GENERATORS:
@@ -525,15 +828,13 @@ def _generate(
             values = GENERATORS[fn](*args)
         except ValueError as exc:
             raise RowError(f"tensor {t!r}: {exc}") from None
-        if not _within(values, _METADATA_RANGES[dtype]):
-            raise RowError(
-                f"tensor {t!r}: {sig.call_tensors[t].values} yields values outside {dtype}"
-            )
+        if not _within(values, ranges[dtype]):
+            raise RowError(f"tensor {t!r}: {sig.inputs[t].values} yields values outside {dtype}")
     shape = GENERATOR_SHAPES[fn](*(a for a in args if not isinstance(a, random.Random)))
     rank = _fixed_rank(
         b.shapes[t],
         lambda e: (
-            len(_evaluate(sig, e, scope, f"tensor {t!r} shape")) if names(e) <= set(scope) else None
+            len(_evaluate(e, scope, f"tensor {t!r} shape")) if names(e) <= set(scope) else None
         ),
     )
     if rank is not None and rank != len(shape):
@@ -541,23 +842,6 @@ def _generate(
             f"tensor {t!r}: {fn} yields rank {len(shape)}, not {ast.unparse(b.shapes[t])}"
         )
     return values, shape
-
-
-def _reinfer(sig: Signature, b: PlanBranch, specs: dict, scope: dict) -> dict:
-    """Solve the indices again from the instantiated inputs and compare with the row's."""
-    known = {
-        k: v
-        for k, v in scope.items()
-        if k in sig.params or (k in sig.forall and sig.kind(k).tag == "DType")
-    }
-    nodes = {t: b.shapes[t] for t in sig.call_tensors if specs.get(t)}
-    steps = unification(nodes, set(known), b.lets)
-    _apply(sig, steps, nodes, {t: specs[t].shape for t in nodes}, known, b.lets)
-    return {
-        n: (known[n], scope[n])
-        for n in sig.forall
-        if n in scope and n in known and known[n] != scope[n]
-    }
 
 
 # ---------------------------------------------------------------- checks
@@ -572,11 +856,8 @@ def _nested(rank: int):
 
 
 def _callee_of(text: str) -> str | None:
-    try:
-        call = parse(text)
-    except SignatureError:
-        return None
-    return callee(call.func) if isinstance(call, ast.Call) else None
+    call = parse_call(text)
+    return None if call is None else callee(call.func)
 
 
 def _dumped(text: str | None) -> str | None:
@@ -596,17 +877,22 @@ def equal_inputs(sig: Signature) -> list[tuple[str, ...]]:
 
 
 def _declaration_errors(sig: Signature) -> list[str]:
-    """Every `values` and `requires` call: a built-in callee, its arity, arguments in the language;
-    and the `requires` contract on every discriminant point."""
+    """Diagnostics of every `values` and `requires` call.
+
+    Each has a built-in callee, its arity and arguments in the language; a `max_segment` sits
+    beside a `prefix_offsets` on its tensor; the `requires` contract holds on every
+    discriminant point.
+    """
     errors, valid = [], {}
     declared = {*sig.forall, *sig.params, *sig.let}
+    scalar_lets = call_scalar_lets(sig)
     env, _ = kind_env(sig, {n: parse(e) for n, e in sig.let.items()})
     generated = {
         n: GENERATOR_RANKS.get(_callee_of(d.values))
-        for n, d in sig.call_tensors.items()
+        for n, d in sig.inputs.items()
         if d.values is not None
     }
-    for t in sig.call_tensors.values():
+    for t in sig.inputs.values():
         declared_calls = [("values", t.values, GENERATOR_KINDS)] if t.values is not None else []
         declared_calls += [("requires", r, PREDICATE_KINDS) for r in t.requires]
         if t.requires and t.values is None:
@@ -626,22 +912,44 @@ def _declaration_errors(sig: Signature) -> list[str]:
             found = []
             for arg in call.args:
                 found += [f"{where}: {e}" for e in language_errors(arg, False)]
+                read = value_names(arg)
                 found += [
-                    f"{where}: name {n!r} is not declared" for n in sorted(names(arg) - scope)
+                    f"{where}: let {n!r} reads a call-time scalar; read it only in a refinement"
+                    for n in sorted(read & scalar_lets)
+                ]
+                found += [f"{where}: name {n!r} is not declared" for n in sorted(read - scope)]
+                found += [
+                    f"{where}: {n!r} is no argument"
+                    for n in sorted(discriminant_names(arg) - {*sig.inputs, *sig.params})
                 ]
             contents = {n: _nested(r) for n, r in generated.items() if r is not None}
-            local = env.narrowed(contents) if field == "requires" else env
+            # A `Maybe` parameter is read as its payload; where it is absent is checked per point.
+            payloads = {
+                n: k.item
+                for n, k in env.kinds.items()
+                if n in sig.params and k and k.tag == "Maybe"
+            }
+            local = env.narrowed(contents | payloads) if field == "requires" else env
             found += call_errors(call, table, local, where)
             errors += found
             if not found:
                 valid.setdefault(t.name, []).append((field, name, call))
+    # The `validate_inputs` check reads a segment bound only on offsets it checks.
+    errors += [
+        f"tensor {n!r}: max_segment needs prefix_offsets on the same tensor"
+        for n, calls in valid.items()
+        if "max_segment" in (held := {p for _, p, _ in calls}) and "prefix_offsets" not in held
+    ]
     return errors + _requires_errors(sig, valid, env)
 
 
 def _requires_errors(sig: Signature, valid: dict, env) -> list[str]:
-    """On every discriminant point where its tensor is present, a `requires` reads only metadata
-    tensors that are present, and its predicate reads the rank the tensor declares there, which
-    must be fixed."""
+    """Diagnostics of the `requires` contract on every discriminant point.
+
+    On every point a domain restriction accepts where its argument holds a tensor, a
+    `requires` reads only metadata arguments holding a tensor and `Maybe` parameters that are
+    present, and its predicate reads the rank the tensor declares there, which must be fixed.
+    """
 
     def length(e: ast.expr) -> int | None:
         kind = infer_kinds(e, env, "")[0]
@@ -650,18 +958,21 @@ def _requires_errors(sig: Signature, valid: dict, env) -> list[str]:
     errors = set()
     for point in points(list(discriminant_axes(sig).values())):
         point = complete_point(sig, point, strict=False)
+        if rejecting_rule(sig, point) is not None:
+            continue
         for name, calls in valid.items():
-            if not point.get(f"present({name})", True):
+            if point.get(f"member({name})", "Tensor") not in TENSOR_MEMBERS:
                 continue
             try:
-                node = fold(expand(sig, sig.call_tensors[name].shape, point), point)
+                node = fold(expand(sig, sig.inputs[name].shape, point), point)
             except SignatureError:
                 node = None
             for field, predicate, call in calls:
                 if field != "requires":
                     continue
-                for m in names(call) & set(sig.call_tensors):
-                    if not point.get(f"present({m})", True):
+                for m in value_names(call) & {*sig.inputs, *sig.params}:
+                    held = point.get(f"member({m})", "Tensor") if m in sig.inputs else None
+                    if held not in (None, *TENSOR_MEMBERS) or not point.get(f"present({m})", True):
                         errors.add(
                             f"tensor {name!r}: {ast.unparse(call)} reads {m!r} where it is absent"
                         )
@@ -687,11 +998,11 @@ def _row_errors(sig: Signature, row: object) -> list[str]:
     label = row.get("label")
     # The manifest spec's cap on a label's length.
     label_max = 24
-    if not isinstance(label, str) or not _LABEL.fullmatch(label):
+    if not isinstance(label, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", label):
         errors.append("`label` must be a non-empty [A-Za-z0-9._-] string")
     elif len(label) > label_max:
         errors.append(f"`label` {label!r} is longer than {label_max} characters")
-    optional = {t.name for t in sig.call_tensors.values() if t.optional is True}
+    optional = {t.name for t in sig.inputs.values() if len(t.members) > 1}
     some = row.get("some", [])
     if (
         not isinstance(some, list)
@@ -700,13 +1011,86 @@ def _row_errors(sig: Signature, row: object) -> list[str]:
     ):
         errors.append("`some` must be a list of distinct names")
     elif set(some) - optional:
-        errors.append(f"`some` names {sorted(set(some) - optional)}, not `optional: true` inputs")
+        errors.append(
+            f"`some` names {sorted(set(some) - optional)}, not arguments with several members"
+        )
     cases = row.get("dtype_cases")
     if "dtype_cases" in row and not (
         isinstance(cases, list) and cases and all(isinstance(c, dict) and c for c in cases)
     ):
         errors.append("`dtype_cases` must be a non-empty list of non-empty mappings")
+    nightly = ("skip", "every-dtype")
+    if "nightly" in row and row["nightly"] not in nightly:
+        errors.append(f"`nightly` must be one of {list(nightly)}")
     return errors
+
+
+def _as_bfloat16(value: Any) -> Any:
+    """*value* with every float16 in it, a `Seq[DType]` element included, read as bfloat16."""
+    if isinstance(value, (list, tuple)):
+        return type(value)(_as_bfloat16(v) for v in value)
+    return "bfloat16" if value == "float16" else value
+
+
+def _plain(value: Any) -> Any:
+    """*value* as plain data that compares by value and type, an ADT value by its fields."""
+    if isinstance(value, ADTValue):
+        return "adt", value.adt, value.kind, _plain(value.fields)
+    if isinstance(value, dict):
+        return "dict", tuple(sorted((k, _plain(v)) for k, v in value.items()))
+    if isinstance(value, (list, tuple)):
+        return "seq", tuple(_plain(v) for v in value)
+    return type(value).__name__, value
+
+
+def bench_calls(plan: EntryPlan, rows: list[dict], nightly: bool) -> list[tuple[dict, dict]]:
+    """The ``(row, dtype_case)`` pairs of an entry's rows a benchmark run times.
+
+    Without *nightly*, every pair. The nightly sweep leaves out ``nightly: skip`` rows, and a
+    float16 call whose instantiated bfloat16 sibling of the same label runs, unless its row
+    is ``nightly: every-dtype``.
+    """
+    pairs = [(row, case) for row in rows for case in row.get("dtype_cases") or [{}]]
+    if not nightly:
+        return pairs
+    sig = plan.sig
+    dtypes = {n for n in sig.forall if _dtype_index(sig, n)} | {
+        p for p in sig.params if sig.kind(p).payload().tag == "DType"
+    }
+    # Generator value sequences shape the metadata, not the indices a call holds.
+    sequences = [n for n, kind in sig.forall.items() if kind == "Seq[Int]"]
+
+    def key(row: dict, case: dict) -> tuple[bool, tuple]:
+        """Whether the call is a float16 call, and the call with every float16 bfloat16.
+
+        A call mixing float16 and bfloat16 promotes differently from its all-bfloat16
+        counterpart, so it is no float16 call.
+        """
+        call = instantiate(plan, row, case, metadata=False)
+        held = repr([v for n, v in call.indices.items() if n in dtypes])
+        as_bfloat16 = _plain(
+            (
+                row.get("label"),
+                {n: _as_bfloat16(v) if n in dtypes else v for n, v in call.indices.items()},
+                # Shapes only: the dtypes are among the indices.
+                {
+                    n: tuple(shape for shape, _ in (t.items if isinstance(t, Elements) else (t,)))
+                    for n, t in call.tensors.items()
+                },
+                call.members,
+                call.scalars,
+                [_convert(sig, n, row[n]) if n in row else None for n in sequences],
+            )
+        )
+        return "'float16'" in held and "'bfloat16'" not in held, as_bfloat16
+
+    calls = [(row, case, *key(row, case)) for row, case in pairs if row.get("nightly") != "skip"]
+    bfloat16_calls = {called for _, _, float16, called in calls if not float16}
+    return [
+        (row, case)
+        for row, case, float16, called in calls
+        if not float16 or row.get("nightly") == "every-dtype" or called not in bfloat16_calls
+    ]
 
 
 def check_workloads(name: str, entry: dict, adts: dict) -> list[str]:
@@ -722,8 +1106,11 @@ def check_workloads(name: str, entry: dict, adts: dict) -> list[str]:
     rows = entry.get("workloads")
     if not isinstance(rows, list) or not rows:
         return [f"{name}: `workloads` must be a non-empty list"]
-    seen, passed, omitted = set(), set(), set()
-    gated = [t.name for t in sig.call_tensors.values() if t.optional is not False]
+    if all(isinstance(row, dict) and row.get("nightly") == "skip" for row in rows):
+        errors.append("every row is `nightly: skip`, so the nightly sweep benchmarks none")
+    seen = set()
+    gated = {t.name: t.members for t in sig.inputs.values() if len(t.members) > 1}
+    covered: dict = {t: set() for t in gated}
     for i, row in enumerate(rows):
         problems = _row_errors(sig, row)
         if problems:
@@ -732,19 +1119,37 @@ def check_workloads(name: str, entry: dict, adts: dict) -> list[str]:
         for case in row.get("dtype_cases", [{}]):
             try:
                 call = instantiate(plan, row, case)
-                call.arguments(dict.fromkeys(sig.ctor_tensors))
+                call.arguments()
             except (RowError, KeyError, TypeError, ValueError) as exc:
                 errors.append(f"row {row['label']!r} {case}: {exc}")
                 continue
             except (ImportError, AttributeError) as exc:
                 errors.append(f"row {row['label']!r} {case}: a constructor class: {exc}")
                 continue
-            passed |= {t for t in gated if call.specs[t] is not None}
-            omitted |= {t for t in gated if call.specs[t] is None}
+            members = call.members
+            for t in gated:
+                covered[t].add(members[t])
             if call.case_id in seen:
                 errors.append(f"case id {call.case_id!r} repeats")
             seen.add(call.case_id)
     if entry.get("status") == "implemented":
-        errors += [f"no row passes optional tensor {t!r}" for t in gated if t not in passed]
-        errors += [f"no row omits optional tensor {t!r}" for t in gated if t not in omitted]
+        errors += [
+            f"no row passes member {m!r} of {t!r}"
+            for t, found in gated.items()
+            for m in found
+            if m not in covered[t] and _reachable(sig, t, m)
+        ]
     return [f"{name}: {e}" for e in errors]
+
+
+def _reachable(sig: Signature, t: str, member: str) -> bool:
+    """Whether a discriminant point a domain restriction accepts has argument *t* hold *member*."""
+    axes = dict(discriminant_axes(sig))
+    axes[t] = (f"member({t})", [member])
+    for point in points(list(axes.values())):
+        try:
+            if rejecting_rule(sig, complete_point(sig, point)) is None:
+                return True
+        except SignatureError:
+            continue
+    return False

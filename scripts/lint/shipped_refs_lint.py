@@ -5,15 +5,15 @@ Flags, on any line of a UTF-8 text file: ``#`` followed by 3+ digits (an issue o
 ``AC-<n>``, ``round-<n> review`` and ``Follow-up: #<n>``. A ``#`` token of 3, 4, 6 or 8 hex
 characters with at least one letter is a CSS color and passes; an all-digit token does not.
 
-Default scan: ``src/tileops/``, ``tests/``, ``benchmarks/``, ``scripts/``, ``workloads/``.
+Default scan: ``src/tileops/``, ``tests/``, ``benchmarks/``, ``scripts/``, ``workloads/``,
+``models/``.
 """
 
-import argparse
 import re
 import sys
 from pathlib import Path
 
-from common import files, relative, report
+from common import lint_files, relative
 
 # The whole hex token, so the color test reads all of it.
 _HASH_TOKEN = re.compile(r"(?<![0-9A-Za-z])#([0-9a-fA-F]+)\b")
@@ -26,7 +26,7 @@ _PLAIN_PATTERNS = (
     ("follow-up marker", re.compile(r"[Ff]ollow-up:\s*#[0-9]+")),
 )
 
-SCANNED = ("src/tileops", "tests", "benchmarks", "scripts", "workloads")
+SCANNED = ("src/tileops", "tests", "benchmarks", "scripts", "workloads", "models")
 
 
 def _hash_number_violations(line: str) -> list[str]:
@@ -63,12 +63,9 @@ def findings(path: Path) -> list[str]:
     return [f"{relative(path)}:{lineno}: {message}" for lineno, message in lint_text(text)]
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("files", nargs="*", type=Path)
-    args = parser.parse_args(argv)
-    return report(e for p in files(args.files, SCANNED, None) for e in findings(p))
+def main(argv: list[str]) -> int:
+    return lint_files(argv, __doc__, SCANNED, None, findings)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))

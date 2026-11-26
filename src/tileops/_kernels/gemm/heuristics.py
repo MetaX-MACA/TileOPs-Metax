@@ -1,6 +1,6 @@
 """Select SM90 dense-GEMM configurations without autotuning.
 
-Candidates cover basic, split-K, cooperative, and ping-pong structures. The
+Candidates cover basic, split-K, cooperative, ping-pong and stream structures. The
 scorer enumerates, prunes, and ranks them with board-calibrated throughput,
 workspace, launch, and issue costs. It returns ``None`` on an uncalibrated
 board so the serving kernel can use its default configuration.
@@ -9,26 +9,65 @@ board so the serving kernel can use its default configuration.
 import functools
 import math
 from dataclasses import dataclass
-from typing import Optional
 
 from tileops._kernels.constants import BLOCK_SHARED_BYTES_OPT_IN
-from tileops._utils import calibration_key
 
 __all__ = [
+    "COOP2_SWAP_STAGING",
+    "FP8_MIN_SLICE_K_TILES",
     "SWAP_AB_MPAD",
     "best_config",
     "fp8_ws_config",
     "gemv_config",
+    "int8_pingpong_grid",
     "int8_w8a8_config",
     "small_batch_config",
     "small_m_splitk_config",
+    "stream_width",
     "two_row_gemv_wins",
 ]
 
-# The grid-fill test, stage choice, and emitted swap-AB config share this N tile.
-_SWAP_AB_BLOCK_NN = 64
-
 SWAP_AB_MPAD = 8
+
+# Shortest K slice, in 128-wide K tiles, an FP8 split-K launch pays for: a slice ends in an
+# fp32 round trip through the workspace and a second launch.
+FP8_MIN_SLICE_K_TILES = 12
+
+# One coop2_swap consumer's output staging buffer: both 64-column halves of its 128 rows,
+# ``store_m = 32`` columns of C at a time.
+COOP2_SWAP_STAGING = (2, 32, 64)
+# The deepest coop2_swap ring; only a ring this deep hides mixed-width tiles, and a
+# shallower one takes its own score factor.
+_COOP2_SWAP_FULL_RING = 4
+# The basic tile widths; ``_fill_cand`` offers only a width outside them.
+_BASIC_WIDTHS = (64, 128, 192, 256)
+
+
+# The static mbarriers sit before the 1024-aligned dynamic shared buffer, so they take its
+# first KiB.
+_STATIC_SMEM_BYTES = 1024
+
+
+def stream_width(m: int) -> tuple[int, bool]:
+    """The stream tile's width and whether it runs the helper's own-width WGMMA.
+
+    The width is A's rows rounded up to the 8-row WGMMA N. A width that does not divide 256 runs
+    the helper's WGMMA over K steps of whole 64-element chunks, and its accumulator reaches
+    the transposed output through a second, untransposed shared tile.
+    """
+    width = -(-m // 8) * 8
+    return width, 256 % width != 0
+
+
+def _ring_budget(staging: int, block_n: int) -> int:
+    """Shared memory a basic or fill tile's operand ring may take.
+
+    The ring shares the opt-in budget with the static mbarriers, the output staging tile of
+    *staging* bytes and the 16-bit bias row the producer stages for a biased call,
+    ``block_n`` wide. Selection does not know whether a call has a bias, so every ring
+    leaves room for that row.
+    """
+    return BLOCK_SHARED_BYTES_OPT_IN[90] - _STATIC_SMEM_BYTES - staging - 2 * block_n
 
 
 @dataclass(frozen=True)
@@ -51,6 +90,19 @@ class _TinyMCalibration:
     cta_gbps: float
     split_k_us: float
     gemv_tbps: float
+    dram_tbps: float
+
+
+@dataclass(frozen=True)
+class _StreamCalibration:
+    """Ranking constants of the stream tile's weight-stream model in :func:`_score_us`.
+
+    The grid streams ``B`` at ``min(CTAs * cta_gbps, dram_tbps)``. Calibration follows
+    :class:`_Calibration`'s contract with every other constant fixed: these two are the stream
+    structure's own, fitted in place of a factor, with which they are redundant.
+    """
+
+    cta_gbps: float
     dram_tbps: float
 
 
@@ -78,7 +130,8 @@ class _Calibration:
         ``softmax(-log score / tau)``, optimized in log space with annealed ``tau``.
         Constraints: neutral initialization, fixed ``tensor_core_tflops`` and basic
         factor to remove scale ambiguity, and neutral values for unidentifiable
-        constants. New structures fit only their own factor with other values fixed.
+        constants. New structures fit only their own factor, or the constants of their own
+        model, with other values fixed.
         Acceptance: evaluate the selected candidate's regret on both sets; held-out
         regret must not exceed that of the shipped calibration.
     """
@@ -90,13 +143,15 @@ class _Calibration:
     tensor_core_tflops: float
     structure_factor: tuple
     tiny_m: _TinyMCalibration
+    stream: _StreamCalibration
 
     def factor(self, structure: str) -> float:
         return dict(self.structure_factor)[structure]
 
 
-def _calibration(device_name: str) -> Optional[_Calibration]:
-    """The calibration measured on *device_name*'s board, or ``None`` for a board without one."""
+def _calibration(calibration: str | None) -> _Calibration | None:
+    """The calibration measured on the board keyed *calibration*, or ``None`` for a board
+    without one."""
     # One entry per board the scorer has been calibrated on, by its calibration key
     # (``tileops._utils.calibration_key``). A board absent here is not ranked; see
     # :func:`best_config`.
@@ -113,7 +168,9 @@ def _calibration(device_name: str) -> Optional[_Calibration]:
                 ("coop2s", 0.125),
                 ("coop2_splitk", 1.0),
                 ("coop2_swap", 1.2),
+                ("coop2_swap_3stage", 1.36),
                 ("fill", 0.58),
+                ("fill_one", 0.524),
                 ("simple", 0.763),
                 ("splitk", 0.904),
             ),
@@ -121,12 +178,13 @@ def _calibration(device_name: str) -> Optional[_Calibration]:
                 latency_us=1.54,
                 cta_gbps=100.0,
                 split_k_us=2.6,
-                gemv_tbps=2.62,
+                gemv_tbps=4.19,
                 dram_tbps=5.04,
             ),
+            stream=_StreamCalibration(cta_gbps=15.9, dram_tbps=1.96),
         ),
     }
-    return calibrations.get(calibration_key(device_name))
+    return calibrations.get(calibration)
 
 
 @dataclass
@@ -140,6 +198,9 @@ class _Cand:
     stage_n: int = 0
     panel_size: int = 16
     cluster_m: int = 1
+    blocks: int = 1
+    # A coop2 tile offered only as the one-wave tile; see ``_enumerate``.
+    one_wave: bool = False
 
     def to_config(self) -> dict:
         if self.structure == "fill":
@@ -185,6 +246,13 @@ class _Cand:
                 "block_n": self.block_n,
                 "num_stages": self.num_stages,
             }
+        if self.structure == "stream":
+            return {
+                "stream": True,
+                "block_k": self.block_k,
+                "num_stages": self.num_stages,
+                "blocks": self.blocks,
+            }
         if self.structure == "coop2_splitk":
             return {
                 "coop2_splitk": True,
@@ -203,12 +271,16 @@ class _Cand:
         }
 
 
-def _enumerate(m: int, n: int, k: int, trans_a: bool, trans_b: bool, sm_count: int) -> list:
+def _enumerate(
+    m: int, n: int, k: int, trans_a: bool, trans_b: bool, sm_count: int, out_bytes: int = 2
+) -> list:
+    """The candidates :func:`_score_us` ranks for a call whose output elements take
+    *out_bytes*, which each structure's output staging tile holds."""
     # Accumulator registers per thread a basic tile may hold: ``bm * bn / 128``.
     max_accum_regs = 200
-    # Deepest ring each structure is built with, whatever the SMEM budget allows; the
-    # one-wave 64x192 basic tile sets its own ring below.
-    ns_cap = {"basic": 4, "splitk": 4, "coop2": 4, "coop2_splitk": 4}
+    # Ring caps below the SMEM budget. Basic and split-K tiles take the deepest ring the
+    # SMEM holds; the one-wave 64x192 basic tile sets its own ring below.
+    ns_cap = {"simple": 4, "coop2": 4, "coop2_splitk": 4}
 
     def _strip_width(bm: int, bn: int, sm_count: int) -> int:
         """L2-footprint-minimizing rasterization panel width.
@@ -221,25 +293,32 @@ def _enumerate(m: int, n: int, k: int, trans_a: bool, trans_b: bool, sm_count: i
 
     def _ns_basic(bm: int, bn: int, bk: int) -> int:
         ring = (bm + bn) * bk * 2
-        return min(ns_cap["basic"], (BLOCK_SHARED_BYTES_OPT_IN[90] - bm * bn * 2) // ring)
+        return _ring_budget(bm * bn * out_bytes, bn) // ring
 
-    def _coop2_ns_sn(bn: int, bk: int):
-        """Deepest ring under ``ns_cap`` the SMEM budget allows; shrink the epilogue
-        staging chunk (stage_n) when that buys another pipeline stage."""
+    def _coop2_ns_sn(bn: int, bk: int, exposed: bool, deep: bool):
+        """The deepest ring the SMEM budget allows, under ``ns_cap`` unless *deep*, and its
+        epilogue staging chunk (stage_n, 0 for the whole tile). A hidden epilogue takes the
+        widest chunk, shrunk only to buy a stage; an *exposed* one takes the chunk of the widest
+        TMA swizzle, in two chunks or more so one chunk's store overlaps the next one's copy."""
         ring = (128 + bn) * bk * 2
         best = None
-        for sn in (bn, bn // 2, bn // 4):
-            if sn < 32 or bn % sn:
+        for sn in range(8, bn + 1, 8) if exposed else (bn, bn // 2, bn // 4):
+            # The coop2 epilogue stores whole chunks of 8 columns.
+            if bn % sn or sn % 8 or (sn < 32 and not exposed):
                 continue
-            ns = min(ns_cap["coop2"], (BLOCK_SHARED_BYTES_OPT_IN[90] - 2 * 64 * sn * 2) // ring)
+            staging = 2 * 64 * sn * out_bytes
+            ns = (BLOCK_SHARED_BYTES_OPT_IN[90] - _STATIC_SMEM_BYTES - staging) // ring
+            if not deep:
+                ns = min(ns_cap["coop2"], ns)
             if ns < 3:
                 continue
-            if best is None or (ns, sn) > best[:2]:
-                best = (ns, sn)
+            # The swizzle span: the largest power of two up to 128 B dividing the row.
+            key = (ns, math.gcd(sn * out_bytes, 128), sn < bn, sn) if exposed else (ns, sn)
+            if best is None or key > best:
+                best = key
         if best is None:
             return None
-        ns, sn = best
-        return ns, (0 if sn == bn else sn)
+        return best[0], (0 if best[-1] == bn else best[-1])
 
     def _stage_rule_ok(bm: int, bn: int, ns: int) -> bool:
         if ns < 3:
@@ -250,7 +329,7 @@ def _enumerate(m: int, n: int, k: int, trans_a: bool, trans_b: bool, sm_count: i
     out = []
 
     for bm in (64, 128):
-        for bn in (64, 128, 192, 256):
+        for bn in _BASIC_WIDTHS:
             if (bm * bn) // 128 > max_accum_regs:
                 continue
             # 64x192 is offered only unsplit, where its grid fits one wave and m holds at
@@ -263,7 +342,9 @@ def _enumerate(m: int, n: int, k: int, trans_a: bool, trans_b: bool, sm_count: i
             ):
                 continue
             if one_wave_192:
-                rings = [(128, 3)] if nt else [(64, 5)]
+                # Offered only where that ring fits beside the output staging tile.
+                bk, ns = (128, 3) if nt else (64, 5)
+                rings = [(bk, ns)] if _ns_basic(bm, bn, bk) >= ns else []
             else:
                 rings = [(bk, _ns_basic(bm, bn, bk)) for bk in (32, 64, 128)]
             for bk, ns in rings:
@@ -296,7 +377,7 @@ def _enumerate(m: int, n: int, k: int, trans_a: bool, trans_b: bool, sm_count: i
         for bn in (64, 128, 192, 256):
             if n % bn:
                 continue
-            ns = _ns_basic(64, bn, 128)
+            ns = min(ns_cap["simple"], _ns_basic(64, bn, 128))
             if ns >= 3:
                 out.append(
                     _Cand(
@@ -309,71 +390,116 @@ def _enumerate(m: int, n: int, k: int, trans_a: bool, trans_b: bool, sm_count: i
                         cluster_m=cluster_m,
                     )
                 )
-    for bn in (64, 128, 176, 192, 256):
+    # The narrowest coop2 width whose grid of 128-row tiles fits one wave, among the widths
+    # the coop2 kernel issues as one WGMMA per 16 of K: those dividing 256, which
+    # ``T.wgmma_gemm`` issues whole, and those ``dense_wgmma_helper.h`` names. Offered only
+    # where the last row tile gives both 64-row consumers rows, and where that grid takes at
+    # least ``wave_15_16`` SMs, the fraction split-K coop2 below accepts for whole row tiles; a
+    # wider tile only fills fewer SMs.
+    rows = math.ceil(m / 128)
+    wave_15_16 = -(-15 * sm_count // 16)
+    one_wave = None
+    if nt and (m % 128 == 0 or m % 128 > 64):
+        widths = (64, 128, 144, 160, 176, 192, 224, 240, 256)
+        fits = [w for w in widths if rows * math.ceil(n / w) <= sm_count]
+        if fits and rows * math.ceil(n / fits[0]) >= wave_15_16:
+            one_wave = fits[0]
+    for bn in sorted({64, 128, 176, 192, 256, one_wave or 256}):
         for bk in (32, 64, 128):
             # 176 fills the waves of some N that 192 and 256 leave a partial last
             # wave. Only as whole tiles: with an N tail its extra tiles each pay an
-            # epilogue the score does not count (4096x7168x2048 measured a tie with
-            # 256). It is one WGMMA only over 64-wide K steps.
-            if bn == 176 and (n % bn or bk != 64):
+            # epilogue the score does not count. The one-wave tile takes the N tail as the other
+            # one-wave widths do. It is one WGMMA only over 64-wide K steps.
+            if bn == 176 and (bk != 64 or (n % bn and bn != one_wave)):
                 continue
-            d = _coop2_ns_sn(bn, bk)
+            mn_tiles = rows * math.ceil(n / bn)
+            # One tile a CTA leaves the epilogue unhidden; a float32 one with 16-byte rows goes
+            # through the TMA store.
+            exposed = mn_tiles <= sm_count and out_bytes == 4 and n * out_bytes % 16 == 0
+            # At 128 wide, two tiles or more along each axis, coop2 outruns the basic tile only on
+            # a ring at least as deep: it takes the deepest ring the SMEM holds (see ``score``).
+            deep = bn == one_wave == 128 and rows > 1 and n > bn
+            d = _coop2_ns_sn(bn, bk, exposed, deep)
             if d is None:
                 continue
             ns, sn = d
             if not _stage_rule_ok(128, bn, ns):
                 continue
-            coop2_ok = bn == 256 or (nt and bn >= 176)
-            mn_tiles = math.ceil(m / 128) * math.ceil(n / bn)
-            if coop2_ok and mn_tiles >= sm_count:
-                out.append(_Cand("coop2", 128, bn, bk, ns, stage_n=sn))
+            coop2_ok = bn == 256 or (nt and bn in (176, 192))
+            # A width that does not divide 256 is one WGMMA only over 64-wide K steps.
+            one_wave_ok = bn == one_wave and (deep or (bn > 128 and (bk == 64 or 256 % bn == 0)))
+            full_wave_ok = coop2_ok and mn_tiles >= sm_count
+            if full_wave_ok or one_wave_ok:
+                out.append(_Cand("coop2", 128, bn, bk, ns, stage_n=sn, one_wave=not full_wave_ok))
             if nt:
                 k_iters = math.ceil(k / bk)
                 ns_sk = min(ns, ns_cap["coop2_splitk"])
                 if ns_sk >= 3 and bn <= 128:
-                    # 15/16 of a wave where no 128-row tile runs past ``m`` (128x4096x12288:
-                    # 34.6 us on 128 CTAs against 36.7); tiles with rows past ``m`` measured
-                    # slower on such a grid and need a full wave.
-                    min_ctas = -(-15 * sm_count // 16) if m % 128 == 0 else sm_count
+                    # 15/16 of a wave suffices when no 128-row tile runs past ``m``; tiles with
+                    # rows past ``m`` need a full wave.
+                    min_ctas = wave_15_16 if m % 128 == 0 else sm_count
                     for sk in (2, 4, 8):
                         if k_iters % sk == 0 and k_iters // sk >= 4 and mn_tiles * sk >= min_ctas:
                             out.append(_Cand("coop2_splitk", 128, bn, bk, ns_sk, split_k=sk))
-    fill = _fill_cand(m, n, k, sm_count) if nt else None
+    fill = _fill_cand(m, n, k, sm_count, out_bytes) if nt else None
     if fill is not None:
         out.append(fill)
-    if not nt and n % 8 == 0:
-        # Reserve two fp16 output chunks per consumer before sizing the operand ring.
-        swap_epilogue = 2 * 2 * 32 * 64 * 2
+    if nt and k > 0:
+        # The stream tile (C.T in 64-row blocks of B) stages its transposed output tile, twice
+        # at a width the helper runs. Every slot reloads A's rows, so A's share of the ring
+        # grows with m: under 6 stages a block's run of B rows is too short to stream faster
+        # than the basic tiles.
+        mpad, helper_width = stream_width(m)
+        staging = mpad * 64 * out_bytes * (2 if helper_width else 1)
+        ring = BLOCK_SHARED_BYTES_OPT_IN[90] - _STATIC_SMEM_BYTES - staging
+        ns = ring // ((64 + mpad) * 128 * 2)
+        if ns >= 6:
+            blocks = math.ceil(math.ceil(n / 64) / sm_count)
+            out.append(_Cand("stream", 64, mpad, 128, ns, blocks=blocks))
+    # The coop2_swap tile's transposed store, stmatrix.trans, writes 16-bit elements only.
+    if not nt and n % 8 == 0 and out_bytes == 2:
+        # Reserve both consumers' fp16 output staging before sizing the operand ring.
+        swap_epilogue = 2 * math.prod(COOP2_SWAP_STAGING) * 2
         for bn in (128, 160, 192):
             stage = (256 + bn) * 64 * 2 + 2 * 8  # operands plus full/empty barriers
-            ns = min(4, (BLOCK_SHARED_BYTES_OPT_IN[90] - swap_epilogue) // stage)
+            ns = min(
+                _COOP2_SWAP_FULL_RING, (BLOCK_SHARED_BYTES_OPT_IN[90] - swap_epilogue) // stage
+            )
             # Three stages cannot hide mixed-width tiles; require whole uniform tiles.
-            if ns >= 4 or (ns >= 3 and m % bn == 0):
+            if ns >= _COOP2_SWAP_FULL_RING or (ns >= 3 and m % bn == 0):
                 out.append(_Cand("coop2_swap", 256, bn, 64, ns))
     return out
 
 
-def _fill_cand(m: int, n: int, k: int, sm_count: int) -> Optional[_Cand]:
+def _fill_cand(m: int, n: int, k: int, sm_count: int, out_bytes: int = 2) -> _Cand | None:
     """The one-wave 64-row NT tile at a width the basic tiles skip, or None.
 
     Its width is the narrowest multiple of 8 whose grid of 64-row tiles fits one wave,
-    offered only where that width is none of the basic widths and ``m`` fills more than
-    three quarters of two 64-row tiles. Each M tile reads every B tile: past two tiles a
-    128-row tile, which shares B between its two consumers, reads less; with one tile, or
-    a mostly empty second one, a split-K grid streams B faster. The tile runs 64-wide K
-    steps on the deepest ring the shared memory holds, one WGMMA of its own width per 16
-    of K, and launches the two M tiles of each N column as one cluster.
+    offered only where that width is none of the basic widths and ``m`` fills more than half
+    of one 64-row tile or more than three quarters of two. Each M tile reads every B tile:
+    past two tiles a 128-row tile, which shares B between its two consumers, reads less; with
+    a mostly empty second tile a split-K grid streams B faster. With one tile each SM streams
+    its own columns of B once and no partial sums leave the CTA, which a split-K grid writes
+    and reduces; the scorer weighs that against the split grid's shorter K per CTA under its
+    own factor, ``fill_one``. At half a tile or less a split-K or 64-wide grid is as fast.
+    The tile runs 64-wide K steps on the deepest ring the shared memory holds, one WGMMA of
+    its own width per 16 of K, and launches the M tiles of each N column as one cluster; a
+    one-tile ring stops at the deepest power of two, the fastest depth on the H200.
     """
-    # The tile's own-width WGMMA needs the TMA store, so 16-byte output rows.
-    if not 96 < m <= 128 or n % 8:
+    m_tiles = 1 if 32 < m <= 64 else 2 if 96 < m <= 128 else 0
+    # The tile's own-width WGMMA needs the TMA store, so 16-byte output rows; its ring needs
+    # a K step to stream.
+    if not m_tiles or n % 8 or k == 0:
         return None
-    width = next((w for w in range(16, 257, 8) if 2 * -(-n // w) <= sm_count), None)
-    if width is None or width in (64, 128, 192, 256):
+    width = next((w for w in range(16, 257, 8) if m_tiles * -(-n // w) <= sm_count), None)
+    if width is None or width in _BASIC_WIDTHS:
         return None
-    # A stage's A and B tiles and its two 8-byte mbarriers; the output staging tile.
-    stage = (64 + width) * 64 * 2 + 16
-    ns = min(-(-k // 64), (BLOCK_SHARED_BYTES_OPT_IN[90] - 64 * width * 2) // stage)
-    return _Cand("fill", 64, width, 64, ns, panel_size=0, cluster_m=2)
+    # A stage's A and B tiles; the output staging tile.
+    stage = (64 + width) * 64 * 2
+    ns = min(-(-k // 64), _ring_budget(64 * width * out_bytes, width) // stage)
+    if m_tiles == 1:
+        ns = 1 << (ns.bit_length() - 1)
+    return _Cand("fill", 64, width, 64, ns, panel_size=0, cluster_m=m_tiles)
 
 
 def _tile_fill(m: int, n: int, block_n: int, sm_count: int) -> float:
@@ -386,7 +512,7 @@ def _tile_fill(m: int, n: int, block_n: int, sm_count: int) -> float:
     return m * n / (math.ceil(tiles / sm_count) * sm_count * 128 * block_n)
 
 
-def _pingpong_config(m: int, n: int, k: int, coop2_block_n: int, sm_count: int) -> Optional[dict]:
+def _pingpong_config(m: int, n: int, k: int, coop2_block_n: int, sm_count: int) -> dict | None:
     """The ping-pong config to run in place of a coop2 tile, or None to keep coop2.
 
     A ping-pong consumer runs its epilogue under the other consumer's mainloop, where
@@ -569,10 +695,7 @@ def _tiny_m_candidates(k: int, gemv: bool) -> list[dict]:
     The operand-swapped kernel at each ring depth, the 64 x 128 tile at each split
     dividing the K-tile count, and with *gemv* the ``GemvKernel`` stand-in ``_GEMV``.
     """
-    out = [
-        {"swap_ab": True, "block_nn": _SWAP_AB_BLOCK_NN, "block_k": 128, "num_stages": ns}
-        for ns in (6, 8, 10)
-    ]
+    out = [{"swap_ab": True, "block_nn": 64, "block_k": 128, "num_stages": ns} for ns in (6, 8, 10)]
     out += [
         {
             "block_m": 64,
@@ -619,21 +742,31 @@ def _tiny_m_config(n: int, k: int, sm_count: int, gemv: bool, cal: _TinyMCalibra
     return min(_tiny_m_candidates(k, gemv), key=lambda c: _tiny_m_score_us(c, n, k, sm_count, cal))
 
 
-def two_row_gemv_wins(n: int, k: int, sm_count: int, board: Optional[str]) -> bool:
+def two_row_gemv_wins(n: int, k: int, sm_count: int, calibration: str | None) -> bool:
     """Whether ``GemvKernel`` outscores every tiny-m tile on an ``m == 2`` NT call.
 
-    *board* is a device name or calibration key; False on a board without a calibration.
+    *calibration* is the board's calibration key; False on a board without a calibration.
     """
-    cal = _calibration(board) if board else None
+    cal = _calibration(calibration)
     return cal is not None and _tiny_m_config(n, k, sm_count, True, cal.tiny_m) is _GEMV
 
 
-def _score_us(cd: _Cand, m: int, n: int, k: int, sm_count: int, cal: _Calibration) -> float:
-    """Predicted microseconds; only the relative ordering is meaningful."""
+def _score_us(
+    cd: _Cand, m: int, n: int, k: int, sm_count: int, cal: _Calibration, out_bytes: int = 2
+) -> float:
+    """Predicted microseconds of a call whose output elements take *out_bytes*; only the
+    relative ordering is meaningful."""
+    if cd.structure == "stream":
+        # The time the grid streams B: each CTA streams its blocks back to back, so the grid
+        # streams at a rate that grows with its CTAs up to the DRAM's; A's reloads and the
+        # tiles' MMA hide under that stream.
+        ctas = math.ceil(math.ceil(n / cd.block_m) / cd.blocks)
+        rate = min(ctas * cal.stream.cta_gbps * 1e3, cal.stream.dram_tbps * 1e6)
+        return n * k * 2 / rate
     if cd.structure == "coop2_swap":
         m, n = n, m
     bm, bn, sk = cd.block_m, cd.block_n, cd.split_k
-    elem, elem_out = 2, 2
+    elem, elem_out = 2, out_bytes
     num_blocks = math.ceil(m / bm) * math.ceil(n / bn) * sk
     num_waves = math.ceil(num_blocks / sm_count)
     wave_eff = num_blocks / (num_waves * sm_count)
@@ -654,6 +787,14 @@ def _score_us(cd: _Cand, m: int, n: int, k: int, sm_count: int, cal: _Calibratio
     if sk > 1:
         red_bytes = sk * m * n * 4 + m * n * elem_out
         us += red_bytes / (cal.reduce_tbps * 1e6)
+    # A 3-stage swap ring takes its own factor: it scores fewer bytes and K steps than a
+    # 4-stage one but runs no faster per FLOP.
+    if cd.structure == "coop2_swap" and cd.num_stages < _COOP2_SWAP_FULL_RING:
+        return us * cal.factor("coop2_swap_3stage")
+    # A one-M-tile fill grid has no cluster and the whole of each SM's B stream; see
+    # ``_fill_cand``.
+    if cd.structure == "fill" and cd.cluster_m == 1:
+        return us * cal.factor("fill_one")
     return us * cal.factor(cd.structure)
 
 
@@ -667,17 +808,32 @@ def _best_config_cached(
     sm_count: int,
     l2_bytes: int,
     cal: _Calibration,
+    out_bytes: int,
 ) -> dict:
     """Cached selection body of :func:`best_config` — do not mutate results."""
     if m <= 8 and not trans_a and trans_b:
         return _tiny_m_config(n, k, sm_count, False, cal.tiny_m)
-    cands = _enumerate(m, n, k, trans_a, trans_b, sm_count)
+    cands = _enumerate(m, n, k, trans_a, trans_b, sm_count, out_bytes)
     if not cands:
         raise AssertionError(
             f"no config candidate for {m}x{n}x{k} (trans_a={trans_a}, "
             f"trans_b={trans_b}, sm_count={sm_count})"
         )
-    best = min(cands, key=lambda c: (_score_us(c, m, n, k, sm_count, cal), -c.block_k))
+
+    # Of two tiles scoring alike, the deeper ring wins: a one-wave coop2 tile on a ring
+    # shallower than the basic tile's loses to it.
+    def score(c: _Cand) -> tuple:
+        return _score_us(c, m, n, k, sm_count, cal, out_bytes), -c.block_k, -c.num_stages
+
+    best = min(cands, key=score)
+    # In one row tile past 64 K steps, a 128 x 128 basic grid streams B at the DRAM rate
+    # whatever share of its last wave it fills, which the score does not model: it reads B
+    # once, as the one-wave coop2 tile does, and keeps the call where it scores best of the
+    # others. A 64-wide basic tile streams B slower than the one-wave tile.
+    if best.one_wave and m <= 128 and math.ceil(k / 64) > 64:
+        other = min((c for c in cands if not c.one_wave), key=score, default=best)
+        if (other.structure, other.block_m, other.block_n) == ("basic", 128, 128):
+            best = other
     if best.structure == "coop2":
         nt = not trans_a and trans_b
         cfg = (nt and _pingpong_config(m, n, k, best.block_n, sm_count)) or best.to_config()
@@ -691,8 +847,8 @@ def _best_config_cached(
     if best.structure == "coop2_swap":
         cfg = best.to_config()
         cfg["group_size_m"] = _group_size_m(n, m, k, best.block_n, l2_bytes, block_m=256)
-        # A ring under 4 stages runs uniform tiles only.
-        if math.ceil(k / best.block_k) >= 16 and best.num_stages >= 4:
+        # A shallower ring runs uniform tiles only.
+        if math.ceil(k / best.block_k) >= 16 and best.num_stages >= _COOP2_SWAP_FULL_RING:
             cfg |= _swap_row_mix(m, n, best.block_n, trans_a, sm_count)
         return cfg
     return best.to_config()
@@ -705,10 +861,11 @@ def best_config(
     trans_a: bool,
     trans_b: bool,
     sm_count: int,
-    device_name: str,
+    calibration: str | None,
     *,
     l2_bytes: int,
-) -> Optional[dict]:
+    out_bytes: int = 2,
+) -> dict | None:
     """Return the analytically selected ``GEMMTMAKernel`` config for a shape.
 
     Args:
@@ -718,10 +875,13 @@ def best_config(
         trans_a: ``A`` stored ``[k, m]`` when True.
         trans_b: ``B`` stored ``[n, k]`` when True.
         sm_count: Streaming multiprocessors of the target device.
-        device_name: The target device as CUDA names it, which selects the
-            profile the ranking constants come from.
+        calibration: The target board's calibration key
+            (``tileops._utils.calibration_key``), which selects the profile the ranking
+            constants come from.
         l2_bytes: L2 cache of the target device, in bytes; it sets the raster group
             of a persistent coop2 or ping-pong tile.
+        out_bytes: Bytes of one output element: 2 for an output in the operands' 16-bit
+            dtype, 4 for a float32 one, whose staging tiles take twice the shared memory.
 
     Returns:
         ``None`` when no profile carries this board's ranking constants, so the
@@ -729,16 +889,16 @@ def best_config(
         Otherwise a config dict in ``GEMMTMAKernel`` schema — either the single-consumer
         form (``block_m/block_n/block_k/num_stages/panel_size/split_k``,
         optionally ``simple``) or a structure-flagged form (``coop2s`` /
-        ``coop2`` / ``coop2_splitk`` / ``coop2_swap`` / ``pingpong`` / ``swap_ab``). A
-        fresh dict per call: the selection itself is
+        ``coop2`` / ``coop2_splitk`` / ``coop2_swap`` / ``pingpong`` / ``stream`` /
+        ``swap_ab``). A fresh dict per call: the selection itself is
         cached, but callers hold (and may mutate) their own copy — sibling
         kernel families mutate ``self.config`` in place, and a shared cached
         dict would be poisoned by that idiom.
     """
-    cal = _calibration(device_name)
+    cal = _calibration(calibration)
     if cal is None:
         return None
-    return dict(_best_config_cached(m, n, k, trans_a, trans_b, sm_count, l2_bytes, cal))
+    return dict(_best_config_cached(m, n, k, trans_a, trans_b, sm_count, l2_bytes, cal, out_bytes))
 
 
 def gemv_config(k: int) -> dict:
@@ -770,13 +930,13 @@ def small_batch_config(n: int, k: int, sm_count: int) -> dict:
     """``GemvKernel`` config rule for its ``lhs_rows`` band (m == 2 NT).
 
     Modal best across the dispatched band: one output column per block, a
-    64-lane reduction over K, 4-deep cp.async ring. One exception: when the
+    64-lane reduction over K, 6-deep cp.async ring. One exception: when the
     grid alone fills the device's CTA slots (block_n=1 -> n CTAs vs the
     32-per-SM cap) AND the per-thread K loop is long, resident warps already
     hide the load latency and the deep ring only adds sync overhead, so the
     2-stage ring wins.
     """
-    cfg = {"block_n": 1, "reduce_threads": 64, "num_stages": 4}
+    cfg = {"block_n": 1, "reduce_threads": 64, "num_stages": 6}
     k_iters = math.ceil(k / (cfg["reduce_threads"] * 8))
     if n >= 28 * sm_count and k_iters >= 12:
         cfg["num_stages"] = 2
@@ -784,15 +944,15 @@ def small_batch_config(n: int, k: int, sm_count: int) -> dict:
 
 
 def small_m_splitk_config(
-    m: int, n: int, k: int, sm_count: int, device_name: str
-) -> Optional[dict]:
+    m: int, n: int, k: int, sm_count: int, calibration: str | None
+) -> dict | None:
     """Select the split-K basic GEMM band fitted on a calibrated board for a small-M NT call."""
     block_k = 128
     k_tiles = k // block_k
     # The row count the small-M split-K band was fitted at, by calibration key. A board
     # without an entry has no band.
     small_m_splitk_m = {"h200": 32}
-    band_m = small_m_splitk_m.get(calibration_key(device_name))
+    band_m = small_m_splitk_m.get(calibration)
     if m != band_m or k % block_k or n % 8 or k_tiles < 48:
         return None
     block_ns = [block_n for block_n in range(8, 129, 8) if n % block_n == 0]
@@ -885,14 +1045,12 @@ def fp8_ws_config(m: int, n: int, k: int, sm_count: int, block_scaled: bool) -> 
     else:
         num_stages = 4
     tiles = -(-m // 128) * -(-n // block_n)
-    # Shortest K slice the FP8 split-K path pays for.
-    fp8_min_slice_k_tiles = 12
     split_k = 1
     for candidate in (4, 2):
         if (
             tiles * candidate <= sm_count
             and k_iters % candidate == 0
-            and k_iters // candidate >= fp8_min_slice_k_tiles
+            and k_iters // candidate >= FP8_MIN_SLICE_K_TILES
         ):
             split_k = candidate
             break
@@ -924,18 +1082,19 @@ def int8_w8a8_config(m: int, n: int, k: int, sm_count: int) -> dict:
     - ``block_n``: the narrowest of 32, 64, 96, 128, 160 and 256 whose grid fits one wave.
       A decode shape is bound by the bytes each SM reads, ``(64 + block_n) * k`` a tile, so
       the narrowest tile whose grid still has an SM for every tile reads the fewest. The
-      widths between are left out: TileLang issues a ``T.wgmma_gemm`` as
-      ``gcd(block_n, 256)``-wide instructions, so 48 runs as three n16 WGMMAs, each
-      re-reading A (measured: 48 no faster than 64 on 64 x 6144 x 4096 at two-thirds the
-      grid). This width was the fastest measured on every decode row of the manifest.
+      kernel issues 96 and 160 as one WGMMA of their own width.
     - ``block_k``: 256 where ``a`` is exactly one full 64-row tile and the tile is at most
-      160 wide, which halves the barrier round trips a K axis takes (measured 0.5-6.3%
-      faster on every ``m = 64`` row); 128 otherwise. At ``m = 1`` TileLang cannot lay out
-      a one-row 256-byte box; at ``m = 128`` and on the 256-wide tile the 256-wide step
-      measured slower.
+      160 wide, which halves the barrier round trips a K axis takes; 128 otherwise. At
+      ``m = 1`` TileLang cannot lay out a one-row 256-byte box.
     - ring depth: the deepest the shared memory holds, at most one stage a K step.
     """
     block_m = 64
+    # FIXME(staged-rollout): the multiples of 16 from 32 to 256 missing here (48, 80, 112, 144,
+    # 176, 192, 208, 224, 240) are left out for a reason that no longer holds.
+    #
+    # Broken invariant: every width the kernel issues as one WGMMA is a candidate.
+    # Why: they were dropped when TileLang split them into narrower WGMMAs.
+    # Cleanup: measure them, then add them or state why they stay out.
     widths = (32, 64, 96, 128, 160, 256)
     tiles_m = -(-m // block_m)
     block_n = next((w for w in widths if tiles_m * -(-n // w) <= sm_count), widths[-1])
@@ -946,3 +1105,67 @@ def int8_w8a8_config(m: int, n: int, k: int, sm_count: int) -> dict:
     staging = block_m * block_n * 2 if m >= block_m else 0
     num_stages = min(-(-k // block_k), (BLOCK_SHARED_BYTES_OPT_IN[90] - staging) // stage)
     return {"block_n": block_n, "num_stages": num_stages, "group_size_m": 8, "block_k": block_k}
+
+
+def _pingpong_busiest(wide: int, narrow: int, block_n: int, narrow_n: int, sm_count: int) -> tuple:
+    """Columns the busiest CTA and the busiest consumer of a persistent ping-pong grid compute,
+    when ``wide`` tiles ``block_n`` wide run before ``narrow`` tiles ``narrow_n`` wide.
+
+    CTA ``p`` takes tiles ``p``, ``p + sm_count``, ...; its consumer ``w % 2`` takes its
+    ``w``-th tile and runs that tile's epilogue.
+    """
+    total = wide + narrow
+    cta = consumer = 0
+    for p in range(min(sm_count, total)):
+        widths = [block_n if t < wide else narrow_n for t in range(p, total, sm_count)]
+        cta = max(cta, sum(widths))
+        consumer = max(consumer, sum(widths[0::2]), sum(widths[1::2]))
+    return cta, consumer
+
+
+def int8_pingpong_grid(m: int, n: int, sm_count: int, group_size_m: int) -> dict:
+    """Tile width and narrow tiles of the persistent INT8 ping-pong GEMM's grid.
+
+    The grid takes 128 x 192 tiles, ending in the narrow tiles :func:`_narrow_tiles` picks,
+    where they leave the busiest CTA no more columns than 128 x 128 tiles and, at equal
+    columns, leave the busiest consumer no more; 128 x 128 tiles otherwise.
+
+    - The busiest CTA's columns bound its tensor work: both consumers share the CTA's tensor
+      cores.
+    - The busiest consumer's columns bound its epilogues, which hide under the other
+      consumer's mainloops only while those are longer; a CTA with an odd tile count gives
+      one consumer the extra tile.
+    - At equal work the 192-wide tile is faster: its TMA loads and WGMMA shared-memory reads
+      carry fewer bytes a MAC, and a CTA hands the tensor cores between its consumers a
+      third less often.
+
+    Returns:
+        ``block_n``, ``narrow_n``, ``narrow_rows`` and ``narrow_cols``; ``narrow_n`` 0 is a
+        uniform grid.
+    """
+    rows = -(-m // 128)
+    uniform = {"block_n": 128, "narrow_n": 0, "narrow_rows": 0, "narrow_cols": 0}
+    uniform_load = _pingpong_busiest(rows * -(-n // 128), 0, 128, 0, sm_count)
+    # A consumer holds its tile as two 64-row int32 accumulators, block_n registers a thread.
+    # 192 is the widest multiple of the 32-column store box that leaves the consumer's
+    # 240-register budget room for its addresses, scales and loop state: 224 leaves 16.
+    wide_n = 192
+    # Every width of whole 32-column store boxes below the wide tile.
+    narrow_widths = tuple(range(wide_n - 32, 0, -32))
+    cols = -(-n // wide_n)
+    narrow = _narrow_tiles(m, n, wide_n, narrow_widths, group_size_m, sm_count) or {
+        "narrow_n": 0,
+        "narrow_rows": 0,
+        "narrow_cols": 0,
+    }
+    narrow_n, narrow_rows, narrow_cols = (
+        narrow["narrow_n"],
+        narrow["narrow_rows"],
+        narrow["narrow_cols"],
+    )
+    tail_cols = -(-(n - narrow_cols * narrow_n) // wide_n)
+    wide_tiles = (rows - narrow_rows) * cols + narrow_rows * tail_cols
+    wide_load = _pingpong_busiest(wide_tiles, narrow_rows * narrow_cols, wide_n, narrow_n, sm_count)
+    if wide_load > uniform_load:
+        return uniform
+    return {"block_n": wide_n, **narrow}

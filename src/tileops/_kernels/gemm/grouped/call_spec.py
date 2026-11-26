@@ -2,7 +2,6 @@
 
 import dataclasses
 from abc import abstractmethod
-from typing import Optional
 
 import torch
 
@@ -24,7 +23,7 @@ class GroupedGEMMCall(CallSpec):
     num_experts: int = 0
     n: int = 0
     k: int = 0
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
     transpose_a: bool = False
     transpose_b: bool = True
 
@@ -75,7 +74,7 @@ def grouped_gemm_entry(cls: type, call: GroupedGEMMCall) -> Entry:
     The device index is in the identity because the kernel is compiled for the
     architecture it is built on.
     """
-    index = call.device.index if call.device is not None else None
+    index = call.device_index
     identity = (
         call.numel,
         call.num_experts,

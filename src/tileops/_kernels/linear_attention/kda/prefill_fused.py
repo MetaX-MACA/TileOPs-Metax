@@ -1,7 +1,5 @@
 """Kimi Delta Attention (KDA) prefill with the chunk step and the scan in one CTA."""
 
-from typing import Optional, Tuple
-
 import torch
 
 from tileops._kernels.kernel_base import CompiledProgram, Entry, Kernel
@@ -10,7 +8,9 @@ from tileops._kernels.linear_attention.call_spec import (
     KDAFwdInterface,
 )
 from tileops._kernels.linear_attention.chunk_plan import CHUNK_SIZE, packed_offsets
+from tileops._kernels.linear_attention.chunk_prefill import referenced_form
 from tileops._kernels.linear_attention.kda.fused_program import fused_chunk_program
+from tileops._kernels.linear_attention.kda.prefill import KDAChunkPrefillFwdKernel
 
 __all__ = ["KDAFusedPrefillFwdKernel"]
 
@@ -20,16 +20,14 @@ class KDAFusedPrefillFwdKernel(Kernel, KDAFwdInterface):
 
     The chunk-local work and the recurrence share a block, so the WY vectors,
     the gated query and key and the intra-chunk attention never reach global
-    memory. The launch is one block per (sequence, value head), so this is the
-    right shape only when there are enough of those to cover the device; below
-    that the chunk-parallel split serves the same call.
+    memory. The launch is one block per (sequence, value head).
     """
 
     supported_archs = [89, 90]
     preferred_over = frozenset({"kda_chunk_prefill"})
 
     @classmethod
-    def refusal(cls, call: KDACall) -> Optional[str]:
+    def refusal(cls, call: KDACall) -> str | None:
         """Why this kernel does not serve *call*, or ``None`` when it does."""
         chunked = call.chunk_refusal
         if chunked is not None:
@@ -38,22 +36,29 @@ class KDAFusedPrefillFwdKernel(Kernel, KDAFwdInterface):
             return "serves a sequence of at least two tokens"
         if call.gate_in_kernel:
             return "raw gates use chunk-parallel preparation"
+        # On SM90 the chunk-parallel path prepares every chunk at once in the joint launch and
+        # walks only the states, while this CTA walks its sequence's chunks whole.
+        if referenced_form(call) and KDAChunkPrefillFwdKernel.refusal(call) is None:
+            return "SM90 prepares given gates of FP32's exponent range on the chunk-parallel path"
         # A CTA per (sequence, value head) pays off only while those cover most SMs; a
         # compact 128-wide SM89 CTA fills one SM's shared memory.
         blocks = call.sequences * call.value_heads
         wanted = call.sm_count if call.arch == 89 and call.dim_k == 128 else call.sm_count * 3 // 4
         if blocks < wanted:
             return f"fuses the scan into {blocks} blocks, fewer than the {wanted} it needs"
-        return None
+        return super().refusal(call)
 
     @classmethod
     def entry_for(cls, call: KDACall) -> Entry:
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         compact = call.arch == 89 and call.dim_k == 128
-        # A second SM90 launch amortizes its switch cost above this per-SM workload.
+        # A second SM90 launch amortizes its switch cost above this per-SM workload. A state
+        # pool takes the one-launch program: the second launch restarts a pair from its
+        # initial state, which the first has overwritten in the pool.
         two_launch_tokens_per_sm = 3072
         two_launch = (
             call.arch == 90
+            and not call.pooled
             and call.batch * call.seq_len * call.value_heads
             >= two_launch_tokens_per_sm * call.sm_count
         )
@@ -71,6 +76,8 @@ class KDAFusedPrefillFwdKernel(Kernel, KDAFwdInterface):
             index,
             compact,
             two_launch,
+            call.state_v_first,
+            call.pooled,
         )
         return identity, lambda: cls(
             heads=call.heads,
@@ -83,6 +90,8 @@ class KDAFusedPrefillFwdKernel(Kernel, KDAFwdInterface):
             device_index=index,
             compact=compact,
             two_launch=two_launch,
+            state_v_first=call.state_v_first,
+            pooled=call.pooled,
         )
 
     def __init__(
@@ -95,9 +104,11 @@ class KDAFusedPrefillFwdKernel(Kernel, KDAFwdInterface):
         l2norm: bool,
         dtype: torch.dtype,
         *,
-        device_index: Optional[int] = None,
+        device_index: int | None = None,
         compact: bool = False,
         two_launch: bool = False,
+        state_v_first: bool = False,
+        pooled: bool = False,
     ) -> None:
         """Hold the call facts the fused program is built from."""
         super().__init__(device_index=device_index)
@@ -110,6 +121,8 @@ class KDAFusedPrefillFwdKernel(Kernel, KDAFwdInterface):
         self.l2norm = l2norm
         self.dtype = dtype
         self.two_launch = two_launch
+        self.state_v_first = state_v_first
+        self.pooled = pooled
 
     def forward(
         self,
@@ -118,12 +131,13 @@ class KDAFusedPrefillFwdKernel(Kernel, KDAFwdInterface):
         v: torch.Tensor,
         g: torch.Tensor,
         beta: torch.Tensor,
-        initial_state: Optional[torch.Tensor] = None,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        cu_seqlens_cpu: Optional[torch.Tensor] = None,
-        A_log: Optional[torch.Tensor] = None,
-        dt_bias: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        initial_state: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
+        A_log: torch.Tensor | None = None,
+        dt_bias: torch.Tensor | None = None,
+        state_indices: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run every chunk inside its own CTA; see the interface for the tensors."""
         del cu_seqlens_cpu, A_log, dt_bias
         self._require_devices(q=q, k=k, v=v, g=g, beta=beta)
@@ -139,12 +153,17 @@ class KDAFusedPrefillFwdKernel(Kernel, KDAFwdInterface):
         vf = v.reshape(1, total, HV, V)
         gf = g.reshape(1, total, HV, K)
         bf = beta.reshape(1, total, HV)
+        # A square state: the zero state is the same in either layout.
         state = (
             torch.zeros(num_seqs, HV, K, V, dtype=torch.float32, device=q.device)
             if initial_state is None
             else initial_state
         )
         program = self.program(self._launcher, H, HV, K, V, total, num_seqs)
+        if self.pooled:
+            # The pool is advanced in place and returned as the final state.
+            o = program(qf, kf, vf, gf, bf, state, offsets, state_indices)
+            return o.reshape(batch, seq_len, HV, V), state
         o, final_state = program(qf, kf, vf, gf, bf, state, offsets)
         return o.reshape(batch, seq_len, HV, V), final_state
 
@@ -163,10 +182,11 @@ class KDAFusedPrefillFwdKernel(Kernel, KDAFwdInterface):
             total,
             num_seqs,
         )
+        layout = {"state_v_first": self.state_v_first}
         if not self.two_launch:
-            return fused_chunk_program(*shape, compact=self.compact)
-        check = CompiledProgram(fused_chunk_program(*shape, stage="check"))
-        rerun = CompiledProgram(fused_chunk_program(*shape, stage="rerun"))
+            return fused_chunk_program(*shape, compact=self.compact, pooled=self.pooled, **layout)
+        check = CompiledProgram(fused_chunk_program(*shape, stage="check", **layout))
+        rerun = CompiledProgram(fused_chunk_program(*shape, stage="rerun", **layout))
 
         def two_launch(qf, kf, vf, gf, bf, state, offsets):
             o, final_state, flags = check(qf, kf, vf, gf, bf, state, offsets)

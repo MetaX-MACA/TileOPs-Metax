@@ -1,17 +1,46 @@
-"""What the 1d, 2d and 3d kernels share: the autotune search space, the grid limit and the
-launch path."""
+"""What the 1d, 2d and 3d kernels share: the swizzle panel, the output tile's epilogue, the
+autotune search space, the grid limit and the launch path."""
 
 import itertools
-from typing import Optional
 
+import tilelang.language as T
 import torch
 
 from tileops._kernels.constants import MAX_GRID_YZ_BLOCKS
 from tileops._kernels.kernel_base import Kernel
-from tileops._utils import get_shared_memory_optin, get_sm_version
+
+# The panel every convolution kernel's block swizzle groups blocks into: a power of two so the
+# block remap divides by shift, and the narrowest one because long grids lose as it widens.
+SWIZZLE_PANEL = 2
 
 
-def grid_refusal(*, y: int = 1, z: int = 1) -> Optional[str]:
+@T.macro
+def stage_output_tile(
+    out_local, out_shared, bias, block_m, block_n, row0, rows, col0, cols, channel0, dtype
+):
+    """Cast the accumulator tile into ``out_shared``, adding the bias where there is one.
+
+    Row ``i`` of the tile is output channel ``channel0 + row0 + i`` and column ``j`` is
+    output position ``col0 + j``. An element past ``rows`` or ``cols`` is stored as zero.
+    """
+    for i, j in T.Parallel(block_m, block_n):
+        row = row0 + i
+        col = col0 + j
+        if bias is not None:
+            out_shared[i, j] = T.if_then_else(
+                (row < rows) & (col < cols),
+                T.cast(out_local[i, j] + T.cast(bias[channel0 + row], out_local.dtype), dtype),
+                T.cast(0.0, dtype),
+            )
+        else:
+            out_shared[i, j] = T.if_then_else(
+                (row < rows) & (col < cols),
+                T.cast(out_local[i, j], dtype),
+                T.cast(0.0, dtype),
+            )
+
+
+def grid_refusal(*, y: int = 1, z: int = 1) -> str | None:
     """Why a launch of ``y`` blocks along grid y and ``z`` along z cannot run, or ``None``."""
     for axis, blocks in (("y", y), ("z", z)):
         if blocks > MAX_GRID_YZ_BLOCKS:
@@ -19,7 +48,7 @@ def grid_refusal(*, y: int = 1, z: int = 1) -> Optional[str]:
     return None
 
 
-def operand_refusal(elements: int) -> Optional[str]:
+def operand_refusal(elements: int) -> str | None:
     """Why a program with an operand of ``elements`` elements cannot build, or ``None``.
 
     TileLang fails to build the programs that ask once an index into that operand passes
@@ -30,57 +59,37 @@ def operand_refusal(elements: int) -> Optional[str]:
     return None
 
 
-def conv_num_stages(device_index: Optional[int]) -> int:
-    """Pipeline depth this target's shared memory holds: three on SM90, two before."""
-    return 3 if get_sm_version(device_index) == 90 else 2
+def conv_num_stages(arch: int) -> int:
+    """Pipeline depth the shared memory of architecture *arch* holds: three on SM90, two
+    before."""
+    return 3 if arch == 90 else 2
 
 
 def conv_autotune_configs(
-    dtype,
-    device_index: Optional[int],
+    dtype: torch.dtype,
+    smem_budget: int,
     *,
     block_m=(32, 64, 128),
     block_n=(64, 128, 256),
     block_k=(32, 64, 128),
-    num_stages=(2, 3),
     threads=(128, 256),
-    enable_rasterization=(False, True),
     out_pad_cols: int = 0,
 ) -> list[dict]:
-    """Search space filtered to combinations that fit in shared memory.
+    """Search space filtered to combinations that fit in *smem_budget* bytes of shared memory.
 
-    ``enable_rasterization`` turns on a swizzle that orders blocks for L2 locality. It
-    is searched rather than fixed because which way wins follows the grid a shape
-    produces, and both ways win on some shapes. Callers narrow the other axes to keep
-    the search the size it was before this one joined it. ``out_pad_cols`` is the
-    number of columns a kernel pads its shared output tile with.
+    ``enable_rasterization`` turns on a swizzle that orders blocks for L2 locality. It is
+    searched rather than fixed because which way wins follows the grid a shape produces.
+    ``out_pad_cols`` is the number of columns a kernel pads its shared output tile with.
     """
-
-    def conv_shared_memory_bytes(
-        block_m: int,
-        block_n: int,
-        block_k: int,
-        num_stages: int,
-        dtype: torch.dtype,
-    ) -> int:
-        dtype_bytes = torch.tensor([], dtype=dtype).element_size()
-        per_stage_bytes = (block_m * block_k + block_k * block_n) * dtype_bytes
-        out_shared_bytes = block_m * (block_n + out_pad_cols) * dtype_bytes
-        return per_stage_bytes * max(1, num_stages) + out_shared_bytes
-
-    limit = get_shared_memory_optin(device_index)
-    valid = []
+    configs = []
     for bm, bn, bk, ns, th, rast in itertools.product(
-        block_m,
-        block_n,
-        block_k,
-        num_stages,
-        threads,
-        enable_rasterization,
+        block_m, block_n, block_k, (2, 3), threads, (False, True)
     ):
-        if conv_shared_memory_bytes(bm, bn, bk, ns, dtype) > limit:
+        stage_bytes = (bm * bk + bk * bn) * dtype.itemsize
+        out_bytes = bm * (bn + out_pad_cols) * dtype.itemsize
+        if stage_bytes * ns + out_bytes > smem_budget:
             continue
-        valid.append(
+        configs.append(
             {
                 "block_m": bm,
                 "block_n": bn,
@@ -90,13 +99,13 @@ def conv_autotune_configs(
                 "enable_rasterization": rast,
             }
         )
-    return valid
+    return configs
 
 
 def launch(
     kernel: Kernel,
     *tensors: torch.Tensor,
-    bias: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
 ) -> torch.Tensor:
     """Run *kernel*'s compiled program, passing *bias* only when the call carries one.
 

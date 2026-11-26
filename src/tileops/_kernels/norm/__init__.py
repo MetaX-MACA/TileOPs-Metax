@@ -10,9 +10,12 @@ from tileops._kernels.norm.batch_norm import (
     BatchNormFwdTrainWideKernel,
 )
 from tileops._kernels.norm.fused_add_norm import (
+    AdaLayerNormHeldKernel,
+    AdaLayerNormZeroHeldKernel,
     FusedAddLayerNormHeldKernel,
     FusedAddLayerNormKernel,
     FusedAddRMSNormKernel,
+    LayerNormHeldKernel,
 )
 from tileops._kernels.norm.fused_add_rms_norm_quant import (
     FusedAddRMSNormPerTokenQuantKernel,
@@ -34,12 +37,15 @@ from tileops._kernels.norm.rms_norm import (
     RMSNormPairedKernel,
     RMSNormTwoPassKernel,
 )
+from tileops._kernels.norm.rms_norm_gated import RMSNormGatedKernel
 from tileops._kernels.norm.rms_norm_on_chip import RMSNormOnChipKernel
 from tileops._kernels.norm.rms_norm_staged import RMSNormStagedKernel
 from tileops._kernels.norm.rms_norm_streaming import RMSNormStreamingKernel
 
 __all__: list[str] = [
+    "AdaLayerNormHeldKernel",
     "AdaLayerNormKernel",
+    "AdaLayerNormZeroHeldKernel",
     "AdaLayerNormZeroKernel",
     "BatchNormBwdKernel",
     "BatchNormBwdSplitKernel",
@@ -62,8 +68,10 @@ __all__: list[str] = [
     "InstanceNormFwdTrainSingleKernel",
     "InstanceNormKernel",
     "InstanceNormNoAffineKernel",
+    "LayerNormHeldKernel",
     "LayerNormKernel",
     "LayerNormWarpRowKernel",
+    "RMSNormGatedKernel",
     "RMSNormKernel",
     "RMSNormOnChipKernel",
     "RMSNormPairedKernel",

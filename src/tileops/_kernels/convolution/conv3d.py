@@ -1,22 +1,21 @@
 """3-D convolution kernels: dense and grouped."""
 
-from typing import Optional
-
 import tilelang
 import tilelang.language as T
 import torch
 
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.convolution._common import (
+    SWIZZLE_PANEL,
     conv_autotune_configs,
     conv_num_stages,
     grid_refusal,
     launch,
     operand_refusal,
+    stage_output_tile,
 )
 from tileops._kernels.convolution.call_spec import Conv3dCall, Conv3dFwdInterface
 from tileops._kernels.kernel_base import Entry, Kernel
-from tileops._utils import is_maca
 
 __all__ = [
     "Conv3dKernel",
@@ -46,29 +45,24 @@ def _conv3d_kernel(
     dilation_h: int,
     dilation_w: int,
     has_bias: bool,
-    dtype: str = "float16",
-    pad_d_end: Optional[int] = None,
-    pad_h_end: Optional[int] = None,
-    pad_w_end: Optional[int] = None,
+    dtype: str,
+    *,
+    pad_d_end: int,
+    pad_h_end: int,
+    pad_w_end: int,
 ):
-    # Swizzle panel: a power of two so the block remap divides by shift, and the
-    # narrowest one because long grids lose as it widens.
-    swizzle_panel = 2
-    # The end of each axis may pad more than the start; unset, it pads the same.
-    pad_d_end = pad_d if pad_d_end is None else pad_d_end
-    pad_h_end = pad_h if pad_h_end is None else pad_h_end
-    pad_w_end = pad_w if pad_w_end is None else pad_w_end
+    # The end of each axis may pad more than the start.
     accum_dtype = "float"
     out_d = (d_in + pad_d + pad_d_end - dilation_d * (kernel_d - 1) - 1) // stride_d + 1
     out_h = (h_in + pad_h + pad_h_end - dilation_h * (kernel_h - 1) - 1) // stride_h + 1
     out_w = (w_in + pad_w + pad_w_end - dilation_w * (kernel_w - 1) - 1) // stride_w + 1
     k_total = kernel_d * kernel_h * kernel_w * c_in
 
-    # Re-enable automatic async copy once TileLang lowers scalar cp.async
-    # widening for vectorized manual data loads. Keep weight T.copy eligible for TMA.
+    # Automatic async copy is off: TileLang does not widen the scalar cp.async it emits for
+    # the gathered data loads. The weight T.copy stays eligible for TMA.
     @tilelang.jit(
         out_idx=[2],
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
         pass_configs={"tl.enable_async_copy": False},
     )
     def _conv3d_func(
@@ -96,7 +90,7 @@ def _conv3d_kernel(
                 weight_flat = T.Tensor((c_out, k_total), dtype, weight.data)
                 out_flat = T.Tensor((n, c_out, out_dhw), dtype, out.data)
 
-                T.use_swizzle(swizzle_panel, enable=enable_rasterization)
+                T.use_swizzle(SWIZZLE_PANEL, enable=enable_rasterization)
                 T.clear(out_local)
 
                 for k_iter in T.Pipelined(T.ceildiv(k_total, block_k), num_stages=num_stages):
@@ -133,21 +127,19 @@ def _conv3d_kernel(
                     T.copy(weight_flat[by * block_m, k_iter * block_k], weight_shared)
                     T.gemm(weight_shared, data_shared, out_local)
 
-                for i, j in T.Parallel(block_m, block_n):
-                    oc = by * block_m + i
-                    spatial_idx = bx * block_n + j
-                    if has_bias:
-                        out_shared[i, j] = T.if_then_else(
-                            (oc < c_out) & (spatial_idx < out_dhw),
-                            T.cast(out_local[i, j] + T.cast(bias[oc], accum_dtype), dtype),
-                            T.cast(0.0, dtype),
-                        )
-                    else:
-                        out_shared[i, j] = T.if_then_else(
-                            (oc < c_out) & (spatial_idx < out_dhw),
-                            T.cast(out_local[i, j], dtype),
-                            T.cast(0.0, dtype),
-                        )
+                stage_output_tile(
+                    out_local,
+                    out_shared,
+                    bias,
+                    block_m,
+                    block_n,
+                    by * block_m,
+                    c_out,
+                    bx * block_n,
+                    out_dhw,
+                    0,
+                    dtype,
+                )
 
                 T.copy(out_shared, out_flat[bz, by * block_m, bx * block_n])
 
@@ -198,33 +190,26 @@ def _conv3d_group_kernel(
     dilation_h: int,
     dilation_w: int,
     has_bias: bool,
-    dtype: str = "float16",
-    groups: int = 1,
-    c_in_g: int = 0,
-    c_out_g: int = 0,
-    pad_d_end: Optional[int] = None,
-    pad_h_end: Optional[int] = None,
-    pad_w_end: Optional[int] = None,
+    dtype: str,
+    groups: int,
+    c_in_g: int,
+    c_out_g: int,
+    *,
+    pad_d_end: int,
+    pad_h_end: int,
+    pad_w_end: int,
 ):
-    # Swizzle panel: a power of two so the block remap divides by shift, and the
-    # narrowest one because long grids lose as it widens.
-    swizzle_panel = 2
-    # The end of each axis may pad more than the start; unset, it pads the same.
-    pad_d_end = pad_d if pad_d_end is None else pad_d_end
-    pad_h_end = pad_h if pad_h_end is None else pad_h_end
-    pad_w_end = pad_w if pad_w_end is None else pad_w_end
+    # The end of each axis may pad more than the start.
     accum_dtype = "float"
     out_d = (d_in + pad_d + pad_d_end - dilation_d * (kernel_d - 1) - 1) // stride_d + 1
     out_h = (h_in + pad_h + pad_h_end - dilation_h * (kernel_h - 1) - 1) // stride_h + 1
     out_w = (w_in + pad_w + pad_w_end - dilation_w * (kernel_w - 1) - 1) // stride_w + 1
     out_dhw = out_d * out_h * out_w
-    c_in_g = c_in_g if c_in_g > 0 else c_in // groups
-    c_out_g = c_out_g if c_out_g > 0 else c_out // groups
     k_total = kernel_d * kernel_h * kernel_w * c_in_g
 
     @tilelang.jit(
         out_idx=[2],
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
         pass_configs={"tl.enable_async_copy": False},
     )
     def _conv3d_group_func(
@@ -255,7 +240,7 @@ def _conv3d_group_kernel(
                 weight_flat = T.Tensor((c_out, k_total), dtype, weight.data)
                 out_flat = T.Tensor((n, c_out, out_dhw), dtype, out.data)
 
-                T.use_swizzle(swizzle_panel, enable=enable_rasterization)
+                T.use_swizzle(SWIZZLE_PANEL, enable=enable_rasterization)
                 T.clear(out_local)
 
                 batch_id = bz // groups
@@ -295,22 +280,19 @@ def _conv3d_group_kernel(
 
                     T.gemm(weight_shared, data_shared, out_local)
 
-                for i, j in T.Parallel(block_m, block_n):
-                    oc_g = by * block_m + i
-                    oc = group_id * c_out_g + oc_g
-                    spatial_idx = bx * block_n + j
-                    if has_bias:
-                        out_shared[i, j] = T.if_then_else(
-                            (oc_g < c_out_g) & (spatial_idx < out_dhw),
-                            T.cast(out_local[i, j] + T.cast(bias[oc], accum_dtype), dtype),
-                            T.cast(0.0, dtype),
-                        )
-                    else:
-                        out_shared[i, j] = T.if_then_else(
-                            (oc_g < c_out_g) & (spatial_idx < out_dhw),
-                            T.cast(out_local[i, j], dtype),
-                            T.cast(0.0, dtype),
-                        )
+                stage_output_tile(
+                    out_local,
+                    out_shared,
+                    bias,
+                    block_m,
+                    block_n,
+                    by * block_m,
+                    c_out_g,
+                    bx * block_n,
+                    out_dhw,
+                    group_id * c_out_g,
+                    dtype,
+                )
 
                 if c_out_g % block_m == 0:
                     # The tile ends on this group's last channel, so the copy cannot spill
@@ -375,10 +357,11 @@ def _conv3d_ndhwc_kernel(
     dilation_w: int,
     has_bias: bool,
     out_pad_cols: int,
-    dtype: str = "float16",
-    pad_d_end: Optional[int] = None,
-    pad_h_end: Optional[int] = None,
-    pad_w_end: Optional[int] = None,
+    dtype: str,
+    *,
+    pad_d_end: int,
+    pad_h_end: int,
+    pad_w_end: int,
 ):
     """Dense Conv3d over NDHWC-staged input and ODHW(I)-staged weights.
 
@@ -386,13 +369,7 @@ def _conv3d_ndhwc_kernel(
     An explicit gather handles per-axis stride, padding and dilation because
     ``T.im2col`` only supports 2D. The contraction axis is ``((kd, kh, kw), c)``
     with contiguous channels for vectorized loads; out-of-bounds inputs are zero."""
-    # Swizzle panel: a power of two so the block remap divides by shift, and the
-    # narrowest one because long grids lose as it widens.
-    swizzle_panel = 2
-    # The end of each axis may pad more than the start; unset, it pads the same.
-    pad_d_end = pad_d if pad_d_end is None else pad_d_end
-    pad_h_end = pad_h if pad_h_end is None else pad_h_end
-    pad_w_end = pad_w if pad_w_end is None else pad_w_end
+    # The end of each axis may pad more than the start.
     accum_dtype = "float"
     out_d = (d + pad_d + pad_d_end - dilation_d * (kernel_d - 1) - 1) // stride_d + 1
     out_h = (h + pad_h + pad_h_end - dilation_h * (kernel_h - 1) - 1) // stride_h + 1
@@ -400,12 +377,11 @@ def _conv3d_ndhwc_kernel(
     out_dhw = out_d * out_h * out_w
     k_total = c_in * kernel_d * kernel_h * kernel_w
 
-    # Unlike the NCDHW kernels above, tl.enable_async_copy stays enabled here:
-    # the NDHWC gather vectorises to >=4B accesses, which are cp.async-eligible
-    # inside the pipelined K loop.
+    # Automatic async copy stays on: the NDHWC gather vectorizes to accesses of 4 bytes or
+    # more, which cp.async takes inside the pipelined K loop.
     @tilelang.jit(
         out_idx=[4],
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
     )
     def _conv3d_ndhwc_func(
         block_m: int,
@@ -469,7 +445,7 @@ def _conv3d_ndhwc_kernel(
                 weight_flat = T.Tensor((c_out, k_total), dtype, weight_kdrsc.data)
                 out_flat = T.Tensor((n, c_out, out_dhw), dtype, out.data)
 
-                T.use_swizzle(swizzle_panel, enable=enable_rasterization)
+                T.use_swizzle(SWIZZLE_PANEL, enable=enable_rasterization)
                 T.clear(out_local)
 
                 for k_iter in T.Pipelined(T.ceildiv(k_total, block_k), num_stages=num_stages):
@@ -597,14 +573,14 @@ class Conv3dKernel(Kernel, Conv3dFwdInterface):
     supported_archs: list[int] = [80, 86, 89, 90]
 
     @classmethod
-    def refusal(cls, call: Conv3dCall) -> Optional[str]:
+    def refusal(cls, call: Conv3dCall) -> str | None:
         if call.groups != 1:
             return "serves ungrouped convolution"
         return super().refusal(call) or grid_refusal(z=call.n)
 
     @classmethod
     def entry_for(cls, call: Conv3dCall) -> Entry:
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         args = dict(
             n=call.n,
             c_in=call.c_in,
@@ -652,47 +628,14 @@ class Conv3dKernel(Kernel, Conv3dFwdInterface):
         dilation_w: int,
         dtype: torch.dtype,
         has_bias: bool = False,
-        pad_end: Optional[tuple[int, ...]] = None,
-        config: Optional[dict] = None,
+        pad_end: tuple[int, ...] | None = None,
+        config: dict | None = None,
         *,
-        device_index: Optional[int] = None,
+        device_index: int | None = None,
     ) -> None:
         super().__init__(device_index=device_index)
-        self.n = n
-        self.c_in = c_in
-        self.d_in = d_in
-        self.h_in = h_in
-        self.w_in = w_in
-        self.c_out = c_out
-        self.kernel_d = kernel_d
-        self.kernel_h = kernel_h
-        self.kernel_w = kernel_w
-        self.stride_d = stride_d
-        self.stride_h = stride_h
-        self.stride_w = stride_w
-        self.pad_d = pad_d
-        self.pad_h = pad_h
-        self.pad_w = pad_w
-        self.pad_d_end, self.pad_h_end, self.pad_w_end = (
-            pad_end if pad_end is not None else (pad_d, pad_h, pad_w)
-        )
-        self.dilation_d = dilation_d
-        self.dilation_h = dilation_h
-        self.dilation_w = dilation_w
         self.dtype = dtype
-        self.has_bias = has_bias
-        self.out_d = (
-            d_in + pad_d + self.pad_d_end - dilation_d * (kernel_d - 1) - 1
-        ) // stride_d + 1
-        self.out_h = (
-            h_in + pad_h + self.pad_h_end - dilation_h * (kernel_h - 1) - 1
-        ) // stride_h + 1
-        self.out_w = (
-            w_in + pad_w + self.pad_w_end - dilation_w * (kernel_w - 1) - 1
-        ) // stride_w + 1
-        self.m = n * self.out_d * self.out_h * self.out_w
-        self.k_total = c_in * kernel_d * kernel_h * kernel_w
-
+        pad_d_end, pad_h_end, pad_w_end = pad_end if pad_end is not None else (pad_d, pad_h, pad_w)
         self.kernel = _conv3d_kernel(
             n,
             c_in,
@@ -714,9 +657,9 @@ class Conv3dKernel(Kernel, Conv3dFwdInterface):
             dilation_w,
             has_bias,
             self.dtype_str,
-            pad_d_end=self.pad_d_end,
-            pad_h_end=self.pad_h_end,
-            pad_w_end=self.pad_w_end,
+            pad_d_end=pad_d_end,
+            pad_h_end=pad_h_end,
+            pad_w_end=pad_w_end,
         )
         self.init_config(config)
 
@@ -726,7 +669,11 @@ class Conv3dKernel(Kernel, Conv3dFwdInterface):
             "block_m": 64,
             "block_n": 64,
             "block_k": 64,
-            "num_stages": 1 if is_maca() else conv_num_stages(self.device_index),
+            "num_stages": (
+                1
+                if self.build_target.kind == "maca"
+                else conv_num_stages(self.build_target.arch)
+            ),
             "threads": 128,
             "enable_rasterization": True,
         }
@@ -735,7 +682,7 @@ class Conv3dKernel(Kernel, Conv3dFwdInterface):
     def autotune_configs(self) -> list[dict]:
         return conv_autotune_configs(
             self.dtype,
-            self.device_index,
+            self.build_target.smem_budget,
             block_n=[32, 64, 128],
             threads=[128],
         )
@@ -744,7 +691,7 @@ class Conv3dKernel(Kernel, Conv3dFwdInterface):
         self,
         x: torch.Tensor,
         weight: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return launch(self, x, weight, bias=bias)
 
@@ -755,7 +702,7 @@ class GroupConv3dKernel(Kernel, Conv3dFwdInterface):
     supported_archs: list[int] = [80, 86, 89, 90]
 
     @classmethod
-    def refusal(cls, call: Conv3dCall) -> Optional[str]:
+    def refusal(cls, call: Conv3dCall) -> str | None:
         if call.groups <= 1:
             return "serves grouped convolution"
         operands = (
@@ -772,7 +719,7 @@ class GroupConv3dKernel(Kernel, Conv3dFwdInterface):
 
     @classmethod
     def entry_for(cls, call: Conv3dCall) -> Entry:
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         args = dict(
             n=call.n,
             c_in=call.c_in,
@@ -796,7 +743,7 @@ class GroupConv3dKernel(Kernel, Conv3dFwdInterface):
             dtype=call.dtype,
             groups=call.groups,
             c_in_g=call.c_in_g,
-            c_out_g=call.c_out // call.groups,
+            c_out_g=call.c_out_g,
         )
         identity = (*args.values(), call.has_bias, index)
         return identity, lambda: cls(**args, has_bias=call.has_bias, device_index=index)
@@ -823,54 +770,24 @@ class GroupConv3dKernel(Kernel, Conv3dFwdInterface):
         dilation_w: int,
         dtype: torch.dtype,
         has_bias: bool = False,
-        pad_end: Optional[tuple[int, ...]] = None,
-        groups: int = 1,
-        c_in_g: Optional[int] = None,
-        c_out_g: Optional[int] = None,
-        config: Optional[dict] = None,
+        pad_end: tuple[int, ...] | None = None,
+        config: dict | None = None,
         *,
-        device_index: Optional[int] = None,
+        groups: int,
+        c_in_g: int,
+        c_out_g: int,
+        device_index: int | None = None,
     ) -> None:
         super().__init__(device_index=device_index)
-        self.n = n
-        self.c_in = c_in
-        self.d_in = d_in
-        self.h_in = h_in
-        self.w_in = w_in
-        self.c_out = c_out
-        self.kernel_d = kernel_d
-        self.kernel_h = kernel_h
-        self.kernel_w = kernel_w
-        self.stride_d = stride_d
-        self.stride_h = stride_h
-        self.stride_w = stride_w
-        self.pad_d = pad_d
-        self.pad_h = pad_h
-        self.pad_w = pad_w
-        self.pad_d_end, self.pad_h_end, self.pad_w_end = (
-            pad_end if pad_end is not None else (pad_d, pad_h, pad_w)
-        )
-        self.dilation_d = dilation_d
-        self.dilation_h = dilation_h
-        self.dilation_w = dilation_w
-        self.groups = groups
-        self.c_in_g = c_in_g if c_in_g is not None else c_in // groups
-        self.c_out_g = c_out_g if c_out_g is not None else c_out // groups
+        if groups <= 1:
+            raise ValueError("GroupConv3dKernel requires groups > 1")
+        if c_in % groups != 0 or c_out % groups != 0:
+            raise ValueError(
+                f"GroupConv3dKernel requires c_in and c_out divisible by groups; "
+                f"got c_in={c_in}, c_out={c_out}, groups={groups}"
+            )
         self.dtype = dtype
-        self.has_bias = has_bias
-        self.out_d = (
-            d_in + pad_d + self.pad_d_end - dilation_d * (kernel_d - 1) - 1
-        ) // stride_d + 1
-        self.out_h = (
-            h_in + pad_h + self.pad_h_end - dilation_h * (kernel_h - 1) - 1
-        ) // stride_h + 1
-        self.out_w = (
-            w_in + pad_w + self.pad_w_end - dilation_w * (kernel_w - 1) - 1
-        ) // stride_w + 1
-        self.m = n * self.groups * self.out_d * self.out_h * self.out_w
-        self.k_total = self.c_in_g * kernel_d * kernel_h * kernel_w
-        self._validate_group_shape()
-
+        pad_d_end, pad_h_end, pad_w_end = pad_end if pad_end is not None else (pad_d, pad_h, pad_w)
         self.kernel = _conv3d_group_kernel(
             n,
             c_in,
@@ -893,22 +810,13 @@ class GroupConv3dKernel(Kernel, Conv3dFwdInterface):
             has_bias,
             self.dtype_str,
             groups,
-            self.c_in_g,
-            self.c_out_g,
-            pad_d_end=self.pad_d_end,
-            pad_h_end=self.pad_h_end,
-            pad_w_end=self.pad_w_end,
+            c_in_g,
+            c_out_g,
+            pad_d_end=pad_d_end,
+            pad_h_end=pad_h_end,
+            pad_w_end=pad_w_end,
         )
         self.init_config(config)
-
-    def _validate_group_shape(self) -> None:
-        if self.groups <= 1:
-            raise ValueError("GroupConv3dKernel requires groups > 1")
-        if self.c_in % self.groups != 0 or self.c_out % self.groups != 0:
-            raise ValueError(
-                f"GroupConv3dKernel requires c_in and c_out divisible by groups; "
-                f"got c_in={self.c_in}, c_out={self.c_out}, groups={self.groups}"
-            )
 
     @property
     def default_config(self) -> dict:
@@ -916,7 +824,11 @@ class GroupConv3dKernel(Kernel, Conv3dFwdInterface):
             "block_m": 64,
             "block_n": 64,
             "block_k": 64,
-            "num_stages": 1 if is_maca() else conv_num_stages(self.device_index),
+            "num_stages": (
+                1
+                if self.build_target.kind == "maca"
+                else conv_num_stages(self.build_target.arch)
+            ),
             "threads": 128,
             "enable_rasterization": True,
         }
@@ -925,7 +837,7 @@ class GroupConv3dKernel(Kernel, Conv3dFwdInterface):
     def autotune_configs(self) -> list[dict]:
         return conv_autotune_configs(
             self.dtype,
-            self.device_index,
+            self.build_target.smem_budget,
             block_n=[32, 64, 128],
             threads=[128],
         )
@@ -934,7 +846,7 @@ class GroupConv3dKernel(Kernel, Conv3dFwdInterface):
         self,
         x: torch.Tensor,
         weight: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return launch(self, x, weight, bias=bias)
 
@@ -958,7 +870,7 @@ class Conv3dNdhwcKernel(Kernel, Conv3dFwdInterface):
     _OUT_PAD_COLS = 2
 
     @classmethod
-    def refusal(cls, call: Conv3dCall) -> Optional[str]:
+    def refusal(cls, call: Conv3dCall) -> str | None:
         """Dense 16-bit calls whose output amortizes the two layout transforms."""
         # The staging is a fixed cost paid before any math, so pointwise and small-output
         # calls stay on the dense implementation even though this one computes them.
@@ -979,7 +891,7 @@ class Conv3dNdhwcKernel(Kernel, Conv3dFwdInterface):
 
     @classmethod
     def entry_for(cls, call: Conv3dCall) -> Entry:
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         args = dict(
             n=call.n,
             c_in=call.c_in,
@@ -1027,10 +939,10 @@ class Conv3dNdhwcKernel(Kernel, Conv3dFwdInterface):
         dilation_w: int,
         dtype: torch.dtype,
         has_bias: bool = False,
-        pad_end: Optional[tuple[int, ...]] = None,
-        config: Optional[dict] = None,
+        pad_end: tuple[int, ...] | None = None,
+        config: dict | None = None,
         *,
-        device_index: Optional[int] = None,
+        device_index: int | None = None,
     ) -> None:
         super().__init__(device_index=device_index)
         self.n = n
@@ -1042,25 +954,8 @@ class Conv3dNdhwcKernel(Kernel, Conv3dFwdInterface):
         self.kernel_d = kernel_d
         self.kernel_h = kernel_h
         self.kernel_w = kernel_w
-        self.stride_d = stride_d
-        self.stride_h = stride_h
-        self.stride_w = stride_w
-        self.pad_d = pad_d
-        self.pad_h = pad_h
-        self.pad_w = pad_w
-        self.pad_d_end, self.pad_h_end, self.pad_w_end = (
-            pad_end if pad_end is not None else (pad_d, pad_h, pad_w)
-        )
-        self.dilation_d = dilation_d
-        self.dilation_h = dilation_h
-        self.dilation_w = dilation_w
         self.dtype = dtype
-        self.has_bias = has_bias
-        self.out_d = (d + pad_d + self.pad_d_end - dilation_d * (kernel_d - 1) - 1) // stride_d + 1
-        self.out_h = (h + pad_h + self.pad_h_end - dilation_h * (kernel_h - 1) - 1) // stride_h + 1
-        self.out_w = (w + pad_w + self.pad_w_end - dilation_w * (kernel_w - 1) - 1) // stride_w + 1
-        self.m = n * self.out_d * self.out_h * self.out_w
-        self.k_total = c_in * kernel_d * kernel_h * kernel_w
+        pad_d_end, pad_h_end, pad_w_end = pad_end if pad_end is not None else (pad_d, pad_h, pad_w)
 
         self.kernel = _conv3d_ndhwc_kernel(
             n,
@@ -1084,9 +979,9 @@ class Conv3dNdhwcKernel(Kernel, Conv3dFwdInterface):
             has_bias,
             self._OUT_PAD_COLS,
             self.dtype_str,
-            pad_d_end=self.pad_d_end,
-            pad_h_end=self.pad_h_end,
-            pad_w_end=self.pad_w_end,
+            pad_d_end=pad_d_end,
+            pad_h_end=pad_h_end,
+            pad_w_end=pad_w_end,
         )
         self.init_config(config)
 
@@ -1105,7 +1000,7 @@ class Conv3dNdhwcKernel(Kernel, Conv3dFwdInterface):
     def autotune_configs(self) -> list[dict]:
         configs = conv_autotune_configs(
             self.dtype,
-            self.device_index,
+            self.build_target.smem_budget,
             block_m=list(self.block_m_candidates),
             block_k=[16, 32, 64, 128, 256],
             threads=[128],
@@ -1117,7 +1012,7 @@ class Conv3dNdhwcKernel(Kernel, Conv3dFwdInterface):
         self,
         x: torch.Tensor,
         weight: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x_ndhwc = torch.empty(
             (self.n, self.d, self.h, self.w, self.c_in),

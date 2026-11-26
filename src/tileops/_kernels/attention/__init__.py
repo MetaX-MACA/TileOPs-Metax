@@ -7,11 +7,17 @@ from tileops._kernels.attention.call_spec import (
 from tileops._kernels.attention.dsa.decode import DSADecodeBasicKernel, DSADecodeKernel
 from tileops._kernels.attention.dsa.decode_ws import DSADecodeWSKernel
 from tileops._kernels.attention.dsa.paged import DSAPagedClusterKernel, DSAPagedWSKernel
+from tileops._kernels.attention.dsa.paged_mma import DSAPagedMMAKernel
 from tileops._kernels.attention.fp8_lightning_indexer import (
     FP8LightningIndexerCall,
     FP8LightningIndexerFwdInterface,
     FP8LightningIndexerKernel,
     FP8LightningIndexerWSKernel,
+)
+from tileops._kernels.attention.gated_pool_compress import (
+    GatedPoolCompressCall,
+    GatedPoolCompressFwdInterface,
+    GatedPoolCompressKernel,
 )
 from tileops._kernels.attention.gqa.bwd import (
     GQABwdMMAKernel,
@@ -19,7 +25,11 @@ from tileops._kernels.attention.gqa.bwd import (
     GQABwdWGMMAPipelinedKernel,
 )
 from tileops._kernels.attention.gqa.bwd_ws import GQABwdWSKernel
-from tileops._kernels.attention.gqa.decode import GQADecodeKernel, GQADecodeLongContextKernel
+from tileops._kernels.attention.gqa.decode import (
+    GQADecodeKernel,
+    GQADecodeNarrowGroupKernel,
+    GQADecodeSplitKernel,
+)
 from tileops._kernels.attention.gqa.decode_bs1 import GQADecodeBs1Kernel
 from tileops._kernels.attention.gqa.decode_fp8 import GQADenseFP8DecodeKernel
 from tileops._kernels.attention.gqa.decode_ws import GQADecodeWSKernel
@@ -32,7 +42,7 @@ from tileops._kernels.attention.gqa.dense import (
 from tileops._kernels.attention.gqa.dense_fp8 import GQADenseFP8Kernel
 from tileops._kernels.attention.gqa.dense_prefill import GQADensePrefillFwdKernel
 from tileops._kernels.attention.gqa.paged import GQAPagedFwdKernel
-from tileops._kernels.attention.gqa.paged_decode import GQADecodePagedKernel
+from tileops._kernels.attention.gqa.paged_decode import MHADecodePagedKernel
 from tileops._kernels.attention.gqa.paged_decode_bs1 import GQADecodePagedBs1Kernel
 from tileops._kernels.attention.gqa.paged_fp8_decode import GQAPagedFP8DecodeKernel
 from tileops._kernels.attention.gqa.paged_fp8_ws import GQAPagedFP8WSKernel
@@ -67,11 +77,16 @@ from tileops._kernels.attention.nsa.compressed_varlen import (
     NSACompressedFwdVarlenTMAKernel,
 )
 from tileops._kernels.attention.nsa.topk_varlen import NSATopKVarlenKernel
-from tileops._kernels.attention.nsa.varlen import NSAFwdVarlenKernel, NSAFwdVarlenTMAKernel
+from tileops._kernels.attention.nsa.varlen import (
+    NSAFwdVarlenGatherKernel,
+    NSAFwdVarlenKernel,
+    NSAFwdVarlenTMAKernel,
+)
 from tileops._kernels.attention.paged_cache_gather import (
     PagedKVCacheGatherCall,
     PagedKVCacheGatherFwdInterface,
     PagedKVCacheGatherKernel,
+    PagedKVCacheGatherShortKernel,
 )
 from tileops._kernels.attention.paged_cache_write import PagedKVCacheWriteKernel
 from tileops._kernels.attention.topk_select import (
@@ -88,6 +103,7 @@ __all__ = [
     "DSADecodeWSKernel",
     "DSAPagedCall",
     "DSAPagedClusterKernel",
+    "DSAPagedMMAKernel",
     "DSAPagedWSKernel",
     "FP8LightningIndexerCall",
     "FP8LightningIndexerFwdInterface",
@@ -99,9 +115,9 @@ __all__ = [
     "GQABwdWSKernel",
     "GQADecodeBs1Kernel",
     "GQADecodeKernel",
-    "GQADecodeLongContextKernel",
+    "GQADecodeNarrowGroupKernel",
     "GQADecodePagedBs1Kernel",
-    "GQADecodePagedKernel",
+    "GQADecodeSplitKernel",
     "GQADecodeWSKernel",
     "GQADenseFP8DecodeKernel",
     "GQADenseFP8Kernel",
@@ -120,6 +136,10 @@ __all__ = [
     "GQAVarlenFP8FwdKernel",
     "GQAVarlenFP8WSFwdKernel",
     "GQAVarlenPackedWSFwdKernel",
+    "GatedPoolCompressCall",
+    "GatedPoolCompressFwdInterface",
+    "GatedPoolCompressKernel",
+    "MHADecodePagedKernel",
     "MHADecodePagedWSKernel",
     "MLADecodeCall",
     "MLADecodeMMAKernel",
@@ -138,12 +158,14 @@ __all__ = [
     "MergeAttentionStatesKernel",
     "NSACompressedFwdVarlenKernel",
     "NSACompressedFwdVarlenTMAKernel",
+    "NSAFwdVarlenGatherKernel",
     "NSAFwdVarlenKernel",
     "NSAFwdVarlenTMAKernel",
     "NSATopKVarlenKernel",
     "PagedKVCacheGatherCall",
     "PagedKVCacheGatherFwdInterface",
     "PagedKVCacheGatherKernel",
+    "PagedKVCacheGatherShortKernel",
     "PagedKVCacheWriteKernel",
     "TopKSelectCall",
     "TopKSelectFwdInterface",

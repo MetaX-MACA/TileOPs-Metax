@@ -4,8 +4,8 @@ from dataclasses import dataclass
 
 import torch
 
-from tileops._kernels.elementwise._broadcast import row_tile_leaves_tail
-from tileops._kernels.elementwise._dtype import BOOL_STORAGE_DTYPE, torch_dtype_nbytes
+from tileops._kernels.elementwise._broadcast import row_tile_leaves_tail, takes_flat_grid
+from tileops._kernels.elementwise._dtype import BOOL_STORAGE_DTYPE
 from tileops._kernels.kernel_base import Kernel
 
 # The default config and the autotune sweep derive elements per thread from these two,
@@ -68,8 +68,10 @@ def default_launch_config(
     vectorized_threads = 128
     threads = direct_threads if strategy == "direct" else vectorized_threads
 
-    elem_bytes = torch_dtype_nbytes(input_dtype)
+    elem_bytes = input_dtype.itemsize
     npt = max(_MIN_NUM_PER_THREAD, bytes_per_thread // elem_bytes)
+    # A bool result is staged through fragments (``BinaryKernel.stage_broadcast``).
+    staged = output_dtype == torch.bool
 
     if output_dtype == torch.bool and stores_bool:
         bool_output_max_npt = 4  # elements per thread a bool store is capped at
@@ -79,8 +81,8 @@ def default_launch_config(
             threads = min(max_threads, threads * npt // capped)
         npt = capped
     else:
-        if torch_dtype_nbytes(output_dtype) < elem_bytes and not _tail_dominated(
-            row_broadcast_inner, n_total, threads, npt, output_dtype == torch.bool
+        if output_dtype.itemsize < elem_bytes and not _tail_dominated(
+            row_broadcast_inner, n_total, threads, npt, staged
         ):
             # A narrower result leaves the store short of a vector, so widen to cover it.
             npt *= 2
@@ -93,7 +95,7 @@ def default_launch_config(
     one_vector_min_waves = 8
     if (
         elem_bytes == 8
-        and torch_dtype_nbytes(output_dtype) == elem_bytes
+        and output_dtype.itemsize == elem_bytes
         and strategy != "direct"
         and n_total is not None
         and resident_threads is not None
@@ -109,11 +111,33 @@ def default_launch_config(
     ):
         npt //= 2
 
-    # L2-sized, low-cost unary bodies allow up to four vectors per thread.
+    # Block dispatch, not DRAM bandwidth, paces a narrower result's flat row-broadcast grid
+    # (``takes_flat_grid``), so it runs 512-thread blocks, three or four resident an SM.
+    flat_threads = 512
+    if (
+        strategy != "direct"
+        and row_broadcast_inner is not None
+        and n_total is not None
+        and output_dtype.itemsize < elem_bytes
+        and n_total >= flat_threads * npt * TARGET_BLOCKS
+        and all(
+            takes_flat_grid(row_broadcast_inner, n_total // row_broadcast_inner, t, npt, staged)
+            for t in (threads, flat_threads)
+        )
+    ):
+        threads = flat_threads
+
+    # A launch held in L2 keeps its stores there, so loads in flight set its time, not DRAM
+    # bandwidth: it runs one wave, each thread holding its share of the resident threads.
     # Whole blocks preserve vectorized loads; ragged sizes retain the default.
     if one_wave_in_l2 and strategy == "register_copy" and n_total is not None and resident_threads:
+        # 256-thread blocks, not 512: a partial last wave of wide blocks leaves more SMs idle.
+        # A small grid keeps them only while it spans four blocks; below that, 128-thread
+        # blocks are faster.
         wide_threads, fewest_blocks = 256, 4
         share = -(-n_total // resident_threads)
+        # At most four 16-byte vectors a thread: within one wave, more bytes in flight a
+        # thread beat more threads. A larger share runs more waves.
         most = 4 * _BYTES_PER_THREAD // elem_bytes
         wave_npt = min(most, max(npt, 1 << (share - 1).bit_length()))
         shrunk = n_total < threads * npt * TARGET_BLOCKS
@@ -149,7 +173,7 @@ def elementwise_autotune_configs(
     # and the sweep would time one kernel three times over.
     if strategy == "direct":
         return [{"threads": t} for t in autotune_threads]
-    elem_bytes = torch_dtype_nbytes(dtype)
+    elem_bytes = dtype.itemsize
     default = max(_MIN_NUM_PER_THREAD, bytes_per_thread // elem_bytes)
     if strategy == "register_copy":
         default = max(default, _register_copy_floor(register_copy_num_per_thread, elem_bytes))
@@ -170,14 +194,13 @@ def elementwise_output_plan(
     input_dtype: torch.dtype,
     declared_output_dtype: torch.dtype | None = None,
     *,
-    strategy: str | None = None,
-    bool_storage: bool = False,
+    strategy: str,
 ) -> _ElementwiseOutputPlan:
     """Return the dtype the kernel writes, and the dtype the caller sees."""
     logical_dtype = declared_output_dtype or input_dtype
     # Every strategy but `direct` can store the result through an int8 buffer, and
     # wants to: a bool store lowers to one byte per lane, where int8 vectorises.
-    bool_via_int8 = bool_storage and declared_output_dtype == torch.bool and strategy != "direct"
+    bool_via_int8 = declared_output_dtype == torch.bool and strategy != "direct"
     kernel_output_dtype = (
         BOOL_STORAGE_DTYPE if bool_via_int8 else Kernel.dtype_to_str(logical_dtype)
     )
@@ -197,24 +220,23 @@ def _bool_output_needs_scalar(
 
 def choose_unary_strategy(
     *,
-    default_strategy: str,
     input_dtype: torch.dtype,
     declared_output_dtype: torch.dtype | None,
 ) -> str:
-    """``direct`` where a bool operand or output cannot be vectorized, else the default."""
+    """``direct`` where a bool operand or output cannot be vectorized, else ``register_copy``."""
     if input_dtype == torch.bool or _bool_output_needs_scalar(input_dtype, declared_output_dtype):
         return "direct"
-    return default_strategy
+    return "register_copy"
 
 
 def choose_binary_strategy(
     *,
-    default_strategy: str,
     input_dtype: torch.dtype,
     declared_output_dtype: torch.dtype | None,
     same_shape: bool,
 ) -> str:
-    """``direct`` for bool, ``register_copy`` for same-shape operands, else the default."""
+    """``direct`` for bool, ``register_copy`` for same-shape operands, else
+    ``explicit_parallel``."""
     if input_dtype == torch.bool or _bool_output_needs_scalar(input_dtype, declared_output_dtype):
         return "direct"
-    return "register_copy" if same_shape else default_strategy
+    return "register_copy" if same_shape else "explicit_parallel"

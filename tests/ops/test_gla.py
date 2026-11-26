@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from tests.workload_test_base import FixtureBase, TestBase
+from tileops._utils import is_maca
 from tileops._kernels.linear_attention.gla.call_spec import GLACall
 from tileops._kernels.linear_attention.gla.dense_decode import GLADenseDecodeFwdKernel
 from tileops._kernels.linear_attention.gla.dense_prefill_partitioned import (
@@ -14,10 +15,10 @@ from tileops._kernels.linear_attention.gla.dense_prefill_partitioned import (
 from tileops._kernels.linear_attention.gla.dense_prefill_subchunk import (
     GLADensePrefillSubchunkKernel,
 )
-from tileops.backend import TensorSpec
+from tileops.backend import BUILTIN, TensorSpec
 from tileops.backend import _registry as registry
 from tileops.linear_attention import GLAChunkBwdOp, GLAChunkFwdOp, GLAFwdOp, GLARecurrentFwdOp
-from workloads.device import run_device
+from workloads.device import run_device, run_device_is_cuda
 from workloads.linear_attention.gla import (
     GLADecodeWorkload,
     GLAFwdWorkload,
@@ -33,12 +34,13 @@ from workloads.linear_attention.gla import (
 )
 from workloads.numerics import compare_outputs
 
-
-def cosine_sim(a: torch.Tensor, b: torch.Tensor) -> float:
-    """Compute cosine similarity between two tensors (flattened)."""
-    a_flat = a.float().flatten()
-    b_flat = b.float().flatten()
-    return (torch.dot(a_flat, b_flat) / (a_flat.norm() * b_flat.norm() + 1e-12)).item()
+chunk_gla = None
+if run_device_is_cuda() and not is_maca() and torch.cuda.is_available():
+    try:
+        from fla.ops.gla import chunk_gla
+    except (ImportError, RuntimeError):
+        # FLA can fail during import when its Mamba dependency probes the CUDA driver.
+        chunk_gla = None
 
 
 class GLAChunkFwdFixture(FixtureBase):
@@ -84,8 +86,13 @@ def test_gla_fwd(
     v = torch.randn(B, T, H, V, device=run_device(), dtype=dtype) * 0.1
     g = -torch.rand(B, T, H, K, device=run_device(), dtype=dtype)
 
-    # --- Torch reference ---
     ref_o, ref_h = gla_fwd_chunked_torch(q, k, v, g, BC, scale=scale, with_chunk_states=True)
+
+    # --- FLA reference (if available; its Triton kernels need CUDA) ---
+    fla = chunk_gla is not None and run_device_is_cuda() and not is_maca()
+    if fla:
+        fla_o, _ = chunk_gla(q.float(), k.float(), v.float(), g.float(), scale=scale)
+        compare_outputs(fla_o.to(dtype), ref_o.to(dtype), chunkwise_verification(dtype))
 
     fwd_op = GLAChunkFwdOp(
         chunk_size=BC,
@@ -95,13 +102,14 @@ def test_gla_fwd(
         fwd_op.request_tune()
     op_o, op_final_state, op_h = fwd_op(q, k, v, g)
 
-    cos = cosine_sim(ref_o, op_o)
-    print(f"  TileOPs vs ref o: cosine={cos:.6f}")
     compare_outputs(
         (op_o, op_final_state, op_h),
         (ref_o.to(op_o.dtype), ref_h[:, -1].float(), ref_h.float()),
         chunkwise_verification(dtype),
     )
+
+    if fla:
+        compare_outputs(op_o, fla_o.to(op_o.dtype), chunkwise_verification(dtype))
 
 
 @pytest.mark.smoke
@@ -161,7 +169,24 @@ class GLAChunkBwdFixture(FixtureBase):
                 pytest.param(
                     1, 256, 4, 128, 128, 32, torch.bfloat16, False, marks=pytest.mark.full
                 ),
-                pytest.param(1, 256, 2, 64, 64, 128, torch.bfloat16, False, marks=pytest.mark.full),
+                # Mixed head dimensions.
+                pytest.param(1, 256, 4, 128, 64, 32, torch.float32, False, marks=pytest.mark.full),
+                pytest.param(1, 256, 4, 64, 128, 64, torch.float16, False, marks=pytest.mark.full),
+                pytest.param(1, 256, 4, 64, 128, 64, torch.bfloat16, False, marks=pytest.mark.full),
+                # Tuned mode on a mixed-head call.
+                pytest.param(1, 256, 4, 128, 128, 32, torch.float16, True, marks=pytest.mark.full),
+                # At chunk 128, head dims 64 / 64, the backward fits only SM90's shared memory.
+                pytest.param(
+                    1,
+                    256,
+                    2,
+                    64,
+                    64,
+                    128,
+                    torch.bfloat16,
+                    False,
+                    marks=(pytest.mark.full, pytest.mark.sm90),
+                ),
             ],
         ),
     ]
@@ -181,7 +206,6 @@ def test_gla_bwd(
     torch.manual_seed(42)
     B, T, H, K, V, BC = batch, seq_len, heads, dim_k, dim_v, chunk_size
 
-    # GLA layout: BTHD — [B, T, H, K/V]
     q = torch.randn(B, T, H, K, device=run_device(), dtype=dtype) * 0.1
     k = torch.randn(B, T, H, K, device=run_device(), dtype=dtype) * 0.1
     v = torch.randn(B, T, H, V, device=run_device(), dtype=dtype) * 0.1
@@ -190,7 +214,6 @@ def test_gla_bwd(
 
     scale = K**-0.5
 
-    # --- Torch reference via autograd ---
     ref_dq, ref_dk, ref_dv, ref_dg = gla_autograd_bwd_torch(do, q, k, v, g, BC, scale=scale)
     ref_grads = {"dq": ref_dq, "dk": ref_dk, "dv": ref_dv, "dg": ref_dg}
 
@@ -258,6 +281,37 @@ def test_gla_chunk_fwd_feeds_bwd(dtype: torch.dtype) -> None:
     compare_outputs(grads, ref_grads, chunkwise_verification(dtype, backward=True))
 
 
+def _transpose_view(tensor: torch.Tensor) -> torch.Tensor:
+    view = tensor.transpose(0, 1).contiguous().transpose(0, 1)
+    assert not view.is_contiguous()
+    return view
+
+
+@pytest.mark.in_tree_kernels
+@pytest.mark.smoke
+@pytest.mark.parametrize(("dtype", "seeded"), [(torch.float16, True), (torch.bfloat16, False)])
+def test_gla_chunk_accepts_strided_inputs(dtype: torch.dtype, seeded: bool) -> None:
+    torch.manual_seed(42)
+    shape = (2, 128, 2, 64)
+    state_shape = (2, 2, 64, 64)
+    device = run_device()
+    q, k, v, do = (torch.randn(shape, device=device, dtype=dtype) * 0.1 for _ in range(4))
+    g = -torch.rand(shape, device=device, dtype=dtype)
+    initial = torch.randn(state_shape, device=device) * 0.1 if seeded else None
+    dfinal = torch.randn(state_shape, device=device) * 0.1
+
+    fwd = GLAChunkFwdOp(target=BUILTIN)
+    bwd = GLAChunkBwdOp(has_initial_state=seeded, target=BUILTIN)
+    packed = fwd(q, k, v, g, initial)
+    views = tuple(_transpose_view(tensor) for tensor in (q, k, v, g))
+    initial_view = _transpose_view(initial) if initial is not None else None
+    torch.testing.assert_close(fwd(*views, initial_view), packed, atol=0, rtol=0)
+
+    backward = (do, dfinal, q, k, v, g, packed[2])
+    views = tuple(_transpose_view(tensor) for tensor in backward)
+    torch.testing.assert_close(bwd(*views), bwd(*backward), atol=0, rtol=0)
+
+
 @pytest.mark.in_tree_kernels
 @pytest.mark.smoke
 def test_gla_refuses_extents_its_gemms_do_not_tile() -> None:
@@ -275,18 +329,45 @@ def test_gla_refuses_extents_its_gemms_do_not_tile() -> None:
 
 @pytest.mark.sm89
 @pytest.mark.smoke
-@pytest.mark.in_tree_kernels
-def test_gla_bwd_refuses_what_99_kb_cannot_hold() -> None:
-    """SM89 gives a block 99 KB of opt-in shared memory, too little for the float32 backward
-    at head dims 128 / 128, so the op refuses it before anything is built."""
-    B, T, H, K, V = 1, 128, 2, 128, 128
+def test_gla_bwd_in_99_kb_of_shared_memory() -> None:
+    """SM89 gives a block 99 KB of opt-in shared memory, so the float32 backward at chunk 64,
+    head dims 64 / 64 forms dv's state term after v's last use."""
+    torch.manual_seed(11)
+    B, T, H, K, V, BC = 1, 320, 2, 64, 64, 64
     device = run_device()
-    q, k = (torch.randn(B, T, H, K, device=device) for _ in range(2))
+    q, k = (torch.randn(B, T, H, K, device=device) * 0.1 for _ in range(2))
+    v, do = (torch.randn(B, T, H, V, device=device) * 0.1 for _ in range(2))
     g = -torch.rand(B, T, H, K, device=device)
-    v, do = (torch.randn(B, T, H, V, device=device) for _ in range(2))
-    h = torch.zeros(B, T // 64 + 1, H, K, V, device=device)
+    dht = torch.randn(B, H, K, V, device=device) * 0.1
+    _, h = gla_fwd_chunked_torch(q, k, v, g, BC, scale=K**-0.5, with_chunk_states=True)
+    grads = GLAChunkBwdOp(chunk_size=BC, scale=K**-0.5)(do, dht, q, k, v, g, h)
+    ref_grads = gla_autograd_bwd_torch(do, q, k, v, g, BC, scale=K**-0.5, dht=dht)
+    compare_outputs(grads[:4], ref_grads, chunkwise_verification(torch.float32, backward=True))
+
+
+@pytest.mark.sm89
+@pytest.mark.smoke
+@pytest.mark.in_tree_kernels
+@pytest.mark.parametrize(
+    "chunk_size,dim_v,dtype",
+    [
+        (64, 128, torch.float32),
+        (32, 96, torch.float32),
+        (32, 192, torch.float16),
+    ],
+)
+def test_gla_bwd_refuses_what_99_kb_cannot_hold(
+    chunk_size: int, dim_v: int, dtype: torch.dtype
+) -> None:
+    """Reject both ordinary and compact layouts exceeding 99 KiB before building a kernel."""
+    B, T, H, K, V = 1, 128, 2, 128, dim_v
+    device = run_device()
+    q, k = (torch.randn(B, T, H, K, device=device, dtype=dtype) for _ in range(2))
+    g = -torch.rand(B, T, H, K, device=device, dtype=dtype)
+    v, do = (torch.randn(B, T, H, V, device=device, dtype=dtype) for _ in range(2))
+    h = torch.zeros(B, T // chunk_size + 1, H, K, V, device=device)
     dht = torch.zeros(B, H, K, V, device=device)
-    op = GLAChunkBwdOp(chunk_size=64)
+    op = GLAChunkBwdOp(chunk_size=chunk_size)
     with pytest.raises(ValueError, match="bytes of shared memory per block"):
         op(do, dht, q, k, v, g, h)
     for interface in GLAChunkBwdOp.interfaces:
@@ -312,18 +393,6 @@ def _skip_unless_kernel_serves(kernel_cls: type, test: GLAFwdWorkload) -> None:
 # The public GLA inference contract and its in-tree dense-prefill path.
 class GLAFwdTest(GLAFwdWorkload, TestBase):
     pass
-
-
-@pytest.fixture
-def isolated_registry():
-    state = registry.snapshot()
-    registry.DETECTORS.clear()
-    registry.BUILDERS.clear()
-    registry.LOAD_FAILURES.clear()
-    registry.default_target = None
-    registry._loaded = True
-    yield
-    registry.restore(state)
 
 
 @pytest.mark.smoke
@@ -407,11 +476,19 @@ def test_gla_fwd_roofline_counts_packed_states(seeded: bool) -> None:
         assert op.eval_roofline() == (7 * 2 * (5 * 8 * 6 + 8 + 6), expected_bytes)
 
 
-@pytest.mark.smoke
 @pytest.mark.in_tree_kernels
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
-@pytest.mark.parametrize("seq_len, dim", [(128, 64), (128, 128), (1024, 64)])
-def test_gla_dense_prefill_matches_torch(dtype: torch.dtype, seq_len: int, dim: int) -> None:
+@pytest.mark.parametrize(
+    "dtype, seq_len, dim",
+    [
+        pytest.param(torch.float16, 128, 64, marks=pytest.mark.smoke, id="fp16-128-64"),
+        pytest.param(torch.bfloat16, 128, 64, marks=pytest.mark.smoke, id="bf16-128-64"),
+        pytest.param(torch.float16, 128, 128, marks=pytest.mark.full, id="fp16-128-128"),
+        pytest.param(torch.bfloat16, 128, 128, marks=pytest.mark.full, id="bf16-128-128"),
+        pytest.param(torch.float16, 1024, 64, marks=pytest.mark.full, id="fp16-1024-64"),
+        pytest.param(torch.bfloat16, 1024, 64, marks=pytest.mark.full, id="bf16-1024-64"),
+    ],
+)
+def test_gla_dense_prefill_matches_fla(dtype: torch.dtype, seq_len: int, dim: int) -> None:
     torch.manual_seed(2160)
     test = GLAFwdTest(2, seq_len, 4, dim, dim, dtype, has_initial_state=True)
     _skip_unless_kernel_serves(GLADensePrefillSubchunkKernel, test)
@@ -423,11 +500,17 @@ def test_gla_dense_prefill_matches_torch(dtype: torch.dtype, seq_len: int, dim: 
     test.check(op, *inputs)
 
 
-@pytest.mark.smoke
 @pytest.mark.in_tree_kernels
-@pytest.mark.parametrize("dtype,dim", [(torch.bfloat16, 64), (torch.float16, 128)])
-@pytest.mark.parametrize("scale", [None, 0.3])
-def test_gla_packed_varlen_matches_torch(dtype: torch.dtype, dim: int, scale: float | None) -> None:
+@pytest.mark.parametrize(
+    "dtype,dim,scale",
+    [
+        pytest.param(torch.bfloat16, 64, None, marks=pytest.mark.smoke),
+        pytest.param(torch.float16, 128, None, marks=pytest.mark.smoke),
+        pytest.param(torch.bfloat16, 64, 0.3, marks=pytest.mark.full),
+        pytest.param(torch.float16, 128, 0.3, marks=pytest.mark.full),
+    ],
+)
+def test_gla_packed_varlen_matches_fla(dtype: torch.dtype, dim: int, scale: float | None) -> None:
     """Sequence lengths from one token up, with the state and the host offsets each absent.
 
     Two heads is the fewest at which a per-sequence state walk oversubscribes the device at
@@ -548,14 +631,13 @@ def test_gla_long_prefill_uses_partitioned_kernel(
     )
 
 
-@pytest.mark.smoke
 @pytest.mark.in_tree_kernels
 @pytest.mark.parametrize(
     "dtype,dim,has_initial_state,scale",
     [
-        (torch.float16, 128, True, None),
-        (torch.bfloat16, 64, False, None),
-        (torch.bfloat16, 64, True, 0.3),
+        pytest.param(torch.float16, 128, True, None, marks=pytest.mark.smoke),
+        pytest.param(torch.bfloat16, 64, False, None, marks=pytest.mark.smoke),
+        pytest.param(torch.bfloat16, 64, True, 0.3, marks=pytest.mark.full),
     ],
 )
 def test_gla_dense_decode_matches_torch(
@@ -641,6 +723,17 @@ def test_gla_decode(
     test.check(op, *test.gen_inputs())
 
 
+@pytest.mark.in_tree_kernels
+@pytest.mark.smoke
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_gla_decode_accepts_strided_inputs(dtype: torch.dtype) -> None:
+    torch.manual_seed(42)
+    inputs = GLADecodeTest(2, 2, 64, 64, dtype).gen_inputs()
+    views = tuple(_transpose_view(tensor) for tensor in inputs)
+    op = GLARecurrentFwdOp(target=BUILTIN)
+    torch.testing.assert_close(op(*views), op(*inputs), atol=0, rtol=0)
+
+
 @GLADecodeSliceFixture
 def test_gla_decode_value_slice(
     batch: int, heads: int, dim_k: int, dim_v: int, dtype: torch.dtype
@@ -659,7 +752,7 @@ def test_gla_decode_multi_step(
     dtype: torch.dtype,
     tune: bool,
 ) -> None:
-    """Test multiple sequential decode steps to verify state propagation."""
+    """Sequential decode steps propagate the state."""
     torch.manual_seed(42)
     num_steps = 8
     B, H, DK, DV = batch, heads, dim_k, dim_v

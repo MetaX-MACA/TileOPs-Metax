@@ -6,7 +6,7 @@
 #
 # --deps image  the venv sees the system site-packages and the wheel goes in with --no-deps,
 #               so torch and tilelang are the ones the runner image bakes. No `pip check`: the
-#               image installs mamba-ssm and flag_gems with --no-deps, pins unsatisfied by design.
+#               image overrides vllm's tilelang pin and installs flag_gems --no-deps.
 # --deps pypi   the venv sees nothing else and `pip check` must pass, so the wheel's declared
 #               dependencies are what a user would resolve.
 #
@@ -59,7 +59,6 @@ unset PYTHONPATH PIP_CONSTRAINT PIP_INDEX_URL PIP_EXTRA_INDEX_URL PIP_FIND_LINKS
 # Each verification starts with empty compiler caches, including repeated runs in WORK_DIR.
 CACHE_DIR="$(mktemp -d "${WORK_DIR}/compiler-cache.XXXXXX")"
 export TILELANG_CACHE_DIR="${CACHE_DIR}/tilelang"
-export TILELANG_TMP_DIR="${CACHE_DIR}/tilelang-tmp"
 export TRITON_CACHE_DIR="${CACHE_DIR}/triton"
 export TORCHINDUCTOR_CACHE_DIR="${CACHE_DIR}/inductor"
 export CUDA_CACHE_PATH="${CACHE_DIR}/cuda"
@@ -193,7 +192,7 @@ env = {
     "compiler_caches": {
         name: os.environ[name]
         for name in (
-            "TILELANG_CACHE_DIR", "TILELANG_TMP_DIR", "TRITON_CACHE_DIR",
+            "TILELANG_CACHE_DIR", "TRITON_CACHE_DIR",
             "TORCHINDUCTOR_CACHE_DIR", "CUDA_CACHE_PATH",
         )
     },

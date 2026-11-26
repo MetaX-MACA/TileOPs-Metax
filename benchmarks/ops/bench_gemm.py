@@ -1,7 +1,8 @@
 """Benchmark TileOPs GEMM, FP8 GEMM, INT8 W8A8 GEMM, W4A8 GEMM and W4A16 GEMM, one case per manifest call, against cuBLAS and the library kernels available for each."""
 
 import contextlib
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any
 
 import pytest
 import torch
@@ -19,8 +20,9 @@ from benchmarks.baselines import (
     quack_op,
     vllm_op,
 )
-from benchmarks.timing import bench_kernel, median_busy_ms
+from benchmarks.timing import bench_kernel
 from tileops._utils import get_sm_version, is_maca
+from tileops._utils.cupti import median_busy_ms
 from tileops.gemm import GEMMFP8FwdOp, GEMMFwdOp, GEMMINT8W8A8FwdOp, GEMMW4A8FwdOp, GEMMW4A16FwdOp
 from workloads.gemm import (
     GEMMFP8Workload,
@@ -37,6 +39,8 @@ class _CublasLtBestGEMM:
 
     Construction ranks cuBLASLt's candidate algorithms and a PyTorch fallback using
     the benchmark timer. Calls reuse the selected algorithm with the caller's operands.
+    cuBLASLt adds a bias along the rows of a column-major result only, so a biased call
+    runs the transposed product, whose column-major result is the row-major output.
 
     Args:
         a: Left operand, ``[m, k]``.
@@ -44,6 +48,10 @@ class _CublasLtBestGEMM:
         trans_b: ``True`` for NT (``A @ Bᵀ``), ``False`` for NN (``A @ B``).
         advanced: ``nvmath.linalg.advanced``, resolved by the caller.
         cublaslt: ``nvmath.bindings.cublasLt``, resolved by the caller.
+        bias: ``[n]``, added to every row, or ``None``.
+        result_type: ``nvmath.CudaDataType.CUDA_R_32F`` for a float32 result of the
+            16-bit operands, which ``torch.mm`` with ``out_dtype`` also computes; ``None``
+            for one in the operands' dtype.
 
     Raises:
         RuntimeError: dtype unsupported, or the plan produced no algorithm.
@@ -53,23 +61,35 @@ class _CublasLtBestGEMM:
     N_CANDIDATES = 8
 
     def __init__(
-        self, a: torch.Tensor, b: torch.Tensor, trans_b: bool, advanced: Any, cublaslt: Any
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        trans_b: bool,
+        advanced: Any,
+        cublaslt: Any,
+        bias: torch.Tensor | None = None,
+        result_type: Any = None,
     ) -> None:
         if a.dtype not in (torch.float16, torch.bfloat16):
             raise RuntimeError(f"unsupported dtype {a.dtype}")
         self.trans_b = trans_b
         self._a = a
         self._b = b
+        self._bias = bias
+        self._float32 = result_type is not None
         rhs = b.t() if trans_b else b
 
-        self._mm = advanced.Matmul(
-            a,
-            rhs,
-            options=advanced.MatmulOptions(
-                compute_type=advanced.MatmulComputeType.COMPUTE_32F,
-                memory_limit=self.WORKSPACE_BYTES,
-            ),
+        options = advanced.MatmulOptions(
+            compute_type=advanced.MatmulComputeType.COMPUTE_32F,
+            memory_limit=self.WORKSPACE_BYTES,
+            result_type=result_type,
         )
+        if bias is None:
+            self._mm = advanced.Matmul(a, rhs, options=options)
+            epilog = {}
+        else:
+            self._mm = advanced.Matmul(rhs.t(), a.t(), options=options)
+            epilog = {"epilog": advanced.MatmulEpilog.BIAS, "epilog_inputs": {"bias": bias}}
         # GEMMFwdOp and the workload's reference accumulate in fp32, so a split-K algorithm
         # may reduce its partials only in the compute type: an in-place reduction sums them
         # in the 16-bit output.
@@ -77,7 +97,8 @@ class _CublasLtBestGEMM:
             preferences=advanced.MatmulPlanPreferences(
                 limit=self.N_CANDIDATES,
                 reduction_scheme_mask=cublaslt.ReductionScheme.COMPUTE_TYPE,
-            )
+            ),
+            **epilog,
         )
         if not algorithms:
             self._mm.free()
@@ -88,9 +109,15 @@ class _CublasLtBestGEMM:
             algorithms,
             key=lambda al: median_busy_ms(bench_kernel(lambda: self._mm.execute(algorithm=al))),
         )
-        torch_ms = median_busy_ms(bench_kernel(lambda: matmul_fp32_reduction(a, rhs)))
+        torch_ms = median_busy_ms(bench_kernel(lambda: self._torch(a, rhs, bias)))
         best_ms = median_busy_ms(bench_kernel(lambda: self._mm.execute(algorithm=self._algorithm)))
         self._use_torch = torch_ms < best_ms
+
+    def _torch(self, a: torch.Tensor, rhs: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
+        """The PyTorch product the cuBLASLt algorithms are ranked against."""
+        if self._float32:
+            return torch.mm(a, rhs, out_dtype=torch.float32)
+        return matmul_fp32_reduction(a, rhs, bias)
 
     def free(self) -> None:
         """Release the plan and its 256 MB workspace, one per workload row."""
@@ -103,32 +130,49 @@ class _CublasLtBestGEMM:
         with contextlib.suppress(Exception):
             self.free()
 
-    def __call__(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    def __call__(
+        self, a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
+    ) -> torch.Tensor:
         rhs = b.t() if self.trans_b else b
-        if a is not self._a or b is not self._b:
-            self._mm.reset_operands(a=a, b=rhs)
-            self._a, self._b = a, b
+        if a is not self._a or b is not self._b or bias is not self._bias:
+            if bias is None:
+                self._mm.reset_operands(a=a, b=rhs)
+            else:
+                self._mm.reset_operands(a=rhs.t(), b=a.t(), epilog_inputs={"bias": bias})
+            self._a, self._b, self._bias = a, b, bias
         if self._use_torch:
-            return matmul_fp32_reduction(a, rhs)
-        return self._mm.execute(algorithm=self._algorithm)
+            return self._torch(a, rhs, bias)
+        out = self._mm.execute(algorithm=self._algorithm)
+        return out if bias is None else out.t()
 
 
 def cublaslt_best(
-    a: torch.Tensor, b: torch.Tensor, *, trans_a: bool, trans_b: bool
-) -> Optional[Callable]:
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    trans_a: bool,
+    trans_b: bool,
+    out_dtype: torch.dtype | None = None,
+) -> Callable | None:
     """Build a cuBLASLt searched-best GEMM callable, or None for a row it cannot take.
 
     Returns ``None`` — the caller keeps the plain ``torch-cublas`` baseline — when
-    ``trans_a`` is True, the dtype is unsupported, or the plan produced no algorithm.
-    A missing nvmath is not caught: it is a declared runner dependency, so its absence
-    is a degraded image and has to fail the row rather than drop the tag.
+    ``trans_a`` is True, the dtype is unsupported, a float32 output carries a bias (the
+    bias epilogue takes a bias of the result type, not the operands' 16-bit one), or the
+    plan produced no algorithm. A missing nvmath is not caught: it is a declared runner
+    dependency, so its absence is a degraded image and has to fail the row rather than
+    drop the tag.
     """
-    if trans_a:
+    if trans_a or (out_dtype is not None and bias is not None):
         return None
     advanced = baseline_module("nvmath.linalg.advanced", "nvmath")
     cublaslt = baseline_module("nvmath.bindings.cublasLt", "nvmath")
+    result_type = None
+    if out_dtype is not None:
+        result_type = baseline_module("nvmath", "nvmath").CudaDataType.CUDA_R_32F
     try:
-        return _CublasLtBestGEMM(a, b, trans_b, advanced, cublaslt)
+        return _CublasLtBestGEMM(a, b, trans_b, advanced, cublaslt, bias, result_type)
     except RuntimeError:
         return None
 
@@ -191,6 +235,14 @@ def _deepgemm_fp8(workload: GEMMFP8Workload) -> Callable[..., torch.Tensor]:
         raise ValueError(
             f"DeepGEMM FP8 requires K divisible by 16 and N divisible by {output_alignment}"
         )
+    # FIXME(staged-rollout): DeepGEMM has no timing on SM90 1D1D rows with M <= 32.
+    #
+    # Broken invariant: every selected baseline times every row it can express.
+    # Why: the SM90 1D1D kernel asserts BLOCK_M % 64 == 0, but the heuristic of the DeepGEMM
+    # vllm 0.34 vendors picks a BLOCK_M of 16 or 32 for M <= 32, so the kernel fails to compile.
+    # Cleanup: remove the check once the vendored DeepGEMM picks a BLOCK_M of 64 there.
+    if arch < 100 and granularity == 1 and workload.m <= 32:
+        raise ValueError("DeepGEMM's SM90 1D1D FP8 GEMM fails to compile for M <= 32")
     gemm = deepgemm_op("fp8_gemm_nt")
 
     def run(a, b, scale_a, scale_b, bias=None):
@@ -213,7 +265,7 @@ def _deepgemm_fp8(workload: GEMMFP8Workload) -> Callable[..., torch.Tensor]:
 
 def _deepgemm_bf16_nt(
     workload: GEMMWorkload, a: torch.Tensor, b: torch.Tensor
-) -> Optional[Callable[..., torch.Tensor]]:
+) -> Callable[..., torch.Tensor] | None:
     """DeepGEMM's dense bf16 GEMM, or None for a row its kernel cannot take.
 
     It reads both operands K-major and bf16 only, which is the N-T layout here, and
@@ -234,10 +286,10 @@ def _deepgemm_bf16_nt(
         return None
 
     gemm = deepgemm_op("bf16_gemm_nt")
-    m, n = workload.m, workload.n
+    m, n, out_dtype = workload.m, workload.n, workload.out_dtype
 
     def run(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+        out = torch.empty((m, n), dtype=out_dtype or a.dtype, device=a.device)
         gemm(a, b, out)
         return out
 
@@ -246,7 +298,7 @@ def _deepgemm_bf16_nt(
 
 def _flashinfer_fp8_per_tensor_unsupported_reason(
     device: torch.device, n: int, k: int
-) -> Optional[str]:
+) -> str | None:
     if device.type != "cuda":
         return f"flashinfer runs on cuda, not {device}"
     arch = get_sm_version(device.index)
@@ -257,7 +309,7 @@ def _flashinfer_fp8_per_tensor_unsupported_reason(
     return None
 
 
-def _quack_gemm_unsupported_reason(workload: GEMMWorkload) -> Optional[str]:
+def _quack_gemm_unsupported_reason(workload: GEMMWorkload) -> str | None:
     """Quack's non-unit operand strides and output row stride must be 16-byte aligned."""
     if not workload.m or not workload.n or not workload.k:
         return None
@@ -269,7 +321,7 @@ def _quack_gemm_unsupported_reason(workload: GEMMWorkload) -> Optional[str]:
     return None
 
 
-def _marlin_w4a16_unsupported_reason(n: int, k: int, group_size: int) -> Optional[str]:
+def _marlin_w4a16_unsupported_reason(n: int, k: int, group_size: int) -> str | None:
     """Marlin's positive group sizes and aligned affine INT4 matrix domain."""
     if get_sm_version() < 80:
         return "Marlin W4A16 requires compute capability at least 80"
@@ -356,17 +408,13 @@ def _prepare_marlin_w4a16_baseline(
             b_q_weight=packed,
             b_bias=None,
             b_scales=weight_scales,
-            a_scales=None,
             global_scale=None,
             b_zeros=weight_zeros,
-            g_idx=None,
-            perm=None,
             workspace=locks,
             b_q_type=scalar_types.uint4,
             size_m=m,
             size_n=n,
             size_k=k,
-            is_k_full=True,
             use_atomic_add=False,
             use_fp32_reduce=use_fp32_reduce,
             is_zp_float=False,
@@ -375,7 +423,7 @@ def _prepare_marlin_w4a16_baseline(
     return _run_marlin, (activation, qweight, scales, zeros, workspace)
 
 
-def _vllm_w4a8_unsupported_reason(n: int, k: int, group_size: int) -> Optional[str]:
+def _vllm_w4a8_unsupported_reason(n: int, k: int, group_size: int) -> str | None:
     """Why vLLM's ``cutlass_w4a8_mm`` cannot take this call, or ``None`` when it can.
 
     CUTLASS's INT4 reorder copies a K row in groups of 128 threads times two nibbles
@@ -447,21 +495,27 @@ def test_gemm_bench(case) -> None:
         bench.Runner(op, case).compare_torch()
         return
     workload = case.workload
-    a, b = case.inputs
+    a, b, *bias = case.inputs
     trans_a, trans_b = workload.trans_a, workload.trans_b
 
     op = GEMMFwdOp(**case.arguments)
 
     implementations = {"torch-cublas": case.torch}
-    best_fn = cublaslt_best(a, b, trans_a=trans_a, trans_b=trans_b)
+    best_fn = cublaslt_best(
+        a, b, *bias, trans_a=trans_a, trans_b=trans_b, out_dtype=workload.out_dtype
+    )
     if best_fn is not None:
         implementations[CUBLASLT_TAG] = best_fn
 
-    deepgemm_fn = _deepgemm_bf16_nt(workload, a, b)
-    if deepgemm_fn is not None:
-        implementations[DEEPGEMM_TAG] = deepgemm_fn
+    if bias:
+        print(f"  [skip] {DEEPGEMM_TAG}: its dense BF16 GEMM adds no bias")
+    else:
+        deepgemm_fn = _deepgemm_bf16_nt(workload, a, b)
+        if deepgemm_fn is not None:
+            implementations[DEEPGEMM_TAG] = deepgemm_fn
 
-    if not trans_a and not trans_b:
+    # FlagGems' mm returns the operands' dtype, so it has no float32 output.
+    if not trans_a and not trans_b and not bias and workload.out_dtype is None:
         flaggems_mm = flaggems_op("mm")
         implementations[FLAGGEMS_TAG] = flaggems_mm
 
@@ -469,8 +523,13 @@ def test_gemm_bench(case) -> None:
     if quack_reason is None:
         quack_gemm = quack_op("gemm", "quack.gemm_interface")
 
-        def quack_fn(a, b):
-            return quack_gemm(a.T if trans_a else a, b.T if trans_b else b)
+        def quack_fn(a, b, bias=None):
+            return quack_gemm(
+                a.T if trans_a else a,
+                b.T if trans_b else b,
+                bias=bias,
+                out_dtype=workload.out_dtype,
+            )
 
         implementations[QUACK_TAG] = quack_fn
     else:

@@ -1,7 +1,6 @@
 import dataclasses
 import itertools
 from abc import abstractmethod
-from typing import Optional
 
 import tilelang
 import torch
@@ -9,10 +8,11 @@ from tilelang import language as T
 from tilelang.layout import make_swizzled_layout
 
 from tileops._csrc import csrc_include
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.attention.dsa.decode_ws import mark_role_branches
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.call_spec import CallSpec
+from tileops._kernels.constants import SETMAXNREG_GRANULARITY, SM90_REGISTERS
 from tileops._kernels.kernel_base import CompiledProgram, Entry, Kernel, KernelInterface
-from tileops._utils import get_shared_memory_optin
 
 __all__ = [
     "FP8LightningIndexerCall",
@@ -33,6 +33,7 @@ class FP8LightningIndexerCall(CallSpec):
     seq_len_kv: int = 0
     kv_group: int = 0
     clean_logits: bool = True
+    check_scale_sign: bool = True
 
 
 class FP8LightningIndexerFwdInterface(KernelInterface):
@@ -53,7 +54,7 @@ class FP8LightningIndexerFwdInterface(KernelInterface):
         """Score each key inside its query's window; nothing is written in place.
 
         The logit of query ``s`` and key ``t`` of group ``g`` sums ``Weights[s, h]`` times
-        ``relu(IndexQ[s, h] . IndexK[t, g]) * IndexKScale[t, g]`` over the heads of group
+        ``relu((IndexQ[s, h] . IndexK[t, g]) * IndexKScale[t, g])`` over the heads of group
         ``g``. Where ``call.clean_logits``, a key outside ``[CuSeqLenKS[s], CuSeqLenKE[s])``
         is set to negative infinity; otherwise its slot holds whatever the scan left.
         Nothing is written in place, and the output aliases no input.
@@ -79,7 +80,7 @@ class FP8LightningIndexerFwdInterface(KernelInterface):
 
 @target_cache(maxsize=32)
 def _fp8_lightning_indexer_kernel(
-    batch, seq_len, heads, index_dim, seq_len_kv, kv_group, min_pipelined_block_q, clean_logits=True
+    batch, seq_len, heads, index_dim, seq_len_kv, kv_group, min_pipelined_block_q, check_scale_sign
 ):
     @tilelang.jit(
         pass_configs={
@@ -203,10 +204,17 @@ def _fp8_lightning_indexer_kernel(
                     for bn_i, bq_i, h_i, g in T.Parallel(
                         block_N, block_Q, heads_per_group, kv_group
                     ):
+                        score = s_reshaped[bn_i, bq_i, h_i, g]
+                        key_scale = index_k_scale_fragment[bn_i, g]
+                        signed_score = (
+                            T.if_then_else(key_scale < 0, -score, score)
+                            if check_scale_sign
+                            else score
+                        )
+                        scale = T.abs(key_scale) if check_scale_sign else key_scale
                         s_reshaped[bn_i, bq_i, h_i, g] = (
-                            T.max(s_reshaped[bn_i, bq_i, h_i, g], 0)
-                            * weights[bq_i, g * heads_per_group + h_i]
-                        ) * index_k_scale_fragment[bn_i, g]
+                            T.max(signed_score, 0) * weights[bq_i, g * heads_per_group + h_i]
+                        ) * scale
 
                     T.reduce_sum(s_reshaped, logits, dim=-2, clear=True)
 
@@ -291,13 +299,13 @@ class FP8LightningIndexerKernel(Kernel, FP8LightningIndexerFwdInterface):
     _MIN_PIPELINED_BLOCK_Q = 2
 
     @classmethod
-    def refusal(cls, call: FP8LightningIndexerCall) -> Optional[str]:
+    def refusal(cls, call: FP8LightningIndexerCall) -> str | None:
         """Why the call cannot fit the device's shared memory at one query a block, or ``None``."""
         if not call.smem_budget:
-            return None
+            return super().refusal(call)
         need = cls._shared_bytes(1, call.heads, call.index_dim, call.kv_group)
         if need <= call.smem_budget:
-            return None
+            return super().refusal(call)
         return (
             f"needs {need} bytes of shared memory per block at {call.heads} heads of dim "
             f"{call.index_dim} in {call.kv_group} groups; the device gives {call.smem_budget}"
@@ -325,6 +333,7 @@ class FP8LightningIndexerKernel(Kernel, FP8LightningIndexerFwdInterface):
             call.seq_len_kv,
             call.kv_group,
             call.clean_logits,
+            check_scale_sign=call.check_scale_sign,
         )
 
     def __init__(
@@ -337,7 +346,9 @@ class FP8LightningIndexerKernel(Kernel, FP8LightningIndexerFwdInterface):
         kv_group,
         clean_logits=True,
         dtype: torch.dtype = torch.float8_e4m3fn,
-        config: Optional[dict] = None,
+        config: dict | None = None,
+        *,
+        check_scale_sign: bool = True,
     ):
         super().__init__()
         if dtype != torch.float8_e4m3fn:
@@ -362,7 +373,7 @@ class FP8LightningIndexerKernel(Kernel, FP8LightningIndexerFwdInterface):
             self.seq_len_kv,
             self.kv_group,
             self._MIN_PIPELINED_BLOCK_Q,
-            self.clean_logits,
+            check_scale_sign,
         )
 
         self.init_config(config)
@@ -370,7 +381,7 @@ class FP8LightningIndexerKernel(Kernel, FP8LightningIndexerFwdInterface):
     @property
     def default_config(self) -> dict:
         return self._default_config_for(
-            get_shared_memory_optin(self.device_index),
+            self.build_target.smem_budget,
             self.heads,
             self.index_dim,
             self.kv_group,
@@ -396,27 +407,12 @@ class FP8LightningIndexerKernel(Kernel, FP8LightningIndexerFwdInterface):
 
     @property
     def autotune_configs(self) -> list[dict]:
-        block_N = [32, 64, 128]
-        num_stages = [0, 1, 2]
-        threads = [128, 256]
-        block_Q = [1, 2, 4]
         # block_Q == 1 runs unpipelined (above), so it is tried at num_stages 0 alone.
-        _configs = [
-            c
-            for c in itertools.product(block_N, num_stages, threads, block_Q)
-            if c[3] >= self._MIN_PIPELINED_BLOCK_Q or c[1] == 0
+        return [
+            {"block_N": n, "num_stages": st, "threads": t, "block_Q": q}
+            for n, st, t, q in itertools.product((32, 64, 128), (0, 1, 2), (128, 256), (1, 2, 4))
+            if q >= self._MIN_PIPELINED_BLOCK_Q or st == 0
         ]
-
-        configs = [
-            {
-                "block_N": c[0],
-                "num_stages": c[1],
-                "threads": c[2],
-                "block_Q": c[3],
-            }
-            for c in _configs
-        ]
-        return configs
 
     def forward(
         self,
@@ -455,19 +451,8 @@ class FP8LightningIndexerKernel(Kernel, FP8LightningIndexerFwdInterface):
         )
         return CompiledProgram(main), clean
 
-    def supply_prog(
-        self, *args, **kwargs
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        # TileLang invokes supply_prog with the candidate JIT params during autotuning;
-        # ignore them and build benchmark inputs from the kernel's shape attributes.
+    def supply_prog(self, *args, **kwargs) -> tuple[torch.Tensor, ...]:
+        # TileLang passes the candidate's JIT parameters, which the inputs do not depend on.
         batch, seq_len, heads, index_dim = self.batch, self.seq_len, self.heads, self.index_dim
         seq_len_kv = self.seq_len_kv
         accum_dtype = torch.float32
@@ -494,8 +479,6 @@ class FP8LightningIndexerKernel(Kernel, FP8LightningIndexerFwdInterface):
 
     @property
     def autotune_supply_prog(self):
-        # The kernel has scalar (int32) params; the default tensor-only input
-        # generation cannot build them, so supply benchmark inputs explicitly.
         return self.supply_prog
 
     def autotune(self, warmup=10, rep=10):
@@ -510,21 +493,32 @@ class FP8LightningIndexerKernel(Kernel, FP8LightningIndexerFwdInterface):
         # warpgroup's loop and the consumers' would deadlock them.
         tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
     },
-    compile_flags=["-O3", "-DNDEBUG", *csrc_include("lightning_indexer_helper.h")],
+    compile_flags=[
+        *CUDA_COMPILE_FLAGS,
+        *csrc_include("lightning_indexer_helper.h", "warp_uniform.h"),
+    ],
 )
 def _fp8_lightning_indexer_ws_kernel(
-    batch, heads, index_dim, block_q, splits, clean_logits, prefetch_q, mixed=False
+    batch,
+    heads,
+    index_dim,
+    block_q,
+    splits,
+    clean_logits,
+    prefetch_q,
+    mixed=False,
+    check_scale_sign=True,
 ):
     """Warp-specialized logits over 64-key tiles.
 
     Warpgroups 0 and 1 take alternate tiles: one m64n``rows`` WGMMA each, then the
     relu-weighted head sums, stored. Warpgroup 2 serves them: warp 0 loads q and the key tiles
-    by TMA, and warps 1 to 3 write -inf over the keys outside every window.
+    by TMA, and warps 1 to 3 write -inf over the keys outside every window. The helper states
+    the head-sum formula.
 
     ``mixed`` builds the one-batch-row launch that runs some query blocks whole and splits the
-    rest: the launch arguments ``whole``, ``shift`` and ``per`` give its CTA mapping, its
-    epilogue sums (x + |x|) * weight on the FMA pipe and halves the sum, and a consumer
-    releases its key stage before the epilogue. Without it the launch arguments go unread.
+    rest: the launch arguments ``whole``, ``shift`` and ``per`` give its CTA mapping. Without
+    it the launch arguments go unread.
     """
     dtype = T.float8_e4m3fn
     accum = T.float32
@@ -535,11 +529,11 @@ def _fp8_lightning_indexer_ws_kernel(
     serving_regs = 24  # the serving warpgroup only issues TMA
     # setmaxnreg moves registers within the CTA's launch allocation: what the serving
     # warpgroup gives back goes to the two consumer warpgroups, in steps of 8.
-    launch_regs = 65536 // 384 // 8 * 8
-    consumer_regs = (launch_regs + (launch_regs - serving_regs) // 2) // 8 * 8
+    step = SETMAXNREG_GRANULARITY
+    launch_regs = SM90_REGISTERS // 384 // step * step
+    consumer_regs = (launch_regs + (launch_regs - serving_regs) // 2) // step * step
     seq_len = T.dynamic("seq_len")
     seq_len_kv = T.dynamic("seq_len_kv")
-    epilogue = "indexer_tile_epilogue_doubled" if mixed else "indexer_tile_epilogue"
 
     def acc_layout(thread_offset):
         """The m64n``rows`` WGMMA accumulator as the PTX arranges it, which the helper reads.
@@ -560,7 +554,7 @@ def _fp8_lightning_indexer_ws_kernel(
         T.set_max_nreg(consumer_regs, 1)
         acc = T.alloc_fragment([block_n, rows], accum)
         T.annotate_layout({acc: acc_layout(128 * wg)})
-        # The head weight of each accumulator column this thread holds: column
+        # Half the head weight of each accumulator column this thread holds: column
         # 8 j + 2 (t % 4) + i at 2 j + i.
         wt = T.alloc_local([rows // 4], accum)
         t = tx % 128
@@ -572,7 +566,9 @@ def _fp8_lightning_indexer_ws_kernel(
                     # The clamp at 0 changes no index; it lets the compiler drop the bounds
                     # checks a run-time CTA mapping would otherwise put on the loads.
                     query = T.max(query, 0)
-                wt[2 * j + i] = Weights[query, col % heads]
+                wt[2 * j + i] = T.call_extern(
+                    "float32", "tileops::indexer_half_weight", Weights[query, col % heads]
+                )
         # The offset of this thread's first stored logit at the walk's first key: query
         # (t % 4) / 2 at tile row 16 (t / 32) + (t % 32) / 4 + 8 (t % 2), the row the helper
         # derives from t; a tile adds its first key.
@@ -589,23 +585,27 @@ def _fp8_lightning_indexer_ws_kernel(
                     stage = wg + 2 * u
                     T.mbarrier_wait_parity(k_full[stage], jj2 % 2)
                     T.wgmma_gemm(Ks[stage, :, :], Qs, acc, transpose_B=True, clear_accum=True)
+                    # The signs of this thread's two key rows, read while the WGMMA runs: the
+                    # head sums start on the accumulator as soon as it lands.
+                    sgn0 = T.alloc_var(accum, init=1.0)
+                    sgn1 = T.alloc_var(accum, init=1.0)
+                    if check_scale_sign:
+                        row0 = row - 8 * (t % 2)  # the thread's rows: row0 and row0 + 8
+                        sgn0 = T.if_then_else(Ss[stage, row0] < 0, -1.0, 1.0)
+                        sgn1 = T.if_then_else(Ss[stage, row0 + 8] < 0, -1.0, 1.0)
                     T.wait_wgmma(0)
-                    if mixed:
-                        # The tile's last read of the stage is the scale of this thread's row:
-                        # the stage goes back to the producer before the epilogue.
-                        key_scale = T.alloc_var(accum, init=Ss[stage, row])
-                        T.mbarrier_arrive(k_free[stage])
+                    # The tile's last read of the stage is the scale of this thread's row: the
+                    # stage goes back to the producer before the epilogue.
+                    key_scale = T.alloc_var(accum, init=Ss[stage, row])
+                    T.mbarrier_arrive(k_free[stage])
                     k0 = T.alloc_var("int32", init=(c0 + wg + 2 * jj) * block_n)
                     T.call_extern(
                         "handle",
-                        f"tileops::{epilogue}<{heads}, {block_q}, {str(clean_logits).lower()}>",
-                        T.address_of(acc[0, 0]), T.address_of(wt[0]),
-                        key_scale if mixed else T.address_of(Ss[stage, 0]),
+                        f"tileops::indexer_tile_epilogue<{heads}, {block_q}, {str(clean_logits).lower()}>",
+                        T.address_of(acc[0, 0]), T.address_of(wt[0]), sgn0, sgn1, key_scale,
                         T.address_of(Logits[b, 0, 0]), off, s0, k0, seq_len, seq_len_kv,
                         T.address_of(Win[0, 0]), k0 >= in_lo and k0 + block_n <= in_hi, t,
                     )  # fmt: skip
-                    if not mixed:
-                        T.mbarrier_arrive(k_free[stage])
 
     @T.prim_func
     def main(
@@ -666,6 +666,7 @@ def _fp8_lightning_indexer_ws_kernel(
                 Win[0, tx] = T.if_then_else(s0 + tx < seq_len, lo, seq_len_kv)
                 Win[1, tx] = T.if_then_else(s0 + tx < seq_len, hi, 0)
             T.sync_threads()
+            mark_role_branches()
             lo_b = T.alloc_var("int32", init=seq_len_kv)
             hi_b = T.alloc_var("int32", init=0)
             # [in_lo, in_hi): keys inside every row's window, empty when a row is past seq_len.
@@ -766,7 +767,7 @@ class FP8LightningIndexerWSKernel(Kernel, FP8LightningIndexerFwdInterface):
     _ROWS = 256  # query-head rows a CTA holds: the WGMMA's N
 
     @classmethod
-    def refusal(cls, call: FP8LightningIndexerCall) -> Optional[str]:
+    def refusal(cls, call: FP8LightningIndexerCall) -> str | None:
         """Why *call* is outside this implementation's region, or ``None`` when it is inside."""
         if call.kv_group != 1:
             return "scores one key group"
@@ -776,13 +777,13 @@ class FP8LightningIndexerWSKernel(Kernel, FP8LightningIndexerFwdInterface):
             return "requires index dimension 64 or 128"
         if call.seq_len_kv % 4:
             return "requires seq_len_kv a multiple of 4, the TMA stride of a logit row"
-        return None
+        return super().refusal(call)
 
     @classmethod
     def splits_for(cls, call: FP8LightningIndexerCall) -> int:
         """CTAs a query block's keys split over: one while the blocks fill the multiprocessors,
         else enough to fill them, with at least two tiles a CTA. A split costs a CTA its own
-        q load and prologue, which measured slower than idle multiprocessors past one block
+        q load and prologue, which costs more than idle multiprocessors past one block
         each."""
         q_blocks = -(-call.seq_len // (cls._ROWS // call.heads))
         if q_blocks >= call.sm_count:
@@ -791,7 +792,7 @@ class FP8LightningIndexerWSKernel(Kernel, FP8LightningIndexerFwdInterface):
         return max(1, min(-(-call.sm_count // q_blocks), tiles // 2))
 
     @classmethod
-    def partial_wave_for(cls, call: FP8LightningIndexerCall) -> Optional[tuple[int, int]]:
+    def partial_wave_for(cls, call: FP8LightningIndexerCall) -> tuple[int, int] | None:
         """``(whole, pieces)`` when the call's query blocks leave a partial last wave on one
         batch row: the first ``whole`` blocks run on one CTA each and every later one splits its
         key tiles over ``pieces`` CTAs, a power of two. A piece costs a CTA prologue, so blocks
@@ -810,7 +811,7 @@ class FP8LightningIndexerWSKernel(Kernel, FP8LightningIndexerFwdInterface):
     def entry_for(cls, call: FP8LightningIndexerCall) -> Entry:
         splits = cls.splits_for(call)
         partial_wave = cls.partial_wave_for(call)
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         return (call, splits, partial_wave, index), lambda: cls(
             call.batch,
             call.seq_len,
@@ -821,6 +822,7 @@ class FP8LightningIndexerWSKernel(Kernel, FP8LightningIndexerFwdInterface):
             splits,
             partial_wave,
             device_index=index,
+            check_scale_sign=call.check_scale_sign,
         )
 
     def __init__(
@@ -832,8 +834,10 @@ class FP8LightningIndexerWSKernel(Kernel, FP8LightningIndexerFwdInterface):
         seq_len_kv: int,
         clean_logits: bool = True,
         splits: int = 1,
-        partial_wave: Optional[tuple[int, int]] = None,
-        device_index: Optional[int] = None,
+        partial_wave: tuple[int, int] | None = None,
+        device_index: int | None = None,
+        *,
+        check_scale_sign: bool = True,
     ) -> None:
         super().__init__(device_index=device_index)
         self.dtype = torch.float8_e4m3fn
@@ -851,6 +855,7 @@ class FP8LightningIndexerWSKernel(Kernel, FP8LightningIndexerFwdInterface):
             self.launch_args = (whole, pieces.bit_length() - 1, -(-tiles // pieces))
         self.splits = splits
         self.partial_wave = partial_wave
+        self.check_scale_sign = check_scale_sign
         self.program(self._compile)
 
     def _compile(self, cfg: dict):
@@ -864,6 +869,7 @@ class FP8LightningIndexerWSKernel(Kernel, FP8LightningIndexerFwdInterface):
             self.clean_logits,
             prefetch_q=self.seq_len_kv <= 4096 * self.splits,
             mixed=self.partial_wave is not None,
+            check_scale_sign=self.check_scale_sign,
         )
         return kernel
 

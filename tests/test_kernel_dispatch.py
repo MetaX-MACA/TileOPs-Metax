@@ -16,9 +16,10 @@ import torch
 import torch.nn.functional as F
 
 import tileops._ops
-from tileops._kernels.call_spec import CallSpec
+from tileops._kernels.call_spec import _DEVICE_FACTS, CallSpec
 from tileops._kernels.kernel_base import Kernel, KernelInterface
 from tileops._kernels.norm.call_spec import LayerNormCall, LayerNormFwdInterface
+from tileops._ops import op_base
 from tileops._ops.op_base import Op
 from tileops.backend import BUILTIN, DeviceFacts, OpNotAvailableError
 from tileops.backend import _registry as registry
@@ -195,7 +196,7 @@ def test_a_hit_is_one_lookup_and_reads_no_device_fact(monkeypatch: pytest.Monkey
     monkeypatch.setattr(op, "_get_or_build_entry", unreachable)
     call = _Call(device=torch.device("cpu"), n=5)
     assert op.kernel_for("scale", lambda: call) is first
-    assert not {"_arch", "_calibration", "_sm_count", "_smem_budget"} & set(vars(call))
+    assert not {f"_{name}" for name in _DEVICE_FACTS} & set(vars(call))
 
 
 def test_call_specs_sharing_a_build_identity_share_one_entry() -> None:
@@ -233,24 +234,22 @@ class _ScalingOnly(_Scaling):
 
 
 @pytest.mark.parametrize(
-    ("kernel_type", "error", "match"),
+    ("kernel_type", "match"),
     [
-        (_ScalingOnly, TypeError, "does not implement _Scaling; .* inherits _Scaling"),
+        (_ScalingOnly, "does not implement _Scaling; .* inherits _Scaling"),
         (
             _implementation("TwoArgs", forward=lambda self, x, y: x),
-            TypeError,
             "does not take _Scaling's arguments",
         ),
         (
             _implementation("StaticEntry", entry_for=staticmethod(lambda call: 0)),
-            TypeError,
             "entry_for is not a classmethod",
         ),
     ],
 )
-def test_a_registered_implementation_implements_its_interface(kernel_type, error, match) -> None:
+def test_a_registered_implementation_implements_its_interface(kernel_type, match) -> None:
     register_kernel_type("_ScaleOp", "added", kernel_type)
-    with pytest.raises(error, match=match):
+    with pytest.raises(TypeError, match=match):
         _ScaleOp()
 
 
@@ -363,7 +362,10 @@ def test_a_record_names_the_fields_off_their_default() -> None:
     cpu = torch.device("cpu")
     assert str(Required(n=0, device=cpu)).endswith(", n=0")
     assert str(Required(m=2, n=0, dims=(1,), device=cpu)).endswith(", m=2, n=0, dims=(1,)")
-    assert str(_Call(n=0, device=cpu)) == "arch=-1, calibration=None, sm_count=0, smem_budget=0"
+    assert str(_Call(n=0, device=cpu)) == (
+        "arch=-1, calibration=None, sm_count=0, smem_budget=0, threads_per_sm=0, "
+        "regs_per_sm=0, smem_per_sm=0, l2_bytes=0"
+    )
 
 
 def test_an_installed_implementation_set_cannot_change() -> None:
@@ -381,6 +383,33 @@ def test_an_installed_implementation_set_cannot_change() -> None:
     assert type(op.entry(5)).__name__ == "Positive"
     op._install_kernel_types()
     assert type(op.entry(5)).__name__ == "Later"
+
+
+def test_a_call_without_a_device_resolves_again_when_the_current_device_is_stubbed_to_change(
+    device_beside_cpu, monkeypatch
+) -> None:
+    """The one-accelerator form of the two-device test below: the current device is stubbed
+    to the CPU, then to the run device."""
+    seen = []
+    on_current = _implementation(
+        "OnCurrentDevice",
+        lambda c: seen.append(c.device) or True,
+        devices=frozenset({"cpu", device_beside_cpu.type}),
+        general=True,
+        entry_for=classmethod(lambda cls, call: ((call.n, call.device), lambda: cls(call.n))),
+    )
+
+    class _CurrentDeviceOp(_ScaleOp):
+        kernel_types = {"on_current": on_current}
+
+    op = _CurrentDeviceOp()
+    devices = [torch.device("cpu", 0), device_beside_cpu]
+    kernels = []
+    for device in devices:
+        monkeypatch.setattr(op_base, "current_device", lambda device=device: device)
+        kernels.append(op.kernel_for("scale", lambda: _Call(n=1)))
+    assert seen == devices
+    assert kernels[0] is not kernels[1]
 
 
 def test_a_call_without_a_device_resolves_again_when_the_current_device_changes(
@@ -486,9 +515,9 @@ class _TorchLayerNorm(Kernel, LayerNormFwdInterface):
 
 
 class _NarrowTorchLayerNorm(_TorchLayerNorm):
-    """An added implementation for short rows, which wins over the in-tree one there."""
+    """An added implementation for short rows, which wins over the in-tree ones there."""
 
-    preferred_over = frozenset({"layer_norm"})
+    preferred_over = frozenset(LayerNormFwdOp.kernel_types)
 
     @classmethod
     def refusal(cls, call: LayerNormCall) -> "str | None":

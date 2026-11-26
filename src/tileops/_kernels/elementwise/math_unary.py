@@ -4,8 +4,13 @@ import tilelang.language as T
 import torch
 
 from tileops._kernels.elementwise._base import FloatUnaryKernel, TorchFallbackKernel
-from tileops._kernels.elementwise._division import float32_quotient
-from tileops._kernels.elementwise._dtype import FLOAT_DTYPES, INT_DTYPES, log_for_output_precision
+from tileops._kernels.elementwise._division import QUOTIENT_NUM_PER_THREAD, float32_quotient
+from tileops._kernels.elementwise._dtype import (
+    FLOAT_DTYPES,
+    INT_DTYPES,
+    dtype_refusal,
+    log_for_output_precision,
+)
 from tileops._kernels.elementwise._erf import erf
 from tileops._kernels.elementwise._nan import bound
 from tileops._kernels.elementwise.call_spec import (
@@ -103,6 +108,8 @@ class ReciprocalFwdKernel(FloatUnaryKernel, ReciprocalFwdInterface):
     boundary. A backend with a native integer-input reciprocal declares nothing
     and receives the integers.
     """
+
+    REGISTER_COPY_NUM_PER_THREAD = QUOTIENT_NUM_PER_THREAD
 
     @classmethod
     def refusal(cls, call) -> "str | None":
@@ -261,6 +268,12 @@ class ErfFwdKernel(FloatUnaryKernel, UnaryElementwiseFwdInterface):
 
     BYTES_PER_THREAD = 32
 
+    @property
+    def FULL_OCCUPANCY(self) -> bool:
+        """Why: a float32 result evaluates ``erff``, which nvcc compiles past the budget; the
+        16-bit polynomial fits it on its own."""
+        return self.dtype == torch.float32
+
     @staticmethod
     def op_func(x):
         return erf(x, x.dtype)
@@ -341,10 +354,7 @@ class RoundDecimalsFwdKernel(Kernel, RoundFwdInterface):
     def refusal(cls, call: RoundCall) -> "str | None":
         if call.decimals == 0:
             return "rounds to a non-zero number of decimal places"
-        if call.dtype not in cls.SUPPORTED_DTYPES:
-            supported = ", ".join(str(dt) for dt in cls.SUPPORTED_DTYPES)
-            return f"serves dtypes [{supported}], not {call.dtype}"
-        return None
+        return dtype_refusal(cls.SUPPORTED_DTYPES, call.dtype) or super().refusal(call)
 
     @classmethod
     def entry_for(cls, call: RoundCall) -> Entry:

@@ -1,10 +1,9 @@
-# Sequence-modeling operators with existing runtime, tests and benchmarks.
+# Sequence-modeling ops.
 
 EngramGateConvFwdOp:
   family: sequence_modeling
   status: implemented
   ref_api: workloads.sequence_modeling.engram.EngramGateConvFwdWorkload.ref_program
-
   signature:
     forall: {M: Dim, seq_len: Dim, d: Dim, T: "DType[float16 | bfloat16]"}
     params:
@@ -25,14 +24,12 @@ EngramGateConvFwdOp:
       rrms_v: {dtype: float32, shape: "[M, seq_len]"}
     shape_rules:
     - "d > 0"
-
   workloads:
   # d is kept 256-aligned so runtime padding does not distort roofline.
   - {M: 1, seq_len: 32, d: 256, dtype_cases: [{T: float16}], label: train-s32}
   - {M: 2, seq_len: 64, d: 512, dtype_cases: [{T: float16}], label: train-s64}
   - {M: 1, seq_len: 128, d: 256, dtype_cases: [{T: bfloat16}], label: train-s128}
   - {M: 3, seq_len: 96, d: 768, dtype_cases: [{T: bfloat16}], label: train-s96}
-
   roofline:
     # Per position: three RMSNorms, the gate dot and sigmoid, vhat, SiLU and the residual
     # (21d + 14), and the causal width-4 depthwise convolution over the taps inside the input.
@@ -42,7 +39,6 @@ EngramGateConvBwdOp:
   family: sequence_modeling
   status: implemented
   ref_api: workloads.sequence_modeling.engram.EngramGateConvBwdWorkload.ref_program
-
   signature:
     forall: {M: Dim, seq_len: Dim, d: Dim, T: "DType[float16 | bfloat16]"}
     params:
@@ -69,13 +65,11 @@ EngramGateConvBwdOp:
       dconv_w: {dtype: float32, shape: "[4, d]"}
     shape_rules:
     - "d > 0"
-
   workloads:
   - {M: 1, seq_len: 32, d: 256, dtype_cases: [{T: float16}], label: train-s32}
   - {M: 2, seq_len: 64, d: 512, dtype_cases: [{T: float16}], label: train-s64}
   - {M: 1, seq_len: 128, d: 256, dtype_cases: [{T: bfloat16}], label: train-s128}
   - {M: 3, seq_len: 96, d: 768, dtype_cases: [{T: bfloat16}], label: train-s96}
-
   roofline:
     # Per position: the normalized-value recomputes, SiLU, RMSNorm, gate and dot backward
     # (45d + 10), and three convolution passes (recompute, weight and input gradients) over
@@ -88,7 +82,6 @@ EngramDecodeFwdOp:
   family: sequence_modeling
   status: implemented
   ref_api: workloads.sequence_modeling.engram.EngramDecodeWorkload.ref_program
-
   signature:
     forall: {batch: Dim, d_mem: Dim, d: Dim, L: Dim, T: "DType[float16 | bfloat16]"}
     params:
@@ -112,70 +105,179 @@ EngramDecodeFwdOp:
     - "conv_kernel_size > 0 and dilation > 0 and max_conv_len > 0 and max_conv_len >= dilation * (conv_kernel_size - 1)"
     - "d > 0"
     - "L <= max_conv_len"
-
   workloads:
   - {batch: 1, d_mem: 512, d: 256, max_conv_len: 12, conv_kernel_size: 4, dilation: 3, L: 12, dtype_cases: [{T: float16}], label: serving-b1}
   - {batch: 4, d_mem: 1024, d: 512, max_conv_len: 20, conv_kernel_size: 4, dilation: 5, L: 20, dtype_cases: [{T: float16}], label: serving-b4}
   - {batch: 8, d_mem: 512, d: 256, max_conv_len: 18, conv_kernel_size: 4, dilation: 3, L: 18, dtype_cases: [{T: bfloat16}], label: serving-b8}
-
   roofline:
     flops: "4 * batch * d_mem * d + batch * (16 * d + conv_kernel_size * 2 * d) + 20 * batch"
 
-MHCPreFwdOp:
-  # The expansion width n is read off phi's second axis, n * n + 2 * n; the stream
-  # is C = n * c_x wide.
+HyperConnectionPreFwdOp:
+  # Manifold hyper-connection pre step (DeepSeek-V4-Flash Block.hc_pre). Per token, x is the n
+  # streams flattened to n * C float32 values; mixes = (x @ fn^T) * rsqrt(mean(x^2) + rms_eps)
+  # splits into n pre, n post and n * n comb logits, each times its hc_scale entry plus hc_base.
+  # pre = sigmoid + hc_pre_eps, post_mix = sigmoid * hc_post_mult_value, and comb_mix is a row
+  # softmax plus hc_sinkhorn_eps, then a column normalization and sinkhorn_repeat - 1
+  # row-then-column normalizations. layer_input = sum_i pre_i * residual_i, rounded once to bfloat16.
   family: sequence_modeling
   status: implemented
-  ref_api: workloads.sequence_modeling.mhc.MHCPreWorkload.ref_program
-
+  ref_api: vllm.model_executor.kernels.mhc.torch.mhc_pre_torch
   signature:
-    forall: {B: Dim, C: Dim, Q: Dim}
+    forall: {S: Shape, n: Dim, C: Dim}
     params:
-      alpha_pre: {type: float}
-      alpha_post: {type: float}
-      alpha_res: {type: float}
+      rms_eps: {type: float}
+      hc_pre_eps: {type: float}
+      hc_sinkhorn_eps: {type: float}
+      hc_post_mult_value: {type: float}
       sinkhorn_repeat: {type: int}
-      sinkhorn_eps: {type: float, default: 0.02}
     inputs:
-      phi: {dtype: float32, shape: "[C, Q]"}
-      x: {dtype: bfloat16, shape: "[B, C]"}
-      b: {dtype: float32, shape: "[Q]"}
+      residual: {dtype: bfloat16, shape: "[*S, n, C]"}
+      fn: {dtype: float32, shape: "[n * n + 2 * n, n * C]"}
+      hc_scale: {dtype: float32, shape: "[3]"}
+      hc_base: {dtype: float32, shape: "[n * n + 2 * n]"}
     outputs:
-      x_res: {dtype: bfloat16, shape: "[B, C]"}
-      x_layer: {dtype: bfloat16, shape: "[B, c_x]"}
-      h_post: {dtype: float32, shape: "[B, n]"}
-    let:
-      n: "mhc.expansion(Q)"
-      c_x: "C // n"
-    shape_rules:
-    - "C > 0 and C % n == 0"
-
+      post_mix: {dtype: float32, shape: "[*S, n, 1]"}
+      comb_mix: {dtype: float32, shape: "[*S, n, n]"}
+      layer_input: {dtype: bfloat16, shape: "[*S, C]"}
   workloads:
-  - {B: 1, C: 5120, Q: 24, alpha_pre: 1.0, alpha_post: 1.0, alpha_res: 1.0, sinkhorn_repeat: 1, label: hidden-1280}
-  - {B: 2, C: 7680, Q: 24, alpha_pre: 1.0, alpha_post: 1.0, alpha_res: 1.0, sinkhorn_repeat: 1, label: hidden-1920}
-  - {B: 4, C: 10240, Q: 24, alpha_pre: 1.0, alpha_post: 1.0, alpha_res: 1.0, sinkhorn_repeat: 1, label: hidden-2560}
-
+  # DeepSeek-V4-Flash: 4 streams of 4096, epsilons 1e-6, post multiplier 2, 20 Sinkhorn
+  # iterations; GLM-5.3-Flash differs in its 1e-5 norm epsilon.
+  - {S: [1], n: 4, C: 4096, rms_eps: 1.0e-6, hc_pre_eps: 1.0e-6, hc_sinkhorn_eps: 1.0e-6, hc_post_mult_value: 2.0, sinkhorn_repeat: 20, label: dsv4-flash-t1}
+  - {S: [4096], n: 4, C: 4096, rms_eps: 1.0e-6, hc_pre_eps: 1.0e-6, hc_sinkhorn_eps: 1.0e-6, hc_post_mult_value: 2.0, sinkhorn_repeat: 20, label: dsv4-flash-t4096}
+  - {S: [32768], n: 4, C: 4096, rms_eps: 1.0e-6, hc_pre_eps: 1.0e-6, hc_sinkhorn_eps: 1.0e-6, hc_post_mult_value: 2.0, sinkhorn_repeat: 20, label: dsv4-flash-t32768}
+  - {S: [3000], n: 4, C: 4096, rms_eps: 1.0e-5, hc_pre_eps: 1.0e-6, hc_sinkhorn_eps: 1.0e-6, hc_post_mult_value: 2.0, sinkhorn_repeat: 20, label: glm-5.3-flash-t3000}
   roofline:
-    flops: "2 * B * C * Q + 2 * B * c_x * n + 2 * B * n * C"
+    # Per token, with Q = n * n + 2 * n logits: the projection (2 per multiply-add) and the
+    # squared sum over n * C, the mean, epsilon and rsqrt, and the Q multiplies; the scale and
+    # base (2 per logit); pre and post (a sigmoid of 4 and one add or multiply each); the softmax (5 per
+    # comb entry) and its epsilon; the first column normalization (sum, add, divide) and each
+    # further row-then-column pair; the weighted stream sum (2 per element).
+    flops: "prod(S) * (2 * (n * n + 2 * n) * n * C + 2 * n * C + 3 + 3 * (n * n + 2 * n) + 10 * n + 6 * n * n + 2 * n * n + n + max((sinkhorn_repeat - 1, 0)) * (4 * n * n + 2 * n) + 2 * n * C)"
 
-MHCPostFwdOp:
+HyperConnectionPostFwdOp:
+  # output[..., j, :] = post_layer_mix[..., j, 0] * x + sum_i comb_res_mix[..., i, j] *
+  # residual[..., i, :], in float32 and rounded once to bfloat16 (DeepSeek-V4-Flash
+  # Block.hc_post). The mixes may arrive in bfloat16, as GLM-5-Next rounds them before mixing.
   family: sequence_modeling
   status: implemented
-  ref_api: workloads.sequence_modeling.mhc.MHCPostWorkload.ref_program
-
+  ref_api: vllm.model_executor.kernels.mhc.torch.mhc_post_torch
   signature:
-    forall: {B: Dim, n: Dim, c_x: Dim}
+    forall: {S: Shape, n: Dim, C: Dim, M: "DType[float32 | bfloat16]"}
     inputs:
-      x_layer_out: {dtype: bfloat16, shape: "[B, c_x]"}
-      h_post: {dtype: float32, shape: "[B, n]"}
-      x_res: {dtype: bfloat16, shape: "[B, n * c_x]"}
+      x: {dtype: bfloat16, shape: "[*S, C]"}
+      residual: {dtype: bfloat16, shape: "[*S, n, C]"}
+      post_layer_mix: {dtype: M, shape: "[*S, n, 1]"}
+      comb_res_mix: {dtype: M, shape: "[*S, n, n]"}
     outputs:
-      x_out: {dtype: bfloat16, shape: "[B, n * c_x]"}
-
+      output: {dtype: bfloat16, shape: "[*S, n, C]"}
   workloads:
-  - {B: 1, n: 4, c_x: 1280, label: hidden-1280}
-  - {B: 2, n: 4, c_x: 1920, label: hidden-1920}
-  - {B: 4, n: 4, c_x: 2560, label: hidden-2560}
-
+  # DeepSeek-V4-Flash and GLM-5.3-Flash: 4 streams of 4096; GLM's mixes in bfloat16.
+  - {S: [1], n: 4, C: 4096, dtype_cases: [{M: float32}], label: dsv4-flash-t1}
+  - {S: [4096], n: 4, C: 4096, dtype_cases: [{M: float32}], label: dsv4-flash-t4096}
+  - {S: [32768], n: 4, C: 4096, dtype_cases: [{M: float32}], label: dsv4-flash-t32768}
+  - {S: [3000], n: 4, C: 4096, dtype_cases: [{M: bfloat16}], label: glm-5.3-flash-t3000}
   roofline:
-    flops: "2 * B * n * c_x"
+    # Per output element: the post multiply, n multiply-adds of the comb mix, and the add.
+    flops: "prod(S) * n * C * (2 * n + 2)"
+
+HyperConnectionHeadFwdOp:
+  # The final collapse of the n streams before the LM head. Per token, x is the streams
+  # flattened in float32, pre = sigmoid((x @ hc_fn^T) * rsqrt(mean(x^2) + rms_norm_eps) *
+  # hc_scale + hc_base) + hc_eps, and output = sum_i pre_i * hidden_states_i, rounded once to
+  # bfloat16 (DeepSeek-V4-Flash ParallelHead.hc_head; parameter names from vLLM's HCHeadOp).
+  family: sequence_modeling
+  status: implemented
+  ref_api: workloads.sequence_modeling.hyper_connection.hc_head
+  signature:
+    forall: {S: Shape, n: Dim, C: Dim}
+    params:
+      rms_norm_eps: {type: float}
+      hc_eps: {type: float}
+    inputs:
+      hidden_states: {dtype: bfloat16, shape: "[*S, n, C]"}
+      hc_fn: {dtype: float32, shape: "[n, n * C]"}
+      hc_scale: {dtype: float32, shape: "[1]"}
+      hc_base: {dtype: float32, shape: "[n]"}
+    outputs:
+      output: {dtype: bfloat16, shape: "[*S, C]"}
+  workloads:
+  # DeepSeek-V4-Flash: 4 streams of 4096, epsilons 1e-6; GLM-5.3-Flash differs in its 1e-5
+  # norm epsilon.
+  - {S: [1], n: 4, C: 4096, rms_norm_eps: 1.0e-6, hc_eps: 1.0e-6, label: dsv4-flash-t1}
+  - {S: [64], n: 4, C: 4096, rms_norm_eps: 1.0e-6, hc_eps: 1.0e-6, label: dsv4-flash-b64}
+  - {S: [4096], n: 4, C: 4096, rms_norm_eps: 1.0e-6, hc_eps: 1.0e-6, label: dsv4-flash-t4096}
+  - {S: [3000], n: 4, C: 4096, rms_norm_eps: 1.0e-5, hc_eps: 1.0e-6, label: glm-5.3-flash-t3000}
+  roofline:
+    # Per token: the projection (2 per multiply-add) and the squared sum over n * C, the
+    # mean, epsilon and rsqrt, its n multiplies, the scale and base, the sigmoid and epsilon
+    # (5 per stream), and the weighted stream sum (2 per element).
+    flops: "prod(S) * (2 * n * n * C + 2 * n * C + 3 + 8 * n + 2 * n * C)"
+
+NGramHashFwdOp:
+  # For token t and head h of order k = 2 + h // (Hd // (N - 1)): ngram_ids[t, h] =
+  # (xor_{i < k} tok[t - i] * multipliers[i]) mod primes[h] + offsets[h], in int64 with
+  # wraparound and a non-negative remainder (Qwen4ExpTextNGramEmbedding). tok[t - i] is the
+  # token i places back in the history (context, then this call's tokens); a shift across an
+  # EOS token or out of the history reads eos_token_id; the EOS token itself takes part.
+  # The context follows vLLM causal_conv1d_update's state rules: sequence b uses row
+  # context_indices[b] (distinct; row b without them), whose N - 1 columns from
+  # o = num_accepted_tokens[b] - 1 (0 without them) hold the prior tokens, oldest first.
+  # Afterwards the row holds, from column 0, the last N - 1 tokens of history and call tokens,
+  # or with num_accepted_tokens the history from column o + 1 and every call token. A sequence
+  # with no tokens leaves its row untouched; one with no history starts from eos_token_id.
+  family: sequence_modeling
+  status: implemented
+  ref_api: workloads.sequence_modeling.ngram_hash.ngram_hash
+  signature:
+    forall: {B: Dim, L: Dim, Tt: Dim, N: Dim, Hd: Dim, S: Dim, W: Dim, seq_lens: "Seq[Int]"}
+    params:
+      eos_token_id: {type: int}
+      validate_inputs: {type: bool, default: false, kw_only: true}
+    types:
+      Tokens:
+        params: {varlen: Bool, B: Dim, L: Dim, Tt: Dim}
+        match: varlen
+        cases:
+        - {when: false, is: "[B, L]"}
+        - {when: true, is: "[Tt]"}
+      Ids:
+        params: {varlen: Bool, B: Dim, L: Dim, Tt: Dim, Hd: Dim}
+        match: varlen
+        cases:
+        - {when: false, is: "[B, L, Hd]"}
+        - {when: true, is: "[Tt, Hd]"}
+      Pool:
+        params: {slotted: Bool, B: Dim, S: Dim, W: Dim}
+        match: slotted
+        cases:
+        - {when: false, is: "[B, W]"}
+        - {when: true, is: "[S, W]"}
+    inputs:
+      input_ids: {dtype: int64, shape: "Tokens[present(cu_seqlens), B, L, Tt]"}
+      context: {dtype: int64, shape: "Pool[present(context_indices), B, S, W]", mutated: true}
+      multipliers: {dtype: int64, shape: "[N]"}
+      primes: {dtype: int64, shape: "[Hd]", values: "full((Hd,), 20000003)", requires: ["in_range(1, 9223372036854775807)"]}
+      offsets: {dtype: int64, shape: "[Hd]"}
+      cu_seqlens: {dtype: int32, shape: "[B + 1]", type: "Tensor | None", default: null, values: "prefix_sum(seq_lens)", requires: ["prefix_offsets(Tt)", "max_segment(W - N + 2 if present(num_accepted_tokens) else Tt)"]}
+      context_indices: {dtype: int32, shape: "[B]", type: "Tensor | None", default: null, values: "sample_indices(B, S)", requires: ["in_range(0, S)"]}
+      num_accepted_tokens: {dtype: int32, shape: "[B]", type: "Tensor | None", default: null, values: "full((B,), 1)", requires: ["in_range(1, W - N + 3)"]}
+    outputs:
+      ngram_ids: {dtype: int64, shape: "Ids[present(cu_seqlens), B, L, Tt, Hd]"}
+    shape_rules:
+    - "N >= 2"
+    - "Hd % (N - 1) == 0"
+    - "W >= N - 1"
+    # With num_accepted_tokens a row keeps the history after its first column and every
+    # call token.
+    - "not present(num_accepted_tokens) or present(cu_seqlens) or W >= N - 2 + L"
+  workloads:
+  # Qwen3.8-Flash-Next decoder layer 2: trigrams, 8 heads per order, eos 248044 (its
+  # Qwen3.6 vocabulary). Prefill and chunked prefill carry a 2-token context per sequence;
+  # decode and multi-token verification address a slot pool.
+  - {B: 1, L: 4096, N: 3, Hd: 16, W: 2, eos_token_id: 248044, label: qwen3.8-flash-prefill}
+  - {Tt: 8192, seq_lens: [3000, 5192], N: 3, Hd: 16, S: 64, W: 2, eos_token_id: 248044, some: [cu_seqlens, context_indices], label: qwen3.8-flash-varlen}
+  - {B: 64, L: 1, N: 3, Hd: 16, S: 256, W: 2, eos_token_id: 248044, some: [context_indices], label: qwen3.8-flash-decode}
+  - {B: 64, L: 4, N: 3, Hd: 16, S: 256, W: 5, eos_token_id: 248044, some: [context_indices, num_accepted_tokens], label: qwen3.8-flash-verify}
+  roofline:
+    # Integer arithmetic only; the context rows the call reaches move.
+    func: "tileops._perf.formulas.ngram_hash_roofline"

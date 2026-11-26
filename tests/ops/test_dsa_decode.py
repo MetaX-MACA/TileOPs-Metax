@@ -5,6 +5,7 @@ from tests.workload_test_base import FixtureBase, TestBase
 from tileops._kernels.attention import DSADecodeBasicKernel, DSADecodeKernel, DSADecodeWSKernel
 from tileops._utils import get_sm_version
 from tileops.attention import DSADenseFwdOp
+from tileops.backend import OpNotAvailableError
 from tileops.backend import _registry as registry
 from tileops.backend._registry import register_kernel_type
 from workloads.attention.dsa import DSADecodeWorkload
@@ -54,6 +55,43 @@ class DSADecodeFixture(FixtureBase):
                     marks=pytest.mark.full,
                     id="full-fp16-tuned",
                 ),
+                # Every causal query sees topk keys, so no row is scanned for dead slots. More
+                # rows than SMs: each CTA runs one row after another.
+                pytest.param(
+                    1,
+                    64,
+                    300,
+                    1024,
+                    512,
+                    0,
+                    192,
+                    1,
+                    1,
+                    1024,
+                    None,
+                    torch.float16,
+                    False,
+                    marks=pytest.mark.full,
+                    id="rows-past-sms-see-topk",
+                ),
+                # Rows that fill fewer than half the SMs: a CTA pair shares each row's keys.
+                pytest.param(
+                    2,
+                    128,
+                    3,
+                    1024,
+                    512,
+                    0,
+                    512,
+                    1,
+                    1,
+                    1024,
+                    None,
+                    torch.float16,
+                    False,
+                    marks=pytest.mark.full,
+                    id="few-rows-see-topk",
+                ),
             ],
         ),
     ]
@@ -95,13 +133,12 @@ def test_dsa_decode_decode(
     test.check(op, *test.gen_inputs())
 
 
-@pytest.mark.smoke
 @pytest.mark.parametrize(
     ("dim_tail", "dtype"),
     [
-        pytest.param(64, torch.bfloat16, id="bf16-tail"),
-        pytest.param(0, torch.bfloat16, id="bf16-no-tail"),
-        pytest.param(0, torch.float16, id="fp16-no-tail"),
+        pytest.param(0, torch.bfloat16, marks=pytest.mark.smoke, id="bf16-no-tail"),
+        pytest.param(0, torch.float16, marks=pytest.mark.smoke, id="fp16-no-tail"),
+        pytest.param(64, torch.bfloat16, marks=pytest.mark.full, id="bf16-tail"),
     ],
 )
 def test_dsa_decode_decode_tail_and_dtype(dim_tail, dtype) -> None:
@@ -183,14 +220,15 @@ def test_dsa_decode_decode_ignores_padded_topk_slots() -> None:
     assert torch.equal(op(q, kv, in_range_pad), expected)
 
 
-@pytest.mark.smoke
 @pytest.mark.sm90
 @pytest.mark.parametrize(
     ("dim", "dim_tail", "heads", "heads_kv", "stride_kv", "dtype"),
     [
-        pytest.param(512, 0, 128, 2, 1, torch.float16, id="512-kv-groups"),
-        pytest.param(512, 64, 64, 1, 2, torch.bfloat16, id="512-kv-stride"),
-        pytest.param(256, 64, 64, 1, 1, torch.bfloat16, id="256"),
+        pytest.param(512, 0, 128, 2, 1, torch.float16, marks=pytest.mark.smoke, id="512-kv-groups"),
+        pytest.param(
+            512, 64, 64, 1, 2, torch.bfloat16, marks=pytest.mark.smoke, id="512-kv-stride"
+        ),
+        pytest.param(256, 64, 64, 1, 1, torch.bfloat16, marks=pytest.mark.full, id="256"),
     ],
 )
 def test_dsa_decode_ignores_keys_past_the_causal_limit(
@@ -215,11 +253,16 @@ def test_dsa_decode_ignores_keys_past_the_causal_limit(
     test.check(op, q, kv, indices)
 
 
-@pytest.mark.smoke
 @pytest.mark.in_tree_kernels
-@pytest.mark.parametrize("row", ["no-valid-index", "very-negative-score"])
 @pytest.mark.parametrize(
     "kernel", [DSADecodeWSKernel, DSADecodeKernel, DSADecodeBasicKernel], ids=lambda k: k.__name__
+)
+@pytest.mark.parametrize(
+    "row",
+    [
+        pytest.param("no-valid-index", marks=pytest.mark.smoke),
+        pytest.param("very-negative-score", marks=pytest.mark.full),
+    ],
 )
 def test_dsa_decode_row_normalization(kernel, row) -> None:
     """Every kernel zeroes a row with no valid key and normalizes a very negative score."""
@@ -252,3 +295,96 @@ def test_dsa_decode_row_normalization(kernel, row) -> None:
     assert isinstance(next(op.iter_kernels()), Pinned)
     if row == "no-valid-index":
         assert op(q, kv, indices)[:, ::2].eq(0).all()
+
+
+@pytest.mark.sm90
+@pytest.mark.parametrize(
+    ("batch", "seq_len", "seq_len_kv", "topk", "with_sink"),
+    [
+        # The bf16-no-tail shape, index-only with a sink over whole pairs.
+        pytest.param(1, 7, 256, 128, True, marks=pytest.mark.smoke, id="sink-whole-pairs"),
+        pytest.param(1, 9, 1000, 160, True, marks=pytest.mark.full, id="odd-block-past-topk"),
+        pytest.param(1, 9, 1000, 200, True, marks=pytest.mark.full, id="both-blocks-ragged"),
+        pytest.param(4, 2, 1000, 640, False, marks=pytest.mark.full, id="mtp-rows"),
+    ],
+)
+def test_dsa_decode_index_only(batch, seq_len, seq_len_kv, topk, with_sink) -> None:
+    """With is_causal false only the indices select keys: -1 skips a slot, an index past
+    the query's position still counts, and a sink of +inf zeroes its head while -inf leaves
+    it as without a sink."""
+    heads = 64
+    test = DSADecodeTest(
+        batch, heads, seq_len, seq_len_kv, 512, 0, topk, 1, 1, 0, is_causal=False,
+        dtype=torch.bfloat16,
+    )  # fmt: skip
+    q, kv, _ = test.gen_inputs()
+    generator = torch.Generator().manual_seed(0)
+    rows = [torch.randperm(seq_len_kv, generator=generator)[:topk] for _ in range(batch * seq_len)]
+    indices = torch.stack(rows).view(batch, seq_len, 1, topk).to(torch.int32)
+    indices[torch.rand(indices.shape, generator=generator) < 0.3] = -1
+    inputs = [q, kv, indices.to(q.device)]
+    if with_sink:
+        sink = torch.randn(heads, generator=generator)
+        sink[0], sink[1] = float("inf"), float("-inf")
+        inputs.append(sink.to(q.device))
+    test.check(DSADenseFwdOp(0, 1, 0, is_causal=False), *inputs)
+
+
+@pytest.mark.sm90
+@pytest.mark.parametrize(
+    ("batch", "seq_len", "seq_len_kv", "heads", "topk", "is_causal"),
+    [
+        # The bf16-no-tail shape: a CTA a row.
+        pytest.param(1, 7, 256, 64, 128, False, marks=pytest.mark.smoke, id="bf16-no-tail-shape"),
+        # More rows than SMs: each CTA runs one row after another.
+        pytest.param(1, 300, 1024, 64, 200, False, marks=pytest.mark.full, id="rows-past-sms"),
+        # Rows that fill fewer than half the SMs: a CTA pair shares each row's keys.
+        pytest.param(4, 2, 1024, 64, 640, False, marks=pytest.mark.full, id="few-rows"),
+        pytest.param(2, 3, 1024, 128, 512, True, marks=pytest.mark.full, id="few-rows-causal"),
+        # More rows than SMs with an odd block count: a row of one block leaves consumer 1
+        # no odd block to score. A topk that is not a multiple of 4 scans one slot a thread.
+        pytest.param(1, 300, 1024, 64, 190, False, marks=pytest.mark.full, id="rows-past-sms-odd"),
+        pytest.param(
+            1, 300, 1024, 64, 192, True, marks=pytest.mark.full, id="rows-past-sms-causal"
+        ),
+        # Between half and all of the SMs: a CTA a row.
+        pytest.param(1, 100, 1024, 64, 640, False, marks=pytest.mark.full, id="row-per-cta"),
+    ],
+)
+def test_dsa_decode_skips_dead_tails(batch, seq_len, seq_len_kv, heads, topk, is_causal) -> None:
+    """Rows end in dead slots of every length, a row with none live included: the blocks
+    past a row's last live slot weigh nothing, however the rows are spread over the SMs."""
+    # Every causal row sees fewer than topk keys.
+    q_start = topk // 2 if is_causal else 0
+    test = DSADecodeTest(
+        batch, heads, seq_len, seq_len_kv, 512, 0, topk, 1, 1, q_start, is_causal=is_causal,
+        dtype=torch.bfloat16,
+    )  # fmt: skip
+    q, kv, _ = test.gen_inputs()
+    generator = torch.Generator().manual_seed(0)
+    rows = batch * seq_len
+    # A causal row pads with seq_len_kv, an index-only one with -1.
+    indices = torch.full((rows, topk), seq_len_kv if is_causal else -1, dtype=torch.int32)
+    for r, live in enumerate(torch.randint(0, topk + 1, (rows,), generator=generator)):
+        live = 0 if r == 0 else int(live)
+        indices[r, :live] = torch.randperm(seq_len_kv, generator=generator)[:live]
+    inputs = [q, kv, indices.view(batch, seq_len, 1, topk).to(q.device)]
+    if not is_causal:
+        sink = torch.randn(heads, generator=generator)
+        sink[0], sink[1] = float("inf"), float("-inf")
+        inputs.append(sink.to(q.device))
+    test.check(DSADenseFwdOp(0, 1, q_start, is_causal=is_causal), *inputs)
+
+
+@pytest.mark.sm90
+@pytest.mark.smoke
+@pytest.mark.in_tree_kernels
+def test_dsa_decode_refuses_index_only_selection_off_dim_512() -> None:
+    """Only the SM90 kernel for value dim 512 serves is_causal false; the others need the
+    causal mask, so the op refuses a dim-256 call before anything is built."""
+    test = DSADecodeTest(1, 64, 1, 256, 256, 64, 128, 1, 1, 0, is_causal=False)
+    op = DSADenseFwdOp(64, 1, 0, is_causal=False)
+    with pytest.raises(OpNotAvailableError, match="requires dim 512.*requires the causal mask"):
+        op(*test.gen_inputs())
+    for interface in DSADenseFwdOp.interfaces:
+        assert not op._entries_built(interface)

@@ -3,24 +3,23 @@
 Inputs and output shapes are documented by ``GEMMTemplate``.
 """
 
-from typing import Callable, Optional
+from collections.abc import Callable
 
 import tilelang
 import tilelang.language as T
 import torch
-from tilelang.cuda.intrinsics.macro.wgmma_macro_generator import (
-    TensorCoreIntrinEmitter as WgmmaEmitter,
-)
 
 from tileops._csrc import csrc_include
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.constants import WARPGROUP_THREADS
 from tileops._kernels.elementwise._erf import erf
+from tileops._kernels.gemm.dense import wgmma_acc_layout
 from tileops._kernels.gemm.persistent.heuristics import (
     ACTIVATIONS,
     INTERLEAVED_ACTIVATIONS,
     PER_GROUP_TYPES,
     PER_ROW_TYPES,
+    ROW_STORE_VECTOR,
     SWIGLUOAI_ALPHA,
     SWIGLUOAI_LIMIT,
     GEMMDesc,
@@ -31,7 +30,7 @@ from tileops._kernels.gemm.persistent.heuristics import (
     spec_from_config,
 )
 from tileops._kernels.kernel_base import Kernel
-from tileops._utils import WARP_LANES, get_sm_count
+from tileops._utils import WARP_LANES
 
 __all__ = [
     "GEMMTemplate",
@@ -62,7 +61,9 @@ def _make_prim_func(
     has_bias: bool,
     pingpong: bool,
     a_box_rows: int,
+    group_starts: bool,
     native_wgmma: bool,
+    vector_row_store: bool,
 ):
     """Build the ``@T.prim_func`` for one spec; parameters are the spec's scalars."""
 
@@ -231,6 +232,20 @@ def _make_prim_func(
     def align_up(x):
         return ((x + T.int32(block_m - 1)) // T.int32(block_m)) * T.int32(block_m)
 
+    def group_start(ends, g):
+        """First row of a psum group *g*: the previous group's end, or its own entry where
+        the layout holds starts."""
+        if group_starts:
+            return ends[g]
+        return T.if_then_else(g > 0, ends[T.max(g - 1, 0)], T.int32(0))
+
+    def group_end(ends, g):
+        """End row of a psum group *g*: its own entry, or the next group's start where the
+        layout holds starts, the last group ending at ``m``."""
+        if group_starts:
+            return T.if_then_else(g + 1 < num_groups, ends[T.min(g + 1, num_groups - 1)], m)
+        return ends[g]
+
     @T.macro
     def swizzle_block(block_idx, num_m_blocks, num_n_blocks, out_m, out_n):
         """Map a tile id to its M and N blocks.
@@ -269,7 +284,8 @@ def _make_prim_func(
 
         Masked groups are ``masked_m[g]`` rows from row 0 of their slab; psum
         groups run from the previous end (aligned up for the aligned variant)
-        to ``ends[g]``.
+        to ``ends[g]``, or from ``ends[g]`` to the next start where the layout holds
+        group starts (``group_start`` and ``group_end``).
         """
         s_cum[0] = T.int32(0)
         prev_end = T.alloc_var("int32", init=0)
@@ -278,6 +294,9 @@ def _make_prim_func(
                 rows = T.max(T.min(ends[g], m), T.int32(0))
             elif aligned_psum:
                 rows = T.max(ends[g] - align_up(prev_end), T.int32(0))
+            elif group_starts:
+                # Separate so templates without group starts compile unchanged source.
+                rows = T.max(group_end(ends, g) - group_start(ends, g), T.int32(0))
             else:
                 rows = T.max(ends[g] - prev_end, T.int32(0))
             s_cum[g + 1] = s_cum[g] + (rows + T.int32(block_m - 1)) // T.int32(block_m)
@@ -311,7 +330,8 @@ def _make_prim_func(
 
         ``t_row0`` indexes the A/C slab the tile belongs to. ``t_rows`` is
         ``block_m`` except on a tight group's last tile. ``ends`` contains
-        per-group ends for psum, masked and recovered per-row layouts. The K
+        per-group ends for psum, masked and recovered per-row layouts, or per-group
+        starts for a tight psum layout with ``group_starts``. The K
         range ``[t_k0, t_k0 + t_klen)`` is the whole ``K`` except for the
         K-grouped type, where it is the group's slice of the prefix sum; its
         first ``t_khead`` columns are alignment padding to mask.
@@ -363,13 +383,13 @@ def _make_prim_func(
                 t_row0[0] = m_blk[0] * T.int32(block_m)
                 t_rows[0] = T.int32(block_m)
             else:
-                prev_end = T.if_then_else(lo > 0, ends[T.max(lo - 1, 0)], T.int32(0))
+                prev_end = group_start(ends, lo)
                 if aligned_psum:
                     t_row0[0] = align_up(prev_end) + m_blk[0] * T.int32(block_m)
                     t_rows[0] = T.int32(block_m)
                 else:
                     t_row0[0] = prev_end + m_blk[0] * T.int32(block_m)
-                    t_rows[0] = T.min(T.int32(block_m), ends[lo] - t_row0[0])
+                    t_rows[0] = T.min(T.int32(block_m), group_end(ends, lo) - t_row0[0])
         else:  # aligned per-row: the flat grid, a tile's group read off its first row
             swizzle_block(block_idx, num_m_blocks, num_n_blocks, m_blk, n_blk)
             t_row0[0] = m_blk[0] * T.int32(block_m)
@@ -509,6 +529,11 @@ def _make_prim_func(
                 inv_sqrt2 = T.cast(0.7071067811865476, accum_dtype)
                 C_s[i, j] = T.cast(half * g * (one + erf(g * inv_sqrt2, cd_dtype)) * u, cd_dtype)
 
+    # A row-masked store over a width that is not a power of two divides each element's index
+    # by the width; ptxas hoists those loop-invariant quotients into registers that spill. Such
+    # a width stores in runs of its widest power-of-two divisor, whose index splits by shifts.
+    store_run = staged_n & -staged_n
+
     @T.macro
     def store_tile(C, C_src, C_up, C_s, group, row0, col0, rows, wg):
         """Stage and store one warp-group's rows of a tile."""
@@ -524,9 +549,32 @@ def _make_prim_func(
             if tight and rows < T.int32(wg_rows):
                 T.sync_threads(barrier_id=epilogue_barrier_base + wg, arrive_count=128)
                 if rows > 0:
-                    for i, j in T.Parallel(wg_rows, staged_n):
-                        if i < rows and col0 + chunk_col + j < c_cols:
-                            C[row0 + i, col0 + chunk_col + j] = C_s[i, j]
+                    if vector_row_store:
+                        # The output row pitch is a multiple of 8 elements
+                        # (``GEMMTemplate.refusal_for``), so a vector at a multiple of
+                        # ``ROW_STORE_VECTOR`` lies wholly inside or wholly past the last column.
+                        for run in range(staged_n // store_run):
+                            run_col = col0 + chunk_col + run * store_run
+                            for i, v in T.Parallel(wg_rows, store_run // ROW_STORE_VECTOR):
+                                if i < rows and run_col + v * ROW_STORE_VECTOR < c_cols:
+                                    T.call_extern(
+                                        "handle",
+                                        "tileops::copy16",
+                                        T.address_of(C[row0 + i, run_col + v * ROW_STORE_VECTOR]),
+                                        T.address_of(
+                                            C_s[i, run * store_run + v * ROW_STORE_VECTOR]
+                                        ),
+                                    )
+                    elif store_run == staged_n:
+                        for i, j in T.Parallel(wg_rows, staged_n):
+                            if i < rows and col0 + chunk_col + j < c_cols:
+                                C[row0 + i, col0 + chunk_col + j] = C_s[i, j]
+                    else:
+                        for run in range(staged_n // store_run):
+                            run_col = col0 + chunk_col + run * store_run
+                            for i, j in T.Parallel(wg_rows, store_run):
+                                if i < rows and run_col + j < c_cols:
+                                    C[row0 + i, run_col + j] = C_s[i, run * store_run + j]
             else:
                 T.fence_proxy_async()
                 T.sync_threads(barrier_id=epilogue_barrier_base + wg, arrive_count=128)
@@ -584,18 +632,7 @@ def _make_prim_func(
     def native_acc_layout(buf, width):
         """The layout ``T.wgmma_gemm`` gives a math warp-group's ``64 x width`` accumulator,
         which the native-width WGMMA writes register for register."""
-        return WgmmaEmitter(
-            a_dtype=dtype,
-            b_dtype=dtype,
-            accum_dtype="float32",
-            a_transposed=False,
-            b_transposed=True,
-            block_row_warps=4,
-            block_col_warps=1,
-            warp_row_tiles=wg_rows // 4,
-            warp_col_tiles=width,
-            chunk=block_k,
-        ).make_mma_store_layout(buf)
+        return wgmma_acc_layout(buf, wg_rows, width, block_k, dtype, "float32")
 
     @T.macro
     def mma(A_s, B_s, C_l, slot, ki):
@@ -1039,24 +1076,17 @@ def _grouped_gemm_kernel(spec: GroupedGEMMSpec):
     has_bias = spec.has_bias
     pingpong = spec.pingpong
     a_box_rows = spec.a_box_rows
-    # TileLang 0.1.12 issues a T.wgmma_gemm of a width that does not divide 256 as
-    # gcd(width, 256)-wide WGMMAs, each re-reading A: 192 as three n64, 224 as seven n32.
-    # dense_wgmma_helper.h issues the widths it instantiates as one WGMMA per 16 of K, on
-    # a 64-row warp-group tile of K-major operands staged 64 wide along K.
-    native_wgmma = (
-        spec.gemm_type is GEMMType.DENSE
-        and a_k_major
-        and b_k_major
-        and block_k == 64
-        and block_m // num_math_wgs == 64
-        and block_n in (192, 224)
-    )
+    group_starts = spec.group_starts
+    native_wgmma = spec.native_wgmma
+    vector_row_store = spec.vector_row_store
     headers = []
     if native_wgmma:
         headers.append("dense_wgmma_helper.h")
     if spec.gemm_type is GEMMType.DENSE and activation == "silu_and_mul":
         headers.append("approx_math.h")
-    compile_flags = ["-O3", "-DENABLE_BF16"]
+    if vector_row_store:
+        headers.append("streaming_load.h")  # copy16
+    compile_flags = [*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"]
     if headers:
         compile_flags += csrc_include(*headers)
 
@@ -1092,7 +1122,9 @@ def _grouped_gemm_kernel(spec: GroupedGEMMSpec):
             has_bias,
             pingpong,
             a_box_rows,
+            group_starts,
             native_wgmma,
+            vector_row_store,
         )
 
     return _func
@@ -1160,14 +1192,15 @@ class GEMMTemplate(Kernel):
         gemm_type: GEMMType,
         *,
         num_groups: int = 1,
-        cd_dtype: Optional[torch.dtype] = None,
+        cd_dtype: torch.dtype | None = None,
         activation: str = "none",
         static_dims: str = "nk",
         m_alignment: int = 128,
         expected_m: int = 0,
-        sm_count: Optional[int] = None,
-        config: Optional[dict] = None,
-        device_index: Optional[int] = None,
+        sm_count: int | None = None,
+        config: dict | None = None,
+        group_starts: bool = False,
+        device_index: int | None = None,
     ) -> None:
         """Fix the template's operand-side parameters; the schedule is chosen per call.
 
@@ -1186,6 +1219,8 @@ class GEMMTemplate(Kernel):
             sm_count: Persistent grid size; the device's SM count when ``None``.
             config: Pins ``block_m``, ``block_n`` and optionally ``num_stages`` instead of
                 running the selector.
+            group_starts: Whether a tight psum ``grouped_layout`` holds group starts rather
+                than ends; the last group then ends at ``M``.
             device_index: Device the kernel is built for; the current one when ``None``.
         """
         super().__init__(device_index=device_index)
@@ -1200,16 +1235,14 @@ class GEMMTemplate(Kernel):
         if activation != "none" and GEMMType(gemm_type) is GEMMType.K_GROUPED_CONTIGUOUS:
             raise ValueError("a fused gated activation needs a per-group B; K-grouped has one B")
         self.gemm_type = GEMMType(gemm_type)
+        self.group_starts = group_starts
         self.activation = activation
         self.num_groups = num_groups
         self.cd_dtype = cd_dtype
         self.static_dims = static_dims
         self.m_alignment = m_alignment
         self.expected_m = expected_m
-        self.sm_count = get_sm_count(device_index) if sm_count is None else sm_count
-        self.device_name = (
-            torch.cuda.get_device_name(device_index) if torch.cuda.is_available() else ""
-        )
+        self.sm_count = self.build_target.sm_count if sm_count is None else sm_count
         self._empty_layout = None
         self.init_config(config)
 
@@ -1218,7 +1251,7 @@ class GEMMTemplate(Kernel):
         # The selector picks per call; nothing to author here.
         return {}
 
-    def init_config(self, config: Optional[dict] = None) -> None:
+    def init_config(self, config: dict | None = None) -> None:
         """Pin every key *config* states; an empty config leaves the choice to the selector."""
         self.config = dict(config or {})
 
@@ -1270,8 +1303,9 @@ class GEMMTemplate(Kernel):
             m_alignment=self.m_alignment,
             expected_m=self.expected_m,
             activation=self.activation,
-            device_name=self.device_name,
+            calibration=self.build_target.calibration,
             has_bias=has_bias,
+            group_starts=self.group_starts,
         )
 
     def spec_for(self, a: torch.Tensor, b: torch.Tensor) -> GroupedGEMMSpec:
@@ -1287,7 +1321,7 @@ class GEMMTemplate(Kernel):
         return a.dtype if self.cd_dtype is None else self.cd_dtype
 
     @staticmethod
-    def refusal_for(a: torch.Tensor, b: torch.Tensor) -> Optional[str]:
+    def refusal_for(a: torch.Tensor, b: torch.Tensor) -> str | None:
         """Why TMA cannot address these operands or the output, or ``None`` when it can.
 
         Every TMA-addressed row pitch must be a multiple of 16 bytes: the contiguous
@@ -1307,7 +1341,7 @@ class GEMMTemplate(Kernel):
             return f"N={b.shape[-2]} is not a multiple of 8 elements (the output row pitch)"
         return None
 
-    def _check_layout(self, desc: GEMMDesc, grouped_layout: Optional[torch.Tensor]) -> None:
+    def _check_layout(self, desc: GEMMDesc, grouped_layout: torch.Tensor | None) -> None:
         gtype = self.gemm_type
         if gtype in (GEMMType.DENSE, GEMMType.BATCHED):
             if grouped_layout is not None:
@@ -1336,9 +1370,9 @@ class GEMMTemplate(Kernel):
         self,
         a: torch.Tensor,
         b: torch.Tensor,
-        grouped_layout: Optional[torch.Tensor] = None,
-        out: Optional[torch.Tensor] = None,
-        bias: Optional[torch.Tensor] = None,
+        grouped_layout: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run dense ``C = A @ B^T`` or its grouped/batched forms.
 

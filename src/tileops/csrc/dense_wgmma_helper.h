@@ -8,12 +8,10 @@
 namespace tileops {
 
 // One 64-wide K step of a 64 x N output tile of a 16-bit NT GEMM, issued as one
-// N-wide WGMMA per 16 of K. TileLang 0.1.12 issues a ``T.wgmma_gemm`` of width
-// N as gcd(N, 256)-wide instructions, each re-reading A from shared memory: 176
-// runs as eleven n16 WGMMAs, 192 as three n64. The accumulator holds what those
-// narrower instructions would: a thread's column c sits in register
-// 4 * (c / 8) + c % 2 of its upper row and two past that of its lower row,
-// whatever the instruction width.
+// N-wide WGMMA per 16 of K. TileLang issues a ``T.wgmma_gemm`` whose width is 8
+// mod 16 as n8 WGMMAs, each re-reading A from shared memory. The accumulator
+// holds what ``T.wgmma_gemm`` writes: a thread's column c sits in register
+// 4 * (c / 8) + c % 2 of its upper row and two past that of its lower row.
 //
 // a_smem and b_smem are one stage's 64 x 64 A tile and N x 64 B tile, each in
 // the 128-byte swizzle ``make_swizzled_layout`` gives a 64-element 16-bit row.
@@ -40,123 +38,31 @@ __device__ __forceinline__ void dense_wgmma_64xN_k64(float* accumulator,
 }
 
 // The instantiations the coop2 kernel and the persistent template name, one per
-// dtype and width.
-__device__ __forceinline__ void dense_wgmma_bf16_64x176_k64(float* accumulator,
-                                                            bfloat16_t* a_smem,
-                                                            bfloat16_t* b_smem,
-                                                            int accumulate) {
-  dense_wgmma_64xN_k64<tl::DataType::kBFloat16, 176>(accumulator, a_smem,
-                                                     b_smem, accumulate);
-}
+// dtype and width: dense_wgmma_{bf16,fp16}_64x<N>_k64.
+#define TILEOPS_DENSE_WGMMA_64XN_K64(TAG, T, AB, N)                       \
+  __device__ __forceinline__ void dense_wgmma_##TAG##_64x##N##_k64(       \
+      float* accumulator, T* a_smem, T* b_smem, int accumulate) {         \
+    dense_wgmma_64xN_k64<AB, N>(accumulator, a_smem, b_smem, accumulate); \
+  }
+#define TILEOPS_DENSE_WGMMA_64XN_K64_BOTH(N)                                 \
+  TILEOPS_DENSE_WGMMA_64XN_K64(bf16, bfloat16_t, tl::DataType::kBFloat16, N) \
+  TILEOPS_DENSE_WGMMA_64XN_K64(fp16, half_t, tl::DataType::kFloat16, N)
 
-__device__ __forceinline__ void dense_wgmma_bf16_64x192_k64(float* accumulator,
-                                                            bfloat16_t* a_smem,
-                                                            bfloat16_t* b_smem,
-                                                            int accumulate) {
-  dense_wgmma_64xN_k64<tl::DataType::kBFloat16, 192>(accumulator, a_smem,
-                                                     b_smem, accumulate);
-}
+TILEOPS_DENSE_WGMMA_64XN_K64_BOTH(144)
+TILEOPS_DENSE_WGMMA_64XN_K64_BOTH(160)
+TILEOPS_DENSE_WGMMA_64XN_K64_BOTH(176)
+TILEOPS_DENSE_WGMMA_64XN_K64_BOTH(192)
+TILEOPS_DENSE_WGMMA_64XN_K64_BOTH(224)
+TILEOPS_DENSE_WGMMA_64XN_K64_BOTH(240)
+TILEOPS_DENSE_WGMMA_64XN_K64_BOTH(256)
 
-__device__ __forceinline__ void dense_wgmma_fp16_64x176_k64(float* accumulator,
-                                                            half_t* a_smem,
-                                                            half_t* b_smem,
-                                                            int accumulate) {
-  dense_wgmma_64xN_k64<tl::DataType::kFloat16, 176>(accumulator, a_smem, b_smem,
-                                                    accumulate);
-}
-
-__device__ __forceinline__ void dense_wgmma_fp16_64x192_k64(float* accumulator,
-                                                            half_t* a_smem,
-                                                            half_t* b_smem,
-                                                            int accumulate) {
-  dense_wgmma_64xN_k64<tl::DataType::kFloat16, 192>(accumulator, a_smem, b_smem,
-                                                    accumulate);
-}
-
-__device__ __forceinline__ void dense_wgmma_bf16_64x144_k64(float* accumulator,
-                                                            bfloat16_t* a_smem,
-                                                            bfloat16_t* b_smem,
-                                                            int accumulate) {
-  dense_wgmma_64xN_k64<tl::DataType::kBFloat16, 144>(accumulator, a_smem,
-                                                     b_smem, accumulate);
-}
-
-__device__ __forceinline__ void dense_wgmma_fp16_64x144_k64(float* accumulator,
-                                                            half_t* a_smem,
-                                                            half_t* b_smem,
-                                                            int accumulate) {
-  dense_wgmma_64xN_k64<tl::DataType::kFloat16, 144>(accumulator, a_smem, b_smem,
-                                                    accumulate);
-}
-
-__device__ __forceinline__ void dense_wgmma_bf16_64x160_k64(float* accumulator,
-                                                            bfloat16_t* a_smem,
-                                                            bfloat16_t* b_smem,
-                                                            int accumulate) {
-  dense_wgmma_64xN_k64<tl::DataType::kBFloat16, 160>(accumulator, a_smem,
-                                                     b_smem, accumulate);
-}
-
-__device__ __forceinline__ void dense_wgmma_fp16_64x160_k64(float* accumulator,
-                                                            half_t* a_smem,
-                                                            half_t* b_smem,
-                                                            int accumulate) {
-  dense_wgmma_64xN_k64<tl::DataType::kFloat16, 160>(accumulator, a_smem, b_smem,
-                                                    accumulate);
-}
-
-__device__ __forceinline__ void dense_wgmma_bf16_64x240_k64(float* accumulator,
-                                                            bfloat16_t* a_smem,
-                                                            bfloat16_t* b_smem,
-                                                            int accumulate) {
-  dense_wgmma_64xN_k64<tl::DataType::kBFloat16, 240>(accumulator, a_smem,
-                                                     b_smem, accumulate);
-}
-
-__device__ __forceinline__ void dense_wgmma_fp16_64x240_k64(float* accumulator,
-                                                            half_t* a_smem,
-                                                            half_t* b_smem,
-                                                            int accumulate) {
-  dense_wgmma_64xN_k64<tl::DataType::kFloat16, 240>(accumulator, a_smem, b_smem,
-                                                    accumulate);
-}
-
-__device__ __forceinline__ void dense_wgmma_bf16_64x256_k64(float* accumulator,
-                                                            bfloat16_t* a_smem,
-                                                            bfloat16_t* b_smem,
-                                                            int accumulate) {
-  dense_wgmma_64xN_k64<tl::DataType::kBFloat16, 256>(accumulator, a_smem,
-                                                     b_smem, accumulate);
-}
-
-__device__ __forceinline__ void dense_wgmma_fp16_64x256_k64(float* accumulator,
-                                                            half_t* a_smem,
-                                                            half_t* b_smem,
-                                                            int accumulate) {
-  dense_wgmma_64xN_k64<tl::DataType::kFloat16, 256>(accumulator, a_smem, b_smem,
-                                                    accumulate);
-}
-
-__device__ __forceinline__ void dense_wgmma_bf16_64x224_k64(float* accumulator,
-                                                            bfloat16_t* a_smem,
-                                                            bfloat16_t* b_smem,
-                                                            int accumulate) {
-  dense_wgmma_64xN_k64<tl::DataType::kBFloat16, 224>(accumulator, a_smem,
-                                                     b_smem, accumulate);
-}
-
-__device__ __forceinline__ void dense_wgmma_fp16_64x224_k64(float* accumulator,
-                                                            half_t* a_smem,
-                                                            half_t* b_smem,
-                                                            int accumulate) {
-  dense_wgmma_64xN_k64<tl::DataType::kFloat16, 224>(accumulator, a_smem, b_smem,
-                                                    accumulate);
-}
+#undef TILEOPS_DENSE_WGMMA_64XN_K64_BOTH
+#undef TILEOPS_DENSE_WGMMA_64XN_K64
 
 // One 64-wide K step of a 128 x N output tile, issued as one N-wide WGMMA per
-// 16 of K for each 64-row half (lo, hi), so a width that does not divide 256
-// reads each A row once. A_MN / B_MN say whether that operand's stage is
-// MN-major (K outer) rather than K-major; the transpose flags follow.
+// 16 of K for each 64-row half (lo, hi); coop2_swap has no other path. A_MN /
+// B_MN say whether that operand's stage is MN-major (K outer) rather than
+// K-major; the transpose flags follow.
 //
 // The stages are in the swizzle ``make_swizzled_layout`` gives them. K-major:
 // 64-element rows in the 128-byte swizzle. MN-major A: a 64 x 128 stage of two
@@ -196,6 +102,49 @@ __device__ __forceinline__ void dense_wgmma_128xN_k64(float* lo, float* hi,
   tl::warpgroup_fence_operand(hi, N / 2);
 }
 
+// One warpgroup's 64 x 64 16-bit A tile (64-element rows in the 128-byte
+// swizzle) in the registers a WGMMA reads A from: four per 16 of K, loaded by
+// one ldmatrix.x4. Register 4 * ki + j holds two adjacent K values of row
+// lane / 4 of the warp's 16 (plus 8 for odd j), from K 16 * ki + 2 * (lane % 4)
+// (plus 8 for j >= 2).
+template <typename T>
+__device__ __forceinline__ void dense_load_a_64x64(const T* a_smem,
+                                                   uint32_t* a) {
+  const int lane = threadIdx.x & 31;
+  const int row = ((threadIdx.x >> 5) & 3) * 16 + (lane & 15);
+  const uint32_t base = smem_ptr_to_uint(a_smem) + row * 128;
+#pragma unroll
+  for (int ki = 0; ki < 4; ++ki) {
+    const int chunk = 2 * ki + (lane >> 4);
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+        : "=r"(a[4 * ki]), "=r"(a[4 * ki + 1]), "=r"(a[4 * ki + 2]),
+          "=r"(a[4 * ki + 3])
+        : "r"(base + ((chunk ^ (row & 7)) << 4)));
+  }
+}
+
+// One 64-wide K step of a 64 x N output tile as ``dense_wgmma_64xN_k64``
+// issues it, A from the registers ``dense_load_a_64x64`` fills, into a fresh
+// accumulator.
+template <tl::DataType AB, int N, typename T>
+__device__ __forceinline__ void dense_wgmma_64xN_k64_rs(float* accumulator,
+                                                        const uint32_t* a,
+                                                        T* b_smem) {
+  tl::GmmaDescriptor desc_b;
+  tl::initialize_wgmma_descriptor<1, 1, 64>(desc_b, b_smem);
+  tl::warpgroup_fence_operand(accumulator, N / 2);
+  tl::warpgroup_arrive();
+#pragma unroll
+  for (int ki = 0; ki < 4; ++ki) {
+    tl::wgmma_rs<AB, AB, tl::DataType::kFloat32, 64, N, 16, false, false>(
+        a + 4 * ki, uint64_t(desc_b + ((ki * 32) >> 4)),
+        reinterpret_cast<uint32_t*>(accumulator), ki > 0);
+  }
+  tl::warpgroup_commit_batch();
+  tl::warpgroup_fence_operand(accumulator, N / 2);
+}
+
 // Columns [8 * t0, 8 * t0 + Cols) of one warpgroup's 64-row fp32 WGMMA
 // accumulator, cast to T and stored transposed into a Cols x 64 shared tile in
 // the 128-byte swizzle: one stmatrix.trans per two 8-column groups and warp.
@@ -229,39 +178,98 @@ __device__ __forceinline__ void dense_store_trans_64(const float* acc, T* smem,
   }
 }
 
-// One 128-wide K step of a 64 x N output tile of an FP8 (e4m3) NT GEMM, issued
-// as one N-wide WGMMA per 32 of K, with the accumulator layout and the 128-byte
-// swizzled stage of ``dense_wgmma_64xN_k64``: a 128-element fp8 row is 128
-// bytes.
-template <int N>
-__device__ __forceinline__ void dense_wgmma_fp8_64xN_k128(float* accumulator,
-                                                          fp8_e4_t* a_smem,
-                                                          fp8_e4_t* b_smem,
-                                                          int accumulate) {
+// Adds bias[col0 + c] to column c of one warpgroup's 64 x N fp32 WGMMA
+// accumulator, laid out as dense_wgmma_64xN_k64's; a column past n - 1 reads
+// bias[n - 1].
+template <int N, typename T>
+__device__ __forceinline__ void dense_add_col_bias_64xN(float* acc,
+                                                        const T* bias, int col0,
+                                                        int n) {
+  static_assert(N % 8 == 0, "a WGMMA accumulator spans whole 8-column groups");
+  const int c = col0 + 2 * (threadIdx.x & 3);
+#pragma unroll
+  for (int g = 0; g < N / 8; ++g) {
+    const float even = static_cast<float>(bias[min(c + 8 * g, n - 1)]);
+    const float odd = static_cast<float>(bias[min(c + 8 * g + 1, n - 1)]);
+    acc[4 * g] += even;
+    acc[4 * g + 1] += odd;
+    acc[4 * g + 2] += even;
+    acc[4 * g + 3] += odd;
+  }
+}
+
+// Adds bias[row0 + r] to row r of the same accumulator, for a tile that holds
+// the output transposed; a row past n - 1 reads bias[n - 1].
+template <int N, typename T>
+__device__ __forceinline__ void dense_add_row_bias_64xN(float* acc,
+                                                        const T* bias, int row0,
+                                                        int n) {
+  static_assert(N % 8 == 0, "a WGMMA accumulator spans whole 8-column groups");
+  const int r =
+      row0 + 16 * ((threadIdx.x >> 5) & 3) + ((threadIdx.x & 31) >> 2);
+  const float upper = static_cast<float>(bias[min(r, n - 1)]);
+  const float lower = static_cast<float>(bias[min(r + 8, n - 1)]);
+#pragma unroll
+  for (int g = 0; g < N / 8; ++g) {
+    acc[4 * g] += upper;
+    acc[4 * g + 1] += upper;
+    acc[4 * g + 2] += lower;
+    acc[4 * g + 3] += lower;
+  }
+}
+
+// One K step of a 64 x N output tile of an 8-bit NT GEMM, K = 128 * Atoms wide,
+// issued as one N-wide WGMMA per 32 of K, all in one commit group: AB operands
+// (FP8 e4m3 or INT8) into a C accumulator (fp32 or int32) laid out as
+// ``dense_wgmma_64xN_k64``'s. a_ring and b_ring are the rings' first stages;
+// the step reads stage ``stage``. Each 128-byte-wide K slice of a stage is its
+// own 128-byte swizzled atom, as ``make_swizzled_layout`` lays out a wider
+// 8-bit row: A's atom is 64 x 128 bytes and B's N x 128, one after another.
+template <tl::DataType AB, tl::DataType C, int N, int Atoms, typename T,
+          typename Acc>
+__device__ __forceinline__ void dense_wgmma_8bit_64xN(Acc* accumulator,
+                                                      T* a_ring, T* b_ring,
+                                                      int stage,
+                                                      int accumulate) {
+  // tl::warpgroup_fence_operand takes fp32 or 32-bit integer registers.
+  using Reg = std::conditional_t<std::is_same_v<Acc, float>, float, uint32_t>;
+  T* a_smem = a_ring + stage * (64 * 128 * Atoms);
+  T* b_smem = b_ring + stage * (N * 128 * Atoms);
   tl::GmmaDescriptor desc_a;
   tl::GmmaDescriptor desc_b;
   tl::initialize_wgmma_descriptor<1, 1, 64>(desc_a, a_smem);
   tl::initialize_wgmma_descriptor<1, 1, 64>(desc_b, b_smem);
-  tl::warpgroup_fence_operand(accumulator, N / 2);
+  tl::warpgroup_fence_operand(reinterpret_cast<Reg*>(accumulator), N / 2);
   tl::warpgroup_arrive();
 #pragma unroll
-  for (int ki = 0; ki < 4; ++ki) {
-    tl::wgmma_ss<tl::DataType::kFloat8_e4m3, tl::DataType::kFloat8_e4m3,
-                 tl::DataType::kFloat32, 64, N, 32, false, false, 1, 1>(
-        uint64_t(desc_a + ((ki * 32) >> 4)),
-        uint64_t(desc_b + ((ki * 32) >> 4)),
+  for (int ki = 0; ki < 4 * Atoms; ++ki) {
+    tl::wgmma_ss<AB, AB, C, 64, N, 32, false, false, 1, 1>(
+        uint64_t(desc_a + (((ki / 4) * 64 * 128 + (ki % 4) * 32) >> 4)),
+        uint64_t(desc_b + (((ki / 4) * N * 128 + (ki % 4) * 32) >> 4)),
         reinterpret_cast<uint32_t*>(accumulator), ki > 0 || accumulate != 0);
   }
   tl::warpgroup_commit_batch();
-  tl::warpgroup_fence_operand(accumulator, N / 2);
+  tl::warpgroup_fence_operand(reinterpret_cast<Reg*>(accumulator), N / 2);
 }
 
-// The instantiation the per-tensor FP8 warp-specialized kernel names.
+// The instantiation the per-tensor FP8 warp-specialized kernel names: one
+// 128-wide K step of the stage at a_smem and b_smem.
 __device__ __forceinline__ void dense_wgmma_fp8_64x176_k128(float* accumulator,
                                                             fp8_e4_t* a_smem,
                                                             fp8_e4_t* b_smem,
                                                             int accumulate) {
-  dense_wgmma_fp8_64xN_k128<176>(accumulator, a_smem, b_smem, accumulate);
+  dense_wgmma_8bit_64xN<tl::DataType::kFloat8_e4m3, tl::DataType::kFloat32, 176,
+                        1>(accumulator, a_smem, b_smem, 0, accumulate);
+}
+
+// The INT8 instantiation, into an int32 accumulator.
+template <int N, int Atoms>
+__device__ __forceinline__ void dense_wgmma_s8_64xN(int* accumulator,
+                                                    signed char* a_ring,
+                                                    signed char* b_ring,
+                                                    int stage, int accumulate) {
+  dense_wgmma_8bit_64xN<tl::DataType::kInt8, tl::DataType::kInt32, N, Atoms>(
+      accumulator, a_ring, b_ring, stage, accumulate);
 }
 
 }  // namespace tileops

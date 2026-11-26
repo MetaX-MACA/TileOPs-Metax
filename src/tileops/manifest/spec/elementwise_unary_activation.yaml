@@ -1,11 +1,4 @@
-# elementwise_unary_activation.yaml -- manifest entries for unary activation ops.
-#
-# Single-input single-output elementwise activation and range-transform ops:
-# ReLU family (relu, gelu, silu, hardswish, hardsigmoid, mish, selu,
-# leaky_relu, elu, hardtanh, softplus), and value-range transforms (clamp,
-# nan_to_num). Source of truth for op interfaces in this family. Loaded
-# and merged with other family files by tileops.manifest at runtime.
-# See docs/design/manifest.md for the full schema.
+# Unary activations and value-range transforms (clamp, nan_to_num).
 
 ReLUFwdOp:
   ref_api: "torch.nn.functional.relu"
@@ -24,12 +17,10 @@ ReLUFwdOp:
   workloads:
   # Hidden-state activation (Llama-3.1-8B prefill)
   - {S: [2048, 4096], dtype_cases: [{T: float16}, {T: bfloat16}], label: "hidden-state-prefill"}
-  # Decode (single token)
   - {S: [1, 4096], dtype_cases: [{T: bfloat16}], label: "hidden-state-decode"}
 
   roofline:
-    # FLOPs: relu(x) = max(0, x). Per roofline.md §1.3 convention,
-    # one compare-and-select = 1 per elem.
+    # One compare-and-select per element.
     flops: "prod(S)"
 
 GELUFwdOp:
@@ -75,8 +66,7 @@ SiLUFwdOp:
   - {S: [1, 14336], dtype_cases: [{T: bfloat16}], label: "llama-8b-ffn-decode"}
 
   roofline:
-    # FLOPs: silu(x) = x * sigmoid(x); sigmoid = neg + exp + add + recip = 4.
-    # silu adds one mul = 5 per elem.
+    # sigmoid (neg, exp, add, recip) and one mul per element.
     flops: "5 * prod(S)"
 
 HardswishFwdOp:
@@ -94,13 +84,12 @@ HardswishFwdOp:
       output: {dtype: T, shape: "[*S]", alias: input}
 
   workloads:
-  # Mobile-style activation map (NHW C, e.g. MobileNetV3 stage)
+  # MobileNetV3 stage activation map.
   - {S: [32, 96, 56, 56], dtype_cases: [{T: float16}, {T: bfloat16}], label: "mbv3-stage2"}
   - {S: [32, 240, 28, 28], dtype_cases: [{T: float16}, {T: bfloat16}], label: "mbv3-stage3"}
 
   roofline:
-    # FLOPs: hardswish(x) = x * relu6(x + 3) / 6.
-    # add(1) + two-sided-clamp(1, per convention) + mul(1) + div(1) = 4 per elem.
+    # x * relu6(x + 3) / 6: add, clamp, mul, div per element.
     flops: "4 * prod(S)"
 
 HardsigmoidFwdOp:
@@ -123,8 +112,7 @@ HardsigmoidFwdOp:
   - {S: [32, 960, 1, 1], dtype_cases: [{T: float16}, {T: bfloat16}], label: "mbv3-se-gate-deep"}
 
   roofline:
-    # FLOPs: hardsigmoid(x) = relu6(x + 3) / 6.
-    # add(1) + two-sided-clamp(1, per convention) + div(1) = 3 per elem.
+    # relu6(x + 3) / 6: add, clamp, div per element.
     flops: "3 * prod(S)"
 
 MishFwdOp:
@@ -147,8 +135,7 @@ MishFwdOp:
   - {S: [16, 512, 40, 40], dtype_cases: [{T: float16}, {T: bfloat16}], label: "yolo-p4"}
 
   roofline:
-    # FLOPs: mish(x) = x * tanh(softplus(x)); softplus = exp + log1p = 2,
-    # tanh(1, transcendental) + final mul(1) = 4 per elem.
+    # x * tanh(softplus(x)): exp, log1p, tanh, mul per element.
     flops: "4 * prod(S)"
 
 SELUFwdOp:
@@ -171,8 +158,7 @@ SELUFwdOp:
   - {S: [2048, 8192], dtype_cases: [{T: float16}, {T: bfloat16}], label: "snn-fc-wide"}
 
   roofline:
-    # FLOPs: selu(x) = lambda * (x if x>0 else alpha*(exp(x)-1)).
-    # compare-and-select(1) + exp(1) + sub(1) + mul-alpha(1) + mul-lambda(1) = 5 per elem.
+    # Select, exp, sub, mul by alpha, mul by lambda per element.
     flops: "5 * prod(S)"
 
 LeakyReLUFwdOp:
@@ -196,8 +182,7 @@ LeakyReLUFwdOp:
   - {S: [16, 512, 32, 32], dtype_cases: [{T: float16}, {T: bfloat16}], label: "gan-feat-deep"}
 
   roofline:
-    # FLOPs: leaky_relu(x) = x if x>0 else negative_slope*x. Per
-    # roofline.md §1.3, compare-and-select(1) + mul(1) = 2 per elem.
+    # Compare-and-select and mul per element.
     flops: "2 * prod(S)"
 
 ELUFwdOp:
@@ -221,8 +206,7 @@ ELUFwdOp:
   - {S: [2048, 8192], dtype_cases: [{T: float16}, {T: bfloat16}], label: "mlp-hidden-wide"}
 
   roofline:
-    # FLOPs: elu(x) = x if x>0 else alpha*(exp(x)-1).
-    # compare-and-select(1) + exp(1) + sub(1) + mul(1) = 4 per elem.
+    # Select, exp, sub, mul per element.
     flops: "4 * prod(S)"
 
 HardtanhFwdOp:
@@ -251,9 +235,7 @@ HardtanhFwdOp:
   - {S: [16, 256, 56, 56], dtype_cases: [{T: float16}, {T: bfloat16}], label: "bounded-conv-feat"}
 
   roofline:
-    # FLOPs: hardtanh = clamp(x, min_val, max_val).
-    # Two-sided clamp = 1 compare-and-select per output element under the
-    # roofline.md §1.3 convention. = 1 per elem.
+    # A two-sided clamp counts as one compare-and-select per element.
     flops: "prod(S)"
 
 SoftplusFwdOp:
@@ -277,15 +259,12 @@ SoftplusFwdOp:
   - {S: [2048, 8192], dtype_cases: [{T: float16}, {T: bfloat16}], label: "mlp-hidden-wide"}
 
   roofline:
-    # FLOPs: softplus(x) = (1/beta) * log(1 + exp(beta*x)) with threshold guard.
-    # mul-beta(1) + threshold compare-and-select(1) + exp(1) + log1p(1) + div-by-beta(1) = 5 per elem.
+    # mul by beta, threshold select, exp, log1p, div by beta per element.
     flops: "5 * prod(S)"
 
-ClampTensorFwdOp:
-  # PyTorch's torch.clamp(input, min=None, max=None) where each bound is a
-  # Tensor or absent, broadcast with input. At least one bound must be passed;
-  # min-only is torch.clamp_min and max-only is torch.clamp_max. The scalar
-  # (Number) form is its own entry, ClampScalarFwdOp.
+ClampFwdOp:
+  # Each bound is a Number, a Tensor broadcast with input, or absent. At least one is passed,
+  # and a Number bound never pairs with a Tensor one, as in torch.clamp's two overloads.
   ref_api: "torch.clamp"
   family: elementwise
   status: implemented
@@ -294,20 +273,25 @@ ClampTensorFwdOp:
     forall: {A: Shape, L: Shape, U: Shape, T: "DType[float16 | bfloat16 | float32]"}
     inputs:
       input: {dtype: T, shape: "[*A]"}
-      min: {dtype: T, shape: "[*L]", optional: true}
-      max: {dtype: T, shape: "[*U]", optional: true}
+      min: {type: "Number | Tensor | None", dtype: T, shape: "[*L]", default: null}
+      max: {type: "Number | Tensor | None", dtype: T, shape: "[*U]", default: null}
     outputs:
-      output: {dtype: T, shape: "ClampOut[A, L, U, present(min), present(max)]"}
+      output: {dtype: T, shape: "ClampOut[A, L, U, member(min) == 'Tensor', member(max) == 'Tensor']"}
     types:
       ClampOut:
-        params: {A: Shape, L: Shape, U: Shape, pl: Bool, pu: Bool}
-        match: [pl, pu]
+        params: {A: Shape, L: Shape, U: Shape, tl: Bool, tu: Bool}
+        match: [tl, tu]
         cases:
         - {when: [true, true], is: "[*broadcast(A, L, U)]"}
         - {when: [true, false], is: "[*broadcast(A, L)]"}
         - {when: [false, true], is: "[*broadcast(A, U)]"}
+        - {when: [false, false], is: "[*A]"}
     shape_rules:
     - "present(min) or present(max)"
+    - "member(min) != 'Number' or member(max) != 'Tensor'"
+    - "member(min) != 'Tensor' or member(max) != 'Number'"
+    - "member(min) != 'Number' or representable(min, T)"
+    - "member(max) != 'Number' or representable(max, T)"
 
   workloads:
   - {A: [4096, 4096], L: [4096, 4096], U: [4096, 4096], some: [min, max], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "16M"}
@@ -317,41 +301,14 @@ ClampTensorFwdOp:
   - {A: [4096, 4096], U: [4096, 4096], some: [max], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "16M-max-only"}
   - {A: [16384, 16384], U: [16384, 16384], some: [max], dtype_cases: [{T: float16}, {T: bfloat16}], label: "256M-max-only"}
   - {A: [16, 256, 56, 56], L: [256, 1, 1], U: [256, 1, 1], some: [min, max], dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "cnn-feat-channel-bounds"}
+  - {A: [4096, 4096], min: -0.5, max: 0.5, dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "16M-number"}
+  - {A: [16384, 16384], min: -0.5, max: 0.5, dtype_cases: [{T: float16}, {T: bfloat16}], label: "256M-number"}
+  - {A: [4096, 4096], min: -0.5, dtype_cases: [{T: float16}], label: "16M-number-min-only"}
+  - {A: [4096, 4096], max: 0.5, dtype_cases: [{T: float16}], label: "16M-number-max-only"}
 
   roofline:
-    flops: "prod(broadcast(A, L, U)) if present(min) and present(max) else prod(broadcast(A, L)) if present(min) else prod(broadcast(A, U))"
-
-ClampScalarFwdOp:
-  # PyTorch's torch.clamp(input, min=None, max=None) with Number (or None)
-  # bounds. The bounds are params here and tensor inputs in ClampTensorFwdOp above:
-  # two signatures, so two entries.
-  ref_api: "torch.clamp"
-  family: elementwise
-  status: implemented
-
-  signature:
-    forall: {S: Shape, T: "DType[float16 | bfloat16 | float32]"}
-    params:
-      min: {type: "Number | None", default: null, kw_only: true}
-      max: {type: "Number | None", default: null, kw_only: true}
-    inputs:
-      input: {dtype: T, shape: "[*S]"}
-    outputs:
-      output: {dtype: T, shape: "[*S]"}
-    shape_rules:
-    - "present(min) or present(max)"
-    - "not present(min) or representable(min.value, T)"
-    - "not present(max) or representable(max.value, T)"
-
-  workloads:
-  - {S: [4096, 4096], min: -0.5, max: 0.5, dtype_cases: [{T: float16}, {T: bfloat16}, {T: float32}], label: "16M"}
-  - {S: [16384, 16384], min: -0.5, max: 0.5, dtype_cases: [{T: float16}, {T: bfloat16}], label: "256M"}
-
-  roofline:
-    # FLOPs: clamp = compare-and-select. Per roofline.md §1.3 convention,
-    # the clamp / min-max family collapses to 1 FLOP per output element
-    # regardless of one or two bounds. = 1 per elem.
-    flops: "prod(S)"
+    # One compare-and-select per output element, whichever bounds apply.
+    flops: "prod(broadcast(A, L, U)) if member(min) == 'Tensor' and member(max) == 'Tensor' else prod(broadcast(A, L)) if member(min) == 'Tensor' else prod(broadcast(A, U)) if member(max) == 'Tensor' else prod(A)"
 
 NanToNumFwdOp:
   ref_api: "torch.nan_to_num"

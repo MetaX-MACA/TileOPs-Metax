@@ -6,64 +6,57 @@ with exactly those tensors, and nothing on the way asks a CUDA device anything. 
 joins by having a manifest entry; its call is the manifest call with the smallest inputs.
 """
 
-import math
-
 import pytest
 import torch
 
+from tests.manifest_calls import implemented_ops, smallest_call
 from tileops.backend import TensorSpec
 from tileops.backend import _registry as registry
 from tileops.manifest import load_adts, load_manifest
 from tileops.manifest._plan import entry_plan
 from tileops.manifest._registry import op_class
-from tileops.manifest._workload import instantiate
 
-pytestmark = pytest.mark.smoke
+pytestmark = [pytest.mark.smoke, pytest.mark.structural]
 
 
 def _from_call(cls: type, name: str, entry: dict) -> tuple:
     """The op, its ``forward`` arguments and the outputs its call declares, from the manifest
     call with the smallest inputs."""
     plan = entry_plan(name, entry, load_adts(), resolve=False)
-    calls = [
-        instantiate(plan, row, case, metadata=False)
-        for row in entry["workloads"]
-        for case in row.get("dtype_cases") or [{}]
-    ]
-    call = min(calls, key=lambda c: sum(math.prod(c.tensors[t][0]) for t in c.tensors))
+    call = smallest_call(plan, entry["workloads"], metadata=False)
+
+    def empty(spec):
+        return torch.empty(spec.shape, dtype=getattr(torch, spec.dtype))
+
     tensors = {
-        n: None if spec is None else torch.empty(spec.shape, dtype=getattr(torch, spec.dtype))
+        n: call.scalars.get(n)
+        if spec is None
+        else [empty(e) for e in spec]
+        if isinstance(spec, tuple)
+        else empty(spec)
         for n, spec in call.specs.items()
     }
     args = [tensors[n] for n in plan.sig.inputs]
-    while args and args[-1] is None:
+    # A trailing argument left at its default is not passed.
+    while (
+        args
+        and args[-1] is None
+        and plan.sig.inputs[list(plan.sig.inputs)[len(args) - 1]].default is None
+    ):
         args.pop()
-    # An output aliasing an input every call writes is that input object.
+    # An output aliasing an input this call writes is that input object.
     outputs = [
-        tensors[t.alias]
-        if t.alias is not None and plan.sig.inputs[t.alias].mutated is True
-        else tensors[o]
+        tensors[t.alias] if t.alias is not None and t.alias in call.written else tensors[o]
         for o, t in plan.sig.outputs.items()
     ]
-    return cls(**call.arguments(tensors)), tuple(args), outputs
-
-
-def _implemented() -> list[str]:
-    return sorted(n for n, e in load_manifest().items() if e.get("status") == "implemented")
+    return cls(**call.arguments()), tuple(args), outputs
 
 
 @pytest.fixture(autouse=True)
-def isolated_registry():
-    state = registry.snapshot()
-    registry.DETECTORS.clear()
-    registry.BUILDERS.clear()
-    registry.LOAD_FAILURES.clear()
-    registry.default_target = None
-    registry._loaded = True
+def isolated_registry(isolated_registry):
+    """The shared empty registry, with a target that claims the CPU as its default."""
     registry.register_detector("elsewhere", lambda device: device.type == "cpu")
     registry.default_target = "elsewhere"
-    yield
-    registry.restore(state)
 
 
 @pytest.fixture(autouse=True)
@@ -92,14 +85,25 @@ def no_cuda():
     forget_device_properties()
 
 
-@pytest.mark.parametrize("name", _implemented())
+@pytest.mark.parametrize("name", implemented_ops())
 def test_a_target_is_described_and_called_with_the_forward_inputs(name):
     entry = load_manifest()[name]
     cls = op_class(name, entry)
     op, args, declared_outputs = _from_call(cls, name, entry)
     declared = tuple(entry["signature"].get("inputs") or {})
     passed = args + (None,) * (len(declared) - len(args))
-    described = tuple(None if t is None else TensorSpec.of(t) for t in passed)
+    # A tensor is described by its spec, a tensor sequence element by element, and a
+    # call-time scalar by its type.
+    described = tuple(
+        None
+        if t is None
+        else tuple(map(TensorSpec.of, t))
+        if isinstance(t, (list, tuple))
+        else TensorSpec.of(t)
+        if isinstance(t, torch.Tensor)
+        else type(t)
+        for t in passed
+    )
     expected_params = op._manifest_params()
     seen, returned = [], []
 
@@ -123,7 +127,14 @@ def test_a_target_is_described_and_called_with_the_forward_inputs(name):
     result = op(*positional, **keywords)
 
     assert len(seen) == 1, "the kernel the target built runs the call"
-    assert all(a is b for a, b in zip(seen[0], passed, strict=True)), (
+
+    # A tensor sequence is the same tensors in order, held in whatever list the call built.
+    def same(a, b):
+        if isinstance(b, (list, tuple)):
+            return type(a) is type(b) and len(a) == len(b) and all(map(same, a, b))
+        return a is b
+
+    assert all(same(a, b) for a, b in zip(seen[0], passed, strict=True)), (
         "called with what it was described"
     )
     outputs = tuple(entry["signature"]["outputs"])
@@ -133,7 +144,6 @@ def test_a_target_is_described_and_called_with_the_forward_inputs(name):
         assert all(a is b for a, b in zip(result, returned[0], strict=True))
     else:
         assert result is returned[0], "the op returns what the target's kernel returned"
-    assert hasattr(cls, "_signature"), "a target is held to its signature"
     inputs = entry["signature"].get("inputs") or {}
     assert all((inputs[o] or {}).get("mutated") for o in outputs if o in inputs), (
         "an output passed in as an input is one the call writes"

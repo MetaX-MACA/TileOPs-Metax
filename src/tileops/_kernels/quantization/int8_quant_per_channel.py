@@ -5,7 +5,7 @@ divides each column by its smoothing factor.
 """
 
 import math
-from typing import ClassVar, Optional
+from typing import ClassVar
 
 import tilelang
 import tilelang.language as T
@@ -28,7 +28,8 @@ from tileops._kernels.quantization.int8_codes import (
     quantize,
     widen,
 )
-from tileops._utils import WARP_LANES, WARP_SHUFFLE_STAGES
+from tileops._kernels.warp_reduce import warp_reduce
+from tileops._utils import WARP_LANES
 
 __all__ = ["INT8QuantPerChannelFwdKernel", "SmoothQuantFwdKernel"]
 
@@ -60,7 +61,7 @@ def _quantize_rows(
     outside that range is divided again with IEEE division.
     """
     n = rows * k
-    vec = VECTOR_ACCESS_BYTES // torch.empty((), dtype=getattr(torch, dtype)).element_size()
+    vec = VECTOR_ACCESS_BYTES // getattr(torch, dtype).itemsize
     aligned = k % vec == 0
     # The storage may end inside the last vector.
     ragged_end = n % vec != 0
@@ -73,7 +74,7 @@ def _quantize_rows(
     # finite 16-bit x whose quotient lies in [2**-40, 2**40]; a quotient above that range
     # stays above it or turns non-finite, one below stays below it. A row whose amax is in
     # [2**-30, 2**40] thus has the exact amax, and its quotients below 2**-40 round to code
-    # 0 either way. Checked against torch on every finite float16 and bfloat16 value.
+    # 0 either way.
     # The bounds as float32 bit patterns, which order as the magnitudes do and put a NaN
     # above every number: a float32 2**e has the pattern (127 + e) << 23.
     smooth_lo = (127 - 60) << 23
@@ -234,11 +235,7 @@ def _quantize_rows(
 
     @T.macro
     def reduce_row(acc, warp_max, tx):
-        for stage in T.serial(WARP_SHUFFLE_STAGES):
-            acc[0] = T.max(
-                acc[0],
-                T.shfl_xor(acc[0], T.int32(WARP_LANES // 2) >> stage, width=WARP_LANES),
-            )
+        warp_reduce(acc, T.max, high_first=True, serial=True)
         if tx % WARP_LANES == 0:
             warp_max[tx // WARP_LANES] = acc[0]
         T.sync_threads()
@@ -396,7 +393,7 @@ def _int8_quant_per_channel_kernel(rows: int, k: int, dtype: str):
 def _smooth_quant_kernel(rows: int, k: int, dtype: str):
     """Build the smoothing and quantization of ``rows`` rows of ``k`` contiguous elements."""
     n = rows * k
-    vec = VECTOR_ACCESS_BYTES // torch.empty((), dtype=getattr(torch, dtype)).element_size()
+    vec = VECTOR_ACCESS_BYTES // getattr(torch, dtype).itemsize
 
     @tilelang.jit(compile_flags=csrc_include("streaming_load.h"))
     def _smooth_quant_func(
@@ -454,22 +451,21 @@ class _INT8QuantPerRowKernel(Kernel):
     _EVICT_FIRST_BYTES: ClassVar[int] = 96 << 20
 
     @classmethod
-    def refusal(cls, call: QuantizeCall) -> Optional[str]:
+    def refusal(cls, call: QuantizeCall) -> str | None:
         int32_max = 2**31 - 1
         reason = super().refusal(call)
         if reason is None and call.rows * call.cols > int32_max - VECTOR_ACCESS_BYTES:
             return f"indexes elements with int32, and N * K = {call.rows * call.cols}"
         return reason
 
-    def __init__(self, call: QuantizeCall, config: Optional[dict] = None) -> None:
-        super().__init__(device_index=call.device.index if call.device is not None else None)
+    def __init__(self, call: QuantizeCall, config: dict | None = None) -> None:
+        super().__init__(device_index=call.device_index)
         self.dtype = call.dtype
         self.rows = call.rows
         self.cols = call.cols
         self._sm_count = call.sm_count
-        props = torch.cuda.get_device_properties(call.device)
-        self._resident_threads = props.max_threads_per_multi_processor
-        self._register_file = props.regs_per_multiprocessor
+        self._resident_threads = call.threads_per_sm
+        self._register_file = call.regs_per_sm
         vec = VECTOR_ACCESS_BYTES // call.dtype.itemsize
         # Vectors a row's window spans at most.
         self._span = call.cols // vec if call.cols % vec == 0 else -(-(call.cols + vec - 1) // vec)
@@ -497,7 +493,7 @@ class _INT8QuantPerRowKernel(Kernel):
     def default_config(self) -> dict:
         if self.cols >= self._WIDE_ROW and self.dtype.itemsize == 2:
             # Four vectors a thread, five CTAs an SM; a sixth caps a thread below what it
-            # holds ([5120, 8192] bfloat16: 33.4 us, 35.2 at 512 threads of two vectors).
+            # holds.
             vpt = 4
             threads = self.config_for(vpt, True, True, 1)["threads"]
             min_blocks = min(5, self._resident_threads // threads)
@@ -510,8 +506,7 @@ class _INT8QuantPerRowKernel(Kernel):
             threads = self.config_for(vpt, True, True, 1)["threads"]
             min_blocks = max(2, self._register_file // (threads * self._MAX_REGISTERS))
         evict_first = self.rows * self.cols * self.dtype.itemsize < self._EVICT_FIRST_BYTES
-        # Pairs of adjacent vectors store 16 bytes of codes at a time: [5120, 8192]
-        # bfloat16 runs 32.5 us with them and 33.1 without.
+        # Pairs of adjacent vectors store 16 bytes of codes at a time.
         return self.config_for(vpt, True, evict_first, min_blocks)
 
     @property
@@ -577,7 +572,7 @@ class SmoothQuantFwdKernel(_INT8QuantPerRowKernel, SmoothQuantFwdInterface):
             "ctas": -(-self.rows // rows_per_cta),
         }
 
-    def _launch(self, rows_per_cta: Optional[int]) -> dict:
+    def _launch(self, rows_per_cta: int | None) -> dict:
         """The fitted launch, with ``rows_per_cta`` rows a CTA or as many as fill the SMs once."""
         vec = VECTOR_ACCESS_BYTES // self.dtype.itemsize
         paired = (
@@ -597,7 +592,7 @@ class SmoothQuantFwdKernel(_INT8QuantPerRowKernel, SmoothQuantFwdInterface):
     @property
     def autotune_configs(self) -> list[dict]:
         # Fewer rows a CTA than fill the SMs once, which a row count that the fill does not
-        # divide can prefer ([3000, 2880] bfloat16: 11.1 us at 8 rows a CTA, 11.7 at 12).
+        # divide can prefer.
         rows_per_cta = -(-self.rows // self.default_config["ctas"])
         fewer = self._launch(-(-2 * rows_per_cta // 3))
         return [self.default_config] + ([fewer] if fewer != self.default_config else [])

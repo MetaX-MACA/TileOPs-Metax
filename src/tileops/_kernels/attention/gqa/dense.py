@@ -2,19 +2,18 @@
 
 import itertools
 import re
-from typing import Callable, Optional
+from collections.abc import Callable
 
 import tilelang
 import tilelang.language as T
 import torch
-import tvm_ffi
 from tilelang import tvm
 from tilelang.layout import make_swizzled_layout
 
 from tileops._csrc import csrc_include
 from tileops._kernels.attention.call_spec import AttentionCall, GQADenseFwdInterface
 from tileops._kernels.attention.online_softmax import make_apply_softcap, make_dense_sink_scale
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, chain_cuda_postproc, target_cache
 from tileops._kernels.constants import (
     LOG2E,
     TMA_DTYPE_BFLOAT16,
@@ -25,10 +24,10 @@ from tileops._kernels.constants import (
     TMA_SWIZZLE_128B,
 )
 from tileops._kernels.kernel_base import CompiledProgram, Entry, Kernel
-from tileops._utils import get_sm_count
 
 __all__ = [
     "GQADensePersistentWSKernel",
+    "GQADenseSlidingWindowBandKernel",
     "GQADenseSlidingWindowKernel",
     "GQADenseWSKernel",
 ]
@@ -38,18 +37,7 @@ _PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
     tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
 }
-_COMPILE_FLAGS = [
-    "-O3",
-    "--use_fast_math",
-    "-Wno-deprecated-declarations",
-    "-U__CUDA_NO_HALF_OPERATORS__",
-    "-U__CUDA_NO_HALF_CONVERSIONS__",
-    "-U__CUDA_NO_HALF2_OPERATORS__",
-    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-    "--expt-relaxed-constexpr",
-    "--expt-extended-lambda",
-    "-DNDEBUG",
-]
+_COMPILE_FLAGS = ["--use_fast_math", *CUDA_COMPILE_FLAGS]
 
 
 def _anchor_value_waits(code: str) -> str:
@@ -71,6 +59,8 @@ def _anchor_value_waits(code: str) -> str:
     entries = (0, 1, 4, 5)
     slot_line = re.compile(r"^(?P<ind>[ \t]*)tileops::value_wait_anchor_slot\((?P<ptr>.*)\);$")
     exp_target = re.compile(r"^\s*(?P<frag>\w+)\[\w+\] = exp2f\(\(\((?P=frag)\[")
+    # The same loop vectorized: exponentials into a temporary, then one store of it.
+    vec_store = re.compile(r"^\s*\*\(float\d\*\)\((?P<frag>\w+) \+ .*\) = (?P<tmp>__\d+);$")
     lines = code.split("\n")
     for n, line in enumerate(lines):
         if "tileops::value_wait_anchor_slot" not in line:
@@ -79,11 +69,19 @@ def _anchor_value_waits(code: str) -> str:
         if slot is None:
             raise RuntimeError(f"unrecognized value_wait_anchor_slot line: {line.strip()}")
         frag = None
-        for prev in reversed(lines[:n]):
+        for k in range(n - 1, -1, -1):
+            prev = lines[k]
             if prev.strip() == "tl::wait_wgmma<1>();":
                 break
             m = exp_target.match(prev)
             if m is not None:
+                frag = m["frag"]
+                break
+            m = vec_store.match(prev)
+            if m is not None and any(
+                line.lstrip().startswith(f"{m['tmp']}.") and "= exp2f(" in line
+                for line in lines[max(k - 4, 0) : k]
+            ):
                 frag = m["frag"]
                 break
         if frag is None:
@@ -93,19 +91,7 @@ def _anchor_value_waits(code: str) -> str:
     return "\n".join(lines)
 
 
-def _register_value_wait_anchor() -> None:
-    """Chain the anchor rewrite after whatever holds TileLang's CUDA post-processing slot."""
-    previous = tvm_ffi.get_global_func("tilelang_callback_cuda_postproc", allow_missing=True)
-
-    def postproc(code, target):
-        if previous is not None:
-            code = previous(code, target)
-        return _anchor_value_waits(code)
-
-    tilelang.register_cuda_postproc(postproc)
-
-
-_register_value_wait_anchor()
+chain_cuda_postproc(_anchor_value_waits)
 
 
 @target_cache(maxsize=32)
@@ -122,10 +108,12 @@ def _gqa_dense_rope_qk_kernel(
     rope_layout,
     dtype,
     rope_dtype=None,
-    threads=256,
-    num_per_thread=4,
+    out_dtype=None,
 ):
     rope_dtype = dtype if rope_dtype is None else rope_dtype
+    out_dtype = dtype if out_dtype is None else out_dtype
+    threads = 256
+    num_per_thread = 4
     half = rotary_dim // 2
     q_rows = B * Sq * H
     k_rows = B * Skv * Hkv
@@ -138,55 +126,50 @@ def _gqa_dense_rope_qk_kernel(
     block_size = threads * num_per_thread
     co = Skv - Sq
 
+    @T.macro
+    def rotate_pair(X, XRot, RopeCos, RopeSin, pair, heads, seq_len, first_position):
+        """Rotate pair ``pair`` of ``X``; a row of ``heads`` heads sits at its token's position
+        plus ``first_position`` in the tables."""
+        row = pair // half
+        freq = pair % half
+        seq = (row // heads) % seq_len
+        d0 = freq if rope_layout == "neox" else freq * 2
+        d1 = freq + half if rope_layout == "neox" else freq * 2 + 1
+        base = row * D
+        c = T.Cast("float32", RopeCos[first_position + seq, freq])
+        s = T.Cast("float32", RopeSin[first_position + seq, freq])
+        x0 = T.Cast("float32", X[base + d0])
+        x1 = T.Cast("float32", X[base + d1])
+        XRot[base + d0] = T.Cast(out_dtype, x0 * c - x1 * s)
+        XRot[base + d1] = T.Cast(out_dtype, x1 * c + x0 * s)
+
+    @T.macro
+    def copy_tail(X, XRot, pair):
+        """Copy element ``pair`` of the unrotated channels past ``rotary_dim``."""
+        idx = pair // tail * D + rotary_dim + pair % tail
+        XRot[idx] = X[idx]
+
     @T.prim_func
     def main(
         Q: T.Tensor([q_rows * D], dtype),
         K: T.Tensor([k_rows * D], dtype),
         RopeCos: T.Tensor([max_position, half], rope_dtype),
         RopeSin: T.Tensor([max_position, half], rope_dtype),
-        QRot: T.Tensor([q_rows * D], dtype),
-        KRot: T.Tensor([k_rows * D], dtype),
+        QRot: T.Tensor([q_rows * D], out_dtype),
+        KRot: T.Tensor([k_rows * D], out_dtype),
     ):
         with T.Kernel(T.ceildiv(walked, block_size), threads=threads) as bx:
             for tx, it in T.Parallel(threads, num_per_thread):
                 pair = (bx * threads + tx) * num_per_thread + it
                 if pair < q_pairs:
-                    row = pair // half
-                    freq = pair % half
-                    seq = (row // H) % Sq
-                    d0 = freq if rope_layout == "neox" else freq * 2
-                    d1 = freq + half if rope_layout == "neox" else freq * 2 + 1
-                    base = row * D
-                    c = T.Cast("float32", RopeCos[co + seq, freq])
-                    s = T.Cast("float32", RopeSin[co + seq, freq])
-                    x0 = T.Cast("float32", Q[base + d0])
-                    x1 = T.Cast("float32", Q[base + d1])
-                    QRot[base + d0] = T.Cast(dtype, x0 * c - x1 * s)
-                    QRot[base + d1] = T.Cast(dtype, x1 * c + x0 * s)
+                    rotate_pair(Q, QRot, RopeCos, RopeSin, pair, H, Sq, co)
                 if pair < k_pairs:
-                    row = pair // half
-                    freq = pair % half
-                    seq = (row // Hkv) % Skv
-                    d0 = freq if rope_layout == "neox" else freq * 2
-                    d1 = freq + half if rope_layout == "neox" else freq * 2 + 1
-                    base = row * D
-                    c = T.Cast("float32", RopeCos[seq, freq])
-                    s = T.Cast("float32", RopeSin[seq, freq])
-                    x0 = T.Cast("float32", K[base + d0])
-                    x1 = T.Cast("float32", K[base + d1])
-                    KRot[base + d0] = T.Cast(dtype, x0 * c - x1 * s)
-                    KRot[base + d1] = T.Cast(dtype, x1 * c + x0 * s)
+                    rotate_pair(K, KRot, RopeCos, RopeSin, pair, Hkv, Skv, 0)
                 if tail > 0:
                     if pair < q_tail:
-                        row = pair // tail
-                        col = pair % tail
-                        idx = row * D + rotary_dim + col
-                        QRot[idx] = Q[idx]
+                        copy_tail(Q, QRot, pair)
                     if pair < k_tail:
-                        row = pair // tail
-                        col = pair % tail
-                        idx = row * D + rotary_dim + col
-                        KRot[idx] = K[idx]
+                        copy_tail(K, KRot, pair)
 
     return main
 
@@ -207,8 +190,10 @@ class _DenseQKRoPEPreprocessor:
         rotary_dim: int,
         rope_layout: str,
         dtype: str,
-        rope_dtype: Optional[str] = None,
+        rope_dtype: str | None = None,
+        out_dtype: str | None = None,
     ) -> None:
+        self.out_dtype = out_dtype
         self.args = (
             batch,
             heads,
@@ -225,13 +210,13 @@ class _DenseQKRoPEPreprocessor:
 
     def build(self) -> Callable:
         """The rotation, launched as ``rotate(q, k, rope_cos, rope_sin) -> (q_rot, k_rot)``."""
-        program = CompiledProgram(_gqa_dense_rope_qk_kernel(*self.args))
+        program = CompiledProgram(_gqa_dense_rope_qk_kernel(*self.args, out_dtype=self.out_dtype))
 
         def rotate(
             q: torch.Tensor,
             k: torch.Tensor,
-            rope_cos: Optional[torch.Tensor],
-            rope_sin: Optional[torch.Tensor],
+            rope_cos: torch.Tensor | None,
+            rope_sin: torch.Tensor | None,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             if rope_cos is None or rope_sin is None:
                 raise ValueError("fused RoPE requires rope_cos and rope_sin")
@@ -254,8 +239,9 @@ def make_dense_qk_rope_preprocessor(
     rotary_dim: int,
     rope_layout: str,
     dtype: str,
-    rope_dtype: Optional[str] = None,
-) -> Optional[_DenseQKRoPEPreprocessor]:
+    rope_dtype: str | None = None,
+    out_dtype: str | None = None,
+) -> _DenseQKRoPEPreprocessor | None:
     """Build the shared Dense Q/K RoPE stage when requested."""
     if not fuse_rope:
         return None
@@ -271,6 +257,7 @@ def make_dense_qk_rope_preprocessor(
         rope_layout,
         dtype,
         rope_dtype,
+        out_dtype,
     )
 
 
@@ -286,11 +273,6 @@ def _gqa_dense_ws_kernel(
     sm_scale,
     softcap,
     dtype,
-    block_M=128,
-    block_N=128,
-    nsK=2,
-    nsV=2,
-    threads=384,
     has_sinks=False,
     with_lse=False,
 ):
@@ -303,6 +285,9 @@ def _gqa_dense_ws_kernel(
     scale = LOG2E if use_softcap else score_scale * LOG2E
     groups = H // Hkv
     accum = "float"
+    block_M = block_N = 128
+    nsK = nsV = 2
+    threads = 384
     half = block_M // 2
     # Threads of the two MMA consumer warpgroups.
     nmma = 256
@@ -311,16 +296,7 @@ def _gqa_dense_ws_kernel(
     seq_len_kv = T.dynamic("seq_len_kv")
 
     sink_scale = make_dense_sink_scale(scale, half)
-
-    @T.macro
-    def apply_softcap(acc_s, rows, cols):
-        for i, j in T.Parallel(rows, cols):
-            capped = T.cast(softcap, accum) * T.tanh(
-                acc_s[i, j] * T.cast(score_scale / softcap, accum)
-            )
-            acc_s[i, j] = T.if_then_else(
-                acc_s[i, j] == -T.infinity(accum), -T.infinity(accum), capped
-            )
+    apply_softcap = make_apply_softcap(score_scale, softcap, accum, half, block_N)
 
     @T.macro
     def store_lse(Lse, logsum, sm, bz, by, row0):
@@ -332,6 +308,146 @@ def _gqa_dense_ws_kernel(
                     T.log(logsum[i]) + sm[i] * T.cast(scale / LOG2E, accum),
                     -T.infinity(accum),
                 )
+
+    @T.macro
+    def kv_step(
+        wg, k, masked, Qs, Ks, Vs, kready, kfree, vready, vfree, acc_s, pcast, acc_o, sm, smp,
+        alpha, ss, logsum, row_limit, my_bar, nxt_bar,
+    ):  # fmt: skip
+        """Key step k: under the issue turn, QK of key tile k and PV of tile k - 1; then the
+        softmax of tile k. With ``masked`` it masks the keys past ``row_limit`` (causal) or
+        past the keys."""
+        sk = k % nsK
+        svp = (k - 1) % nsV
+        T.sync_threads(my_bar, nmma)
+        T.mbarrier_wait_parity(kready[sk], (k // nsK) % 2)
+        T.wgmma_gemm(
+            Qs[wg, :, :], Ks[sk, :, :], acc_s, transpose_B=True, policy=Pol, clear_accum=True
+        )
+        for i, j in T.Parallel(half, D):
+            acc_o[i, j] *= alpha[i]
+        T.mbarrier_wait_parity(vready[svp], ((k - 1) // nsV) % 2)
+        T.wgmma_gemm(pcast, Vs[svp, :, :], acc_o, policy=Pol, clear_accum=False)
+        T.named_barrier_arrive(nxt_bar, nmma)
+        T.wait_wgmma(1)
+        T.mbarrier_arrive(kfree[sk])
+        if masked:
+            if is_causal:
+                for i, j in T.Parallel(half, block_N):
+                    acc_s[i, j] = T.if_then_else(
+                        row_limit - k * block_N + i >= j, acc_s[i, j], -T.infinity(accum)
+                    )
+            else:
+                for i, j in T.Parallel(half, block_N):
+                    acc_s[i, j] = T.if_then_else(
+                        k * block_N + j < seq_len_kv, acc_s[i, j], -T.infinity(accum)
+                    )
+        if use_softcap:
+            apply_softcap(acc_s)
+        T.copy(sm, smp)
+        T.reduce_max(acc_s, sm, dim=1, clear=False)
+        for i in T.Parallel(half):
+            alpha[i] = T.exp2(smp[i] * scale - sm[i] * scale)
+        for i, j in T.Parallel(half, block_N):
+            acc_s[i, j] = T.exp2(acc_s[i, j] * scale - sm[i] * scale)
+        T.reduce_sum(acc_s, ss, dim=1)
+        T.wait_wgmma(0)
+        T.mbarrier_arrive(vfree[svp])
+        for i in T.Parallel(half):
+            logsum[i] = logsum[i] * alpha[i] + ss[i]
+        T.copy(acc_s, pcast)
+
+    @T.macro
+    def consume(
+        wg, Qs, Ks, Vs, Os, O, q_bar, kready, kfree, vready, vfree, Sinks, Lse, q0, eff,
+        causal_offset, by, bz,
+    ):  # fmt: skip
+        """Consumer warpgroup ``wg``: query rows ``q0 + 64 wg`` onward; the two groups pass the
+        MMA issue turn between them."""
+        T.set_max_nreg(240, 1)
+        r0 = wg * half
+        my_bar = wg + 1
+        nxt_bar = 2 - wg
+        acc_s = T.alloc_fragment([half, block_N], accum)
+        pcast = T.alloc_fragment([half, block_N], dtype)  # register-P (rs-wgmma)
+        acc_o = T.alloc_fragment([half, D], accum)
+        sm = T.alloc_fragment([half], accum)
+        smp = T.alloc_fragment([half], accum)
+        alpha = T.alloc_fragment([half], accum)
+        ss = T.alloc_fragment([half], accum)
+        logsum = T.alloc_fragment([half], accum)
+
+        T.fill(acc_o, 0)
+        T.fill(logsum, 0)
+        T.fill(alpha, 1.0)
+        T.fill(sm, -T.infinity(accum))
+        T.mbarrier_wait_parity(q_bar, 0)
+        if wg == 1:
+            T.named_barrier_arrive(1, nmma)
+
+        T.sync_threads(my_bar, nmma)
+        T.mbarrier_wait_parity(kready[0], 0)
+        T.wgmma_gemm(
+            Qs[wg, :, :], Ks[0, :, :], acc_s, transpose_B=True, policy=Pol, clear_accum=True
+        )
+        T.named_barrier_arrive(nxt_bar, nmma)
+        T.wait_wgmma(0)
+        T.mbarrier_arrive(kfree[0])
+        row_limit = q0 + r0 + causal_offset
+        if is_causal and row_limit < block_N - 1:
+            for i, j in T.Parallel(half, block_N):
+                acc_s[i, j] = T.if_then_else(row_limit + i >= j, acc_s[i, j], -T.infinity(accum))
+        elif not is_causal and seq_len_kv < block_N:
+            for i, j in T.Parallel(half, block_N):
+                acc_s[i, j] = T.if_then_else(j < seq_len_kv, acc_s[i, j], -T.infinity(accum))
+        if use_softcap:
+            apply_softcap(acc_s)
+        T.reduce_max(acc_s, sm, dim=1, clear=False)
+        for i, j in T.Parallel(half, block_N):
+            acc_s[i, j] = T.exp2(acc_s[i, j] * scale - sm[i] * scale)
+        T.reduce_sum(acc_s, ss, dim=1)
+        for i in T.Parallel(half):
+            logsum[i] = ss[i]
+        T.copy(acc_s, pcast)
+
+        # Key tiles below nu need no mask.
+        if is_causal:
+            nu = T.alloc_var("int32", init=T.max(1, T.min(eff, T.floordiv(row_limit + 1, block_N))))
+        else:
+            nu = T.alloc_var("int32", init=T.max(1, T.floordiv(seq_len_kv, block_N)))
+        for k in T.serial(1, nu):
+            kv_step(
+                wg, k, False, Qs, Ks, Vs, kready, kfree, vready, vfree, acc_s, pcast, acc_o, sm,
+                smp, alpha, ss, logsum, row_limit, my_bar, nxt_bar,
+            )  # fmt: skip
+        for k in T.serial(nu, eff):
+            kv_step(
+                wg, k, True, Qs, Ks, Vs, kready, kfree, vready, vfree, acc_s, pcast, acc_o, sm,
+                smp, alpha, ss, logsum, row_limit, my_bar, nxt_bar,
+            )  # fmt: skip
+
+        svp = (eff - 1) % nsV
+        for i, j in T.Parallel(half, D):
+            acc_o[i, j] *= alpha[i]
+        T.mbarrier_wait_parity(vready[svp], ((eff - 1) // nsV) % 2)
+        T.wgmma_gemm(pcast, Vs[svp, :, :], acc_o, policy=Pol, clear_accum=False)
+        T.wait_wgmma(0)
+        T.mbarrier_arrive(vfree[svp])
+        if has_sinks:
+            sink_scale(logsum, sm, Sinks, alpha, by, 0, half)
+            for i in T.Parallel(half):
+                alpha[i] /= logsum[i]
+        else:
+            for i in T.Parallel(half):
+                alpha[i] = 1.0 / logsum[i]
+        if with_lse:
+            store_lse(Lse, logsum, sm, bz, by, q0 + r0)
+        for i, j in T.Parallel(half, D):
+            acc_o[i, j] *= alpha[i]
+        T.copy(acc_o, Os[wg, :, :])
+        T.fence_proxy_async()
+        T.sync_threads(3 + wg, 128)
+        T.copy(Os[wg, :, :], O[bz, q0 + r0 : q0 + r0 + half, by, :])
 
     @T.macro
     def attention(
@@ -346,9 +462,8 @@ def _gqa_dense_ws_kernel(
             Qs = T.alloc_shared([2, half, D], dtype)
             Ks = T.alloc_shared([nsK, block_N, D], dtype)
             Vs = T.alloc_shared([nsV, block_N, D], dtype)
-            Os = T.alloc_shared(
-                [2, half, D], dtype
-            )  # per-WG smem-staged output (FlashInfer epilogue)
+            # Each consumer warpgroup stages its output here for one TMA store.
+            Os = T.alloc_shared([2, half, D], dtype)
             T.annotate_layout(
                 {
                     Qs: make_swizzled_layout(Qs),
@@ -357,7 +472,7 @@ def _gqa_dense_ws_kernel(
                 }
             )
 
-            q_bar = T.alloc_barrier([32])  # 1-warp producer (FlashInfer NUM_PRODUCER_THREADS=32)
+            q_bar = T.alloc_barrier([32])
             kready = T.alloc_barrier([32] * nsK)
             kfree = T.alloc_barrier([nmma] * nsK)
             vready = T.alloc_barrier([32] * nsV)
@@ -379,8 +494,8 @@ def _gqa_dense_ws_kernel(
             tx = T.get_thread_binding()
 
             if tx >= 256:
-                T.set_max_nreg(24, 0)  # producer is TMA-only: release regs to consumers
-            if tx >= 256 and tx < 288:  # only 1 warp issues TMA + waits (rest of WG idle)
+                T.set_max_nreg(24, 0)  # the producer only issues TMA
+            if tx >= 256 and tx < 288:  # one producer warp issues the loads
                 T.tma_copy(Q[bz, q0 : q0 + half, by, :], Qs[0, :, :], barrier=q_bar)
                 T.tma_copy(Q[bz, q0 + half : q0 + block_M, by, :], Qs[1, :, :], barrier=q_bar)
                 T.mbarrier_arrive(q_bar)
@@ -403,335 +518,15 @@ def _gqa_dense_ws_kernel(
                     T.mbarrier_arrive(vready[sv])
 
             with T.ws(0):
-                T.set_max_nreg(240, 1)
-                r0 = 0 * half
-                my_bar = 1
-                nxt_bar = 2
-                acc_s = T.alloc_fragment([half, block_N], accum)
-                pcast = T.alloc_fragment([half, block_N], dtype)  # register-P (rs-wgmma)
-                acc_o = T.alloc_fragment([half, D], accum)
-                sm = T.alloc_fragment([half], accum)
-                smp = T.alloc_fragment([half], accum)
-                alpha = T.alloc_fragment([half], accum)
-                ss = T.alloc_fragment([half], accum)
-                logsum = T.alloc_fragment([half], accum)
-
-                T.fill(acc_o, 0)
-                T.fill(logsum, 0)
-                T.fill(alpha, 1.0)
-                T.fill(sm, -T.infinity(accum))
-                T.mbarrier_wait_parity(q_bar, 0)
-
-                T.sync_threads(my_bar, nmma)
-                T.mbarrier_wait_parity(kready[0], 0)
-                T.wgmma_gemm(
-                    Qs[0, :, :], Ks[0, :, :], acc_s, transpose_B=True, policy=Pol, clear_accum=True
-                )
-                T.named_barrier_arrive(nxt_bar, nmma)
-                T.wait_wgmma(0)
-                T.mbarrier_arrive(kfree[0])
-                if is_causal and q0 + r0 + causal_offset < block_N - 1:
-                    mask_limit = q0 + r0 + causal_offset
-                    for i, j in T.Parallel(half, block_N):
-                        acc_s[i, j] = T.if_then_else(
-                            mask_limit + i >= j, acc_s[i, j], -T.infinity(accum)
-                        )
-                elif not is_causal and seq_len_kv < block_N:
-                    for i, j in T.Parallel(half, block_N):
-                        acc_s[i, j] = T.if_then_else(
-                            j < seq_len_kv, acc_s[i, j], -T.infinity(accum)
-                        )
-                if use_softcap:
-                    apply_softcap(acc_s, half, block_N)
-                T.reduce_max(acc_s, sm, dim=1, clear=False)
-                for i, j in T.Parallel(half, block_N):
-                    acc_s[i, j] = T.exp2(acc_s[i, j] * scale - sm[i] * scale)
-                T.reduce_sum(acc_s, ss, dim=1)
-                for i in T.Parallel(half):
-                    logsum[i] = ss[i]
-                T.copy(acc_s, pcast)
-
-                if is_causal:
-                    nu = T.alloc_var(
-                        "int32",
-                        init=T.max(
-                            1,
-                            T.min(eff, T.floordiv(q0 + r0 + causal_offset + 1, block_N)),
-                        ),
-                    )
-                else:
-                    nu = T.alloc_var("int32", init=T.max(1, T.floordiv(seq_len_kv, block_N)))
-                for k in T.serial(1, nu):
-                    sk = k % nsK
-                    svp = (k - 1) % nsV
-                    T.sync_threads(my_bar, nmma)
-                    T.mbarrier_wait_parity(kready[sk], (k // nsK) % 2)
-                    T.wgmma_gemm(
-                        Qs[0, :, :],
-                        Ks[sk, :, :],
-                        acc_s,
-                        transpose_B=True,
-                        policy=Pol,
-                        clear_accum=True,
-                    )
-                    for i, j in T.Parallel(half, D):
-                        acc_o[i, j] *= alpha[i]
-                    T.mbarrier_wait_parity(vready[svp], ((k - 1) // nsV) % 2)
-                    T.wgmma_gemm(pcast, Vs[svp, :, :], acc_o, policy=Pol, clear_accum=False)
-                    T.named_barrier_arrive(nxt_bar, nmma)
-                    T.wait_wgmma(1)
-                    T.mbarrier_arrive(kfree[sk])
-                    if use_softcap:
-                        apply_softcap(acc_s, half, block_N)
-                    T.copy(sm, smp)
-                    T.reduce_max(acc_s, sm, dim=1, clear=False)
-                    for i in T.Parallel(half):
-                        alpha[i] = T.exp2(smp[i] * scale - sm[i] * scale)
-                    for i, j in T.Parallel(half, block_N):
-                        acc_s[i, j] = T.exp2(acc_s[i, j] * scale - sm[i] * scale)
-                    T.reduce_sum(acc_s, ss, dim=1)
-                    T.wait_wgmma(0)
-                    T.mbarrier_arrive(vfree[svp])
-                    for i in T.Parallel(half):
-                        logsum[i] = logsum[i] * alpha[i] + ss[i]
-                    T.copy(acc_s, pcast)
-                for k in T.serial(nu, eff):
-                    sk = k % nsK
-                    svp = (k - 1) % nsV
-                    T.sync_threads(my_bar, nmma)
-                    T.mbarrier_wait_parity(kready[sk], (k // nsK) % 2)
-                    T.wgmma_gemm(
-                        Qs[0, :, :],
-                        Ks[sk, :, :],
-                        acc_s,
-                        transpose_B=True,
-                        policy=Pol,
-                        clear_accum=True,
-                    )
-                    for i, j in T.Parallel(half, D):
-                        acc_o[i, j] *= alpha[i]
-                    T.mbarrier_wait_parity(vready[svp], ((k - 1) // nsV) % 2)
-                    T.wgmma_gemm(pcast, Vs[svp, :, :], acc_o, policy=Pol, clear_accum=False)
-                    T.named_barrier_arrive(nxt_bar, nmma)
-                    T.wait_wgmma(1)
-                    T.mbarrier_arrive(kfree[sk])
-                    if is_causal:
-                        mask_limit_tail = q0 + r0 + causal_offset - k * block_N
-                        for i, j in T.Parallel(half, block_N):
-                            acc_s[i, j] = T.if_then_else(
-                                mask_limit_tail + i >= j, acc_s[i, j], -T.infinity(accum)
-                            )
-                    else:
-                        for i, j in T.Parallel(half, block_N):
-                            acc_s[i, j] = T.if_then_else(
-                                k * block_N + j < seq_len_kv,
-                                acc_s[i, j],
-                                -T.infinity(accum),
-                            )
-                    if use_softcap:
-                        apply_softcap(acc_s, half, block_N)
-                    T.copy(sm, smp)
-                    T.reduce_max(acc_s, sm, dim=1, clear=False)
-                    for i in T.Parallel(half):
-                        alpha[i] = T.exp2(smp[i] * scale - sm[i] * scale)
-                    for i, j in T.Parallel(half, block_N):
-                        acc_s[i, j] = T.exp2(acc_s[i, j] * scale - sm[i] * scale)
-                    T.reduce_sum(acc_s, ss, dim=1)
-                    T.wait_wgmma(0)
-                    T.mbarrier_arrive(vfree[svp])
-                    for i in T.Parallel(half):
-                        logsum[i] = logsum[i] * alpha[i] + ss[i]
-                    T.copy(acc_s, pcast)
-
-                svp = (eff - 1) % nsV
-                for i, j in T.Parallel(half, D):
-                    acc_o[i, j] *= alpha[i]
-                T.mbarrier_wait_parity(vready[svp], ((eff - 1) // nsV) % 2)
-                T.wgmma_gemm(pcast, Vs[svp, :, :], acc_o, policy=Pol, clear_accum=False)
-                T.wait_wgmma(0)
-                T.mbarrier_arrive(vfree[svp])
-                if has_sinks:
-                    sink_scale(logsum, sm, Sinks, alpha, by, 0, half)
-                    for i in T.Parallel(half):
-                        alpha[i] /= logsum[i]
-                else:
-                    for i in T.Parallel(half):
-                        alpha[i] = 1.0 / logsum[i]
-                if with_lse:
-                    store_lse(Lse, logsum, sm, bz, by, q0 + r0)
-                for i, j in T.Parallel(half, D):
-                    acc_o[i, j] *= alpha[i]
-                T.copy(acc_o, Os[0, :, :])
-                T.fence_proxy_async()
-                T.sync_threads(3, 128)
-                T.copy(Os[0, :, :], O[bz, q0 + r0 : q0 + r0 + half, by, :])
-
+                consume(
+                    0, Qs, Ks, Vs, Os, O, q_bar, kready, kfree, vready, vfree, Sinks, Lse, q0, eff,
+                    causal_offset, by, bz,
+                )  # fmt: skip
             with T.ws(1):
-                T.set_max_nreg(240, 1)
-                r0 = 1 * half
-                my_bar = 2
-                nxt_bar = 1
-                acc_s = T.alloc_fragment([half, block_N], accum)
-                pcast = T.alloc_fragment([half, block_N], dtype)  # register-P (rs-wgmma)
-                acc_o = T.alloc_fragment([half, D], accum)
-                sm = T.alloc_fragment([half], accum)
-                smp = T.alloc_fragment([half], accum)
-                alpha = T.alloc_fragment([half], accum)
-                ss = T.alloc_fragment([half], accum)
-                logsum = T.alloc_fragment([half], accum)
-
-                T.fill(acc_o, 0)
-                T.fill(logsum, 0)
-                T.fill(alpha, 1.0)
-                T.fill(sm, -T.infinity(accum))
-                T.mbarrier_wait_parity(q_bar, 0)
-                T.named_barrier_arrive(1, nmma)
-
-                T.sync_threads(my_bar, nmma)
-                T.mbarrier_wait_parity(kready[0], 0)
-                T.wgmma_gemm(
-                    Qs[1, :, :], Ks[0, :, :], acc_s, transpose_B=True, policy=Pol, clear_accum=True
-                )
-                T.named_barrier_arrive(nxt_bar, nmma)
-                T.wait_wgmma(0)
-                T.mbarrier_arrive(kfree[0])
-                if is_causal and q0 + r0 + causal_offset < block_N - 1:
-                    mask_limit_wg1 = q0 + r0 + causal_offset
-                    for i, j in T.Parallel(half, block_N):
-                        acc_s[i, j] = T.if_then_else(
-                            mask_limit_wg1 + i >= j, acc_s[i, j], -T.infinity(accum)
-                        )
-                elif not is_causal and seq_len_kv < block_N:
-                    for i, j in T.Parallel(half, block_N):
-                        acc_s[i, j] = T.if_then_else(
-                            j < seq_len_kv, acc_s[i, j], -T.infinity(accum)
-                        )
-                if use_softcap:
-                    apply_softcap(acc_s, half, block_N)
-                T.reduce_max(acc_s, sm, dim=1, clear=False)
-                for i, j in T.Parallel(half, block_N):
-                    acc_s[i, j] = T.exp2(acc_s[i, j] * scale - sm[i] * scale)
-                T.reduce_sum(acc_s, ss, dim=1)
-                for i in T.Parallel(half):
-                    logsum[i] = ss[i]
-                T.copy(acc_s, pcast)
-
-                if is_causal:
-                    nu_wg1 = T.alloc_var(
-                        "int32",
-                        init=T.max(
-                            1,
-                            T.min(eff, T.floordiv(q0 + r0 + causal_offset + 1, block_N)),
-                        ),
-                    )
-                else:
-                    nu_wg1 = T.alloc_var("int32", init=T.max(1, T.floordiv(seq_len_kv, block_N)))
-                for k in T.serial(1, nu_wg1):
-                    sk = k % nsK
-                    svp_wg1 = (k - 1) % nsV
-                    T.sync_threads(my_bar, nmma)
-                    T.mbarrier_wait_parity(kready[sk], (k // nsK) % 2)
-                    T.wgmma_gemm(
-                        Qs[1, :, :],
-                        Ks[sk, :, :],
-                        acc_s,
-                        transpose_B=True,
-                        policy=Pol,
-                        clear_accum=True,
-                    )
-                    for i, j in T.Parallel(half, D):
-                        acc_o[i, j] *= alpha[i]
-                    T.mbarrier_wait_parity(vready[svp_wg1], ((k - 1) // nsV) % 2)
-                    T.wgmma_gemm(pcast, Vs[svp_wg1, :, :], acc_o, policy=Pol, clear_accum=False)
-                    T.named_barrier_arrive(nxt_bar, nmma)
-                    T.wait_wgmma(1)
-                    T.mbarrier_arrive(kfree[sk])
-                    if use_softcap:
-                        apply_softcap(acc_s, half, block_N)
-                    T.copy(sm, smp)
-                    T.reduce_max(acc_s, sm, dim=1, clear=False)
-                    for i in T.Parallel(half):
-                        alpha[i] = T.exp2(smp[i] * scale - sm[i] * scale)
-                    for i, j in T.Parallel(half, block_N):
-                        acc_s[i, j] = T.exp2(acc_s[i, j] * scale - sm[i] * scale)
-                    T.reduce_sum(acc_s, ss, dim=1)
-                    T.wait_wgmma(0)
-                    T.mbarrier_arrive(vfree[svp_wg1])
-                    for i in T.Parallel(half):
-                        logsum[i] = logsum[i] * alpha[i] + ss[i]
-                    T.copy(acc_s, pcast)
-                for k in T.serial(nu_wg1, eff):
-                    sk = k % nsK
-                    svp_wg1_tail = (k - 1) % nsV
-                    T.sync_threads(my_bar, nmma)
-                    T.mbarrier_wait_parity(kready[sk], (k // nsK) % 2)
-                    T.wgmma_gemm(
-                        Qs[1, :, :],
-                        Ks[sk, :, :],
-                        acc_s,
-                        transpose_B=True,
-                        policy=Pol,
-                        clear_accum=True,
-                    )
-                    for i, j in T.Parallel(half, D):
-                        acc_o[i, j] *= alpha[i]
-                    T.mbarrier_wait_parity(vready[svp_wg1_tail], ((k - 1) // nsV) % 2)
-                    T.wgmma_gemm(
-                        pcast, Vs[svp_wg1_tail, :, :], acc_o, policy=Pol, clear_accum=False
-                    )
-                    T.named_barrier_arrive(nxt_bar, nmma)
-                    T.wait_wgmma(1)
-                    T.mbarrier_arrive(kfree[sk])
-                    if is_causal:
-                        mask_limit_wg1_tail = q0 + r0 + causal_offset - k * block_N
-                        for i, j in T.Parallel(half, block_N):
-                            acc_s[i, j] = T.if_then_else(
-                                mask_limit_wg1_tail + i >= j, acc_s[i, j], -T.infinity(accum)
-                            )
-                    else:
-                        for i, j in T.Parallel(half, block_N):
-                            acc_s[i, j] = T.if_then_else(
-                                k * block_N + j < seq_len_kv,
-                                acc_s[i, j],
-                                -T.infinity(accum),
-                            )
-                    if use_softcap:
-                        apply_softcap(acc_s, half, block_N)
-                    T.copy(sm, smp)
-                    T.reduce_max(acc_s, sm, dim=1, clear=False)
-                    for i in T.Parallel(half):
-                        alpha[i] = T.exp2(smp[i] * scale - sm[i] * scale)
-                    for i, j in T.Parallel(half, block_N):
-                        acc_s[i, j] = T.exp2(acc_s[i, j] * scale - sm[i] * scale)
-                    T.reduce_sum(acc_s, ss, dim=1)
-                    T.wait_wgmma(0)
-                    T.mbarrier_arrive(vfree[svp_wg1_tail])
-                    for i in T.Parallel(half):
-                        logsum[i] = logsum[i] * alpha[i] + ss[i]
-                    T.copy(acc_s, pcast)
-
-                svp_wg1_final = (eff - 1) % nsV
-                for i, j in T.Parallel(half, D):
-                    acc_o[i, j] *= alpha[i]
-                T.mbarrier_wait_parity(vready[svp_wg1_final], ((eff - 1) // nsV) % 2)
-                T.wgmma_gemm(pcast, Vs[svp_wg1_final, :, :], acc_o, policy=Pol, clear_accum=False)
-                T.wait_wgmma(0)
-                T.mbarrier_arrive(vfree[svp_wg1_final])
-                if has_sinks:
-                    sink_scale(logsum, sm, Sinks, alpha, by, 0, half)
-                    for i in T.Parallel(half):
-                        alpha[i] /= logsum[i]
-                else:
-                    for i in T.Parallel(half):
-                        alpha[i] = 1.0 / logsum[i]
-                if with_lse:
-                    store_lse(Lse, logsum, sm, bz, by, q0 + r0)
-                for i, j in T.Parallel(half, D):
-                    acc_o[i, j] *= alpha[i]
-                T.copy(acc_o, Os[1, :, :])
-                T.fence_proxy_async()
-                T.sync_threads(4, 128)
-                T.copy(Os[1, :, :], O[bz, q0 + r0 : q0 + r0 + half, by, :])
+                consume(
+                    1, Qs, Ks, Vs, Os, O, q_bar, kready, kfree, vready, vfree, Sinks, Lse, q0, eff,
+                    causal_offset, by, bz,
+                )  # fmt: skip
 
     if has_sinks:
 
@@ -786,7 +581,7 @@ class GQADenseWSKernel(Kernel, GQADenseFwdInterface):
         return (2 * 64 + 2 * 128 + 2 * 128 + 2 * 64) * dim * 2
 
     @classmethod
-    def refusal(cls, call: AttentionCall) -> Optional[str]:
+    def refusal(cls, call: AttentionCall) -> str | None:
         """The contiguous prefill region: more than one query position, no window, not FP8,
         at head dimensions whose buffers fit the device."""
         if call.is_fp8 or call.max_seqlen_q == 1 or call.uses_sliding_window:
@@ -824,7 +619,7 @@ class GQADenseWSKernel(Kernel, GQADenseFwdInterface):
             has_sinks=call.has_sinks,
             return_lse=call.return_lse,
             **call.rope_args,
-            device_index=call.device.index if call.device is not None else None,
+            device_index=call.device_index,
         )
 
     def __init__(
@@ -837,9 +632,9 @@ class GQADenseWSKernel(Kernel, GQADenseFwdInterface):
         dim: int,
         is_causal: bool,
         dtype: torch.dtype,
-        sm_scale: Optional[float] = None,
+        sm_scale: float | None = None,
         softcap: float = 0.0,
-        config: Optional[dict] = None,
+        config: dict | None = None,
         *,
         fuse_rope: bool = False,
         max_position: int = 1,
@@ -847,7 +642,7 @@ class GQADenseWSKernel(Kernel, GQADenseFwdInterface):
         rope_layout: str = "neox",
         has_sinks: bool = False,
         return_lse: bool = False,
-        device_index: Optional[int] = None,
+        device_index: int | None = None,
     ) -> None:
         super().__init__(device_index=device_index)
         self.has_sinks = has_sinks
@@ -863,7 +658,7 @@ class GQADenseWSKernel(Kernel, GQADenseFwdInterface):
             softcap,
             self.dtype_str,
         )
-        self._extra_args = self._program_args(dim, device_index)
+        self._extra_args = self._program_args(dim)
         self.rope = make_dense_qk_rope_preprocessor(
             fuse_rope=fuse_rope,
             batch=batch,
@@ -890,7 +685,7 @@ class GQADenseWSKernel(Kernel, GQADenseFwdInterface):
         rope = self.rope.build() if self.rope is not None else None
         return CompiledProgram(kernel), rope
 
-    def _program_args(self, dim: int, device_index: Optional[int]) -> dict:
+    def _program_args(self, dim: int) -> dict:
         """Build arguments beyond the call's shape; the two-consumer program takes none."""
         return {}
 
@@ -903,12 +698,12 @@ class GQADenseWSKernel(Kernel, GQADenseFwdInterface):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        q_scale: Optional[torch.Tensor] = None,
-        k_scale: Optional[torch.Tensor] = None,
-        v_scale: Optional[torch.Tensor] = None,
-        rope_cos: Optional[torch.Tensor] = None,
-        rope_sin: Optional[torch.Tensor] = None,
-        sinks: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+        rope_cos: torch.Tensor | None = None,
+        rope_sin: torch.Tensor | None = None,
+        sinks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         self._require_devices(q=q, k=k, v=v)
         attention, rope = self.program(self._compile)
@@ -1002,9 +797,6 @@ def _gqa_dense_ws_persistent_kernel(
     softcap,
     dtype,
     block_M=128,
-    block_N=128,
-    nsK=2,
-    nsV=2,
     num_ctas=132,
     has_sinks=False,
 ):
@@ -1018,6 +810,8 @@ def _gqa_dense_ws_persistent_kernel(
     scale = LOG2E if use_softcap else score_scale * LOG2E
     groups = H // Hkv
     accum = "float"
+    block_N = 128
+    nsK = nsV = 2
     half = 64
     num_consumers = block_M // half
     nmma = 128 * num_consumers
@@ -1037,16 +831,7 @@ def _gqa_dense_ws_persistent_kernel(
     # their issue turn more than the sums it saves.
     use_ones = num_consumers == 3
     sum_cols = 8  # columns of the ones operand: the narrowest WGMMA N
-
-    @T.macro
-    def apply_softcap(acc_s, rows, cols):
-        for i, j in T.Parallel(rows, cols):
-            capped = T.cast(softcap, accum) * T.tanh(
-                acc_s[i, j] * T.cast(score_scale / softcap, accum)
-            )
-            acc_s[i, j] = T.if_then_else(
-                acc_s[i, j] == -T.infinity(accum), -T.infinity(accum), capped
-            )
+    apply_softcap = make_apply_softcap(score_scale, softcap, accum, half, block_N)
 
     tiles_of_cta_count, zigzag, tile_coords = _persistent_tiles(
         B, H, block_M, block_N, is_causal, num_ctas, seq_len_q, seq_len_kv, 1
@@ -1097,7 +882,7 @@ def _gqa_dense_ws_persistent_kernel(
                         k * block_N + j < seq_len_kv, acc_s[i, j], -T.infinity(accum)
                     )
         if use_softcap:
-            apply_softcap(acc_s, half, block_N)
+            apply_softcap(acc_s)
         T.copy(sm, smp)
         T.reduce_max(acc_s, sm, dim=1, clear=False)
         for i in T.Parallel(half):
@@ -1189,7 +974,7 @@ def _gqa_dense_ws_persistent_kernel(
                 for i, j in T.Parallel(half, block_N):
                     acc_s[i, j] = T.if_then_else(j < seq_len_kv, acc_s[i, j], -T.infinity(accum))
             if use_softcap:
-                apply_softcap(acc_s, half, block_N)
+                apply_softcap(acc_s)
             T.reduce_max(acc_s, sm, dim=1, clear=False)
             for i, j in T.Parallel(half, block_N):
                 acc_s[i, j] = T.exp2(acc_s[i, j] * scale - sm[i] * scale)
@@ -1264,9 +1049,8 @@ def _gqa_dense_ws_persistent_kernel(
             Qs = T.alloc_shared([2, num_consumers, half, D], dtype)
             Ks = T.alloc_shared([nsK, block_N, D], dtype)
             Vs = T.alloc_shared([nsV, block_N, D], dtype)
-            Os = T.alloc_shared(
-                [num_consumers, half, D], dtype
-            )  # per-WG smem-staged output (FlashInfer epilogue)
+            # Each consumer warpgroup stages its output here for one TMA store.
+            Os = T.alloc_shared([num_consumers, half, D], dtype)
             T.annotate_layout(
                 {
                     Qs: make_swizzled_layout(Qs),
@@ -1297,9 +1081,9 @@ def _gqa_dense_ws_persistent_kernel(
                 T.fence_proxy_async()
                 T.sync_threads()
 
-            if tx >= nmma:  # ================= producer =================
-                T.set_max_nreg(producer_regs, 0)  # producer is TMA-only: release regs to consumers
-            if tx >= nmma and tx < nmma + 32:  # only 1 warp issues TMA + waits (rest of WG idle)
+            if tx >= nmma:
+                T.set_max_nreg(producer_regs, 0)
+            if tx >= nmma and tx < nmma + 32:  # one producer warp issues the loads
                 g = T.alloc_var("int32", init=0)
                 for it in T.serial(tiles_of_cta):
                     by, bz, q0, eff = tile_coords(zigzag(it, cta), num_q_tiles, causal_offset)
@@ -1546,7 +1330,7 @@ def _gqa_dense_persistent_d128_kernel(
             for ki in T.unroll(D // k_step if steps is None else steps):
                 k_off = ki % per_panel * k_step * elem_bytes
                 T.ptx_wgmma_ss(
-                    "float32", "m64n%dk16" % n, True, True, mma_dtype, mma_dtype, "fp32",
+                    "float32", f"m64n{n}k16", True, True, mma_dtype, mma_dtype, "fp32",
                     desc_q.data, (ki // per_panel * q_panel_elems * elem_bytes + k_off) >> 4,
                     desc_k.data, (ki // per_panel * kv_panel_elems * elem_bytes + k_off) >> 4,
                     acc_s.data, 0, T.Select(ki > 0, 1, 0), 1, 1,
@@ -2225,7 +2009,7 @@ class GQADensePersistentWSKernel(GQADenseWSKernel):
         return sum(-(-b // 1024) * 1024 for b in buffers)
 
     @classmethod
-    def refusal(cls, call: AttentionCall) -> Optional[str]:
+    def refusal(cls, call: AttentionCall) -> str | None:
         """As the WS kernel, with its own buffers; only the D128 program writes the
         log-sum-exp."""
         if call.return_lse and call.dim != 128:
@@ -2241,9 +2025,7 @@ class GQADensePersistentWSKernel(GQADenseWSKernel):
         args = super()._entry_args(call)
         if call.dim != 128:
             return args
-        index = call.device.index if call.device is not None else None
-        device = torch.cuda.current_device() if index is None else index
-        l2_bytes = torch.cuda.get_device_properties(device).L2_cache_size
+        l2_bytes = call.l2_bytes
         kv_bytes = call.batch * call.heads_kv * call.seqlen_kv * call.dim * 2 * 2
         splits = cls._num_splits(call)
         return {
@@ -2283,8 +2065,8 @@ class GQADensePersistentWSKernel(GQADenseWSKernel):
         self.diag_aligned = diag_aligned
         super().__init__(*args, **kwargs)
 
-    def _program_args(self, dim: int, device_index: Optional[int]) -> dict:
-        return {"block_M": self._block_m(dim), "num_ctas": get_sm_count(device_index)}
+    def _program_args(self, dim: int) -> dict:
+        return {"block_M": self._block_m(dim), "num_ctas": self.build_target.sm_count}
 
     def _compile(self, cfg: dict) -> tuple:
         """Head dimension 128 runs the per-thread program; the others, the tile-level one."""
@@ -2314,12 +2096,12 @@ class GQADensePersistentWSKernel(GQADenseWSKernel):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        q_scale: Optional[torch.Tensor] = None,
-        k_scale: Optional[torch.Tensor] = None,
-        v_scale: Optional[torch.Tensor] = None,
-        rope_cos: Optional[torch.Tensor] = None,
-        rope_sin: Optional[torch.Tensor] = None,
-        sinks: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+        rope_cos: torch.Tensor | None = None,
+        rope_sin: torch.Tensor | None = None,
+        sinks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """As the WS kernel; with key parts, the parts' outputs are merged into the result."""
         if self.num_splits == 1:
@@ -2357,7 +2139,7 @@ def _gqa_sw_fwd_wgmma_pipelined_kernel(
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
-    sm_scale: Optional[float] = None,
+    sm_scale: float | None = None,
     softcap: float = 0.0,
     dtype: str = "float16",
     has_sinks: bool = False,
@@ -2370,9 +2152,9 @@ def _gqa_sw_fwd_wgmma_pipelined_kernel(
     has_window = window_size_left >= 0 or window_size_right >= 0
 
     @tilelang.jit(
-        out_idx=[4, 5],
+        out_idx=[4],
         pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
     )
     def _gqa_sw_fwd_wgmma_pipelined_func(block_m, block_n, num_stages, threads):
         sink_scale = make_dense_sink_scale(scale, block_m)
@@ -2448,7 +2230,6 @@ def _gqa_sw_fwd_wgmma_pipelined_kernel(
             v: T.Tensor(kv_shape, dtype),
             sinks: T.Tensor([heads] if has_sinks else q_shape, "float32" if has_sinks else dtype),
             output: T.Tensor(q_shape, dtype),
-            lse: T.Tensor([batch, heads, seq_len], accum_dtype),
         ) -> None:
             with T.Kernel(T.ceildiv(seq_len, block_m), heads, batch, threads=threads) as (
                 bx,
@@ -2495,8 +2276,6 @@ def _gqa_sw_fwd_wgmma_pipelined_kernel(
                     mma0(k, q_shared, k_shared, acc_s, k_idx, bx, by, bz)
                     if use_softcap:
                         apply_softcap(acc_s)
-                    # Online softmax with scores_max clamping.
-                    # Clamping prevents exp2(+inf) when all block scores are -inf.
                     T.copy(scores_max, scores_max_prev)
                     T.fill(scores_max, -T.infinity(accum_dtype))
                     T.reduce_max(acc_s, scores_max, dim=1, clear=False)
@@ -2535,9 +2314,6 @@ def _gqa_sw_fwd_wgmma_pipelined_kernel(
                 T.copy(acc_o, o_shared)
                 T.sync_threads(3, threads)
                 T.copy(o_shared, output[bz, bx * block_m : (bx + 1) * block_m, by, :])
-                for i in T.Parallel(block_m):
-                    logsum[i] = T.log2(logsum[i]) + scores_max[i] * scale
-                T.copy(logsum, lse[bz, by, bx * block_m : (bx + 1) * block_m])
 
         return _gqa_sw_fwd_wgmma_pipelined_main
 
@@ -2553,7 +2329,7 @@ def _gqa_sw_fwd_packed_kernel(
     dim: int,
     window_size_left: int,
     block_m: int,
-    sm_scale: Optional[float] = None,
+    sm_scale: float | None = None,
     softcap: float = 0.0,
     dtype: str = "float16",
     has_sinks: bool = False,
@@ -2570,9 +2346,9 @@ def _gqa_sw_fwd_packed_kernel(
     accum_dtype = "float"
 
     @tilelang.jit(
-        out_idx=[4, 5],
+        out_idx=[4],
         pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
     )
     def _gqa_sw_fwd_packed_func(num_stages):
         block_n = block_m
@@ -2638,7 +2414,6 @@ def _gqa_sw_fwd_packed_kernel(
             v: T.Tensor(kv_shape, dtype),
             sinks: T.Tensor([heads] if has_sinks else q_shape, "float32" if has_sinks else dtype),
             output: T.Tensor(q_shape, dtype),
-            lse: T.Tensor([batch, heads, seq_len], accum_dtype),
         ) -> None:
             with T.Kernel(T.ceildiv(seq_len, block_m), heads_kv, batch, threads=threads) as (
                 bx,
@@ -2715,9 +2490,6 @@ def _gqa_sw_fwd_packed_kernel(
                     T.copy(acc_o, o_shared)
                     T.sync_threads(3, threads)
                     T.copy(o_shared, output[bz, bx * block_m : (bx + 1) * block_m, head, :])
-                    for i in T.Parallel(block_m):
-                        logsum[i] = T.log2(logsum[i]) + scores_max[i] * scale
-                    T.copy(logsum, lse[bz, head, bx * block_m : (bx + 1) * block_m])
 
         return _gqa_sw_fwd_packed_main
 
@@ -2730,7 +2502,7 @@ class GQADenseSlidingWindowKernel(Kernel, GQADenseFwdInterface):
     supported_archs: list[int] = [90]
 
     @classmethod
-    def refusal(cls, call: AttentionCall) -> Optional[str]:
+    def refusal(cls, call: AttentionCall) -> str | None:
         """The contiguous windowed region, which FP8 has its own implementation for."""
         if call.return_lse:
             return "does not return the log-sum-exp"
@@ -2757,7 +2529,7 @@ class GQADenseSlidingWindowKernel(Kernel, GQADenseFwdInterface):
             softcap=call.softcap,
             has_sinks=call.has_sinks,
             **call.rope_args,
-            device_index=call.device.index if call.device is not None else None,
+            device_index=call.device_index,
         )
         return tuple(args.values()), lambda: cls(**args)
 
@@ -2772,16 +2544,16 @@ class GQADenseSlidingWindowKernel(Kernel, GQADenseFwdInterface):
         window_size_left: int,
         window_size_right: int,
         dtype: torch.dtype,
-        sm_scale: Optional[float] = None,
+        sm_scale: float | None = None,
         softcap: float = 0.0,
-        config: Optional[dict] = None,
+        config: dict | None = None,
         *,
         fuse_rope: bool = False,
         max_position: int = 1,
         rotary_dim: int = 0,
         rope_layout: str = "neox",
         has_sinks: bool = False,
-        device_index: Optional[int] = None,
+        device_index: int | None = None,
     ) -> None:
         super().__init__(device_index=device_index)
         self.has_sinks = has_sinks
@@ -2852,19 +2624,18 @@ class GQADenseSlidingWindowKernel(Kernel, GQADenseFwdInterface):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        q_scale: Optional[torch.Tensor] = None,
-        k_scale: Optional[torch.Tensor] = None,
-        v_scale: Optional[torch.Tensor] = None,
-        rope_cos: Optional[torch.Tensor] = None,
-        rope_sin: Optional[torch.Tensor] = None,
-        sinks: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+        rope_cos: torch.Tensor | None = None,
+        rope_sin: torch.Tensor | None = None,
+        sinks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         self._require_devices(q=q, k=k, v=v)
         attention, rope = self.program(self._compile)
         if rope is not None:
             q, k = rope(q, k, rope_cos, rope_sin)
-        output, _ = attention(q, k, v, sinks if self.has_sinks else q)
-        return output
+        return attention(q, k, v, sinks if self.has_sinks else q)
 
     def _compile(self, cfg: dict) -> tuple:
         """The attention program for *cfg*, and the Q/K rotation ahead of it or ``None``."""
@@ -2885,7 +2656,7 @@ class GQADenseSlidingWindowBandKernel(Kernel, GQADenseFwdInterface):
     _BAND_TILE = 128
 
     @classmethod
-    def refusal(cls, call: AttentionCall) -> Optional[str]:
+    def refusal(cls, call: AttentionCall) -> str | None:
         """A causal window of at most one key tile whose band fits shared memory."""
         if call.return_lse:
             return "does not return the log-sum-exp"
@@ -2915,7 +2686,7 @@ class GQADenseSlidingWindowBandKernel(Kernel, GQADenseFwdInterface):
             softcap=call.softcap,
             has_sinks=call.has_sinks,
             **call.rope_args,
-            device_index=call.device.index if call.device is not None else None,
+            device_index=call.device_index,
         )
         return tuple(args.values()), lambda: cls(**args)
 
@@ -2928,16 +2699,16 @@ class GQADenseSlidingWindowBandKernel(Kernel, GQADenseFwdInterface):
         dim: int,
         window_size_left: int,
         dtype: torch.dtype,
-        sm_scale: Optional[float] = None,
+        sm_scale: float | None = None,
         softcap: float = 0.0,
-        config: Optional[dict] = None,
+        config: dict | None = None,
         *,
         fuse_rope: bool = False,
         max_position: int = 1,
         rotary_dim: int = 0,
         rope_layout: str = "neox",
         has_sinks: bool = False,
-        device_index: Optional[int] = None,
+        device_index: int | None = None,
     ) -> None:
         super().__init__(device_index=device_index)
         self.has_sinks = has_sinks
@@ -2983,19 +2754,18 @@ class GQADenseSlidingWindowBandKernel(Kernel, GQADenseFwdInterface):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        q_scale: Optional[torch.Tensor] = None,
-        k_scale: Optional[torch.Tensor] = None,
-        v_scale: Optional[torch.Tensor] = None,
-        rope_cos: Optional[torch.Tensor] = None,
-        rope_sin: Optional[torch.Tensor] = None,
-        sinks: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+        rope_cos: torch.Tensor | None = None,
+        rope_sin: torch.Tensor | None = None,
+        sinks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         self._require_devices(q=q, k=k, v=v)
         attention, rope = self.program(self._compile)
         if rope is not None:
             q, k = rope(q, k, rope_cos, rope_sin)
-        output, _ = attention(q, k, v, sinks if self.has_sinks else q)
-        return output
+        return attention(q, k, v, sinks if self.has_sinks else q)
 
     def _compile(self, cfg: dict) -> tuple:
         """The attention program for *cfg*, and the Q/K rotation ahead of it or ``None``."""

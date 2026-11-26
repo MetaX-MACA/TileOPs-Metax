@@ -8,13 +8,11 @@ state slice nor the gate, because every term the gate scales is zero, and the st
 outer product of the token's key and value alone.
 """
 
-from typing import Optional
-
 import tilelang
 import tilelang.language as T
 import torch
 
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.constants import LOG2E
 from tileops._kernels.kernel_base import Entry, Kernel
 from tileops._kernels.linear_attention.gla.call_spec import (
@@ -65,7 +63,7 @@ def _gla_dense_decode_tl(
     @tilelang.jit(
         out_idx=[-2, -1],
         pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
-        compile_flags=["-O3", "-DENABLE_BF16", "--use_fast_math"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16", "--use_fast_math"],
     )
     def decode():
         # A parameter this build leaves unread is declared one element wide, and the kernel
@@ -138,7 +136,7 @@ class GLADenseDecodeFwdKernel(Kernel, GLAFwdInterface):
     supported_archs = [80, 89, 90]
 
     @classmethod
-    def refusal(cls, call: GLACall) -> Optional[str]:
+    def refusal(cls, call: GLACall) -> str | None:
         reason = dense_refusal(call)
         if reason is not None:
             return reason
@@ -167,7 +165,7 @@ class GLADenseDecodeFwdKernel(Kernel, GLAFwdInterface):
         scale: float,
         dtype: torch.dtype,
         has_initial_state: bool = False,
-        device_index: Optional[int] = None,
+        device_index: int | None = None,
     ) -> None:
         super().__init__(device_index=device_index)
         if dim_k not in (64, 128) or dim_v not in (64, 128):
@@ -183,9 +181,7 @@ class GLADenseDecodeFwdKernel(Kernel, GLAFwdInterface):
         self.has_initial_state = has_initial_state
         self.init_config()
         self.program(self._compile)
-        device = (
-            torch.device("cuda", device_index) if device_index is not None else torch.device("cuda")
-        )
+        device = self._build_device
         self._unread_gate = torch.empty(1, dtype=dtype, device=device)
         self._unread_state = torch.empty(1, dtype=torch.float32, device=device)
 
@@ -193,10 +189,8 @@ class GLADenseDecodeFwdKernel(Kernel, GLAFwdInterface):
     def default_config(self) -> dict:
         """The lanes that split the key dimension for one state column.
 
-        The state slice is a dependent global read, and a second lane group is what
-        overlaps it; a build that reads no state has nothing to overlap and pays for the
-        extra warp. Re-fit by sweeping ``lane_group`` against the decode workload rows of
-        `benchmarks/ops/bench_gla.py`.
+        The state slice is a dependent global read, and a second lane group overlaps it; a
+        build that reads no state has nothing to overlap and pays for the extra warp.
         """
         return {"lane_group": 2 if self.has_initial_state else 1}
 
@@ -219,9 +213,9 @@ class GLADenseDecodeFwdKernel(Kernel, GLAFwdInterface):
         k: torch.Tensor,
         v: torch.Tensor,
         g: torch.Tensor,
-        initial_state: Optional[torch.Tensor] = None,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        cu_seqlens_cpu: Optional[torch.Tensor] = None,
+        initial_state: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if cu_seqlens is not None or cu_seqlens_cpu is not None:
             raise ValueError("GLA dense decode does not support packed varlen inputs")

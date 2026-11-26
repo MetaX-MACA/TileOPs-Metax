@@ -3,7 +3,7 @@ the kernel interfaces their implementations inherit."""
 
 import dataclasses
 from abc import abstractmethod
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -28,6 +28,8 @@ __all__ = [
     "MGroupedGEMMFP8Call",
     "MGroupedGEMMFP8FwdInterface",
     "MGroupedGEMMFwdInterface",
+    "MGroupedGEMMMXFP4Call",
+    "MGroupedGEMMMXFP4FwdInterface",
     "PermuteAlignCall",
     "PermuteAlignFwdInterface",
     "PostPermuteCall",
@@ -36,7 +38,14 @@ __all__ = [
     "PrePermuteFwdInterface",
     "SharedExpertMLPCall",
     "SharedExpertMLPFwdInterface",
+    "route_metadata_size",
 ]
+
+
+def route_metadata_size(num_experts: int, num_tokens: int, top_k: int) -> int:
+    """``int32`` elements of the indexed route metadata: per-expert route counts, each route's
+    rank within its expert, then up to ``num_tokens`` routes listed per expert."""
+    return num_experts + num_tokens * top_k + num_experts * num_tokens
 
 
 @dataclasses.dataclass(frozen=True)
@@ -49,10 +58,12 @@ class FusedTopKCall(CallSpec):
     scoring_func: str = "softmax"
     renormalize: bool = False
     with_correction_bias: bool = False
+    # Whether the caller passes each token's experts, so that nothing is selected.
+    with_expert_ids: bool = False
     num_expert_group: int = 1
     topk_group: int = 1
     routed_scaling_factor: float = 1.0
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -71,7 +82,7 @@ class SharedExpertMLPCall(CallSpec):
     num_tokens: int = 0
     hidden_size: int = 0
     ffn_size: int = 0
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -83,7 +94,7 @@ class IndexedExpertCall(CallSpec):
     num_experts: int = 0
     hidden_size: int = 0
     ffn_size: int = 0
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
     routed_scaling_factor: float = 1.0
 
     @property
@@ -107,11 +118,21 @@ class PrePermuteCall(CallSpec):
     num_tokens: int = 0
     hidden_size: int = 0
     top_k: int = 0
-    routing_input_kind: str = "topk_ids"
 
 
 @dataclasses.dataclass(frozen=True)
-class MGroupedGEMMCall(CallSpec):
+class _MGroupedLayoutCall(CallSpec):
+    """The expert layout of an M-grouped GEMM call, the first fields of each call record."""
+
+    kind: str = ""  # "contiguous" | "masked"
+    packing: str | None = None  # "tight" | "aligned"; None for masked
+    metadata_kind: str | None = None  # "physical_psum" | "per_row"; None for masked
+    alignment: int = 1  # 1 unless packing == "aligned"
+    max_m: int | None = None  # masked only
+
+
+@dataclasses.dataclass(frozen=True)
+class MGroupedGEMMCall(_MGroupedLayoutCall):
     """Complete selection facts for one M-grouped GEMM invocation.
 
     The layout arrives structured — ``kind`` first, then the contiguous
@@ -122,11 +143,6 @@ class MGroupedGEMMCall(CallSpec):
     record's equality: a candidate selected on it is still cached without it.
     """
 
-    kind: str = ""  # "contiguous" | "masked"
-    packing: str | None = None  # "tight" | "aligned"; None for masked
-    metadata_kind: str | None = None  # "physical_psum" | "per_row"; None for masked
-    alignment: int = 1  # 1 unless packing == "aligned"
-    max_m: int | None = None  # masked only
     # Gated activation fused into the epilogue ("silu_and_mul", ...); None for a
     # plain GEMM. With one, ``n`` is B's gate and up width together and C has n / 2.
     activation: str | None = None
@@ -141,7 +157,7 @@ class MGroupedGEMMCall(CallSpec):
 
 
 @dataclasses.dataclass(frozen=True)
-class MGroupedGEMMFP8Call(CallSpec):
+class MGroupedGEMMFP8Call(_MGroupedLayoutCall):
     """Complete selection facts for one block-scaled FP8 M-grouped GEMM invocation.
 
     The layout arrives as ``MGroupedGEMMCall``'s does. The scale shapes are carried whole so
@@ -151,11 +167,6 @@ class MGroupedGEMMFP8Call(CallSpec):
     this record's equality.
     """
 
-    kind: str = ""  # "contiguous" | "masked"
-    packing: str | None = None  # "tight" | "aligned"; None for masked
-    metadata_kind: str | None = None  # "physical_psum" | "per_row"; None for masked
-    alignment: int = 1  # 1 unless packing == "aligned"
-    max_m: int | None = None  # masked only
     ab_dtype: torch.dtype | None = None
     num_groups: int = 0
     m: int = dataclasses.field(default=0, compare=False)
@@ -166,6 +177,23 @@ class MGroupedGEMMFP8Call(CallSpec):
 
 
 @dataclasses.dataclass(frozen=True)
+class MGroupedGEMMMXFP4Call(_MGroupedLayoutCall):
+    """Complete selection facts for one MXFP4 M-grouped GEMM invocation.
+
+    The layout arrives as ``MGroupedGEMMCall``'s does. ``scale_dtype`` is the dtype of both
+    scale tensors, ``float8_e8m0fnu`` or ``float32``. ``m``, the materialized row count, is a
+    fact of the call and not of the built kernel, so it is excluded from this record's
+    equality.
+    """
+
+    scale_dtype: torch.dtype | None = None
+    num_groups: int = 0
+    m: int = dataclasses.field(default=0, compare=False)
+    n: int = 0
+    k: int = 0
+
+
+@dataclasses.dataclass(frozen=True)
 class PostPermuteCall(CallSpec):
     """Complete selection facts for one post-permute invocation."""
 
@@ -173,13 +201,14 @@ class PostPermuteCall(CallSpec):
     max_m: int | None = None
     epilogue: "RoutingEpilogueSpec | None" = None
     input_dtype: torch.dtype | None = None
-    routing_weight_dtype: torch.dtype | None = None
     output_dtype: torch.dtype | None = None
     num_experts: int = 0
     materialized_rows: int = 0
     num_tokens: int = 0
     hidden_size: int = 0
     top_k: int = 0
+    # Whether a residual is added to the reduction before the cast.
+    has_residual: bool = False
 
 
 class FusedTopKFwdInterface(KernelInterface):
@@ -189,7 +218,10 @@ class FusedTopKFwdInterface(KernelInterface):
 
     @abstractmethod
     def forward(
-        self, gating_output: torch.Tensor, correction_bias: Optional[torch.Tensor] = None
+        self,
+        gating_output: torch.Tensor,
+        correction_bias: torch.Tensor | None = None,
+        expert_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Score the router logits, then select each token's ``call.top_k`` experts.
 
@@ -204,8 +236,12 @@ class FusedTopKFwdInterface(KernelInterface):
             gating_output: Contiguous ``(call.num_tokens, call.num_experts)`` in
                 ``call.dtype`` on ``call.device``.
             correction_bias: Contiguous ``float32`` ``(call.num_experts,)``, passed exactly
-                when ``call.with_correction_bias``. It is added to the sigmoid scores for the
+                when ``call.with_correction_bias``. It is added to the scores for the
                 selection only; the returned weights stay the unbiased scores.
+            expert_ids: Contiguous ``int32`` ``(call.num_tokens, call.top_k)`` in
+                ``[0, call.num_experts)``, passed exactly when ``call.with_expert_ids``. They
+                replace the selection: ``topk_ids`` holds them, and the weights are their
+                scores.
 
         Returns:
             New ``(topk_weights, topk_ids)``: ``float32`` and ``int32``, both
@@ -305,9 +341,9 @@ class MGroupedGEMMFwdInterface(KernelInterface):
         a: torch.Tensor,
         b: torch.Tensor,
         layout_metadata: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
+        out: torch.Tensor | None = None,
         *,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Contract each expert's rows of *a* with its weights and add its bias.
 
@@ -350,7 +386,7 @@ class MGroupedGEMMFP8FwdInterface(KernelInterface):
         b: torch.Tensor,
         b_scale: torch.Tensor,
         layout_metadata: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Contract each expert's rows with its weights under their block scales.
 
@@ -383,6 +419,52 @@ class MGroupedGEMMFP8FwdInterface(KernelInterface):
         """
 
 
+class MGroupedGEMMMXFP4FwdInterface(KernelInterface):
+    """One GEMM per expert of FP8 rows and packed e2m1 weights under their scales, in a masked or
+    contiguous layout."""
+
+    request = MGroupedGEMMMXFP4Call
+
+    @abstractmethod
+    def forward(
+        self,
+        a: torch.Tensor,
+        a_scale: torch.Tensor,
+        b: torch.Tensor,
+        b_scale: torch.Tensor,
+        layout_metadata: torch.Tensor,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Contract each expert's rows with its dequantized weights.
+
+        For a row ``r`` of expert ``g``, ``out[r, n] = sum_k a[r, k] * a_scale[r, k // 128] *
+        e2m1(b[g, n, k]) * b_scale[g, n, k // 32]``, accumulated in float32 and written in
+        bfloat16. Byte ``j`` of a row of ``b`` holds the e2m1 codes of ``k = 2j`` (low nibble)
+        and ``2j + 1``. A masked layout gives expert ``g`` the first ``layout_metadata[g]`` rows
+        of its slab; a contiguous one gives it the rows its metadata marks, as
+        ``MGroupedGEMMFwdInterface`` reads them. Every other row of *out* holds unspecified
+        values. The metadata's values are not checked, since checking would synchronise.
+
+        Args:
+            a: Contiguous ``float8_e4m3fn`` ``(call.m, call.k)``, or ``(call.num_groups,
+                call.max_m, call.k)`` when masked, on ``call.device``.
+            a_scale: Contiguous ``call.scale_dtype``, *a*'s shape with ``call.k / 128``
+                columns.
+            b: Contiguous ``uint8`` ``(call.num_groups, call.n, call.k / 2)``.
+            b_scale: Contiguous ``call.scale_dtype`` ``(call.num_groups, call.n, call.k / 32)``.
+            layout_metadata: Contiguous ``int32`` metadata of the layout: ``(call.num_groups,)``
+                valid row counts when masked, segment end rows under ``physical_psum``, or
+                ``(call.m,)`` expert ids under ``per_row``.
+            out: An optional contiguous ``bfloat16`` buffer, shaped like the return value,
+                written in place and returned; ``None`` allocates one. It shares no byte
+                with an input.
+
+        Returns:
+            ``(call.m, call.n)``, or ``(call.num_groups, call.max_m, call.n)`` when masked, in
+            ``bfloat16``.
+        """
+
+
 class PostPermuteFwdInterface(KernelInterface):
     """Token order restored from the expert rows, with the routing epilogue applied once."""
 
@@ -394,13 +476,14 @@ class PostPermuteFwdInterface(KernelInterface):
         expert_output: torch.Tensor,
         inverse_indices: torch.Tensor,
         topk_weights: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
+        out: torch.Tensor | None = None,
+        residual: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Weight each route's row, sum a token's routes, and store in ``call.output_dtype``.
 
         The reduction accumulates in float32 and is scaled by
-        ``call.epilogue.routed_scaling_factor`` before the cast. *out* shares no byte with
-        an input, all of which are read concurrently.
+        ``call.epilogue.routed_scaling_factor``, and *residual* is added, before the cast.
+        *out* shares no byte with an input, all of which are read concurrently.
 
         Args:
             expert_output: Contiguous ``(call.materialized_rows, call.hidden_size)`` in
@@ -410,6 +493,8 @@ class PostPermuteFwdInterface(KernelInterface):
             topk_weights: Contiguous ``float32`` ``(call.num_tokens, call.top_k)``.
             out: An optional contiguous ``(call.num_tokens, call.hidden_size)`` buffer in
                 ``call.output_dtype``, written in place and returned; ``None`` allocates one.
+            residual: Contiguous ``(call.num_tokens, call.hidden_size)`` in
+                ``call.input_dtype``, passed exactly when ``call.has_residual``.
 
         Returns:
             ``(call.num_tokens, call.hidden_size)`` in ``call.output_dtype``.
@@ -429,7 +514,7 @@ class IndexedRouteStatsFwdInterface(KernelInterface):
         ``call.num_tokens`` routes listed per expert. The op allocates *out* from this,
         so every implementation writes the same layout.
         """
-        return call.num_experts * (1 + call.num_tokens) + call.num_tokens * call.top_k
+        return route_metadata_size(call.num_experts, call.num_tokens, call.top_k)
 
     @abstractmethod
     def forward(self, expert_ids: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
@@ -460,8 +545,8 @@ class IndexedExpertGateUpFwdInterface(KernelInterface):
         a: torch.Tensor,
         weights: torch.Tensor,
         expert_ids: torch.Tensor,
-        route_metadata: Optional[torch.Tensor] = None,
-        out: Optional[torch.Tensor] = None,
+        route_metadata: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Project each token onto its routed experts and apply ``silu(gate) * up``.
 
@@ -494,8 +579,8 @@ class IndexedExpertDownFwdInterface(KernelInterface):
         a: torch.Tensor,
         weights: torch.Tensor,
         expert_ids: torch.Tensor,
-        route_metadata: Optional[torch.Tensor] = None,
-        out: Optional[torch.Tensor] = None,
+        route_metadata: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Contract each route's row with its expert's down projection.
 
@@ -530,7 +615,8 @@ class IndexedWeightedReduceFwdInterface(KernelInterface):
         """Reduce the route axis, scaled by ``call.routed_scaling_factor``.
 
         The sum accumulates in float32 and is cast to ``call.dtype`` on the store. *output* is
-        written in place and returned; it must not overlap *expert_output*.
+        written in place and returned; it must not overlap *expert_output* or
+        *topk_weights*, which the reduction reads while it writes.
 
         Args:
             expert_output: Contiguous ``(call.num_tokens, call.top_k, call.hidden_size)`` in

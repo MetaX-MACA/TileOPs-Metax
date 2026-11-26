@@ -14,7 +14,9 @@ and -inf fills, eliminating host-side ``F.pad`` from the forward path.
 """
 
 import functools
-from typing import Callable
+import math
+import operator
+from collections.abc import Callable
 
 import tilelang
 import tilelang.language as T
@@ -27,13 +29,15 @@ from tileops._kernels.constants import VECTOR_ACCESS_BYTES
 from tileops._kernels.kernel_base import CompiledProgram, Kernel
 from tileops._kernels.reduction._primitives import (
     AUTOTUNE_THREADS,
-    DEFAULT_ALIGNMENT,
     DEFAULT_THREADS,
     FRAGMENT_ELEMS_PER_THREAD,
     BlockConfigPlanner,
     RowTiledAutotuneMixin,
-    ceildiv_int,
     exp_shifted,
+    exp_shifted_scaled,
+    fold_max_sum,
+    fold_max_sum_into,
+    keeps_input_rows,
     restore_same_shape,
     rows_for_axes,
 )
@@ -46,7 +50,12 @@ from tileops._kernels.reduction._split_softmax import (
 from tileops._kernels.reduction.call_spec import SoftmaxCall, SoftmaxFwdInterface
 from tileops._kernels.streaming_load import load16
 from tileops._kernels.tiling import align_up
-from tileops._utils import WARP_LANES, WARP_SHUFFLE_STAGES, is_maca
+from tileops._utils import WARP_LANES, is_maca
+from tileops._kernels.streaming_load import load16, load16_evict_last
+from tileops._kernels.tiling import ALIGNMENT, align_up
+from tileops._kernels.warp_reduce import warp_reduce
+from tileops._utils import WARP_LANES
+from tileops.manifest.primitives import ceil_div
 
 __all__ = [
     "SoftmaxKernel",
@@ -67,9 +76,8 @@ def _softmax_streaming_kernel(M, N, op_kind, dtype, out_dtype, ctas, ctas_per_sm
     tiles of a row, as many whole ones as ``held_bytes`` of shared memory take, are kept
     from the first pass, so the second reads them from shared memory instead.
     """
-    vec = VECTOR_ACCESS_BYTES // (DataType(dtype).bits // 8)
-    while N % vec:
-        vec //= 2
+    itemsize = DataType(dtype).bits // 8
+    vec = math.gcd(N, VECTOR_ACCESS_BYTES // itemsize)
     neg_inf = float("-inf")
 
     @tilelang.jit(out_idx=[1])
@@ -77,19 +85,13 @@ def _softmax_streaming_kernel(M, N, op_kind, dtype, out_dtype, ctas, ctas_per_sm
         tile = threads * accesses * vec
         tiles = -(-N // tile)
         warps = threads // WARP_LANES
-        kept = min(N // tile, held_bytes // (tile * DataType(dtype).bits // 8))
+        kept = min(N // tile, held_bytes // (tile * itemsize))
 
         def row_scale(total):
             """What a row's result takes from its sum: its reciprocal, or its log."""
             if op_kind == "softmax":
                 return 1.0 / total
             return T.log(total)
-
-        def fold(m, s, other_m, other_s):
-            """The ``(max, sum)`` of two partial pairs; two empty ones stay empty."""
-            top = T.max(m, other_m)
-            both = s * exp_shifted(m, top) + other_s * exp_shifted(other_m, top)
-            return top, T.if_then_else(top == neg_inf, T.cast(0, "float32"), both)
 
         @T.prim_func
         def main(
@@ -143,10 +145,7 @@ def _softmax_streaming_kernel(M, N, op_kind, dtype, out_dtype, ctas, ctas_per_sm
                                 T.cast(0, "float32"),
                                 exp_shifted(T.cast(held[j], "float32"), top),
                             )
-                    for k in T.unroll(WARP_LANES.bit_length() - 1):
-                        peer[0] = T.shfl_xor(stat[0], T.shift_left(1, k))
-                        peer[1] = T.shfl_xor(stat[1], T.shift_left(1, k))
-                        stat[0], stat[1] = fold(stat[0], stat[1], peer[0], peer[1])
+                    warp_reduce(stat, fold_max_sum_into, 2, peer=peer)
                     if tx % WARP_LANES == 0:
                         warp_stats[step % 2, 0, tx // WARP_LANES] = stat[0]
                         warp_stats[step % 2, 1, tx // WARP_LANES] = stat[1]
@@ -154,7 +153,7 @@ def _softmax_streaming_kernel(M, N, op_kind, dtype, out_dtype, ctas, ctas_per_sm
                     stat[0] = T.cast(neg_inf, "float32")
                     stat[1] = T.cast(0, "float32")
                     for w in T.unroll(warps):
-                        stat[0], stat[1] = fold(
+                        stat[0], stat[1] = fold_max_sum(
                             stat[0], stat[1], warp_stats[step % 2, 0, w], warp_stats[step % 2, 1, w]
                         )
                     scale = row_scale(stat[1])
@@ -184,10 +183,7 @@ def _softmax_streaming_kernel(M, N, op_kind, dtype, out_dtype, ctas, ctas_per_sm
     return _func
 
 
-# Single-tile kernel (N fits in shared memory) -- original fast path
-
-
-def _held_row(M: int, N: int, dtype: str, out_dtype: str, threads: int, vec: int):
+def _held_row(M: int, N: int, dtype: str, out_dtype: str, threads: int, vec: int, keep: bool):
     """Softmax of one row a block, each thread holding ``N / threads`` elements in registers.
 
     Thread ``t`` holds vectors ``k * threads + t``. Max and sum fold across a warp with
@@ -209,18 +205,17 @@ def _held_row(M: int, N: int, dtype: str, out_dtype: str, threads: int, vec: int
             warp_sum = T.alloc_shared((num_warps,), "float32")
 
             for k in T.unroll(steps):
-                load16(held, k * vec, x, (row, (k * threads + tx) * vec))
+                if keep:
+                    load16_evict_last(held, k * vec, x, (row, (k * threads + tx) * vec))
+                else:
+                    load16(held, k * vec, x, (row, (k * threads + tx) * vec))
             for i in T.unroll(held_n):
                 vals[i] = T.cast(held[i], "float32")
 
             part[0] = vals[0]
             for i in T.unroll(1, held_n):
                 part[0] = T.max(part[0], vals[i])
-            for stage in T.unroll(WARP_SHUFFLE_STAGES):
-                part[0] = T.max(
-                    part[0],
-                    T.shfl_xor(part[0], T.int32(WARP_LANES // 2) >> stage, width=WARP_LANES),
-                )
+            warp_reduce(part, T.max, high_first=True)
             if tx % WARP_LANES == 0:
                 warp_max[tx // WARP_LANES] = part[0]
             T.sync_threads()
@@ -228,14 +223,11 @@ def _held_row(M: int, N: int, dtype: str, out_dtype: str, threads: int, vec: int
                 part[0] = T.max(part[0], warp_max[w])
 
             for i in T.unroll(held_n):
-                vals[i] = exp_shifted(vals[i], part[0])
+                vals[i] = exp_shifted_scaled(vals[i], part[0])
             part[0] = vals[0]
             for i in T.unroll(1, held_n):
                 part[0] = part[0] + vals[i]
-            for stage in T.unroll(WARP_SHUFFLE_STAGES):
-                part[0] = part[0] + T.shfl_xor(
-                    part[0], T.int32(WARP_LANES // 2) >> stage, width=WARP_LANES
-                )
+            warp_reduce(part, operator.add, high_first=True)
             if tx % WARP_LANES == 0:
                 warp_sum[tx // WARP_LANES] = part[0]
             T.sync_threads()
@@ -243,7 +235,8 @@ def _held_row(M: int, N: int, dtype: str, out_dtype: str, threads: int, vec: int
             for w in T.unroll(1, num_warps):
                 part[0] = part[0] + warp_sum[w]
 
-            part[0] = 1.0 / part[0]
+            # The reciprocal cancels the terms' scale.
+            part[0] = T.call_extern("float32", "tileops::approx_rcp", part[0])
             for i in T.unroll(held_n):
                 out[i] = T.cast(vals[i] * part[0], out_dtype)
             for k in T.unroll(steps):
@@ -254,12 +247,12 @@ def _held_row(M: int, N: int, dtype: str, out_dtype: str, threads: int, vec: int
 
 
 @target_cache(maxsize=64)
-def _softmax_kernel_single(M: int, N: int, op_kind: str, dtype: str, out_dtype: str):
+def _softmax_kernel_single(M: int, N: int, op_kind: str, dtype: str, out_dtype: str, keep: bool):
     """Build a single-tile softmax/log_softmax kernel (N fits in smem).
 
     Accepts an ``(M, N)`` input tensor. A softmax row of whole thread-wide vectors, one a
     block, runs ``_held_row``. Otherwise, when ``N`` is not a multiple of
-    ``DEFAULT_ALIGNMENT``, the kernel uses element-wise ``T.if_then_else``
+    ``ALIGNMENT``, the kernel uses element-wise ``T.if_then_else``
     loads that substitute ``-inf`` for out-of-bounds columns (kernel-side
     boundary handling), and when ``N`` is already aligned, the fast ``T.copy``
     path is used.
@@ -272,15 +265,13 @@ def _softmax_kernel_single(M: int, N: int, op_kind: str, dtype: str, out_dtype: 
     a second fragment of row width, which is what pushes a thread's slice into local
     memory.
     """
-    N_padded = align_up(N, DEFAULT_ALIGNMENT)
+    N_padded = align_up(N, ALIGNMENT)
     _needs_pad = N_padded != N
-    # Compile-time Python constant used for padding; it is still cast to
-    # the kernel dtype where needed inside the generated kernel.
     _neg_inf = float("-inf")
     _stages_row = op_kind == "log_softmax"
     vec = VECTOR_ACCESS_BYTES // (DataType(dtype).bits // 8)
 
-    @tilelang.jit(out_idx=[1], compile_flags=csrc_include("streaming_load.h"))
+    @tilelang.jit(out_idx=[1], compile_flags=csrc_include("streaming_load.h", "approx_math.h"))
     def _func(block_m, threads):
         # Whole thread-wide vectors use register storage and warp reductions.
         # Wider rows retain the tile to keep three held buffers within the register budget.
@@ -290,7 +281,7 @@ def _softmax_kernel_single(M: int, N: int, op_kind: str, dtype: str, out_dtype: 
             and N % (threads * vec) == 0
             and N // threads <= FRAGMENT_ELEMS_PER_THREAD
         ):
-            return _held_row(M, N, dtype, out_dtype, threads, vec)
+            return _held_row(M, N, dtype, out_dtype, threads, vec, keep)
 
         @T.prim_func
         def main(
@@ -379,7 +370,7 @@ def _softmax_split_finalize_kernel(
     in every lane, and a divide or a log left inside the element loop is paid
     once per element.
     """
-    num_segs = ceildiv_int(N, seg_n)
+    num_segs = ceil_div(N, seg_n)
     fold = make_block_split_fold(num_segs, threads)
 
     @tilelang.jit(out_idx=[3])
@@ -446,7 +437,7 @@ def _softmax_fused_split_kernel(
     nothing; an all--inf row still reads NaN for softmax and log_softmax, as
     torch does.
     """
-    num_segs = ceildiv_int(N, seg_n)
+    num_segs = ceil_div(N, seg_n)
     fold = make_block_split_fold(num_segs, threads)
 
     @tilelang.jit(out_idx=[3])
@@ -526,6 +517,11 @@ class _SoftmaxKernelBase(Kernel, SoftmaxFwdInterface):
 
     supported_archs: list[int] = [80, 86, 89, 90]
 
+    def __init__(self, call: SoftmaxCall):
+        super().__init__(device_index=call.device_index)
+        self.call = call
+        self.dtype = call.dtype
+
     def _rows(self, x: torch.Tensor) -> torch.Tensor:
         """The rows of *x* along ``call.axis``."""
         return rows_for_axes(x, (self.call.axis,))
@@ -549,7 +545,7 @@ class _SoftmaxKernelBase(Kernel, SoftmaxFwdInterface):
         reductions across threads, one fp32 for each of its default threads; where the two
         pass the budget, the rows are planned against the budget less that scratch.
         """
-        n_padded = align_up(call.n, DEFAULT_ALIGNMENT)
+        n_padded = align_up(call.n, ALIGNMENT)
         elem_bytes = call.dtype.itemsize
         num_buffers = cls.num_buffers(call)
         block_m, tile_n = cls._plan_rows(n_padded, elem_bytes, call.smem_budget, num_buffers)
@@ -580,7 +576,7 @@ class _SoftmaxKernelBase(Kernel, SoftmaxFwdInterface):
         if is_maca():
             return None
         seg_n = cls.split_seg_n(call)
-        if ceildiv_int(call.n, seg_n) * call.m > SPLIT_BLOCKS_PER_SM * call.sm_count:
+        if ceil_div(call.n, seg_n) * call.m > SPLIT_BLOCKS_PER_SM * call.sm_count:
             return None
         threads = WARP_LANES
         while threads <= DEFAULT_THREADS:
@@ -613,10 +609,40 @@ class _SoftmaxKernelBase(Kernel, SoftmaxFwdInterface):
                 continue
             if best_tile_n == 0:
                 continue
-            if tn == 0 or ceildiv_int(n_padded, tn) < ceildiv_int(n_padded, best_tile_n):
+            if tn == 0 or ceil_div(n_padded, tn) < ceil_div(n_padded, best_tile_n):
                 best_bm = bm
                 best_tile_n = tn
         return best_bm, best_tile_n
+
+
+class _PlannedSoftmaxKernel(_SoftmaxKernelBase):
+    """A softmax program built whole from its call: nothing to tune.
+
+    The rows are viewed as ``(m * cluster, n // cluster)``, one program row a CTA;
+    ``cluster`` is 1 where a row is not split.
+    """
+
+    cluster = 1
+
+    @property
+    def default_config(self) -> dict:
+        return {}
+
+    @property
+    def autotune_configs(self) -> list[dict]:
+        return [self.default_config]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalize ``call.axis`` of the contiguous input *x*."""
+        rows = self._rows(x)
+        m = rows.shape[0]
+        chunk = self.call.n // self.cluster
+        y = self.program(self._compile)(rows.reshape(m * self.cluster, chunk))
+        return restore_same_shape(y.reshape(m, self.call.n), self.call.shape, (self.call.axis,))
+
+    def _compile(self, cfg: dict):
+        """The program."""
+        return self.kernel()
 
 
 class SoftmaxSplitKernel(_SoftmaxKernelBase):
@@ -636,9 +662,7 @@ class SoftmaxSplitKernel(_SoftmaxKernelBase):
         return super().refusal(call)
 
     def __init__(self, call: SoftmaxCall):
-        super().__init__(device_index=call.device.index)
-        self.call = call
-        self.dtype = call.dtype
+        super().__init__(call)
         self.program(self._launcher)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -651,7 +675,7 @@ class SoftmaxSplitKernel(_SoftmaxKernelBase):
         partials and the finalize."""
         call = self.call
         seg_n = self.split_seg_n(call)
-        num_segs = ceildiv_int(call.n, seg_n)
+        num_segs = ceil_div(call.n, seg_n)
         out_dtype = self.dtype_to_str(call.out_dtype)
         fused_threads = self.fused_split_threads(call)
         if fused_threads is not None:
@@ -705,9 +729,7 @@ class SoftmaxStreamingKernel(_SoftmaxKernelBase):
         return super().refusal(call)
 
     def __init__(self, call: SoftmaxCall):
-        super().__init__(device_index=call.device.index)
-        self.call = call
-        self.dtype = call.dtype
+        super().__init__(call)
         ctas_per_sm = 1024 // self.default_config["threads"]
         self.kernel = _softmax_streaming_kernel(
             call.m,
@@ -767,13 +789,11 @@ class SoftmaxKernel(RowTiledAutotuneMixin, _SoftmaxKernelBase):
         return super().refusal(call)
 
     def __init__(self, call: SoftmaxCall):
-        super().__init__(device_index=call.device.index)
-        self.call = call
+        super().__init__(call)
         self.M = call.m
         self.N = call.n
-        self.dtype = call.dtype
         self.out_dtype_str = self.dtype_to_str(call.out_dtype)
-        self.N_padded = align_up(self.N, DEFAULT_ALIGNMENT)
+        self.N_padded = align_up(self.N, ALIGNMENT)
         self._elem_bytes = call.dtype.itemsize
         self._smem_budget = call.smem_budget
         self._planner = BlockConfigPlanner(
@@ -790,7 +810,12 @@ class SoftmaxKernel(RowTiledAutotuneMixin, _SoftmaxKernelBase):
     def _build_row_kernel(self, tile_n: int):
         # ``refusal`` admits one-tile rows only, so every candidate's tile_n is 0.
         return _softmax_kernel_single(
-            self.M, self.N, self.call.op_kind, self.dtype_str, self.out_dtype_str
+            self.M,
+            self.N,
+            self.call.op_kind,
+            self.dtype_str,
+            self.out_dtype_str,
+            keeps_input_rows(self.call),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

@@ -16,9 +16,6 @@ class MLADecodeFixture(FixtureBase):
         (
             "batch, heads, heads_kv, seq_len_kv, dim, dim_pe, dtype, tune",
             [
-                pytest.param(
-                    32, 128, 1, 8192, 512, 64, torch.float16, False, marks=pytest.mark.smoke
-                ),
                 # The KV gather walks dim in 128-column steps; D = 128 takes one.
                 pytest.param(
                     2,
@@ -42,8 +39,11 @@ class MLADecodeFixture(FixtureBase):
                     64,
                     torch.float16,
                     False,
-                    marks=pytest.mark.smoke,
+                    marks=pytest.mark.full,
                     id="tail-heads",
+                ),
+                pytest.param(
+                    32, 128, 1, 8192, 512, 64, torch.float16, False, marks=pytest.mark.full
                 ),
                 pytest.param(
                     1,
@@ -80,16 +80,15 @@ def test_mla_decode(
     test.check(op, *test.gen_inputs())
 
 
-@pytest.mark.smoke
 @pytest.mark.parametrize(
     "seq_len_kv",
     [
-        # The cache ends inside a tile.
-        pytest.param(300, id="ragged-tail"),
         # One key: the first tile holds it, and every later key position is masked.
-        pytest.param(1, id="empty-split"),
+        pytest.param(1, marks=pytest.mark.smoke, id="empty-split"),
         # No keys at all: the output is the empty sum.
-        pytest.param(0, id="no-keys"),
+        pytest.param(0, marks=pytest.mark.smoke, id="no-keys"),
+        # The cache ends inside a tile.
+        pytest.param(300, marks=pytest.mark.full, id="ragged-tail"),
     ],
 )
 def test_mla_decode_masks_keys_past_the_cache_end(seq_len_kv: int) -> None:
@@ -100,19 +99,18 @@ def test_mla_decode_masks_keys_past_the_cache_end(seq_len_kv: int) -> None:
 
 
 @pytest.mark.in_tree_kernels
-@pytest.mark.smoke
 @pytest.mark.sm90
 @pytest.mark.parametrize(
     "batch, heads, seq_len_kv, dtype, splits",
     [
         # Two requests of two head blocks leave the SMs mostly idle: runs of two tiles.
-        pytest.param(2, 128, 1000, torch.float16, 8, id="split"),
-        # Nine tiles in four runs of three: the last run starts past the cache end.
-        pytest.param(2, 128, 520, torch.float16, 4, id="empty-run"),
+        pytest.param(2, 128, 1000, torch.float16, 8, marks=pytest.mark.smoke, id="split"),
         # One head block a request, which no other block shares tiles with: no L2 prefetch.
-        pytest.param(2, 64, 1000, torch.bfloat16, 8, id="one-head-block"),
+        pytest.param(2, 64, 1000, torch.bfloat16, 8, marks=pytest.mark.smoke, id="one-head-block"),
+        # Nine tiles in four runs of three: the last run starts past the cache end.
+        pytest.param(2, 128, 520, torch.float16, 4, marks=pytest.mark.full, id="empty-run"),
         # 68 blocks fill a wave: one run a request.
-        pytest.param(34, 128, 130, torch.bfloat16, 1, id="whole"),
+        pytest.param(34, 128, 130, torch.bfloat16, 1, marks=pytest.mark.full, id="whole"),
     ],
 )
 def test_mla_decode_takes_the_seesaw_on_sm90(batch, heads, seq_len_kv, dtype, splits) -> None:

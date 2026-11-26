@@ -1,13 +1,13 @@
-"""Paged decode attention for any head grouping, MHA included.
+"""Paged decode attention programs for any head grouping.
 
 One CTA owns ``block_M`` query rows of one KV head. Row ``r`` of a request is
 query position ``r // group`` of head ``r % group`` within the heads sharing
 that KV head. MHA is the ``group == 1`` case; a one-token GQA decode is the
-``seqlen_q == 1`` case.
+``seqlen_q == 1`` case. ``MHADecodePagedKernel`` serves MHA paged decode; the
+batch-1 GQA paged kernel builds on this module's programs.
 """
 
 import itertools
-from typing import Optional
 
 import tilelang
 import tilelang.language as T
@@ -23,12 +23,11 @@ from tileops._kernels.attention.online_softmax import (
     make_online_softmax_with_mask_guard,
     make_rescale,
 )
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.constants import LOG2E
 from tileops._kernels.kernel_base import Entry, Kernel
-from tileops._utils import get_shared_memory_optin, get_sm_count, get_sm_version
 
-__all__ = ["GQADecodePagedKernel"]
+__all__ = ["MHADecodePagedKernel"]
 
 
 def gqa_decode_paged_block_ns(page_size: int) -> tuple[int, ...]:
@@ -132,9 +131,10 @@ def _shared_bytes(config: dict, dim: int, element: int, arch: int) -> int:
 
 
 def _make_tile_steps(
-    block_M, block_N, dim, dtype, page_size, group, seqlen_q, is_causal, sm_scale, softcap
-):
-    """The macros both variants share: the Q gather and the key tile updates.
+    block_M, block_N, num_stages, dim, dtype, page_size, group, seqlen_q, is_causal, sm_scale,
+    softcap,
+):  # fmt: skip
+    """The macros both variants share: the Q gather and the key scan.
 
     Full tiles run pipelined at ``block_N`` rows. The tile crossing the cache end runs
     first, unpipelined, in ``_tail_block_n`` rows through buffers of its own, and loads
@@ -146,6 +146,7 @@ def _make_tile_steps(
     make_softmax = make_online_softmax_with_mask_guard if is_causal else make_online_softmax
     rescale = make_rescale(block_M, dim)
     rows = seqlen_q * group
+    tail_n = _tail_block_n(block_N)
 
     @T.macro
     def load_q(Q, Q_shared, bid, kv_head, row0):
@@ -232,8 +233,33 @@ def _make_tile_steps(
         return T.max(0, T.min(kv_len, kv_len - seqlen_q + last_pos + 1))
 
     full_tile = make_tile_step(block_N, False)
-    tail_tile = make_tile_step(_tail_block_n(block_N), True)
-    return load_q, full_tile, tail_tile, visible_end
+    tail_tile = make_tile_step(tail_n, True)
+
+    @T.macro
+    def scan_keys(
+        K, V, block_table, Q_shared, K_shared, V_shared, acc_s, acc_s_cast, K_tail, V_tail,
+        acc_tail, acc_tail_cast, acc_o, scores_max, scores_max_prev, scores_scale, scores_sum,
+        logsum, bid, kv_head, row0, kv_len, offset, loop_range,
+    ):  # fmt: skip
+        """Fold the *loop_range* key tiles from tile *offset* into the block's output and
+        softmax statistics. The tile crossing the cache end, if the block reaches it, runs
+        first."""
+        stats = (acc_o, scores_max, scores_max_prev, scores_scale, scores_sum, logsum)
+        full_range = T.max(0, T.min(loop_range, kv_len // block_N - offset))
+        tail_start = (offset + full_range) * block_N
+        tail_end = T.min(visible_end(row0, kv_len), (offset + loop_range) * block_N)
+        for t in T.serial(T.max(0, T.ceildiv(tail_end - tail_start, tail_n))):
+            tail_tile(
+                K, V, block_table, Q_shared, K_tail, V_tail, acc_tail, acc_tail_cast, *stats,
+                bid, kv_head, row0, tail_start // tail_n + t, kv_len,
+            )  # fmt: skip
+        for k in T.Pipelined(full_range, num_stages=num_stages):
+            full_tile(
+                K, V, block_table, Q_shared, K_shared, V_shared, acc_s, acc_s_cast, *stats,
+                bid, kv_head, row0, k + offset, kv_len,
+            )  # fmt: skip
+
+    return load_q, scan_keys, visible_end
 
 
 @target_cache(maxsize=32)
@@ -260,16 +286,17 @@ def gqa_decode_no_split_paged_kernel(
         pass_configs={
             tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
         },
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
     )
     def _func(block_M, block_N, num_stages, threads):
         shape_q = [batch, seqlen_q, heads, dim]
         shape_kv = [seqlen_kv, heads_kv, dim]
         tail_n = _tail_block_n(block_N)
         alloc_weights = _weights_alloc(threads)
-        load_q, full_tile, tail_tile, visible_end = _make_tile_steps(
-            block_M, block_N, dim, dtype, page_size, group, seqlen_q, is_causal, sm_scale, softcap
-        )
+        load_q, scan_keys, visible_end = _make_tile_steps(
+            block_M, block_N, num_stages, dim, dtype, page_size, group, seqlen_q, is_causal,
+            sm_scale, softcap,
+        )  # fmt: skip
 
         @T.prim_func
         def gqa_decode_no_split(
@@ -310,54 +337,11 @@ def gqa_decode_no_split_paged_kernel(
                 T.fill(scores_max, -T.infinity(accum_dtype))
 
                 loop_range = T.ceildiv(visible_end(row0, kv_len), block_N)
-                # The tile crossing the cache end, if this block reaches it, runs first.
-                full_range = T.min(loop_range, kv_len // block_N)
-                tail_start = full_range * block_N
-                tail_end = T.min(visible_end(row0, kv_len), loop_range * block_N)
-                for t in T.serial(T.max(0, T.ceildiv(tail_end - tail_start, tail_n))):
-                    tail_tile(
-                        K,
-                        V,
-                        block_table,
-                        Q_shared,
-                        K_tail,
-                        V_tail,
-                        acc_tail,
-                        acc_tail_cast,
-                        acc_o,
-                        scores_max,
-                        scores_max_prev,
-                        scores_scale,
-                        scores_sum,
-                        logsum,
-                        bz,
-                        by,
-                        row0,
-                        tail_start // tail_n + t,
-                        kv_len,
-                    )
-                for k in T.Pipelined(full_range, num_stages=num_stages):
-                    full_tile(
-                        K,
-                        V,
-                        block_table,
-                        Q_shared,
-                        K_shared,
-                        V_shared,
-                        acc_s,
-                        acc_s_cast,
-                        acc_o,
-                        scores_max,
-                        scores_max_prev,
-                        scores_scale,
-                        scores_sum,
-                        logsum,
-                        bz,
-                        by,
-                        row0,
-                        k,
-                        kv_len,
-                    )
+                scan_keys(
+                    K, V, block_table, Q_shared, K_shared, V_shared, acc_s, acc_s_cast, K_tail,
+                    V_tail, acc_tail, acc_tail_cast, acc_o, scores_max, scores_max_prev,
+                    scores_scale, scores_sum, logsum, bz, by, row0, kv_len, 0, loop_range,
+                )  # fmt: skip
                 for i, d in T.Parallel(block_M, dim):
                     if row0 + i < rows:
                         Output[bz, (row0 + i) // group, by * group + (row0 + i) % group, d] = (
@@ -394,7 +378,7 @@ def _gqa_decode_split_paged_kernel(
         pass_configs={
             tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
         },
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
     )
     def _func(block_M, block_N, num_split, num_stages, threads):
         shape_q = [batch, seqlen_q, heads, dim]
@@ -403,9 +387,10 @@ def _gqa_decode_split_paged_kernel(
         part_shape = [batch, heads_kv, num_split, rows, dim]
         tail_n = _tail_block_n(block_N)
         alloc_weights = _weights_alloc(threads)
-        load_q, full_tile, tail_tile, visible_end = _make_tile_steps(
-            block_M, block_N, dim, dtype, page_size, group, seqlen_q, is_causal, sm_scale, softcap
-        )
+        load_q, scan_keys, visible_end = _make_tile_steps(
+            block_M, block_N, num_stages, dim, dtype, page_size, group, seqlen_q, is_causal,
+            sm_scale, softcap,
+        )  # fmt: skip
         # The table's capacity splits into equal runs of whole key tiles, the last split
         # taking the remainder.
         capacity_tiles = max_pages_per_req * page_size // block_N
@@ -461,54 +446,11 @@ def _gqa_decode_split_paged_kernel(
                     0,
                     T.min(blocks_in_split, T.ceildiv(visible_end(row0, kv_len), block_N) - offset),
                 )
-                # The tile crossing the cache end, if this block reaches it, runs first.
-                full_range = T.max(0, T.min(loop_range, kv_len // block_N - offset))
-                tail_start = (offset + full_range) * block_N
-                tail_end = T.min(visible_end(row0, kv_len), (offset + loop_range) * block_N)
-                for t in T.serial(T.max(0, T.ceildiv(tail_end - tail_start, tail_n))):
-                    tail_tile(
-                        K,
-                        V,
-                        block_table,
-                        Q_shared,
-                        K_tail,
-                        V_tail,
-                        acc_tail,
-                        acc_tail_cast,
-                        acc_o,
-                        scores_max,
-                        scores_max_prev,
-                        scores_scale,
-                        scores_sum,
-                        logsum,
-                        bid,
-                        kv_head,
-                        row0,
-                        tail_start // tail_n + t,
-                        kv_len,
-                    )
-                for k in T.Pipelined(full_range, num_stages=num_stages):
-                    full_tile(
-                        K,
-                        V,
-                        block_table,
-                        Q_shared,
-                        K_shared,
-                        V_shared,
-                        acc_s,
-                        acc_s_cast,
-                        acc_o,
-                        scores_max,
-                        scores_max_prev,
-                        scores_scale,
-                        scores_sum,
-                        logsum,
-                        bid,
-                        kv_head,
-                        row0,
-                        k + offset,
-                        kv_len,
-                    )
+                scan_keys(
+                    K, V, block_table, Q_shared, K_shared, V_shared, acc_s, acc_s_cast, K_tail,
+                    V_tail, acc_tail, acc_tail_cast, acc_o, scores_max, scores_max_prev,
+                    scores_scale, scores_sum, logsum, bid, kv_head, row0, kv_len, offset, loop_range,
+                )  # fmt: skip
                 for i, d in T.Parallel(block_M, dim):
                     acc_o[i, d] = T.if_then_else(logsum[i] == 0, 0, acc_o[i, d] / logsum[i])
                 for i in T.Parallel(block_M):
@@ -584,15 +526,18 @@ def _gqa_decode_split_paged_kernel(
     return _func
 
 
-class GQADecodePagedKernel(Kernel, MHAPagedDecodeFwdInterface):
-    """Paged decode for any head grouping and one query length shared by every request."""
+class MHADecodePagedKernel(Kernel, MHAPagedDecodeFwdInterface):
+    """MHA paged decode for one query length shared by every request.
+
+    Only ``MHAPagedFwdOp`` registers it, so every call it serves has one query head a KV head.
+    """
 
     supported_archs: list[int] = [80, 89, 90]
     # The implementation behind the specialised ones for this key.
     general: bool = True
 
     @classmethod
-    def refusal(cls, call: AttentionCall) -> Optional[str]:
+    def refusal(cls, call: AttentionCall) -> str | None:
         """Why *call* is outside the decode region, its page size, or a head dim whose
         narrowest tiles overflow the device's shared memory."""
         reason = call.paged_decode_refusal or call.tensor_core_dim_refusal
@@ -616,7 +561,7 @@ class GQADecodePagedKernel(Kernel, MHAPagedDecodeFwdInterface):
         """A one-token causal query sees the whole cache, so it builds the non-causal
         kernel. The device index is in the identity: the kernel is compiled for its
         architecture."""
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         args = (
             call.batch,
             call.heads,
@@ -645,10 +590,10 @@ class GQADecodePagedKernel(Kernel, MHAPagedDecodeFwdInterface):
         max_pages_per_req,
         is_causal,
         dtype="float16",
-        sm_scale: Optional[float] = None,
+        sm_scale: float | None = None,
         softcap: float = 0.0,
-        config: Optional[dict] = None,
-        device_index: Optional[int] = None,
+        config: dict | None = None,
+        device_index: int | None = None,
     ):
         super().__init__(device_index=device_index)
         if heads_kv <= 0 or heads % heads_kv != 0:
@@ -735,13 +680,13 @@ class GQADecodePagedKernel(Kernel, MHAPagedDecodeFwdInterface):
         candidates = _default_configs(
             self._supported_block_ns, self._block_M_choices()[-1], self.dim
         )
-        cap = get_shared_memory_optin(self.device_index)
+        cap = self.build_target.smem_budget
         for config in candidates:
             if self._shared_bytes(config) <= cap:
                 # Splitting the keys pays until the grid fills the device once; a further
                 # split only shortens every block's loop and adds partials to combine.
                 blocks = -(-self.rows // config["block_M"]) * self.heads_kv * self.batch
-                sm_count = get_sm_count(self.device_index)
+                sm_count = self.build_target.sm_count
                 num_split = config["num_split"]
                 while num_split > 1 and blocks * num_split > sm_count:
                     num_split //= 2
@@ -753,11 +698,11 @@ class GQADecodePagedKernel(Kernel, MHAPagedDecodeFwdInterface):
 
     def _shared_bytes(self, config: dict) -> int:
         element = getattr(torch, self.dtype_str).itemsize
-        return _shared_bytes(config, self.dim, element, get_sm_version(self.device_index))
+        return _shared_bytes(config, self.dim, element, self.build_target.arch)
 
     def tuning_candidates(self, configs, untuned=None) -> list[dict]:
         candidates = super().tuning_candidates(configs, untuned)
-        budget = get_shared_memory_optin(self.device_index)
+        budget = self.build_target.smem_budget
         return [c for c in candidates if self._shared_bytes(c) <= budget]
 
     @property

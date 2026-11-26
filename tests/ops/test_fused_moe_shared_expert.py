@@ -1,23 +1,14 @@
-"""Tests for FusedMoESharedExpertFwdOp — FusedMoE with shared expert support.
-
-Verifies:
-  - FusedMoESharedExpertFwdOp returns (shared_output, routed_output) tuple
-  - shared_output matches SharedExpertMLPKernel reference
-  - routed_output matches FusedMoE output
-  - Without the shared weights, shared_output is None
-  - The gpt-oss swigluoai activation is refused
-  - TP sharding: partial outputs sum to float32 math reference
-  - DeepSeek-V3 grouped routing on the routed half, scaled once
-"""
+"""Tests for FusedMoESharedExpertFwdOp, FusedMoE with a shared expert."""
 
 import pytest
 import torch
 
 from tests.workload_test_base import TestBase
+from tileops._kernels.gemm.call_spec import GEMMCall
+from tileops._kernels.gemm.dense import GEMMTMAKernel
 from tileops._kernels.moe import SharedExpertMLPKernel
 from tileops._ops.moe import FusedMoESharedExpertFwdOp, SharedExpertMLPFwdOp
 from tileops._ops.moe.fused_moe import FusedMoEFwdOp
-from tileops._utils import get_sm_version
 from tileops.backend import _registry as registry
 from tileops.backend._registry import register_kernel_type
 from workloads.device import run_device
@@ -41,32 +32,32 @@ def test_the_shared_expert_matches_its_reference(dtype):
     TestBase.check(workload, SharedExpertMLPFwdOp(), *inputs)
 
 
+@pytest.mark.sm90
 @pytest.mark.in_tree_kernels
-@pytest.mark.smoke
 @pytest.mark.parametrize(
     "tokens, hidden, ffn, dtype",
     [
         # Fused gate/up on 192-wide tiles; the down GEMM on 224-wide tiles staged in halves.
-        pytest.param(1024, 256, 512, "bfloat16", id="fused-gate-up"),
-        # Separate gate/up on 256-wide tiles.
-        pytest.param(4096, 256, 512, "bfloat16", id="separate"),
+        pytest.param(1024, 256, 512, "bfloat16", marks=pytest.mark.smoke, id="fused-gate-up"),
         # Fused gate/up on 192-wide tiles over three waves, the last row and column tiles
         # ragged.
-        pytest.param(600, 256, 7384, "float16", id="fused-waves-ragged"),
+        pytest.param(600, 256, 7384, "float16", marks=pytest.mark.smoke, id="fused-waves-ragged"),
+        # Separate gate/up on 256-wide tiles.
+        pytest.param(4096, 256, 512, "bfloat16", marks=pytest.mark.full, id="separate"),
         # Separate gate/up over more than one wave.
-        pytest.param(4096, 256, 2048, "bfloat16", id="separate-two-waves"),
+        pytest.param(4096, 256, 2048, "bfloat16", marks=pytest.mark.full, id="separate-two-waves"),
         # An expert narrower than the model: only the gate/up GEMM, fused on 224-wide tiles,
         # on the template.
-        pytest.param(512, 512, 256, "float16", id="narrow-expert"),
+        pytest.param(512, 512, 256, "float16", marks=pytest.mark.full, id="narrow-expert"),
         # An expert width the fused epilogue cannot store keeps the separate activation.
-        pytest.param(512, 1024, 1020, "bfloat16", id="narrow-expert-unfusable"),
+        pytest.param(
+            512, 1024, 1020, "bfloat16", marks=pytest.mark.full, id="narrow-expert-unfusable"
+        ),
     ],
 )
 def test_the_shared_expert_runs_the_dense_template_past_its_threshold(tokens, hidden, ffn, dtype):
     """A shared expert past ``template_min_m`` runs its gate/up GEMM, and its down GEMM when
     the expert is at least as wide as the model, on the SM90 dense template."""
-    if get_sm_version(torch.device(run_device()).index) != 90:
-        pytest.skip("the dense template serves SM90")
     workload = SharedExpertMLPWorkload(
         manifest_call("SharedExpertMLPFwdOp", {"D": dtype}, T=tokens, H=hidden, S=ffn)
     )
@@ -74,13 +65,12 @@ def test_the_shared_expert_runs_the_dense_template_past_its_threshold(tokens, hi
     TestBase.check(workload, op, *workload.gen_inputs())
 
 
+@pytest.mark.sm90
 @pytest.mark.in_tree_kernels
 @pytest.mark.smoke
 def test_a_published_threshold_decomposes_the_next_call_again():
     """``template_min_m`` decides which GEMMs the expert runs, so publishing it decomposes the
     next call from the new value."""
-    if get_sm_version(torch.device(run_device()).index) != 90:
-        pytest.skip("the dense template serves SM90")
     workload = SharedExpertMLPWorkload(
         manifest_call("SharedExpertMLPFwdOp", {"D": "bfloat16"}, T=1024, H=256, S=512)
     )
@@ -95,12 +85,49 @@ def test_a_published_threshold_decomposes_the_next_call_again():
     assert [type(k) for k in decomposed[0][:2]] != [type(k) for k in templated[:2]]
 
 
-@pytest.mark.smoke
+@pytest.mark.sm90
+@pytest.mark.in_tree_kernels
+@pytest.mark.parametrize(
+    "tokens, hidden, ffn",
+    [
+        # The selector serves the down GEMM with the stream tile.
+        pytest.param(70, 8456, 1048, marks=pytest.mark.smoke, id="stream"),
+        # The selector serves the down GEMM with a two-tile fill cluster, which a 128-row
+        # tile cannot launch.
+        pytest.param(100, 2048, 1024, marks=pytest.mark.full, id="fill-cluster"),
+    ],
+)
+def test_a_published_tile_runs_as_the_basic_gemm_it_states(tokens, hidden, ffn):
+    """A published GEMM tile naming no structure runs each dense GEMM as that basic tile, also
+    one the selector serves with a config outside the basic schema on a 132-SM H200."""
+    workload = SharedExpertMLPWorkload(
+        manifest_call("SharedExpertMLPFwdOp", {"D": "bfloat16"}, T=tokens, H=hidden, S=ffn)
+    )
+    op = SharedExpertMLPFwdOp()
+    inputs = workload.gen_inputs()
+    TestBase.check(workload, op, *inputs)
+    (kernel,) = op.iter_kernels()
+    (selected,) = [p for p in kernel._generation.programs.values() if isinstance(p, tuple)]
+    call = GEMMCall(
+        m=tokens, n=hidden, k=ffn, dtype=torch.bfloat16, trans_b=True, device=run_device()
+    )
+    basic_keys = GEMMTMAKernel._MODAL_CONFIG.keys()
+    if call.calibration == "h200" and call.sm_count == 132:
+        assert selected[1].config.keys() != basic_keys
+    tile = {"block_m": 128, "block_n": 64, "block_k": 64, "num_stages": 4}
+    kernel.config = {**kernel.config, **tile}
+    TestBase.check(workload, op, *inputs)
+    (published,) = [p for p in kernel._generation.programs.values() if isinstance(p, tuple)]
+    for gemm in published[:2]:
+        assert gemm.config.keys() == basic_keys
+        assert {key: gemm.config[key] for key in tile} == tile
+
+
 @pytest.mark.parametrize(
     "hidden, ffn",
     [
-        pytest.param(2048, 1408, id="fused-gate-up"),
-        pytest.param(1024, 6144, id="down"),
+        pytest.param(2048, 1408, marks=pytest.mark.smoke, id="fused-gate-up"),
+        pytest.param(1024, 6144, marks=pytest.mark.full, id="down"),
     ],
 )
 def test_the_shared_expert_splits_k_at_32_tokens(hidden, ffn):
@@ -113,8 +140,10 @@ def test_the_shared_expert_splits_k_at_32_tokens(hidden, ffn):
 
 
 @pytest.mark.in_tree_kernels
-@pytest.mark.smoke
-@pytest.mark.parametrize("num_tokens", [32, 512])
+@pytest.mark.parametrize(
+    "num_tokens",
+    [pytest.param(32, marks=pytest.mark.smoke), pytest.param(512, marks=pytest.mark.full)],
+)
 def test_fused_moe_shared_expert_basic(num_tokens):
     """FusedMoESharedExpertFwdOp with shared expert kernel."""
     torch.manual_seed(42)
@@ -194,12 +223,28 @@ def test_fused_moe_shared_expert_refuses_swigluoai():
 
 
 @pytest.mark.smoke
-def test_fused_moe_shared_expert_tp():
-    """TP sharding: sum of partial outputs matches float32 math reference.
+def test_the_shared_expert_refuses_a_non_silu_activation():
+    """The shared-expert kernel applies silu_and_mul; with gelu routed experts the two halves
+    would disagree, so a call passing the shared weights is refused."""
+    T, E, H, F, S = 4, 4, 128, 128, 128
+    op = FusedMoESharedExpertFwdOp(2, activation="gelu_and_mul")
+    args = (
+        torch.randn(T, H, dtype=torch.bfloat16, device=run_device()),
+        torch.randn(T, E, device=run_device()),
+        torch.randn(E, 2 * F, H, dtype=torch.bfloat16, device=run_device()),
+        torch.randn(E, H, F, dtype=torch.bfloat16, device=run_device()),
+        None,
+        torch.randn(2 * S, H, dtype=torch.bfloat16, device=run_device()),
+        torch.randn(H, S, dtype=torch.bfloat16, device=run_device()),
+    )
+    with pytest.raises(ValueError, match="silu_and_mul"):
+        op(*args)
 
-    Uses float32 dtype to eliminate bf16 rounding differences between
-    TP-sharded and single-GPU computation paths.
-    """
+
+@pytest.mark.smoke
+def test_fused_moe_shared_expert_tp():
+    """TP sharding: the float32 sum of the ranks' partial outputs matches the per-shard
+    reference."""
     torch.manual_seed(42)
     T, E, K, H, F, F_s = 32, 8, 2, 64, 32, 16
     tp_size = 2
@@ -213,8 +258,7 @@ def test_fused_moe_shared_expert_tp():
     shared_w_gate_up = torch.randn(F_s * 2, H, dtype=dtype, device=dev) * 0.02
     shared_w_down = torch.randn(H, F_s, dtype=dtype, device=dev) * 0.02
 
-    # Float32 math reference: compute each TP shard's contribution manually
-    # This matches exactly what each rank's kernel computes (column-parallel on gate_up, row-parallel on down)
+    # Each rank's contribution: column-parallel on gate_up, row-parallel on down.
     shard_size = F_s // tp_size
     partial_sum_ref = torch.zeros(T, H, dtype=torch.float32, device=dev)
     for tp_rank in range(tp_size):
@@ -369,8 +413,8 @@ def test_grouped_routing_with_the_shared_expert() -> None:
         scoring_func="sigmoid",
         renormalize=True,
         routed_scaling_factor=2.5,
-        some=["correction_bias", "shared_w_gate_up"],
+        some=["correction_bias", "shared_w_gate_up", "shared_w_down"],
     )
     workload = FusedMoESharedExpertWorkload(call)
-    op = FusedMoESharedExpertFwdOp(**call.arguments({}))
+    op = FusedMoESharedExpertFwdOp(**call.arguments())
     TestBase.check(workload, op, *workload.gen_inputs())

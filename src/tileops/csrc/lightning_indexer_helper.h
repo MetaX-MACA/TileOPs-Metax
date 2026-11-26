@@ -2,60 +2,74 @@
 
 namespace tileops {
 
-// relu(x), or x + |x| = 2 relu(x) with DOUBLED.
-template <bool DOUBLED>
-__device__ __forceinline__ float relu_term(float x) {
-  return DOUBLED ? x + fabsf(x) : fmaxf(x, 0.f);
+// Half of head weight ``w``, kept to within one subnormal ulp where it is
+// subnormal: the kernel compiles with denormal flushing, which would drop the
+// half of a normal weight below 2^-125.
+__device__ __forceinline__ float indexer_half_weight(float w) {
+  float half;
+  asm("mul.rn.f32 %0, %1, 0f3F000000;" : "=f"(half) : "f"(w));
+  return half;
+}
+
+// a * b + c without flushing a subnormal operand or result.
+__device__ __forceinline__ float indexer_fma(float a, float b, float c) {
+  float d;
+  asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(d) : "f"(a), "f"(b), "f"(c));
+  return d;
 }
 
 // The epilogue of one 64-key tile of the lightning indexer over its BQ queries,
 // for thread t of the consumer warpgroup that holds the tile's m64n(HEADS * BQ)
 // WGMMA accumulator.
 //
-// Accumulator element 4 j + 2 h + b of thread t sits at key row 16 (t / 32) +
-// (t % 32) / 4
-// + 8 h and query-head column 8 j + 2 (t % 4) + b. ``wt`` holds that column's
-// head weight at 2 j + b. Each (row, query) logit is the head sum of
-// relu(score) * weight, one FMNMX and one FFMA an element. The four lanes that
-// share a row then reduce-scatter the 2 BQ sums, so lane t % 4 ends with the
-// (query q, row half h) of 2 q + h congruent to it, and stores them times the
-// key's scale. Outside its row's window a logit is -inf when CLEAN;
-// ``interior`` says the whole tile is inside every window and inside the
+// Accumulator element 4 j + 2 h + b of thread t sits at key row
+// 16 (t / 32) + (t % 32) / 4 + 8 h and query-head column 8 j + 2 (t % 4) + b.
+// ``wt`` holds half that column's head weight at 2 j + b. Each (row, query)
+// logit is the head sum of relu(score * key_scale) * weight, which is
+// |key_scale| relu(sgn score) * weight with sgn the sign of the key scale. The
+// head sums are of (score + sgn |score|) * weight / 2 = sgn relu(sgn score) *
+// weight, so the stored logit is the sum times key_scale. ``sgn0`` and ``sgn1``
+// are the signs at row halves 0 and 1, or 1 for a call that takes every key
+// scale as nonnegative; ``key_scale`` is the scale of this thread's stored row,
+// 16 (t / 32) + (t % 32) / 4 + 8 (t % 2). The four lanes that share a row
+// reduce-scatter the 2 BQ sums, so lane t % 4 ends with the (query q, row half
+// h) of 2 q + h congruent to it. Outside its row's window a logit is -inf when
+// CLEAN; ``interior`` says the whole tile is inside every window and inside the
 // tensor.
-//
-// With DOUBLED each element costs one FADD and one FFMA, both on the FMA pipe:
-// the sum is of (x + |x|) * weight, twice relu(x) * weight, halved before
-// ``key_scale_in``, the scale of this thread's stored row. The op docstring
-// states where this differs from the relu sum.
-template <int HEADS, int BQ, bool CLEAN, bool DOUBLED>
-__device__ __forceinline__ void indexer_tile_epilogue_impl(
-    const float* acc, const float* wt, const float* scale, float key_scale_in,
+template <int HEADS, int BQ, bool CLEAN>
+__device__ __forceinline__ void indexer_tile_epilogue(
+    const float* acc, const float* wt, float sgn0, float sgn1, float key_scale,
     float* logits, long long off, int s0, int k0, int seq_len, int seq_len_kv,
     const int* win, bool interior, int t) {
   constexpr int N = 2 * BQ;  // (query, row half) sums a thread holds
   static_assert(N % 4 == 0, "four lanes share a row's sums");
-  constexpr int JQ = HEADS / 8;  // column blocks of 8 a query
   const int lane4 = t % 4;
-  const int row0 = 16 * (t / 32) + (t % 32) / 4;
-  // Partial sums first, sum 2 q + h of query q at row half h.
+  const int row = 16 * (t / 32) + (t % 32) / 4 + 8 * (lane4 % 2);
+  // Sum 2 q + h of query q at row half h, two FFMAs a term; the accumulating
+  // one keeps a subnormal half weight or product along the head-sum FMA chain;
+  // the reduce-scatter adds and the product with the key scale still flush.
+  constexpr int JQ = HEADS / 8;
   float v[N];
 #pragma unroll
   for (int q = 0; q < BQ; ++q) {
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
+      const float sgn = h ? sgn1 : sgn0;
+      const auto term = [=](float x, float w, float sum) {
+        return indexer_fma(fmaf(fabsf(x), sgn, x), w, sum);
+      };
       // Two chains a sum below 16 sums a thread, so at least 16 FFMA chains run
       // at once.
       float a = 0.f, b = 0.f;
 #pragma unroll
       for (int jj = 0; jj < JQ; ++jj) {
         const int j = q * JQ + jj;
-        a = fmaf(relu_term<DOUBLED>(acc[4 * j + 2 * h]), wt[2 * j], a);
+        const float x0 = acc[4 * j + 2 * h], x1 = acc[4 * j + 2 * h + 1];
+        a = term(x0, wt[2 * j], a);
         if (N < 16) {
-          b = fmaf(relu_term<DOUBLED>(acc[4 * j + 2 * h + 1]), wt[2 * j + 1],
-                   b);
+          b = term(x1, wt[2 * j + 1], b);
         } else {
-          a = fmaf(relu_term<DOUBLED>(acc[4 * j + 2 * h + 1]), wt[2 * j + 1],
-                   a);
+          a = term(x1, wt[2 * j + 1], a);
         }
       }
       v[2 * q + h] = N < 16 ? a + b : a;
@@ -86,12 +100,9 @@ __device__ __forceinline__ void indexer_tile_epilogue_impl(
   // locates the first, each next one is two queries further. A row past
   // seq_len gets an address but no store.
   float* out = logits + off + k0;
-  const int row = row0 + 8 * (lane4 % 2);
-  const float key_scale = DOUBLED ? key_scale_in : scale[row];
 #pragma unroll
   for (int m = 0; m < N / 4; ++m) {
-    float v_out = DOUBLED ? __fmul_rn(__fmul_rn(own[m], 0.5f), key_scale)
-                          : own[m] * key_scale;
+    float v_out = own[m] * key_scale;
     float* p = out + 2LL * m * seq_len_kv;
     if (interior) {
       *p = v_out;
@@ -106,26 +117,6 @@ __device__ __forceinline__ void indexer_tile_epilogue_impl(
       }
     }
   }
-}
-
-template <int HEADS, int BQ, bool CLEAN>
-__device__ __forceinline__ void indexer_tile_epilogue(
-    const float* acc, const float* wt, const float* scale, float* logits,
-    long long off, int s0, int k0, int seq_len, int seq_len_kv, const int* win,
-    bool interior, int t) {
-  indexer_tile_epilogue_impl<HEADS, BQ, CLEAN, false>(
-      acc, wt, scale, 0.f, logits, off, s0, k0, seq_len, seq_len_kv, win,
-      interior, t);
-}
-
-template <int HEADS, int BQ, bool CLEAN>
-__device__ __forceinline__ void indexer_tile_epilogue_doubled(
-    const float* acc, const float* wt, float key_scale, float* logits,
-    long long off, int s0, int k0, int seq_len, int seq_len_kv, const int* win,
-    bool interior, int t) {
-  indexer_tile_epilogue_impl<HEADS, BQ, CLEAN, true>(
-      acc, wt, nullptr, key_scale, logits, off, s0, k0, seq_len, seq_len_kv,
-      win, interior, t);
 }
 
 }  // namespace tileops

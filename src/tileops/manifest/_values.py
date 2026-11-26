@@ -10,9 +10,9 @@ import importlib
 
 from tileops.manifest._dtype_rules import DTYPE_BITS
 from tileops.manifest._expr import evaluate, parse
-from tileops.manifest._kinds import split_union
+from tileops.manifest._kinds import split_commas, split_union
 
-__all__ = ["ADTValue", "convert", "is_integer", "python_class"]
+__all__ = ["ADTValue", "convert", "element_types", "is_integer", "python_class"]
 
 
 class ADTValue:
@@ -82,8 +82,11 @@ def _member(member: str, value, adts: dict):
         "Number": isinstance(value, (int, float)),
         "str": isinstance(value, str),
         "dict": isinstance(value, dict),
-        "torch.dtype": isinstance(value, str) and value in DTYPE_BITS,
+        "torch.dtype": str(value).removeprefix("torch.") in DTYPE_BITS
+        and (isinstance(value, str) or type(value).__name__ == "dtype"),
     }
+    if member == "torch.dtype" and simple[member]:
+        return str(value).removeprefix("torch.")
     if member in simple:
         return value if simple[member] else _REJECT
     if member.startswith("'"):
@@ -101,21 +104,34 @@ def _member(member: str, value, adts: dict):
     return value
 
 
+def element_types(container: str, length: int) -> list[str] | None:
+    """The type of each of `length` elements of a `list[...]` or `tuple[...]` type.
+
+    None when a fixed-length tuple has another arity.
+    """
+    inner = container[container.index("[") + 1 : -1]
+    if container.startswith("list["):
+        return [inner] * length
+    items = split_commas(inner)
+    if items[-1] == "...":
+        return [items[0]] * length
+    return items if len(items) == length else None
+
+
 def _sequence(member: str, head: str, value, adts: dict):
     if not isinstance(value, (list, tuple)):
         return _REJECT
-    inner = member[len(head) : -1]
-    items = [inner] * len(value)
-    if head == "tuple[" and not inner.endswith(",..."):
-        items = inner.split(",")
-        if len(items) != len(value):
-            return _REJECT
-    elif head == "tuple[":
-        items = [inner.removesuffix(",...")] * len(value)
+    items = element_types(member, len(value))
+    if items is None:
+        return _REJECT
     out = []
     for text, item in zip(items, value, strict=True):
         converted = next(
-            (c for m in text.split("|") if not isinstance(c := _member(m, item, adts), _Rejected)),
+            (
+                c
+                for m in split_union(text)
+                if not isinstance(c := _member(m, item, adts), _Rejected)
+            ),
             _REJECT,
         )
         if isinstance(converted, _Rejected):
@@ -133,9 +149,14 @@ def _field_ok(text: str, value) -> bool:
 
 
 def _adt(name: str, value, adts: dict):
-    """An ADT literal checked against its constructor's fields and invariant, as an
-    `ADTValue`; a Python object checked against its constructor's class, as itself."""
+    """`value` checked as a value of ADT `name`.
+
+    An ADT literal is checked against its constructor's fields and invariant and returned as an
+    `ADTValue`; a Python object is checked against its constructor's class and returned as is.
+    """
     ctors = adts[name]["sum"]
+    if isinstance(value, ADTValue) and value.adt == name:
+        return value
     if isinstance(value, dict):
         if len(value) != 1 or next(iter(value)) not in ctors:
             raise ValueError(f"{value!r} is not one of the constructors {sorted(ctors)}")

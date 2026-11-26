@@ -12,9 +12,11 @@ from tileops._kernels.elementwise._base import (
     MultiInputElementwiseKernel,
 )
 from tileops._kernels.elementwise._division import (
+    QUOTIENT_NUM_PER_THREAD,
+    fast_quotient,
     float32_quotient,
     full_range_fdiv,
-    in_range_fdiv,
+    half_quotient,
 )
 from tileops._kernels.elementwise._dtype import (
     BINARY_FULL_DTYPES,
@@ -45,12 +47,6 @@ __all__ = [
     "RemainderFwdKernel",
     "SubFwdKernel",
 ]
-
-
-# Elements a register-copy thread of the division family carries; div, truncated div,
-# remainder and floor_divide agree on it. Their quotient body outlasts a second load
-# of a 2-byte operand, and eight is still two loads of a 4-byte one.
-_QUOTIENT_NUM_PER_THREAD = 8
 
 
 class AddFwdKernel(AlphaScaledBinaryKernel):
@@ -88,26 +84,64 @@ class MulFwdKernel(BinaryKernel, BinaryElementwiseFwdInterface):
         return a * b
 
 
-class DivFwdKernel(BinaryKernel, BinaryElementwiseFwdInterface):
+class _QuotientKernel(BinaryKernel, BinaryElementwiseFwdInterface):
+    """A float quotient body."""
+
+    SUPPORTED_DTYPES = FLOAT_DTYPES
+    REGISTER_COPY_NUM_PER_THREAD = QUOTIENT_NUM_PER_THREAD
+
+    @property
+    def stage_broadcast(self) -> bool:
+        """A broadcast block runs a guarded quotient, or one whose extern calls scalarise the
+        copies, only through fragments."""
+        return True
+
+
+class _FlooredQuotientKernel(_QuotientKernel):
+    """A body built from the floored quotient's tiers (``_floored_tiers``).
+
+    A subclass defines ``_tiers(num, den, dtype)``, which returns the tiers and the exact
+    fallback for two float32 operands.
+    """
+
+    @property
+    def bias_rows(self) -> "int | None":
+        """The floored body is register-heavy: reusing a bias vector across rows costs occupancy."""
+        return None
+
+    @classmethod
+    def op_func(cls, a, b):
+        def body(num, den):
+            tiers, slow = cls._tiers(num, den, a.dtype)
+            return T.Cast(a.dtype, _first_holding(tiers, slow))
+
+        return _on_float32(a, b, body)
+
+    @classmethod
+    def fast_func(cls, a, b):
+        """The cheapest form of ``op_func``, and where it holds."""
+        num, den = T.Cast("float32", a), T.Cast("float32", b)
+        value, holds = cls._tiers(num, den, a.dtype)[0][0]
+        return T.Cast(a.dtype, value), holds
+
+
+class DivFwdKernel(_QuotientKernel):
     """Element-wise division: y = a / b.
 
     Divides in float32 and rounds once at the store, which is what torch does.
-    float16 takes ``approx_fdiv`` and bfloat16 ``full_range_fdiv``.
+    float16 takes ``half_quotient``. A bfloat16 or float32 thread takes ``fast_quotient``
+    for its elements and divides exactly only where its guard fails for one of them,
+    with ``full_range_fdiv`` for bfloat16 and the IEEE divide for float32.
     """
 
-    SUPPORTED_DTYPES = FLOAT_DTYPES
-    REGISTER_COPY_NUM_PER_THREAD = _QUOTIENT_NUM_PER_THREAD
+    # ``half_quotient``'s reciprocal.
+    CSRC_HEADERS = ("approx_math.h",)
 
     @classmethod
     def refusal(cls, call: DivCall) -> "str | None":
         if call.rounding_mode is not None:
             return f"divides exactly, not with rounding_mode={call.rounding_mode!r}"
         return super().refusal(call)
-
-    @property
-    def stage_broadcast(self) -> bool:
-        """The extern call scalarises the copies, so keep them off its loop."""
-        return self.dtype in (torch.float16, torch.bfloat16) or super().stage_broadcast
 
     @property
     def bias_rows(self) -> "int | None":
@@ -117,22 +151,24 @@ class DivFwdKernel(BinaryKernel, BinaryElementwiseFwdInterface):
     @staticmethod
     def op_func(a, b):
         num, den = T.Cast("float32", a), T.Cast("float32", b)
+        if str(a.dtype) == "float16":
+            return T.Cast(a.dtype, half_quotient(num, den))
         return T.Cast(a.dtype, float32_quotient(str(a.dtype), num, den))
 
     @property
     def fast_func(self):
-        """bfloat16's ``full_range_fdiv`` without its scaling, where that scales by one."""
-        if self.dtype != torch.bfloat16:
+        if self.dtype == torch.float16:
             return None
 
         def fast(a, b):
-            value, holds = in_range_fdiv(T.Cast("float32", a), T.Cast("float32", b))
+            num, den = T.Cast("float32", a), T.Cast("float32", b)
+            value, holds = fast_quotient(str(a.dtype), num, den)
             return T.Cast(a.dtype, value), holds
 
         return fast
 
 
-class DivTruncFwdKernel(BinaryKernel, BinaryElementwiseFwdInterface):
+class DivTruncFwdKernel(_QuotientKernel):
     """Element-wise truncated division: y = trunc(a / b), as torch computes it.
 
     torch rounds the quotient to the input dtype before truncating it, so a
@@ -142,19 +178,11 @@ class DivTruncFwdKernel(BinaryKernel, BinaryElementwiseFwdInterface):
     operand pairs of either dtype.
     """
 
-    SUPPORTED_DTYPES = FLOAT_DTYPES
-    REGISTER_COPY_NUM_PER_THREAD = _QUOTIENT_NUM_PER_THREAD
-
     @classmethod
     def refusal(cls, call: DivCall) -> "str | None":
         if call.rounding_mode != "trunc":
             return f"truncates the quotient, not rounding_mode={call.rounding_mode!r}"
         return super().refusal(call)
-
-    @property
-    def stage_broadcast(self) -> bool:
-        """The extern calls scalarise the copies, so keep them off their loop."""
-        return True
 
     @staticmethod
     def op_func(a, b):
@@ -243,9 +271,11 @@ def _nudged_floor(num, den, dtype, fast_body):
     quotient is k, and a nonzero ``q`` carries the sign of ``a / b``. ``holds`` fails
     on a zero, NaN or infinite ``q`` and on one past the limit: every zero, infinite
     or NaN operand, every quotient that underflows and every divisor
-    ``T.fast_rcp`` does not cover.
+    ``T.fast_rcp`` does not cover. It also fails on a ``|q|`` of at most ``2**-26`` of
+    the limit, where ``|q| - limit / 2`` rounds to ``-limit / 2``; such a quotient takes
+    the IEEE tier.
     """
-    limit = T.cast(_NUDGED_QUOTIENT[str(dtype)], "float32")
+    half = T.cast(_NUDGED_QUOTIENT[str(dtype)] / 2, "float32")
     # One reciprocal serves every element that shares b. ``T.fast_rcp`` is one MUFU.RCP,
     # two ulp for a normal b whose reciprocal is normal; it reads a subnormal b as a zero
     # and returns an infinity, and returns a zero for a reciprocal that would be
@@ -256,8 +286,8 @@ def _nudged_floor(num, den, dtype, fast_body):
     def value(q):
         return fast_body(T.floor(_lifted(q)), q)
 
-    holds = T.And(T.abs(quotient) < limit, quotient != T.cast(0.0, "float32"))
-    return value(quotient), holds
+    holds = T.abs(T.abs(quotient) - half) < half
+    return bound(quotient, value), holds
 
 
 def _floored_tiers(num, den, dtype, limit, fast_body):
@@ -289,7 +319,7 @@ def _on_float32(a, b, body):
     )
 
 
-class RemainderFwdKernel(BinaryKernel, BinaryElementwiseFwdInterface):
+class RemainderFwdKernel(_FlooredQuotientKernel):
     """Element-wise remainder: y = a % b, with the sign of b.
 
     torch's CUDA kernel takes ``fmod`` in fp32, which is exact, and adds b when the
@@ -297,17 +327,21 @@ class RemainderFwdKernel(BinaryKernel, BinaryElementwiseFwdInterface):
     one ``fma`` from the exact floored quotient; ``fmodf`` serves the rest.
     """
 
-    REGISTER_COPY_NUM_PER_THREAD = _QUOTIENT_NUM_PER_THREAD
-
     @staticmethod
-    def _remainder(num, den, dtype):
+    def _tiers(num, den, dtype):
         """``(tiers, slow())`` for ``a % b``: see ``_floored_tiers`` and ``RemainderFwdKernel``."""
         zero = T.cast(0.0, "float32")
 
+        def times_sign_of_num(x):
+            """*x* with its sign bit flipped where ``num``'s is set."""
+            sign = tirx.bitwise_and(T.reinterpret(num, "uint32"), T.cast(1 << 31, "uint32"))
+            return T.reinterpret(tirx.bitwise_xor(T.reinterpret(x, "uint32"), sign), "float32")
+
         def from_quotient(k, q):
-            r = T.ieee_fmaf(-k, den, num)
-            # A zero remainder is fmod's, which keeps the dividend's sign.
-            return tirx.Select(r == zero, T.copysign(zero, num), r)
+            # ``a - k * b`` is ``|a| - k * (b * sign(a))`` times sign(a), rounded once either
+            # way. An exact zero comes out +0 on ``|a|``, so the sign put back gives fmod's
+            # zero, which keeps the dividend's sign.
+            return times_sign_of_num(T.ieee_fmaf(-k, times_sign_of_num(den), T.abs(num)))
 
         def signed(mod):
             flip = T.And(mod != zero, (den < zero) != (mod < zero))
@@ -315,28 +349,6 @@ class RemainderFwdKernel(BinaryKernel, BinaryElementwiseFwdInterface):
 
         tiers = _floored_tiers(num, den, dtype, _FAST_QUOTIENT, from_quotient)
         return tiers, bound(T.fmod(num, den), signed)
-
-    SUPPORTED_DTYPES = FLOAT_DTYPES
-
-    @property
-    def stage_broadcast(self) -> bool:
-        """The extern calls scalarise the copies, so keep them off their loop."""
-        return True
-
-    @staticmethod
-    def op_func(a, b):
-        def body(num, den):
-            tiers, slow = RemainderFwdKernel._remainder(num, den, a.dtype)
-            return T.Cast(a.dtype, _first_holding(tiers, slow))
-
-        return _on_float32(a, b, body)
-
-    @staticmethod
-    def fast_func(a, b):
-        """The cheapest form of ``op_func``, and where it holds."""
-        num, den = T.Cast("float32", a), T.Cast("float32", b)
-        value, holds = RemainderFwdKernel._remainder(num, den, a.dtype)[0][0]
-        return T.Cast(a.dtype, value), holds
 
 
 class PowFwdKernel(BinaryKernel, BinaryElementwiseFwdInterface):
@@ -377,7 +389,7 @@ class PowFwdKernel(BinaryKernel, BinaryElementwiseFwdInterface):
         return T.Cast(a.dtype, T.if_then_else(expo == zero, one, out))
 
 
-class FloorDivideFwdKernel(BinaryKernel, BinaryElementwiseFwdInterface):
+class FloorDivideFwdKernel(_FlooredQuotientKernel):
     """Element-wise floor division: y = floor(a / b), as torch defines it.
 
     Follows torch's CUDA kernel: ``(a - fmod(a, b)) / b`` in fp32, one less when the
@@ -386,8 +398,6 @@ class FloorDivideFwdKernel(BinaryKernel, BinaryElementwiseFwdInterface):
     (``1.0 // 0.1`` is 9) and at an infinite b.
     """
 
-    REGISTER_COPY_NUM_PER_THREAD = _QUOTIENT_NUM_PER_THREAD
-
     @classmethod
     def refusal(cls, call: DivCall) -> "str | None":
         if call.rounding_mode != "floor":
@@ -395,7 +405,7 @@ class FloorDivideFwdKernel(BinaryKernel, BinaryElementwiseFwdInterface):
         return super().refusal(call)
 
     @staticmethod
-    def _floor_divide(num, den, dtype):
+    def _tiers(num, den, dtype):
         """``(tiers, slow())`` for torch's ``div_floor_floating`` on two float32 values.
 
         torch divides ``a - fmod(a, b)``, a multiple of b, by b, floors the quotient into
@@ -440,28 +450,6 @@ class FloorDivideFwdKernel(BinaryKernel, BinaryElementwiseFwdInterface):
         limit = exact_multiple_quotient.get(str(dtype), _FAST_QUOTIENT)
         return _floored_tiers(num, den, dtype, limit, whole), slow()
 
-    SUPPORTED_DTYPES = FLOAT_DTYPES
-
-    @property
-    def stage_broadcast(self) -> bool:
-        """The extern calls scalarise the copies, so keep them off their loop."""
-        return True
-
-    @staticmethod
-    def op_func(a, b):
-        def body(num, den):
-            tiers, slow = FloorDivideFwdKernel._floor_divide(num, den, a.dtype)
-            return T.Cast(a.dtype, _first_holding(tiers, slow))
-
-        return _on_float32(a, b, body)
-
-    @staticmethod
-    def fast_func(a, b):
-        """The cheapest form of ``op_func``, and where it holds."""
-        num, den = T.Cast("float32", a), T.Cast("float32", b)
-        value, holds = FloorDivideFwdKernel._floor_divide(num, den, a.dtype)[0][0]
-        return T.Cast(a.dtype, value), holds
-
 
 class LerpFwdKernel(BinaryKernel, LerpFwdInterface):
     """Element-wise lerp: y = a + weight * (b - a).
@@ -500,19 +488,12 @@ class LerpFwdKernel(BinaryKernel, LerpFwdInterface):
         return f"{self._op_func_name()}|weight={weight!r}", lerp_func
 
 
-class MaximumFwdKernel(BinaryKernel, BinaryElementwiseFwdInterface):
-    """Element-wise maximum: y = max(a, b).
+class _NanExtremumKernel(BinaryKernel, BinaryElementwiseFwdInterface):
+    """``maximum`` or ``minimum``: NaN where either float operand is NaN, as torch answers.
 
-    For float dtypes, matches torch.maximum semantics:
-    - If either operand is NaN, the result is NaN.
-    - maximum(+0.0, -0.0) = +0.0 (IEEE 754 signed-zero).
-
-    For integer / bool dtypes (no NaN representation), uses ``T.max``
-    directly without the NaN guards.
-
-    Performance (float path): uses T.max for the fast path (correct
-    signed-zero on CUDA -- fmaxf returns +0 for max(+0,-0)) plus one
-    isnan guard for NaN propagation.
+    The signed zeros order as in torch: ``fmaxf`` and ``fminf``, and the half formats'
+    NaN builtins, return +0 for max(+0, -0) and -0 for min(-0, +0). Integer and bool
+    dtypes have no NaN and take ``T.max`` / ``T.min`` directly.
     """
 
     SUPPORTED_DTYPES = BINARY_FULL_DTYPES
@@ -529,42 +510,18 @@ class MaximumFwdKernel(BinaryKernel, BinaryElementwiseFwdInterface):
         to scalarise them, and follow the base default.
         """
         return self.dtype.is_floating_point or super().stage_broadcast
+
+
+class MaximumFwdKernel(_NanExtremumKernel):
+    """Element-wise maximum: y = max(a, b)."""
 
     @staticmethod
     def op_func(a, b):
         return nan_max(a, b)
 
 
-class MinimumFwdKernel(BinaryKernel, BinaryElementwiseFwdInterface):
-    """Element-wise minimum: y = min(a, b).
-
-    For float dtypes, matches torch.minimum semantics:
-    - If either operand is NaN, the result is NaN.
-    - minimum(-0.0, +0.0) = -0.0 (IEEE 754 signed-zero).
-
-    For integer / bool dtypes (no NaN representation), uses ``T.min``
-    directly without the NaN guards.
-
-    Performance (float path): uses T.min for the fast path (correct
-    signed-zero on CUDA -- fminf returns -0 for min(-0,+0)) plus one
-    isnan guard for NaN propagation. See MaximumFwdKernel for full
-    rationale.
-    """
-
-    SUPPORTED_DTYPES = BINARY_FULL_DTYPES
-
-    @property
-    def stage_broadcast(self) -> bool:
-        """The float body scalarises the copies, so keep them off its loop.
-
-        Both float forms do it: fp32's NaN select, and the half formats' NaN
-        builtin, which the vectoriser cannot see through either. Staged, the
-        builtin costs what a plain ``T.max`` costs.
-
-        Integer and bool dtypes take ``T.min``/``T.max`` directly, with nothing
-        to scalarise them, and follow the base default.
-        """
-        return self.dtype.is_floating_point or super().stage_broadcast
+class MinimumFwdKernel(_NanExtremumKernel):
+    """Element-wise minimum: y = min(a, b)."""
 
     @staticmethod
     def op_func(a, b):
@@ -581,7 +538,7 @@ def _lerp(start, end, weight):
 
 
 @target_cache(maxsize=32)
-def _make_lerp_tensor_kernel(N, dtype, threads=256, npt=8):
+def _make_lerp_tensor_kernel(N, dtype):
     """Build Tensor-weight lerp kernel: out = a + weight * (b - a).
 
     ``LerpTensorFwdKernel.forward`` sends here the calls whose three operands each hold
@@ -631,7 +588,6 @@ class LerpTensorFwdKernel(MultiInputElementwiseKernel, LerpTensorFwdInterface):
     float tensors of the same dtype, broadcast together.
     """
 
-    SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
     INPUTS = (("a", "tile"), ("b", "tile"), ("w", "tile"))
 
     @staticmethod

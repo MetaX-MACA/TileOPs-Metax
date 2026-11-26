@@ -5,17 +5,13 @@ import inspect
 import math
 import threading
 import warnings
+import weakref
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from types import MappingProxyType
 from typing import (
-    Callable,
+    Any,
     ClassVar,
-    Hashable,
-    Iterator,
-    Mapping,
-    Optional,
-    Sequence,
-    Union,
 )
 
 import torch
@@ -25,20 +21,26 @@ from tileops._kernels.build_target import building_on, target_of
 from tileops._kernels.call_spec import CallSpec
 from tileops._kernels.constants import VECTOR_ACCESS_BYTES
 from tileops._kernels.kernel_base import Kernel, KernelInterface
-from tileops._ops._params_codegen import PARAM_NAMES_ATTRIBUTE
 from tileops._ops._signature_codegen import (
+    PARAM_NAMES_ATTRIBUTE,
     CheckError,
     ResultCheck,
     SignatureCall,
     _snapshot,
     in_tree,
+    install_param_names,
+    leaves,
+    maybe_install_signature,
+    op_entry,
     param_state,
+    tensorless_device,
 )
-from tileops._ops.compile_boundary import register_instance
+from tileops._ops.compile_boundary import instance_key, register_instance
 from tileops._utils.device import current_device, device_context
 from tileops.backend import (
     BUILTIN,
     OpNotAvailableError,
+    OpNotServedError,
     Target,
     TensorSpec,
     registered_targets,
@@ -68,22 +70,54 @@ _OPEN_CALLS = threading.local()
 _UNOBSERVED = object()
 
 
-def _misaligned(t: "torch.Tensor | None") -> bool:
-    """Whether *t* does not start on a 16-byte boundary. A tensor whose storage has no
-    address, a fake one or a wrapper refusing the read, passes as it is."""
-    if t is None or (type(t) is not torch.Tensor and _addressless(t)):
-        return False
-    return t.data_ptr() % VECTOR_ACCESS_BYTES != 0
+def _address(t: object) -> "int | None":
+    """The address *t* starts at, or None for an absent value, a scalar, or a tensor whose
+    storage has no address: a fake one, or a wrapper refusing the read."""
+    if not isinstance(t, torch.Tensor):
+        return None
+    if type(t) is not torch.Tensor:
+        if isinstance(t, FakeTensor):
+            return None
+        try:
+            return t.data_ptr()
+        except RuntimeError:
+            return None
+    return t.data_ptr()
 
 
-def _addressless(t: torch.Tensor) -> bool:
-    """Whether the storage of *t*, a tensor subclass, has no address to read."""
-    if isinstance(t, FakeTensor):
-        return True
-    try:
-        t.data_ptr()
-    except RuntimeError:
-        return True
+def _slot_spec(t: object) -> object:
+    """What a kernel builder is told of the input *t*: a ``TensorSpec`` for a tensor, a tuple of
+    them for a tensor sequence, ``None`` for an absent input, and its type for a call-time
+    scalar."""
+    if t is None:
+        return None
+    if isinstance(t, (list, tuple)):
+        return tuple(map(TensorSpec.of, t))
+    return TensorSpec.of(t) if isinstance(t, torch.Tensor) else type(t)
+
+
+def _element_span(t: torch.Tensor) -> int:
+    """The elements from the first element of *t*, which holds one, to its last, holes of a
+    strided layout included."""
+    return sum((n - 1) * s for n, s in zip(t.shape, t.stride(), strict=True)) + 1
+
+
+def _overlaps_itself(t: torch.Tensor) -> bool:
+    """Whether two elements of *t*, which holds one, share an address.
+
+    torch decides most layouts. One it cannot is disjoint when, its dimensions of more than
+    one element ordered by stride, each stride passes the farthest element the smaller ones
+    reach, and overlaps when it holds more elements than the addresses it spans; any other
+    is the caller's obligation, since deciding it reads every offset.
+    """
+    overlap = torch._debug_has_internal_overlap(t)
+    if overlap != 2:
+        return overlap == 1
+    reach = 0
+    for stride, size in sorted((s, n) for n, s in zip(t.shape, t.stride(), strict=True) if n > 1):
+        if stride <= reach:
+            return t.numel() > _element_span(t)
+        reach += (size - 1) * stride
     return False
 
 
@@ -100,9 +134,8 @@ def _overlap_checks(
         return ()
     spans = [
         0
-        if t is None or t.is_meta or not t.numel()
-        else (sum((n - 1) * s for n, s in zip(t.shape, t.stride(), strict=True)) + 1)
-        * t.element_size()
+        if not isinstance(t, torch.Tensor) or t.is_meta or not t.numel()
+        else _element_span(t) * t.element_size()
         for t in tensors
     ]
     checks = []
@@ -133,20 +166,43 @@ def _aligned(
     written. A copy hides no overlap: the call has been checked to write no tensor sharing a
     byte with another.
     """
-    passed = (*inputs, *writes.values())
+    passed = leaves((*inputs, *writes.values()))
     back = plan.staging.get(written)
     if back is None:
-        names = (*type(op)._signature.sig.inputs, *writes)
+        names = _leaf_names((*type(op)._signature.sig.inputs, *writes), (*inputs, *writes.values()))
         writing = written.union(writes) if writes else written
         back = plan.staging[written] = tuple(i for i in plan.copied if names[i] in writing)
     tensors = list(passed)
     for i in plan.copied:
         tensors[i] = passed[i].clone()
-    count = len(inputs)
+    count = len(leaves(inputs))
     if writes:
         writes = dict(zip(writes, tensors[count:], strict=True))
     back = tuple([(tensors[i], passed[i]) for i in back]) if back else ()
-    return tuple(tensors[:count]), writes, back
+    return _regrouped(inputs, tensors[:count]), writes, back
+
+
+def _leaf_names(names: tuple, slots: tuple) -> tuple:
+    """The slot name of each of :func:`leaves` of *slots*, whose names are *names*."""
+    return tuple(
+        name
+        for name, value in zip(names, slots, strict=True)
+        for _ in (value if isinstance(value, (list, tuple)) else (value,))
+    )
+
+
+def _regrouped(slots: tuple, flat: list) -> tuple:
+    """*slots* with their :func:`leaves` replaced, in order, by *flat*: a tensor sequence keeps
+    its list or tuple type."""
+    out, k = [], 0
+    for value in slots:
+        if isinstance(value, (list, tuple)):
+            out.append(type(value)(flat[k : k + len(value)]))
+            k += len(value)
+        else:
+            out.append(flat[k])
+            k += 1
+    return tuple(out)
 
 
 def _restored(result: object, back: tuple) -> object:
@@ -168,8 +224,8 @@ class _Plan:
 
     A specialization is everything the generated checks, the call specs and the plan read:
     each tensor's shape, strides, dtype and device, whether each call tensor starts on a
-    16-byte boundary, which tensors are present, the op's params and construction-time
-    tensors, the execution arguments, and the current device of a call no tensor places. The
+    16-byte boundary, which members the call-time arguments hold, the op's params, the
+    execution arguments, and the current device of a call no tensor places. The
     plan holds the checked call's facts, the call tensors it copies to a 16-byte boundary, the
     pairs of call tensors that must share no byte, its effect branch, its result check, whether
     it writes no element, and each kernel request ``forward`` made, in request order. It holds
@@ -181,7 +237,7 @@ class _Plan:
         "copied",
         "overlaps",
         "metadata",
-        "offsets",
+        "contents",
         "effect",
         "empty",
         "result_check",
@@ -191,6 +247,7 @@ class _Plan:
         "requests",
         "delegates",
         "filling",
+        "scalar",
     )
 
     def __init__(
@@ -205,13 +262,10 @@ class _Plan:
         # Its own copy of the indices: a param a call reads can be a list or an ADT, which
         # the op's later edits must not reach.
         self.call = dataclasses.replace(call, indices=copy.deepcopy(call.indices), metadata=None)
-        # Each metadata tensor by name, with its position among the inputs, or None for a
-        # construction-time tensor, which the op holds.
-        self.metadata = tuple(
-            (name, order.index(name) if name in sig.inputs else None) for name in call.metadata
-        )
-        # The `validate_inputs` check of the call's packed offsets, or None when it has none.
-        self.offsets = signature.offsets.get(call.branch_key)
+        # Each metadata tensor by name, with its position among the inputs.
+        self.metadata = tuple((name, order.index(name)) for name in call.metadata)
+        # The `validate_inputs` check of the call's tensor contents, or None when it has none.
+        self.contents = signature.contents.get(call.branch_key)
         self.copied, self.effect, self.empty, self.stages = copied, effect, empty, stages
         self.overlaps = overlaps
         # The copied positions to copy back, by the inputs the implementation writes.
@@ -225,6 +279,9 @@ class _Plan:
         # Held while a call extends either list, so calls missing together extend it once.
         # Reentrant: a sub-op built under it may resolve its own plan.
         self.filling = threading.RLock()
+        # Whether a call-time argument holds a scalar member: its value may decide a call
+        # spec and the plan holds no scalar value, so each request builds its spec.
+        self.scalar = any(m in sig.inputs[t].scalars for t, m in (call.members or {}).items())
 
 
 class _Request:
@@ -314,27 +371,13 @@ class Op(ABC):
     one manifest entry (``family``, ``signature``, and optionally ``roofline`` and
     ``workloads``), and subclasses ``Op`` itself, never an op of ``tileops``. A subclass
     assigns its manifest parameters, calls ``super().__init__(target=target)``, and writes its
-    computation in ``forward``.
-
-    Code that calls an op constructs it with ``target``, the construction parameter every op
-    takes, which names the set of kernels that serves it. It calls the op as ``op(...)`` with
-    ``forward``'s parameters and never calls ``forward`` itself. ``serving_target`` is the
-    target the instance selected; ``last_call`` and ``eval_roofline()`` are the last
-    completed call and its ``(flops, bytes)``; ``request_tune()`` and ``kernel_config()``
-    request tuning and read the configuration in use; ``iter_kernels()`` lists the kernels
-    the op and its sub-ops have built.
-
-    A subclass calls ``Op.__init__(*, target=None)`` once its manifest parameters are
-    assigned, and builds derived attributes and sub-ops after it. It declares its
-    implementations and the places it calls them in ``kernel_types`` and ``interfaces``, and in
-    ``injected_parameters`` the constructor parameters beyond the manifest's and ``target``
-    that the manifest validator allows. ``dtype`` is ``None`` here; a subclass taking a
-    ``dtype`` parameter overrides it. ``forward`` is the computation, the one method every op
-    writes. Inside it, ``kernel_for(interface, call)`` returns the entry that serves a call and
-    ``key_for(interface, call)`` the key of its implementation; ``delegate_types`` and
-    ``delegate_for(stage, identity, ...)`` declare and hold the sub-ops. ``roof_key()``,
-    ``eval_roofline_read_bytes()`` and ``roofline_data_terms()`` are the parts of the roofline
-    a subclass may override.
+    computation in ``forward``; it builds derived attributes and sub-ops after
+    ``super().__init__``. It declares ``kernel_types``, ``interfaces``, ``delegate_types`` and
+    ``injected_parameters``; it may override ``dtype``, ``roof_key()``,
+    ``eval_roofline_read_bytes()`` and ``roofline_data_terms()``. Callers call the op as
+    ``op(...)``, never ``forward``. Each member states its contract in its own docstring or
+    comment; docs/design/ops-design-reference.md describes the call protocol and the kernel
+    caching methods.
 
     A member whose name starts with an underscore belongs to the base class and its generated
     code; a subclass neither calls nor overrides it.
@@ -347,7 +390,7 @@ class Op(ABC):
     # The bound builder: ``_UNRESOLVED`` before a call binds one, ``None`` for the in-tree
     # kernels, or a target's build_kernel.
     _target_builder: object = _UNRESOLVED
-    # The target bound with it, for ``serving_target`` and error messages.
+    # The target bound with it, for ``serving_target``.
     _serving_target: Target = None
     # Whether this instance has warned that a kernel of its target cannot be tuned.
     _tune_warned: bool = False
@@ -366,6 +409,8 @@ class Op(ABC):
     # entries by ``(interface, call spec)``, built entries by interface and
     # ``(implementation, identity)``, and the kernels a target built by device and inputs.
     _entries_by_call: dict[tuple[str, Hashable], object]
+    # The most call specs ``_entries_by_call`` holds; the oldest is evicted past it.
+    _MAX_DISPATCHED_CALLS: ClassVar[int] = 256
     _built_entries: dict[str, dict[Hashable, object]]
     _target_kernels: dict[tuple, object]
     # Held sub-ops, ``{stage: {identity: op}}``, and which stage holds each sub-op, by its
@@ -379,9 +424,15 @@ class Op(ABC):
     # The plan of each specialization this instance has resolved, by its key
     # (``_observe``). Built empty by ``__init__``.
     _plans: dict
+    # The most plans ``_plans`` holds; the oldest is evicted past it. Bounded because calls
+    # whose shapes keep changing, such as decode steps over a growing cache, resolve one each.
+    _MAX_PLANS: ClassVar[int] = 256
     # The generated signature plan; None for a class without a manifest entry.
     _signature: ClassVar[object] = None
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
+    # Whether a call's tensor contents are checked against their `requires`; set by every op
+    # whose signature declares `validate_inputs`.
+    validate_inputs: bool
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         """Install what the subclass's manifest entry generates, and the param names a
@@ -398,9 +449,6 @@ class Op(ABC):
                 rejects.
         """
         super().__init_subclass__(**kwargs)
-        from tileops._ops._params_codegen import maybe_install_param_names
-        from tileops._ops._signature_codegen import maybe_install_signature, op_entry
-
         if not in_tree(cls):
             for base in cls.__mro__[1:]:
                 if base is not Op and issubclass(base, Op) and in_tree(base):
@@ -411,7 +459,7 @@ class Op(ABC):
         entry = op_entry(cls)
         if maybe_install_signature(cls, entry):
             cls.__call__ = cls.__dict__.get("_call_boundary", Op.__call__)
-        maybe_install_param_names(cls, entry)
+        install_param_names(cls, entry)
 
     # The op's dispatch keys and the kernel class each names. An op with no kernel of its own
     # (a composite) declares none.
@@ -443,11 +491,18 @@ class Op(ABC):
     # Operators this op registers on the torch.compile boundary; non-empty exactly when the
     # op has one. The signature generates them for a class whose entry has a call-time tensor
     # input and no composition, and such an op must compile cold with ``fullgraph=True``.
-    # Naming them is what lets a test assert the traced graph holds nothing else, which is
-    # what keeps the graph the same when another target serves the op. A tuple because a
-    # conditional in-place write registers two. Registration happens once per class, so this
-    # is class state.
+    # Naming them lets a test assert the traced graph holds nothing else, which keeps the
+    # graph the same when another target serves the op. A conditional in-place write
+    # registers two.
     compile_op_names: ClassVar[tuple[str, ...]] = ()
+
+    # The attributes the compile boundary's fake reads, in key order: the signature's params.
+    # Assigning one changes `_instance_key`.
+    _instance_key_names: ClassVar[tuple[str, ...]] = ()
+    # The manifest entry the fake is generated from, as text.
+    _instance_key_entry: ClassVar[str] = ""
+    # Serializes the assignments that change an op's compile-boundary key.
+    _instance_key_lock: ClassVar[threading.Lock] = threading.Lock()
 
     # Injected implementation objects ``__init__`` takes beyond ``signature.params`` and the
     # execution-policy parameters every op takes (docs/design/manifest.md § Signature).
@@ -478,7 +533,8 @@ class Op(ABC):
         if check is not None:
             self._construction_indices = check(self)
         self._install_kernel_types()
-        self._instance_key = register_instance(self)
+        self._instance_identity = register_instance(self)
+        self._instance_key = instance_key(self._instance_identity, self._instance_key_state())
         # The binding caches and the sub-op tables, so no method asks whether they exist;
         # installing built the two entry caches.
         self._target_kernels = {}
@@ -488,6 +544,22 @@ class Op(ABC):
         self._delegate_stages = {}
         self._effect_branches = {}
         self._plans = {}
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name not in self._instance_key_names or "_instance_identity" not in self.__dict__:
+            object.__setattr__(self, name, value)
+            return
+        # Keeps a concurrent assignment from publishing the key of a value it replaced.
+        with self._instance_key_lock:
+            object.__setattr__(self, name, value)
+            self._instance_key = instance_key(self._instance_identity, self._instance_key_state())
+
+    def _instance_key_state(self) -> tuple:
+        """What the compile boundary's fake reads of this op, in `_instance_key_names` order."""
+        return (
+            self._instance_key_entry,
+            *(getattr(self, n, None) for n in self._instance_key_names),
+        )
 
     def _infer_output_shapes(self, *shapes: tuple[int, ...], dtypes=None) -> dict:
         """Infer output tensor shapes from input shapes, in ``signature.inputs`` order.
@@ -522,7 +594,7 @@ class Op(ABC):
             f"states its manifest entry as the class attribute `spec`"
         )
 
-    def eval_roofline_read_bytes(self) -> Optional[int]:
+    def eval_roofline_read_bytes(self) -> int | None:
         """The read half of ``eval_roofline()[1]``, for the NCU bytes audit.
 
         ``bytes`` minus the write half, which the signature settles: every
@@ -751,7 +823,8 @@ class Op(ABC):
             call: A function of no argument returning the call spec, an instance of the
                 interface's ``request``. What it reads is part of the specialization: the
                 call's tensors' layouts, the op's params, the execution arguments and the
-                call device.
+                call device. An op with a call-time scalar argument runs it on every request,
+                since the scalar's value may decide the spec.
 
         Raises:
             RuntimeError: What :meth:`_get_or_build_entry` raises.
@@ -773,7 +846,7 @@ class Op(ABC):
             )
         calls = _OPEN_CALLS.__dict__.get("stack")
         frame = calls[-1] if calls else None
-        if frame is None or frame.op is not self or frame.plan is None:
+        if frame is None or frame.op is not self or frame.plan is None or frame.plan.scalar:
             return self._entry(interface, call())
         request = self._planned_request(frame, interface, call)
         entries = self._entries_by_call
@@ -797,7 +870,7 @@ class Op(ABC):
         """
         calls = _OPEN_CALLS.__dict__.get("stack")
         frame = calls[-1] if calls else None
-        if frame is None or frame.op is not self or frame.plan is None:
+        if frame is None or frame.op is not self or frame.plan is None or frame.plan.scalar:
             return call()
         return self._planned_request(frame, interface, call).spec
 
@@ -820,7 +893,7 @@ class Op(ABC):
         if entry is None or call.stated_device_facts:
             entry = self._get_or_build_entry(interface, call)
             # Bound dispatch memoization independently of compiled-entry reuse.
-            if len(dispatched) >= 256:
+            if len(dispatched) >= self._MAX_DISPATCHED_CALLS:
                 dispatched.pop(next(iter(dispatched)), None)
             dispatched[(interface, call)] = entry
         return entry
@@ -960,28 +1033,19 @@ class Op(ABC):
                 execution[name] = value
         return inputs, writes, execution
 
-    def _named_tensors(
-        self, inputs: "tuple[torch.Tensor | None, ...]", writes: "dict[str, torch.Tensor]"
-    ) -> "dict[str, torch.Tensor | None]":
-        """Every tensor a call passes, by signature name: what the generated checks read.
-
-        One call builds it once and hands the same mapping to the check and to the result
-        check; the two see identical arguments by construction.
-        """
-        sig = type(self)._signature.sig
-        return {**dict(zip(sig.inputs, inputs, strict=True)), **writes}
-
     def _observe(
         self,
         inputs: tuple,
         writes: "dict[str, torch.Tensor]",
         execution: "dict[str, object]",
         direct: bool = False,
-    ) -> "tuple | None":
-        """The key of this call's specialization, or None for a call that keeps no plan; with
-        *direct*, None also for a call the dispatcher would do more for than run its body. Next
-        to it, the address of each call tensor, inputs then writes, or None when the key is
-        None or the op writes no tensor slot."""
+    ) -> "tuple[tuple | None, list | None]":
+        """The pair ``(key, addresses)``.
+
+        *key* is this call's specialization key, or None for a call that keeps no plan; with
+        *direct*, None also for a call the dispatcher would do more for than run its body.
+        *addresses* holds the address of each call tensor, inputs then writes, or is None when
+        the key is None or the op writes no tensor slot."""
         return type(self)._signature.observe(self, inputs, writes, execution, direct)
 
     def _resolve_plan(
@@ -989,10 +1053,7 @@ class Op(ABC):
     ) -> _Plan:
         """Run the generated checks on this call and hold what they decide under *key*.
 
-        Construction's checks run again first, for the params as they are now. The call checks
-        may move a construction-time tensor to the call device and signature dtype, which
-        changes the key; the plan is held only when the key observed after the checks is
-        *key*.
+        Construction's checks run again first, for the params as they are now.
 
         Raises:
             CheckError: The call is outside the signature; nothing is held.
@@ -1008,17 +1069,29 @@ class Op(ABC):
         """:meth:`_resolve_plan` for a key no plan is held under yet."""
         signature = type(self)._signature
         self._construction_indices = type(self)._check_construction(self)
-        tensors = self._named_tensors(inputs, writes)
+        tensors = {**dict(zip(signature.sig.inputs, inputs, strict=True)), **writes}
         call = signature.check(self, tensors)
-        present = tuple(tensors.get(name) is not None for name in signature.tensor_axes)
-        passed = (*inputs, *writes.values())
+        # Two elements of a written tensor at one address would be written twice. The layout
+        # decides it, so the plan, keyed by layout, checks it once.
+        for name in sorted(call.written.union(writes)):
+            written = tensors[name]
+            if isinstance(written, torch.Tensor) and written.numel() and _overlaps_itself(written):
+                raise CheckError(f"{type(self).__name__}: {name} must not overlap itself in memory")
+        present = signature.states(tensors)
+        slots = (*inputs, *writes.values())
+        passed = leaves(slots)
         plan = _Plan(
             signature,
             call,
-            tuple(i for i, t in enumerate(passed) if _misaligned(t)),
+            # A tensor whose storage has no address passes as it is.
+            tuple(
+                i
+                for i, t in enumerate(passed)
+                if (address := _address(t)) is not None and address % VECTOR_ACCESS_BYTES
+            ),
             _overlap_checks(
                 type(self).__name__,
-                tuple(tensors),
+                _leaf_names(tuple(tensors), slots),
                 passed,
                 call.written.union(writes),
                 self._declared_overlaps(),
@@ -1027,14 +1100,9 @@ class Op(ABC):
             self._writes_no_elements(call),
             self._empty_stages(),
         )
-        if key is not None and (
-            not signature.ctor_names or self._observe(inputs, writes, execution)[0] == key
-        ):
-            # Calls whose shapes keep changing, such as decode steps over a growing cache,
-            # resolve a plan each; the oldest one goes once this many are held.
-            held = 256
+        if key is not None:
             plans = self._plans
-            if len(plans) >= held:
+            if len(plans) >= self._MAX_PLANS:
                 plans.pop(next(iter(plans), None), None)
             plans[key] = plan
         return plan
@@ -1079,19 +1147,20 @@ class Op(ABC):
                 plan = frame.plan = self._resolve_plan(key, inputs, writes, execution or {})
             if plan.overlaps:
                 if addresses is None:
-                    # A call no observer read: None where a tensor is absent or has no address.
-                    addresses = [
-                        None
-                        if t is None or (type(t) is not torch.Tensor and _addressless(t))
-                        else t.data_ptr()
-                        for t in (*inputs, *writes.values())
-                    ]
+                    # A call no observer read.
+                    addresses = list(map(_address, leaves((*inputs, *writes.values()))))
                 for i, j, span, other, message in plan.overlaps:
                     a, b = addresses[i], addresses[j]
                     if a is not None and b is not None and a < b + other and b < a + span:
                         raise CheckError(message)
-            if plan.offsets is not None and self.validate_inputs:
-                plan.offsets(plan.call, inputs)
+            signature = type(self)._signature
+            values = signature.values.get(plan.call.branch_key)
+            if values is not None:
+                values(
+                    self, dict(zip(signature.sig.inputs, inputs, strict=True)), plan.call.indices
+                )
+            if plan.contents is not None and self.validate_inputs:
+                plan.contents(plan.call, inputs)
             if plan.empty:
                 # An empty call runs no implementation, so none has to be available for it;
                 # its result is built here, so no result check runs. A named target must exist.
@@ -1108,10 +1177,10 @@ class Op(ABC):
                 if builder is _UNRESOLVED:
                     # Set before selecting, so a selection that fails halfway is undone too.
                     bound_here = True
-                    self._bind_target(plan.call.device)
-                    builder = self._target_builder
+                    builder = self._bind_target(plan.call.device)
                 if builder is not None:
                     result = self._run_on_target(
+                        builder,
                         inputs,
                         writes,
                         kernel_written,
@@ -1167,11 +1236,7 @@ class Op(ABC):
                     f"it; hold every sub-op with delegate_for(stage, identity, ...)"
                 )
             staged.append((stage, record))
-        metadata = (
-            {name: getattr(self, name) if i is None else inputs[i] for name, i in plan.metadata}
-            if plan.metadata
-            else {}
-        )
+        metadata = {name: inputs[i] for name, i in plan.metadata} if plan.metadata else {}
         record = _CallRecord(plan.call, metadata, tuple(staged), plan.stages)
         self._last_call = record
         if calls:
@@ -1188,25 +1253,22 @@ class Op(ABC):
         if calls:
             calls[-1].children.append((self, record))
 
-    def _has_target_builder(self) -> bool:
-        """Whether a target's builder, rather than the in-tree kernels, serves this instance."""
-        return self._target_builder is not None and self._target_builder is not _UNRESOLVED
-
     def _run_on_target(
         self,
+        builder: object,
         inputs: "tuple[torch.Tensor | None, ...]",
         writes: "dict[str, torch.Tensor]",
         written: "frozenset[str] | None" = None,
         execution: "dict[str, object] | None" = None,
         device: "torch.device | None" = None,
     ) -> object:
-        """Run the whole op on the target bound to this instance.
+        """Run the whole op on the target whose *builder* this call selected.
 
         What the op layer guarantees every target: every tensor on one device, every
         input the call does not write contiguous, every call tensor on a 16-byte boundary, and
         the checks generated from the signature.
-        The kernel is built once per device, input dtypes and shapes, and the manifest params
-        it is built with, a tensor param by identity.
+        The kernel is built once per builder, device, input dtypes and shapes, the type of each
+        call-time scalar, and the manifest params it is built with.
 
         *device* is the call device the checks placed the call on; a traced call, which runs
         no check, places it from its tensors or the ``device`` param.
@@ -1217,69 +1279,57 @@ class Op(ABC):
         names, mutated = self._forward_io()
         written = mutated if written is None else written
         inputs = tuple(
-            t if t is None or name in written else t.contiguous()
+            type(t)(x.contiguous() for x in t)
+            if isinstance(t, (list, tuple)) and name not in written
+            else t.contiguous()
+            if isinstance(t, torch.Tensor) and name not in written
+            else t
             for name, t in zip(names, inputs, strict=True)
         )
         if device is None:
-            device = self._traced_device((*inputs, *writes.values()))
+            device = self._traced_device(leaves((*inputs, *writes.values())))
         params = self._manifest_params()
-        # An absent optional input keeps its slot as ``None``, so two calls differing
-        # only in which one they omit key apart. A tensor param keys by identity, which a
-        # builder may hold: the key holds the tensor too, so no other one takes its identity.
-        tensors = tuple(v for v in params.values() if isinstance(v, torch.Tensor)) if params else ()
-        signature = (
-            device,
-            *(None if t is None else (t.dtype, tuple(t.shape)) for t in inputs),
-            _snapshot(params),
-            *tensors,
-        )
-        # A builder may read a tensor param's contents, so a write in place rebuilds.
-        versions = (
-            tuple(None if t.is_inference() else t._version for t in tensors) if tensors else ()
-        )
-        named = dict(zip(names, inputs, strict=True))
-        # Each kernel with the versions it was built at, read and written as one entry.
-        built = self.__dict__.get("_target_built")
-        if built is None:
-            built = self.__dict__.setdefault("_target_built", {})
-        entry = built.get(signature)
-        if entry is None or entry[1] != versions or None in versions:
-            # Concurrent misses build one kernel, from copies of the non-tensor params.
+        # The builder's description of each input keys the kernel: an absent input keeps its
+        # slot as ``None``, so two calls differing only in which one they omit key apart, and a
+        # call-time scalar keys by its type, never its value. The builder keys too: a kernel
+        # serves only the builder that built it.
+        specs = tuple(map(_slot_spec, inputs))
+        signature = (device, *specs, _snapshot(params), builder)
+        built = self._target_kernels
+        kernel = built.get(signature)
+        if kernel is None:
+            # Concurrent misses build one kernel, from copies of the params.
             with self._building:
-                entry = built.get(signature)
-                if entry is None or entry[1] != versions or None in versions:
-                    owned = {
-                        k: v if isinstance(v, torch.Tensor) else copy.deepcopy(v)
-                        for k, v in params.items()
-                    }
-                    kernel = self._build_target_kernel(device, named, owned)
-                    entry = (kernel, versions)
-                    if None not in versions:
-                        built[signature] = entry
-                        self._target_kernels[signature] = kernel
-        kernel = entry[0]
+                kernel = built.get(signature)
+                if kernel is None:
+                    owned = copy.deepcopy(params)
+                    kernel = built[signature] = self._build_target_kernel(
+                        builder, device, specs, owned
+                    )
         result = kernel(*inputs, **writes, **(execution or {}))
         # An op whose every output is an input it writes returns nothing, as its forward does.
         outputs = self._forward_outputs()
-        if outputs and all(name in named for name in outputs):
+        if outputs and all(name in names for name in outputs):
             return None
         return result
 
     def _traced_device(self, arguments: tuple) -> "torch.device | None":
         """The call device of a call no check placed, from its *arguments*: its tensors'
-        device, `device: cpu` tensors aside, else :meth:`_device_without_call_tensors`."""
+        device, `device: cpu` tensors aside, else the declared ``device`` param, else the
+        accelerator's current one, as the generated checks place it."""
         devices = {t.device for t in arguments if isinstance(t, torch.Tensor)}
         devices = {d for d in devices if d.type != "cpu"} or devices
-        return next(iter(devices)) if devices else self._device_without_call_tensors()
+        return next(iter(devices)) if devices else tensorless_device(self)
 
     def _build_target_kernel(
         self,
+        builder: object,
         device: "torch.device | None",
-        inputs: "dict[str, torch.Tensor | None]",
+        specs: tuple,
         params: "dict[str, object]",
     ) -> object:
-        """Ask the target for the kernel serving calls on *device* described by *inputs*,
-        built with the manifest *params*.
+        """Ask *builder* for the kernel serving calls on *device* whose inputs *specs*
+        describe, one :func:`_slot_spec` each, built with the manifest *params*.
 
         The builder runs with *device* current. In tuned mode the kernel is tuned before it
         is returned, so a kernel whose tuning raised is never cached and the next call builds
@@ -1288,16 +1338,15 @@ class Op(ABC):
         Raises:
             OpNotAvailableError: The builder returned something that is not callable.
         """
-        specs = tuple(None if t is None else TensorSpec.of(t) for t in inputs.values())
         # Built with its device current, as an in-tree entry is: a builder may compile or
         # allocate for whichever device is current.
         with device_context(device):
-            kernel = self._target_builder(*specs, **params)
+            kernel = builder(*specs, **params)
         if not callable(kernel):
             raise OpNotAvailableError(
-                f"target {self._serving_target!r} built {kernel!r} for "
-                f"{type(self).__name__}, which is not callable; a builder returns "
-                f"something the op can call with the tensors it was described"
+                f"the kernel builder {builder!r} returned {kernel!r}, which is not "
+                f"callable, for {type(self).__name__}; a builder returns something the "
+                f"op can call with the tensors it was described"
             )
         if self._tune_requested:
             self._tune_target_kernel(device, kernel)
@@ -1309,17 +1358,22 @@ class Op(ABC):
         A kernel that defines no ``request_tune`` cannot be tuned, and the op warns once.
         """
         tune = getattr(kernel, "request_tune", None)
-        if not callable(tune):
-            self._warn_untunable_target_kernel()
-            return
-        with device_context(device):
-            tune()
+        if callable(tune):
+            with device_context(device):
+                tune()
+        elif not self._tune_warned:
+            self._tune_warned = True
+            warnings.warn(
+                f"{type(self).__name__}'s target kernel {kernel!r} defines no request_tune",
+                UserWarning,
+                stacklevel=3,
+            )
 
     def _manifest_params(self) -> dict[str, object]:
         """The op's manifest params, by name, with the values this instance holds.
 
         ``build_kernel`` is called with these by keyword. Names come from the manifest
-        (``_params_codegen``), values off the instance, so a param the manifest defaults to
+        (``install_param_names``), values off the instance, so a param the manifest defaults to
         null arrives as the instance holds it: ``None`` unless the caller gave a value.
 
         Raises:
@@ -1342,15 +1396,19 @@ class Op(ABC):
         return values
 
     def _entries_built(self, interface: str) -> Mapping[Hashable, object]:
-        """Return a read-only view of the entries built for *interface* so far, whoever built them.
+        """Return a read-only mapping of the entries built for *interface* so far, whoever built them.
 
         Empty before the interface's first build. A target serves the whole op, so for an op a
-        target serves every interface shows the target's kernels, one per input signature. For
+        target serves every interface maps to a copy of the target's kernels taken at the
+        call, one per input signature; an in-tree op's mapping is a live view. For
         introspection — tests, benchmark reporting — never for dispatch: an execution path
         asks ``kernel_for`` so a miss builds rather than raises.
         """
-        if self._has_target_builder():
-            return MappingProxyType(self._target_kernels)
+        builder = self._target_builder
+        if builder is not None and builder is not _UNRESOLVED:
+            # Copied in one step, so a concurrent call adding a kernel cannot break the loop.
+            held = tuple(self._target_kernels.items())
+            return MappingProxyType(dict(held))
         return MappingProxyType(self._built_entries.get(interface, {}))
 
     def delegate_for(
@@ -1368,10 +1426,8 @@ class Op(ABC):
             stage: A key of ``delegate_types``.
             identity: Everything that can change what gets built, as an implementation's
                 ``entry_for`` returns it, or ``None`` to hold the sub-op for this op's
-                specialization (its params and construction tensors). Under ``None`` a sub-op
-                does not see a param edited in place (assign a new value), a write to an
-                inference construction tensor, or, in a traced call, a construction tensor
-                replaced since the last eager call.
+                specialization (its params). Under ``None`` a sub-op does not see a param
+                edited in place (assign a new value).
             given: The caller's implementation for this stage, or ``None`` to build one.
                 One given under identity ``None`` is held for every specialization.
             params: The sub-op's constructor arguments other than the execution policy.
@@ -1387,20 +1443,19 @@ class Op(ABC):
             calls = _OPEN_CALLS.__dict__.get("stack")
             frame = calls[-1] if calls else None
             plan = frame.plan if frame is not None and frame.op is self else None
-            tensors = self._construction_tensors_key()
             if plan is None:
-                return self._settled_delegate(stage, params, tensors)
+                return self._settled_delegate(stage, params)
             # By request position: one plan's forward makes the same requests in order.
             held, index = plan.delegates, frame.delegate_index
             frame.delegate_index = index + 1
             if index < len(held):
                 entry = held[index]
-                if entry[0] == stage and entry[2] == tensors:
+                if entry[0] == stage:
                     return entry[1]
             with plan.filling:
-                delegate = self._settled_delegate(stage, params, tensors)
+                delegate = self._settled_delegate(stage, params)
                 del held[index:]
-                held.append((stage, delegate, tensors))
+                held.append((stage, delegate))
             return delegate
         if identity not in entries:
             # Concurrent misses, from any plan, build one sub-op.
@@ -1416,53 +1471,21 @@ class Op(ABC):
                             f"{identity!r}"
                         )
                     entries[identity] = delegate
-                    # Which stage holds each sub-op.
+                    # Which stage holds each sub-op, replaced ones included, until it is
+                    # collected.
                     self._delegate_stages[id(delegate)] = stage
+                    weakref.finalize(
+                        delegate, self._delegate_stages.pop, id(delegate), None
+                    ).atexit = False
                     # A sub-op held while this op is in tuned mode joins it, built or given.
                     if self._tune_requested:
                         delegate.request_tune()
         return entries[identity]
 
-    def _construction_tensors_key(self) -> "tuple | None":
-        """Each construction-time tensor by identity and version; ``None`` in a trace."""
-        if torch.compiler.is_compiling():
-            return None
-        signature = getattr(type(self), "_signature", None)
-        names = signature.ctor_names if signature is not None else ()
-        if not names:
-            return ()
-        tensors = (getattr(self, name, None) for name in names)
-        return tuple(
-            None if t is None else (id(t), None if t.is_inference() else t._version)
-            for t in tensors
-        )
-
-    def _settled_delegate(self, stage: str, params: dict, tensors: "tuple | None") -> "Op":
-        """The sub-op of *stage* for this op's params and construction tensors (*tensors*),
-        built from *params* on a miss; one built for other tensors is replaced."""
+    def _settled_delegate(self, stage: str, params: dict) -> "Op":
+        """The sub-op of *stage* for this op's params, built from *params* on a miss."""
         signature = getattr(type(self), "_signature", None)
         identity = (stage, None if signature is None else param_state(self, signature.sig))
-        if tensors is not None:
-            built_for = self.__dict__.setdefault("_settled_tensors", {})
-            entries = self._delegates.setdefault(stage, {})
-            with self._building:
-                held = entries.get(identity)
-                if held is not None and built_for.get(identity) != tensors:
-                    # Replaced: no plan may reach it again.
-                    for plan in self._plans.values():
-                        at = next((i for i, e in enumerate(plan.delegates) if e[1] is held), None)
-                        if at is not None:
-                            del plan.delegates[at:]
-                    del entries[identity]
-                    # A call still running on the replaced sub-op records under its stage.
-                    retired = self.__dict__.setdefault("_retired_delegates", {})
-                    older = retired.pop(identity, None)
-                    if older is not None:
-                        del self._delegate_stages[id(older)]
-                    retired[identity] = held
-                delegate = self.delegate_for(stage, identity, **params)
-                built_for[identity] = tensors
-            return delegate
         return self.delegate_for(stage, identity, **params)
 
     def _held_delegates(self) -> Sequence["Op"]:
@@ -1487,7 +1510,7 @@ class Op(ABC):
             return BUILTIN
         return self._serving_target
 
-    def kernel_config(self) -> Optional[dict]:
+    def kernel_config(self) -> dict[str, Any] | None:
         """The configuration the op's kernels published, or ``None``.
 
         An op given a config of its own answers with it; otherwise the first configured
@@ -1521,7 +1544,12 @@ class Op(ABC):
         """
         seen: set[int] = set()
         for op in self._walk_ops():
-            held = [entry for entries in op._built_entries.values() for entry in entries.values()]
+            # Copied in one step each: calls may add entries while this walks.
+            held = [
+                entry
+                for entries in tuple(op._built_entries.values())
+                for entry in tuple(entries.values())
+            ]
             for entry in held:
                 for kernel in self._entry_kernels(entry):
                     if id(kernel) not in seen:
@@ -1537,7 +1565,8 @@ class Op(ABC):
         """
         seen: set[tuple] = set()
         for op in self._walk_ops():
-            for signature, kernel in op._target_kernels.items():
+            # Copied in one step: tuning runs between yields while calls may add kernels.
+            for signature, kernel in tuple(op._target_kernels.items()):
                 device = signature[0]
                 if (device, id(kernel)) not in seen:
                     seen.add((device, id(kernel)))
@@ -1545,31 +1574,12 @@ class Op(ABC):
 
     def _device_without_call_tensors(self) -> "torch.device | None":
         """The call device of a call that carries no tensor: the declared ``device`` param,
-        else the construction-time tensors' device, else the accelerator's current one.
+        else the accelerator's current one.
 
         The same rule the generated checks apply, for a caller that runs no check: a traced
         call, or an op body building a call spec for an op with no tensor input.
         """
-        from tileops._ops._signature_codegen import tensorless_device
-
-        sig = type(self)._signature.sig
-        held = tuple(
-            tensor
-            for name, decl in sig.ctor_tensors.items()
-            if not decl.cpu and (tensor := getattr(self, name, None)) is not None
-        )
-        return tensorless_device(type(self).__name__, self, held)
-
-    def _declared_device(self) -> "torch.device | None":
-        """Where the call runs when no tensor says: the ``device`` param an op declares.
-
-        Only an op with no tensor input declares one, and ``None`` there leaves the
-        choice to the target.
-        """
-        if "device" not in getattr(self, PARAM_NAMES_ATTRIBUTE, ()):
-            return None
-        device = getattr(self, "device", None)
-        return None if device is None else torch.device(device)
+        return tensorless_device(self)
 
     @staticmethod
     def _entry_kernels(entry: object) -> "list[Kernel]":
@@ -1594,7 +1604,7 @@ class Op(ABC):
     def _walk_ops(self) -> Iterator["Op"]:
         """Yield this op and the ops it runs kernels through, each one once."""
         seen: set[int] = set()
-        stack: list["Op"] = [self]
+        stack: list[Op] = [self]
         while stack:
             op = stack.pop()
             if id(op) in seen:
@@ -1628,20 +1638,8 @@ class Op(ABC):
         for op, device, kernel in self._target_kernels_by_device():
             op._tune_target_kernel(device, kernel)
 
-    def _warn_untunable_target_kernel(self) -> None:
-        """Warn, once per instance, that a kernel of this op's target cannot be tuned."""
-        if self._tune_warned:
-            return
-        self._tune_warned = True
-        warnings.warn(
-            f"{type(self).__name__} is served by target {self._serving_target!r}, whose "
-            f"kernel defines no request_tune",
-            UserWarning,
-            stacklevel=4,
-        )
-
     @abstractmethod
-    def forward(self, *args: object, **kwargs: object) -> Union[torch.Tensor, tuple]:
+    def forward(self, *args: object, **kwargs: object) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Run the op.
 
         Returns:
@@ -1650,7 +1648,7 @@ class Op(ABC):
         """
         raise NotImplementedError("forward method is not implemented")
 
-    def __call__(self, *args: object, **kwargs: object) -> Union[torch.Tensor, tuple]:
+    def __call__(self, *args: object, **kwargs: object) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Make the op callable.
 
         ``forward`` is the op's computation, and it runs inside :meth:`_execute`. An op with
@@ -1668,11 +1666,12 @@ class Op(ABC):
         if type(self)._signature is None:
             raise self._no_entry()
         if torch.compiler.is_compiling():
-            if self._target_builder is _UNRESOLVED:
-                self._bind_target(self._traced_device((*args, *kwargs.values())))
-            if self._has_target_builder():
+            builder = self._target_builder
+            if builder is _UNRESOLVED:
+                builder = self._bind_target(self._traced_device(leaves((*args, *kwargs.values()))))
+            if builder is not None:
                 inputs, writes, execution = self._split_forward_args(args, kwargs)
-                return self._run_on_target(inputs, writes, None, execution)
+                return self._run_on_target(builder, inputs, writes, None, execution)
             return self.forward(*args, **kwargs)
         inputs, writes, execution = self._split_forward_args(args, kwargs)
         return self._execute(inputs, writes, None, execution)
@@ -1730,23 +1729,22 @@ class Op(ABC):
         self._entries_by_call = {}
         self._built_entries = {}
         self._target_kernels = {}
-        self.__dict__.pop("_target_built", None)
 
-    def _bind_target(self, device: "torch.device | None") -> None:
-        """Decide which target serves this instance on the call *device*, and remember its
-        builder.
+    def _bind_target(self, device: "torch.device | None") -> object:
+        """Decide which target serves this instance on the call *device*, remember its
+        builder, and return the builder this call runs on: ``None`` for the in-tree kernels.
 
         Once decided it does not change: the kernels this instance has built belong to that
         target. An instance is therefore bound to that target's devices — handing it tensors
         from elsewhere is a caller error, and the kernel is what reports it. *device* is the
-        one the signature check placed the call on; a call with none probes nothing and
-        decides nothing.
+        one the signature check placed the call on. Without a named or process-default target,
+        a call with none probes nothing, decides nothing and runs on the in-tree kernels.
 
         A composite — an op that builds no kernel of its own — needs no builder: without
         one its sub-ops each select a target of their own.
 
         Raises:
-            OpNotAvailableError: The selected target registers no builder for this op,
+            OpNotServedError: The selected target registers no builder for this op,
                 and the op builds kernels of its own.
         """
         target = select_target(self.target, device)
@@ -1754,11 +1752,11 @@ class Op(ABC):
             self._serving_target = None
             if device is not None:
                 self._target_builder = None  # a device was probed, so the answer is decided
-            return
+            return None
         if target is BUILTIN:
             self._serving_target = BUILTIN
             self._target_builder = None
-            return
+            return None
         # A target serves only the ops of tileops, which it knows by their manifest keys.
         builder = (
             registered_kernel_builder(type(self).__name__, target) if in_tree(type(self)) else None
@@ -1766,14 +1764,16 @@ class Op(ABC):
         if builder is None and not self.kernel_types:
             self._serving_target = target
             self._target_builder = None
-            return
+            return None
         if builder is None:
-            raise OpNotAvailableError(
+            raise OpNotServedError(
                 f"target {target!r} registers no kernel builder for "
                 f"{type(self).__name__}; targets that do: "
                 f"{registered_targets(type(self).__name__)}. There is no fall back to the "
                 f"in-tree implementation: those kernels do not run on this target's "
-                f"devices."
+                f"devices.",
+                target=target,
             )
         self._serving_target = target
         self._target_builder = builder
+        return builder

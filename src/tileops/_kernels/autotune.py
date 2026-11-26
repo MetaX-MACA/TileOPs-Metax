@@ -1,11 +1,4 @@
-"""TileLang's autotuner, with the input supplier in the key of every result it persists.
-
-TileLang keys a tuning result by the builder's source and arguments, the candidates and the
-profiling settings; ``supply_prog`` is not among them. A result tuned on one supplier's inputs
-is therefore reused after the supplier changes, from the in-process cache and from
-``TILELANG_CACHE_DIR`` alike. :func:`autotune` adds :func:`supply_fingerprint` to that key,
-and compiles every candidate for the caller's target. Every TileOPs tuning goes through it.
-"""
+"""Autotuning keyed by supplier state and timing policy; CUDA uses median device-busy time."""
 
 import dataclasses
 import enum
@@ -13,9 +6,11 @@ import functools
 import hashlib
 import inspect
 import sys
+import threading
 import types
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
 import torch
 from tilelang import env as tilelang_env
@@ -24,11 +19,29 @@ from tilelang.autotuner import tuner as _tilelang_tuner
 from tilelang.autotuner.tuner import AutoTuneImpl, AutoTuner
 from tilelang.backend.target import determine_target
 
-__all__ = ["TUNING_FATAL", "autotune", "supply_fingerprint"]
+from tileops._utils.cupti import (
+    AttributionError,
+    CUPTIError,
+    collect_attributed,
+    l2_flush_buffer,
+    median_busy_ms,
+    reset_persisting_l2_cache,
+)
+
+__all__ = ["TUNING_FATAL", "autotune", "candidate_busy_ms", "supply_fingerprint"]
 
 # What a tuning loop re-raises instead of skipping the candidate: exhausted device memory, which
-# every later candidate meets too, and an error in the code driving the candidate.
-TUNING_FATAL = (torch.OutOfMemoryError, TypeError, AttributeError, NameError, AssertionError)
+# every later candidate meets too, an error in the code driving the candidate, and a reading
+# the CUPTI collector failed to take, which leaves the ranking incomplete.
+TUNING_FATAL = (
+    torch.OutOfMemoryError,
+    TypeError,
+    AttributeError,
+    NameError,
+    AssertionError,
+    CUPTIError,
+    AttributionError,
+)
 
 # TileLang's first tuning would add a handler writing `autotuner.log` into the working directory
 # and another printing to stdout. Unless TileLang already installed them, its records go to the
@@ -181,7 +194,8 @@ class _Fingerprint:
                 self.module(value.__name__)
         elif callable(value) and not hasattr(value, "__dict__"):
             # A builtin or C function: its name is all there is to read.
-            self._add("callable", getattr(value, "__module__", None), _qualname(value))
+            qualname = getattr(value, "__qualname__", None) or type(value).__qualname__
+            self._add("callable", getattr(value, "__module__", None), qualname)
         else:
             self.instance(value)
 
@@ -296,11 +310,7 @@ def _tensor_contents(tensor: torch.Tensor) -> str:
     return hashlib.sha256(data.numpy().tobytes()).hexdigest()
 
 
-def _qualname(value: object) -> str:
-    return getattr(value, "__qualname__", None) or type(value).__qualname__
-
-
-def supply_fingerprint(supply_prog: Optional[Callable]) -> str:
+def supply_fingerprint(supply_prog: Callable | None) -> str:
     """Fingerprint supplier code and captured state for persistent autotune results.
 
     First-party function bytecode, module source and referenced runtime attributes
@@ -317,26 +327,166 @@ def supply_fingerprint(supply_prog: Optional[Callable]) -> str:
     return fingerprint.hexdigest()
 
 
+# How a candidate is read, by the kind of target it is compiled for. Part of the key of every
+# stored result, so a result ranked by another reading is tuned again.
+_DEVICE_BUSY = "median-device-busy-after-l2-read"
+_TILELANG_EVENTS = "tilelang-cuda-events"
+
+
+# CUPTI collects one session at a time and records every thread's launches, so readings
+# and TileLang's concurrent benchmark steps queue here. Reentrant: a step takes a reading.
+_READING = threading.RLock()
+
+
+def _flush_l2(buffer: torch.Tensor) -> None:
+    """Return persisting L2 lines to normal priority, then evict L2 by reading *buffer*, an
+    :func:`~tileops._utils.cupti.l2_flush_buffer` on a CUDA device, so every candidate is
+    ranked from the same cache state. A read leaves no dirty lines to write back during the
+    timed call."""
+    # Imported on first use: Triton is needed only where a CUDA device is timed.
+    from tileops._utils._l2_sweep import read_sweep
+
+    reset_persisting_l2_cache()
+    read_sweep(buffer)
+
+
+def candidate_busy_ms(fn: Callable[[], Any], n_warmup: int, n_repeat: int) -> float:
+    """The median device-busy time of *fn*, in ms, on the current CUDA device, each call
+    prepared by :func:`_flush_l2`.
+
+    Raises:
+        CUPTIError, AttributionError: The collector failed to take the reading.
+    """
+    with _READING:
+        device = torch.cuda.current_device()  # lint: device-api allow: CUPTI runs on CUDA only
+        flush = l2_flush_buffer(torch.device("cuda", device))
+
+        def prepare(_iteration: int) -> None:
+            # Drained on both sides of the flush, so each candidate call starts on an idle
+            # device after the previous one has finished.
+            torch.cuda.synchronize()  # lint: device-api allow: CUPTI runs on CUDA only
+            _flush_l2(flush)
+            torch.cuda.synchronize()  # lint: device-api allow: CUPTI runs on CUDA only
+
+        for _ in range(n_warmup):
+            prepare(0)
+            fn()
+        torch.cuda.synchronize()  # lint: device-api allow: CUPTI runs on CUDA only
+        # Every record, as a call that lost one of its kernels to a full buffer reads short and wins.
+        samples = collect_attributed(lambda _iteration: fn(), n_repeat, prepare, every_record=True)
+        return median_busy_ms(samples)
+
+
+class _BusyTimedKernel:
+    """Override candidate profiling and retain collector failures for the tuner."""
+
+    def __init__(self, kernel: Any, failures: list[BaseException]) -> None:
+        self._kernel = kernel
+        self._failures = failures
+
+    def get_profiler(self, **kwargs: Any) -> Any:
+        profiler = self._kernel.get_profiler(**kwargs)
+
+        def do_bench(
+            func: Callable | None = None,
+            *,
+            n_warmup: int,
+            n_repeat: int,
+            input_tensors: list,
+            backend: str,
+            device: Any = None,
+            # Ignored: the busy median takes every repeat, so no candidate stops early.
+            early_stop_baseline: float | None = None,
+        ) -> float:
+            fn = functools.partial(func or profiler.func, *input_tensors)
+            with torch.cuda.device(device):  # lint: device-api allow: CUPTI runs on CUDA only
+                fn()
+                torch.cuda.synchronize()  # lint: device-api allow: CUPTI runs on CUDA only
+                try:
+                    return candidate_busy_ms(fn, n_warmup, n_repeat)
+                except Exception as exc:
+                    self._failures.append(exc)
+                    raise
+
+        profiler.do_bench = do_bench
+        return profiler
+
+
 @dataclasses.dataclass
 class _SupplyKeyedAutoTune(AutoTuneImpl):
-    """TileLang's tuner, whose cache key also holds the supplier's fingerprint."""
+    """Include supplier and timing policy in cache keys and use CUPTI on CUDA."""
 
     supply_key: str = ""
+
+    def _make_jit_compile_func(self, mode: str, args: tuple, kwargs: dict) -> Callable:
+        """Compile candidates concurrently, each on a JIT object no other candidate writes.
+
+        TileLang 0.1.15 writes a candidate's per-config pass options onto the shared
+        ``jit_impl`` and holds one lock across every compile, so its compile pool builds one
+        candidate at a time. Here a candidate with options compiles on a copy carrying them,
+        as tile-ai/tilelang#3476 does, and no compile needs the lock.
+        """
+
+        def jit_compile(**config_arg: Any) -> Any:
+            # The tuner states the key on every candidate, None where it has no options.
+            options = config_arg.pop(_tilelang_tuner._PASS_CONFIGS_KEY, None)
+            if options is not None:
+                merged = {**(self.jit_impl.pass_configs or {}), **options}
+                jit_impl = dataclasses.replace(self.jit_impl, pass_configs=merged)
+                return jit_impl.compile(*args, **{**kwargs, **config_arg})
+            if mode == "lazy":
+                return self.jit_impl(*args, **kwargs, __tune_params=config_arg)
+            return self.jit_impl.compile(*args, **{**kwargs, **config_arg})
+
+        return jit_compile
 
     def get_tunner(self) -> AutoTuner:
         tuner = super().get_tunner()
         tilelang_key = tuner.generate_cache_key
+        on_cuda = tuner.compile_args.target.kind.name == "cuda"
+        timing = _DEVICE_BUSY if on_cuda else _TILELANG_EVENTS
 
         def generate_cache_key(parameters: dict, extra_parameters: dict) -> str:
             key = tilelang_key(parameters, extra_parameters)
-            return hashlib.sha256(f"{key}:{self.supply_key}".encode()).hexdigest()
+            return hashlib.sha256(f"{key}:{self.supply_key}:{timing}".encode()).hexdigest()
 
-        # An instance attribute, as TileLang's own ``get_tunner`` overrides ``run``.
+        # Instance attributes, as TileLang's own ``get_tunner`` overrides ``run``.
         tuner.generate_cache_key = generate_cache_key
+        if not on_cuda:
+            return tuner
+
+        # A reading the instrument failed to take leaves the ranking incomplete: the tuning
+        # raises it, before TileLang stores a result chosen without that candidate.
+        failures: list[BaseException] = []
+        benchmark, save, run = tuner._benchmark_target, tuner._save_result_to_disk, tuner.run
+
+        def benchmark_target(jit_kernel: Any, **kwargs: Any) -> Any:
+            with _READING:
+                return benchmark(jit_kernel=_BusyTimedKernel(jit_kernel, failures), **kwargs)
+
+        def save_result_to_disk(key: str, result: Any) -> None:
+            if failures:
+                raise failures[0]
+            save(key, result)
+
+        def tune(*args: Any, **kwargs: Any) -> Any:
+            try:
+                result = run(*args, **kwargs)
+            except Exception as exc:
+                if failures and exc is not failures[0]:
+                    raise failures[0] from exc
+                raise
+            if failures:
+                raise failures[0]
+            return result
+
+        tuner._benchmark_target = benchmark_target
+        tuner._save_result_to_disk = save_result_to_disk
+        tuner.run = tune
         return tuner
 
 
-def autotune(*, supply_prog: Optional[Callable] = None, **kwargs: Any) -> Callable:
+def autotune(*, supply_prog: Callable | None = None, **kwargs: Any) -> Callable:
     """``tilelang.autotuner.autotune``, keying each result by the fingerprint of *supply_prog*.
 
     Takes the arguments TileLang's ``autotune`` takes. The key is TileLang's key hashed with

@@ -1,7 +1,7 @@
 """Mamba-2 benchmarks, one case per manifest call. The SSD stages and the full forward
-(SSDChunkCumsum, SSDChunkCoupling, SSDChunkState, SSDStatePassing, SSDChunkScan) run against the
-mamba_ssm Triton kernels and mamba_chunk_scan_combined; the causal convolution ahead of them
-against vLLM's Triton kernels.
+(SSDChunkCumsum, SSDChunkCoupling, SSDChunkState, SSDStatePassing, SSDChunkScan) run against
+vLLM's Triton kernels, which carry mamba_ssm's over packed varlen tokens, and
+mamba_chunk_scan_combined_varlen; the causal convolution ahead of them against vLLM's too.
 """
 
 import pytest
@@ -15,9 +15,9 @@ from benchmarks.baselines import (
     baseline_module,
     compiled_reference,
     flashinfer_op,
-    optional_baseline,
     private_inputs,
     vllm_op,
+    vllm_state_lines,
 )
 from tileops._ops.mamba.causal_conv1d import CausalConv1dFwdOp, CausalConv1dUpdateFwdOp
 from tileops._ops.mamba.mamba2_fwd import Mamba2FwdOp
@@ -33,22 +33,41 @@ from workloads.mamba import ssd_decode_result
 
 VLLM_CONV1D = "model_executor.layers.mamba.ops.causal_conv1d"
 
-# Optional mamba_ssm Triton baselines
-_mamba_chunk_cumsum_fwd = optional_baseline(
-    "mamba_ssm.ops.triton.ssd_chunk_state", "mamba-ssm", "_chunk_cumsum_fwd"
-)
-_mamba_chunk_scan_fwd = optional_baseline(
-    "mamba_ssm.ops.triton.ssd_chunk_scan", "mamba-ssm", "_chunk_scan_fwd"
-)
-_mamba_chunk_state_fwd = optional_baseline(
-    "mamba_ssm.ops.triton.ssd_chunk_state", "mamba-ssm", "_chunk_state_fwd"
-)
-_mamba_state_passing_fwd = optional_baseline(
-    "mamba_ssm.ops.triton.ssd_state_passing", "mamba-ssm", "_state_passing_fwd"
-)
-_mamba_chunk_scan_combined = optional_baseline(
-    "mamba_ssm.ops.triton.ssd_combined", "mamba-ssm", "mamba_chunk_scan_combined"
-)
+# vLLM's Mamba-2 kernels, which carry mamba_ssm's Triton SSD stages over packed varlen tokens.
+_VLLM_SSD = "vllm.model_executor.layers.mamba.ops."
+
+
+def _vllm_ssd(module: str, name: str):
+    return getattr(baseline_module(_VLLM_SSD + module, VLLM_TAG), name)
+
+
+def _vllm_chunks(batch: int, seqlen: int, chunk_size: int, device: torch.device):
+    """vLLM's chunking of *batch* packed sequences of *seqlen* tokens: the chunk boundaries,
+    each sequence's last chunk, and each chunk's sequence."""
+    chunks = -(-seqlen // chunk_size)
+    within = torch.arange(chunks, device=device) * chunk_size
+    starts = (torch.arange(batch, device=device)[:, None] * seqlen + within).flatten()
+    bounds = torch.cat([starts, starts.new_tensor([batch * seqlen])]).to(torch.int32)
+    last = (torch.arange(1, batch + 1, device=device) * chunks - 1).to(torch.int32)
+    owner = torch.arange(batch, device=device).repeat_interleave(chunks).to(torch.int32)
+    return bounds, last, owner
+
+
+def _to_vllm_chunks(t: torch.Tensor) -> torch.Tensor:
+    """(b, h, c, L) as vLLM's (h, b * c, L)."""
+    return t.transpose(0, 1).flatten(1, 2).contiguous()
+
+
+def _from_vllm_chunks(t: torch.Tensor, batch: int) -> torch.Tensor:
+    """vLLM's (h, b * c, L) as (b, h, c, L)."""
+    return t.unflatten(1, (batch, -1)).transpose(0, 1)
+
+
+def _end_states(entering: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """States entering each chunk, (b, c, ...), as vLLM's states leaving each chunk, packed,
+    and the states entering each sequence. A sequence's last state is never read."""
+    leaving = torch.cat([entering[:, 1:], torch.zeros_like(entering[:, :1])], dim=1)
+    return leaving.flatten(0, 1).contiguous(), entering[:, 0].contiguous()
 
 
 def _torch_baselines(implementations: dict, ref_program) -> None:
@@ -65,12 +84,18 @@ def test_ssd_chunk_coupling_fwd_bench(case) -> None:
         return
     chunk_len = case.params["chunk_size"]
     op = SSDChunkCouplingFwdOp(**case.arguments)
-    _bmm_chunk_fwd = baseline_module("mamba_ssm.ops.triton.ssd_bmm", "mamba-ssm")._bmm_chunk_fwd
+    bmm_chunk_fwd = _vllm_ssd("ssd_bmm", "_bmm_chunk_fwd")
+    c_in = case.inputs[0]
+    batch, seqlen = c_in.shape[:2]
+    bounds, _, _ = _vllm_chunks(batch, seqlen, chunk_len, c_in.device)
 
-    def mamba_fn(c, b):
-        return _bmm_chunk_fwd(c, b, chunk_len, causal=True, output_dtype=c.dtype).tril()
+    def vllm_fn(c, b):
+        cb = bmm_chunk_fwd(
+            c.flatten(0, 1), b.flatten(0, 1), chunk_len, bounds, causal=True, output_dtype=c.dtype
+        )
+        return cb.unflatten(0, (batch, -1)).tril()
 
-    bench.Runner(op, case).compare({"mamba": mamba_fn, "torch": case.reference})
+    bench.Runner(op, case).compare({VLLM_TAG: vllm_fn, "torch": case.reference})
 
 
 @pytest.mark.parametrize("case", bench.cases(SSDChunkCumsumFwdOp), ids=lambda case: case.id)
@@ -81,20 +106,27 @@ def test_ssd_chunk_cumsum_fwd_bench(case) -> None:
         return
     dt, A, dt_bias = case.inputs
     op = SSDChunkCumsumFwdOp(**case.arguments)
-    implementations = {}
+    chunk_cumsum_fwd = _vllm_ssd("ssd_chunk_state", "_chunk_cumsum_fwd")
+    batch, seqlen = dt.shape[:2]
+    bounds, _, _ = _vllm_chunks(batch, seqlen, op.chunk_size, dt.device)
 
-    # _chunk_cumsum_fwd returns (dA_cumsum, dt_out) with a float32 dt_out; the baseline
-    # returns them in TileOPs' order and dtype.
-    if _mamba_chunk_cumsum_fwd is not None:
+    # vLLM returns (dA_cumsum, dt_out) with a float32 dt_out; return TileOPs' order and dtype.
+    def vllm_fwd():
+        dA_cumsum, dt_out = chunk_cumsum_fwd(
+            dt.flatten(0, 1),
+            A,
+            op.chunk_size,
+            bounds,
+            dt_bias=dt_bias,
+            dt_softplus=op.dt_softplus,
+            dt_limit=(op.dt_min, op.dt_max),
+        )
+        return (
+            _from_vllm_chunks(dt_out, batch).to(op.out_dtype),
+            _from_vllm_chunks(dA_cumsum, batch),
+        )
 
-        def mamba_fwd():
-            dA_cumsum, dt_out = _mamba_chunk_cumsum_fwd(
-                dt, A, op.chunk_size, dt_bias=dt_bias, dt_softplus=op.dt_softplus
-            )
-            return dt_out.to(op.out_dtype), dA_cumsum
-
-        implementations["mamba"] = bench.Implementation(run=mamba_fwd, args=())
-
+    implementations = {VLLM_TAG: bench.Implementation(run=vllm_fwd, args=())}
     _torch_baselines(implementations, case.reference)
     bench.Runner(op, case).compare(implementations)
 
@@ -107,17 +139,30 @@ def test_ssd_chunk_scan_fwd_bench(case) -> None:
         return
     x, cb, dA_cumsum, C, prev_states, dt = case.inputs
     op = SSDChunkScanFwdOp(**case.arguments)
-    implementations = {}
+    chunk_scan_fwd = _vllm_ssd("ssd_chunk_scan", "_chunk_scan_fwd")
+    batch, seqlen = x.shape[:2]
+    bounds, _, owner = _vllm_chunks(batch, seqlen, dt.shape[-1], x.device)
+    leaving, initial = _end_states(prev_states)
+    cb_v, dt_v, dA_v = cb.flatten(0, 1), _to_vllm_chunks(dt), _to_vllm_chunks(dA_cumsum)
+    out = torch.empty_like(x.flatten(0, 1))
 
-    if _mamba_chunk_scan_fwd is not None:
-        # mamba signature: _chunk_scan_fwd(cb, x, dt, dA_cumsum, C, states, ...)
-        def mamba_fwd():
-            # Match the op's FP32 output; the cast is part of this baseline's timing.
-            out, _ = _mamba_chunk_scan_fwd(cb, x, dt, dA_cumsum, C, prev_states)
-            return out.float()
+    def vllm_fwd():
+        chunk_scan_fwd(
+            cb_v,
+            x.flatten(0, 1),
+            dt_v,
+            dA_v,
+            C.flatten(0, 1),
+            leaving,
+            bounds,
+            out,
+            owner,
+            initial_states=initial,
+        )
+        # Match the op's FP32 output; the cast is part of this baseline's timing.
+        return out.unflatten(0, (batch, seqlen)).float()
 
-        implementations["mamba"] = bench.Implementation(run=mamba_fwd, args=())
-
+    implementations = {VLLM_TAG: bench.Implementation(run=vllm_fwd, args=())}
     _torch_baselines(implementations, case.reference)
     bench.Runner(op, case).compare(implementations)
 
@@ -132,12 +177,18 @@ def test_ssd_chunk_state_fwd_bench(case) -> None:
     op = SSDChunkStateFwdOp(**case.arguments)
     implementations = {}
 
-    if _mamba_chunk_state_fwd is not None:
-        # dt and dA_cumsum share TileOPs' (b, h, c, L) layout.
-        def mamba_fwd():
-            return _mamba_chunk_state_fwd(Bmat, x, dt, dA_cumsum, seq_idx=seq_idx)
+    # vLLM restarts only at chunk boundaries, so a seq_idx inside a chunk has no equivalent.
+    if seq_idx is None:
+        chunk_state_fwd = _vllm_ssd("ssd_chunk_state", "_chunk_state_fwd")
+        batch, seqlen = x.shape[:2]
+        bounds, _, _ = _vllm_chunks(batch, seqlen, dt.shape[-1], x.device)
+        dt_v, dA_v = _to_vllm_chunks(dt), _to_vllm_chunks(dA_cumsum)
 
-        implementations["mamba"] = bench.Implementation(run=mamba_fwd, args=())
+        def vllm_fwd():
+            states = chunk_state_fwd(Bmat.flatten(0, 1), x.flatten(0, 1), dt_v, dA_v, bounds)
+            return states.unflatten(0, (batch, -1))
+
+        implementations[VLLM_TAG] = bench.Implementation(run=vllm_fwd, args=())
 
     _torch_baselines(implementations, case.reference)
     bench.Runner(op, case).compare(implementations)
@@ -151,17 +202,23 @@ def test_ssd_state_passing_fwd_bench(case) -> None:
         return
     states, dA_chunk_cumsum, initial_states = case.inputs
     op = SSDStatePassingFwdOp(**case.arguments)
-    implementations = {}
+    state_passing_fwd = _vllm_ssd("ssd_state_passing", "_state_passing_fwd")
+    batch, chunks = states.shape[:2]
+    last = (torch.arange(1, batch + 1, device=states.device) * chunks - 1).to(torch.int32)
+    # vLLM reads each chunk's total decay from the last slot of a full cumsum.
+    dA_v = dA_chunk_cumsum.transpose(0, 1).flatten(1).unsqueeze(-1).contiguous()
+    packed = states.flatten(0, 1)
+    first = initial_states if initial_states is not None else torch.zeros_like(states[:, 0])
 
-    if _mamba_state_passing_fwd is not None:
-        # dA_chunk_cumsum shares TileOPs' (b, h, c) layout; float32 output as TileOPs.
-        def mamba_fwd():
-            return _mamba_state_passing_fwd(
-                states, dA_chunk_cumsum, initial_states=initial_states, out_dtype=torch.float32
-            )
+    # vLLM returns each chunk's leaving state; TileOPs, each entering state and the final one.
+    def vllm_fwd():
+        leaving = state_passing_fwd(
+            packed, dA_v, last, initial_states=initial_states, out_dtype=torch.float32
+        ).unflatten(0, (batch, chunks))
+        entering = torch.cat([first.float()[:, None], leaving[:, :-1]], dim=1)
+        return entering, leaving[:, -1]
 
-        implementations["mamba"] = bench.Implementation(run=mamba_fwd, args=())
-
+    implementations = {VLLM_TAG: bench.Implementation(run=vllm_fwd, args=())}
     _torch_baselines(implementations, case.reference)
     bench.Runner(op, case).compare(implementations)
 
@@ -174,16 +231,15 @@ def test_ssd_decode_bench(case) -> None:
         return
     x = case.inputs[2]
     op = SSDRecurrentFwdOp(**case.arguments)
-
-    selective_state_update = baseline_module(
-        "mamba_ssm.ops.triton.selective_state_update", "mamba-ssm"
-    ).selective_state_update
+    selective_state_update = _vllm_ssd("mamba_ssm", "selective_state_update")
 
     skip = torch.zeros(x.shape[1:], dtype=torch.float32, device=x.device)
+    out = torch.empty(x.shape, dtype=torch.float32, device=x.device)
 
-    def mamba_fn(A, dt, x, B, C, state):
-        # FP32 x preserves the contract's output; explicit zero bias avoids an upstream None-stride bug.
-        return selective_state_update(state, x.float(), dt, A, B, C, D=skip, dt_bias=skip)
+    def vllm_fn(A, dt, x, B, C, state):
+        # FP32 x preserves the contract's output.
+        selective_state_update(state, x.float(), dt, A, B, C, skip, skip, out=out)
+        return out
 
     flashinfer_update = flashinfer_op("mamba.selective_state_update")
 
@@ -200,7 +256,7 @@ def test_ssd_decode_bench(case) -> None:
 
     bench.Runner(op, case).compare(
         {
-            "mamba": private_state(lambda *args: ssd_decode_result(mamba_fn, *args)),
+            VLLM_TAG: private_state(lambda *args: ssd_decode_result(vllm_fn, *args)),
             FLASHINFER_TAG: private_state(lambda *args: ssd_decode_result(flashinfer_fn, *args)),
             "torch-ref": private_state(case.reference),
             TORCH_COMPILE_TAG: private_state(compiled_reference(case.reference)),
@@ -216,76 +272,89 @@ def test_mamba2_fwd_bench(case):
         return
     x, dt, A, B, C, dt_bias, initial_states = case.inputs
     op = Mamba2FwdOp(**case.arguments)
-    implementations = {}
     reference = case.reference
+    combined = _vllm_ssd("ssd_combined", "mamba_chunk_scan_combined_varlen")
+    batch, seqlen = x.shape[:2]
+    bounds, last, owner = _vllm_chunks(batch, seqlen, op.chunk_size, x.device)
+    seqlens = torch.arange(batch + 1, device=x.device, dtype=torch.int32) * seqlen
+    out = torch.empty_like(x.flatten(0, 1))
 
     # Only the five leading tensors are positional, so every path gets identical clone
     # treatment; the optional tensors are captured.
     reference_args = (x, dt, A, B, C)
-    if _mamba_chunk_scan_combined is not None:
 
-        def _mamba_wrapper(x, dt, A, B, C):
-            out, final_states = _mamba_chunk_scan_combined(
-                x,
-                dt,
-                A,
-                B,
-                C,
-                op.chunk_size,
-                dt_bias=dt_bias,
-                dt_softplus=op.dt_softplus,
-                initial_states=initial_states,
-                return_final_states=True,
-            )
-            return out.float(), final_states.float()
-
-        implementations["mamba"] = bench.Implementation(run=_mamba_wrapper, args=reference_args)
+    def _vllm_wrapper(x, dt, A, B, C):
+        final_states = combined(
+            x.flatten(0, 1),
+            dt.flatten(0, 1),
+            A,
+            B.flatten(0, 1),
+            C.flatten(0, 1),
+            op.chunk_size,
+            seqlens,
+            bounds,
+            last,
+            owner,
+            out,
+            dt_bias=dt_bias,
+            initial_states=initial_states,
+            dt_softplus=op.dt_softplus,
+            # The intermediate states must share the float32 initial states' dtype.
+            state_dtype=torch.float32,
+        )
+        return out.unflatten(0, (batch, seqlen)).float(), final_states.float()
 
     def _torch_wrapper(x, dt, A, B, C):
         return reference(x, dt, A, B, C, dt_bias, initial_states)
 
-    implementations["torch-ref"] = bench.Implementation(run=_torch_wrapper, args=reference_args)
-    implementations[TORCH_COMPILE_TAG] = bench.Implementation(
-        run=compiled_reference(_torch_wrapper), args=reference_args
-    )
-
+    implementations = {
+        VLLM_TAG: bench.Implementation(run=_vllm_wrapper, args=reference_args),
+        "torch-ref": bench.Implementation(run=_torch_wrapper, args=reference_args),
+        TORCH_COMPILE_TAG: bench.Implementation(
+            run=compiled_reference(_torch_wrapper), args=reference_args
+        ),
+    }
     bench.Runner(op, case).compare(implementations)
 
 
-def _vllm_state_lines(conv_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """vLLM's cache lines for *conv_state*, and the indices of the sequences' lines.
+def _vllm_conv_lines(conv_state: torch.Tensor, slots: torch.Tensor | None, count: int):
+    """vLLM's cache lines for *conv_state*, the line of each of the *count* sequences, and the
+    reset that loads the state into them; without *slots*, sequence i holds state i."""
+    if slots is None:
+        slots = torch.arange(count, dtype=torch.int32, device=conv_state.device)
+    return vllm_state_lines(conv_state, slots)
 
-    vLLM skips cache line 0, its null block, so the sequences use lines 1 to B.
-    """
-    lines = torch.empty(
-        (conv_state.shape[0] + 1, *conv_state.shape[1:]),
-        dtype=conv_state.dtype,
-        device=conv_state.device,
-    )
-    indices = torch.arange(1, conv_state.shape[0] + 1, dtype=torch.int32, device=conv_state.device)
-    return lines, indices
+
+def _vllm_taps_differ(case) -> str | None:
+    """Why vLLM's taps are not *case*'s, or None."""
+    if case.arguments.get("dilation", 1) != 1:
+        return "vLLM convolves adjacent taps only"
+    return None
+
+
+def _vllm_conv_differs(case) -> str | None:
+    """Why vLLM's convolution computes something else than *case*, or None."""
+    differs = _vllm_taps_differ(case)
+    if differs is not None:
+        return differs
+    if case.inputs[1].dtype != case.inputs[0].dtype:
+        return "vLLM takes the weight in the activation dtype"
+    return None
 
 
 @pytest.mark.parametrize("case", bench.cases(CausalConv1dFwdOp), ids=lambda case: case.id)
 def test_causal_conv1d_bench(case) -> None:
     """Prefill against vLLM, which takes the (D, Tt) transposed view of the same storage."""
-    if is_maca():
-        op = CausalConv1dFwdOp(**case.arguments)
-        bench.Runner(op, case).compare_torch()
-        return
-    x, weight, conv_state, cu_seqlens, bias, has_initial_state = case.inputs
+    x, weight, conv_state, cu_seqlens, bias, has_initial_state, cache_indices = case.inputs
     op = CausalConv1dFwdOp(**case.arguments)
     causal_conv1d_fn = vllm_op("causal_conv1d_fn", module=VLLM_CONV1D)
-    lines, indices = _vllm_state_lines(conv_state)
+    lines, indices, reset = _vllm_conv_lines(conv_state, cache_indices, cu_seqlens.numel() - 1)
     # vLLM reads the flags unconditionally; absent, no sequence has a state.
     flags = (
         has_initial_state
         if has_initial_state is not None
         else torch.zeros(cu_seqlens.numel() - 1, dtype=torch.bool, device=x.device)
     )
-
-    def reset() -> None:
-        lines[1:].copy_(conv_state)
 
     def run() -> tuple[torch.Tensor, torch.Tensor]:
         out = causal_conv1d_fn(
@@ -300,31 +369,41 @@ def test_causal_conv1d_bench(case) -> None:
         )
         return out.t(), lines[1:]
 
-    bench.Runner(op, case).compare({VLLM_TAG: bench.Implementation(run=run, args=(), reset=reset)})
+    vllm = bench.Implementation(
+        run=run, args=(), reset=reset, noncomparable_reason=_vllm_conv_differs(case)
+    )
+    bench.Runner(op, case).compare({VLLM_TAG: vllm})
 
 
 @pytest.mark.parametrize("case", bench.cases(CausalConv1dUpdateFwdOp), ids=lambda case: case.id)
 def test_causal_conv1d_update_bench(case) -> None:
-    if is_maca():
-        op = CausalConv1dUpdateFwdOp(**case.arguments)
-        bench.Runner(op, case).compare_torch()
-        return
-    x, weight, conv_state, bias = case.inputs
+    x, weight, conv_state, bias, slots, accepted, query_start_loc = case.inputs
     op = CausalConv1dUpdateFwdOp(**case.arguments)
     causal_conv1d_update = vllm_op("causal_conv1d_update", module=VLLM_CONV1D)
-    lines, indices = _vllm_state_lines(conv_state)
+    count = x.shape[0] if query_start_loc is None else query_start_loc.numel() - 1
+    lines, indices, reset = _vllm_conv_lines(conv_state, slots, count)
     out = torch.empty_like(x)
-
-    def reset() -> None:
-        lines[1:].copy_(conv_state)
+    varlen = {}
+    if query_start_loc is not None:
+        varlen = {"query_start_loc": query_start_loc, "max_query_len": op.max_query_len}
 
     def run() -> tuple[torch.Tensor, torch.Tensor]:
         causal_conv1d_update(
-            x, lines, weight, bias, activation=op.activation, conv_state_indices=indices, out=out
-        )
+            x, lines, weight, bias, activation=op.activation, conv_state_indices=indices,
+            num_accepted_tokens=accepted, out=out, **varlen,
+        )  # fmt: skip
         return out, lines[1:]
 
-    bench.Runner(op, case).compare({VLLM_TAG: bench.Implementation(run=run, args=(), reset=reset)})
+    # vLLM's causal_conv1d_update multiplies a float32 weight in float32, as the reference does.
+    implementations = {
+        VLLM_TAG: bench.Implementation(
+            run=run, args=(), reset=reset, noncomparable_reason=_vllm_taps_differ(case)
+        )
+    }
+    if accepted is not None:
+        # The reference advances its state argument in place.
+        implementations["torch-ref"] = private_inputs(case.torch, case.inputs, 2)
+    bench.Runner(op, case).compare(implementations)
 
 
 def _vllm_selective_scan(case) -> bench.Implementation:
@@ -408,51 +487,36 @@ def _vllm_selective_scan(case) -> bench.Implementation:
 
 @pytest.mark.parametrize("case", bench.cases(SelectiveScanFwdOp), ids=lambda case: case.id)
 def test_selective_scan_bench(case) -> None:
-    """The Mamba-1 scan against mamba_ssm's CUDA scan, vLLM's CUDA scan, and for one decode
-    step mamba_ssm's Triton state update."""
-    if is_maca():
-        op = SelectiveScanFwdOp(**case.arguments)
-        bench.Runner(op, case).compare_torch()
-        return
+    """The Mamba-1 scan against vLLM's CUDA scan, and for one decode step vLLM's Triton
+    state update."""
     u, delta, A, B_in, C_in, D_in, z, delta_bias, seq_idx, initial_states = case.inputs
     op = SelectiveScanFwdOp(**case.arguments)
     softplus = case.arguments["delta_softplus"]
     implementations = {VLLM_TAG: _vllm_selective_scan(case)}
 
-    # mamba_ssm's scan neither restarts at seq_idx nor starts from a given state.
-    if seq_idx is None and initial_states is None:
-        selective_scan_fn = baseline_module(
-            "mamba_ssm.ops.selective_scan_interface", "mamba-ssm"
-        ).selective_scan_fn
-
-        def mamba_fn(u, delta, A, B_in, C_in, D_in, z, delta_bias, seq_idx, initial_states):
-            return selective_scan_fn(
-                u, delta, A, B_in, C_in, D_in, z, delta_bias, softplus, return_last_state=True
-            )
-
-        implementations["mamba"] = mamba_fn
-
     # The state update takes one step with one group of B and C, and requires a state.
     if u.shape[2] == 1 and B_in.shape[1] == 1 and initial_states is not None:
-        selective_state_update = baseline_module(
-            "mamba_ssm.ops.triton.selective_state_update", "mamba-ssm"
-        ).selective_state_update
+        selective_state_update = _vllm_ssd("mamba_ssm", "selective_state_update")
+        # vLLM takes D and the delta bias as tensors and writes into a given output.
+        zeros = torch.zeros(u.shape[1], dtype=torch.float32, device=u.device)
+        out = torch.empty(u.shape[:2], dtype=u.dtype, device=u.device)
 
         def update_fn(u, delta, A, B_in, C_in, D_in, z, delta_bias, seq_idx, state):
-            y = selective_state_update(
+            selective_state_update(
                 state,
                 u[..., 0],
                 delta[..., 0],
                 A,
                 B_in[:, 0, :, 0],
                 C_in[:, 0, :, 0],
-                D_in,
+                zeros if D_in is None else D_in,
+                zeros if delta_bias is None else delta_bias,
                 None if z is None else z[..., 0],
-                delta_bias,
                 dt_softplus=softplus,
+                out=out,
             )
-            return y[..., None], state
+            return out[..., None], state
 
-        implementations["mamba-state-update"] = private_inputs(update_fn, case.inputs, 9)
+        implementations["vllm-state-update"] = private_inputs(update_fn, case.inputs, 9)
 
     bench.Runner(op, case).compare(implementations)

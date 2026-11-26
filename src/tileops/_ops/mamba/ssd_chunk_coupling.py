@@ -1,8 +1,7 @@
-"""
-CB Producer Op - High-level interface for CB matrix computation.
-"""
+"""CB producer op: the causal per-chunk C@B matrix."""
 
-from typing import ClassVar, Mapping
+from collections.abc import Mapping
+from typing import ClassVar
 
 import torch
 

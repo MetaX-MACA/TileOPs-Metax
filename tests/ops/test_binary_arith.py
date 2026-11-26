@@ -15,8 +15,7 @@ from tileops._ops.elementwise import (
     AddFwdOp,
     DivFwdOp,
     FloorDivideFwdOp,
-    LerpScalarFwdOp,
-    LerpTensorFwdOp,
+    LerpFwdOp,
     MaximumFwdOp,
     MinimumFwdOp,
     MulFwdOp,
@@ -27,22 +26,15 @@ from tileops._ops.elementwise import (
 from workloads.device import run_device, run_device_available
 from workloads.elementwise import (
     AddBroadcastWorkload,
-    AddSameShapeCase,
     BinaryPositiveCase,
     BinarySameShapeCase,
     ElementwiseWorkload,
-    FloorDivideCase,
+    Float16DivisorClassesWorkload,
     LerpCancellationWorkload,
     LerpCase,
     PowPositiveWorkload,
-    RemainderCase,
 )
 from workloads.numerics import compare_outputs
-
-
-class AddSameShapeTest(AddSameShapeCase, TestBase):
-    pass
-
 
 # coalesce_broadcast_dims unit tests
 
@@ -92,12 +84,12 @@ class AddSameShapeFixture(FixtureBase):
 
 @AddSameShapeFixture
 def test_add_same_shape(n_total: int, dtype: torch.dtype) -> None:
-    test = AddSameShapeTest(n_total, dtype)
+    test = BinarySameShapeTest(n_total, dtype, "AddFwdOp")
     op = AddFwdOp()
     test.check(op, *test.gen_inputs())
 
 
-# Broadcast pattern tests (L3)
+# Broadcast pattern tests
 
 
 class AddBroadcastFixture(FixtureBase):
@@ -192,13 +184,6 @@ _ARITH_BROADCAST_OPS = [
         lambda s, d: torch.rand(*s, dtype=d, device=run_device()) + 0.1,
     ),
     (
-        "lerp",
-        LerpScalarFwdOp,
-        lambda a, b: torch.lerp(a.float(), b.float(), 0.5).to(a.dtype),
-        lambda s, d: torch.randn(*s, dtype=d, device=run_device()),
-        lambda s, d: torch.randn(*s, dtype=d, device=run_device()),
-    ),
-    (
         "maximum",
         MaximumFwdOp,
         lambda a, b: torch.maximum(a.float(), b.float()).to(a.dtype),
@@ -281,10 +266,6 @@ class BinaryPositiveTest(BinaryPositiveCase, TestBase):
 # Same-shape correctness for simple binary arith ops
 
 
-class RemainderTest(RemainderCase, TestBase):
-    pass
-
-
 class PowPositiveTest(PowPositiveWorkload, TestBase):
     """Pow needs positive base and small exponent to avoid overflow in fp16."""
 
@@ -301,7 +282,11 @@ class BinaryArithOpFixture(FixtureBase):
                     MulFwdOp, lambda n, d: BinarySameShapeTest(n, d, "MulFwdOp"), id="mul"
                 ),
                 pytest.param(DivFwdOp, lambda n, d: BinaryPositiveTest(n, d, "DivFwdOp"), id="div"),
-                pytest.param(RemainderFwdOp, RemainderTest, id="remainder"),
+                pytest.param(
+                    RemainderFwdOp,
+                    lambda n, d: BinaryPositiveTest(n, d, "RemainderFwdOp"),
+                    id="remainder",
+                ),
                 pytest.param(PowFwdOp, PowPositiveTest, id="pow"),
                 pytest.param(
                     MaximumFwdOp,
@@ -346,26 +331,21 @@ class FloorDivideFixture(FixtureBase):
     ]
 
 
-class FloorDivideTest(FloorDivideCase, TestBase):
-    pass
-
-
 @FloorDivideFixture
 def test_floor_divide_op(n_total: int, dtype: torch.dtype) -> None:
-    test = FloorDivideTest(n_total, dtype)
+    test = BinaryPositiveTest(n_total, dtype, "FloorDivideFwdOp")
     op = FloorDivideFwdOp()
     test.check(op, *test.gen_inputs())
 
 
-@pytest.mark.smoke
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize(
     "a_shape, b_shape",
     [
         # Wide enough that float32 keeps two vectors a thread.
-        pytest.param((1 << 18,), (1 << 18,), id="same"),
-        pytest.param((4, 2048), (1, 2048), id="bias"),
-        pytest.param((2, 16, 56, 56), (16, 1, 1), id="channel"),
+        pytest.param((1 << 18,), (1 << 18,), id="same", marks=pytest.mark.smoke),
+        pytest.param((4, 2048), (1, 2048), id="bias", marks=pytest.mark.full),
+        pytest.param((2, 16, 56, 56), (16, 1, 1), id="channel", marks=pytest.mark.full),
     ],
 )
 def test_floor_ops_match_torch_on_special_values(a_shape, b_shape, dtype) -> None:
@@ -402,7 +382,6 @@ def test_floor_ops_match_torch_on_special_values(a_shape, b_shape, dtype) -> Non
         assert torch.equal(torch.signbit(out[number]), torch.signbit(ref[number]))
 
 
-@pytest.mark.smoke
 @pytest.mark.skipif(not run_device_available(), reason="the run device is not available")
 @pytest.mark.parametrize(
     "dtype, make_op, ref_fn",
@@ -429,8 +408,9 @@ def test_floor_ops_match_torch_on_special_values(a_shape, b_shape, dtype) -> Non
 @pytest.mark.parametrize(
     "a_shape, b_shape",
     [
-        pytest.param((1 << 16,), (1 << 16,), id="same"),
-        pytest.param((64, 1024), (1, 1024), id="bias"),
+        pytest.param((1 << 16,), (1 << 16,), id="same", marks=pytest.mark.smoke),
+        pytest.param((64, 1024), (1, 1024), id="bias", marks=pytest.mark.full),
+        pytest.param((4, 64, 35, 35), (64, 1, 1), id="channel-ragged", marks=pytest.mark.full),
     ],
 )
 def test_16bit_div_matches_torch_bit_for_bit(a_shape, b_shape, dtype, make_op, ref_fn) -> None:
@@ -472,6 +452,70 @@ def test_bfloat16_div_channel_broadcast_matches_torch_bit_for_bit() -> None:
     number = ~ref.isnan()
     assert torch.equal(out.isnan(), ~number)
     assert torch.equal(out[number].view(torch.int16), ref[number].view(torch.int16))
+
+
+# Every DivFwdOp grid that runs a guarded quotient: same-shape blocks, the bias grid with
+# either operand as the bias row, staged rows holding a stride-0 operand, the flat channel
+# grid and ragged channel rows.
+_DIV_LAYOUTS = [
+    pytest.param((1 << 16,), (1 << 16,), id="same", marks=pytest.mark.smoke),
+    pytest.param((256, 1024), (1, 1024), id="bias", marks=pytest.mark.full),
+    pytest.param((1, 1024), (256, 1024), id="bias-a", marks=pytest.mark.full),
+    pytest.param((256, 2048), (256, 1), id="column", marks=pytest.mark.full),
+    pytest.param((4, 64, 16, 16), (64, 1, 1), id="channel", marks=pytest.mark.full),
+    pytest.param((4, 64, 35, 35), (64, 1, 1), id="channel-ragged", marks=pytest.mark.full),
+]
+
+
+@pytest.mark.skipif(not run_device_available(), reason="the run device is not available")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("a_shape, b_shape", _DIV_LAYOUTS)
+def test_div_matches_torch_bit_for_bit(a_shape, b_shape, dtype) -> None:
+    """bfloat16 and float32 division give torch's quotient on the fast path and in the fallback.
+
+    Ordinary operands keep most threads on the fast path. Random bit patterns, zeros
+    and float32 operands just inside and outside ``[2**-31, 2**33)`` send neighbouring
+    threads to the fallback. The pinned float32 pairs are quotients the fast path rounds
+    correctly only with its reciprocal's Newton step.
+    """
+    gen = torch.Generator(device=run_device()).manual_seed(0)
+    bits = torch.int16 if dtype == torch.bfloat16 else torch.int32
+
+    def operand(shape):
+        x = torch.randn(shape, generator=gen, device=run_device())
+        raw = torch.randint(-(2**31), 2**31, shape, generator=gen, device=run_device())
+        pick = torch.randint(0, 64, shape, generator=gen, device=run_device())
+        ends = torch.tensor([2.0**-31, 2.0**33], device=run_device())
+        zero = torch.zeros(1, device=run_device())
+        edges = torch.cat([ends, torch.nextafter(ends, torch.zeros_like(ends)), zero])
+        x = torch.where(pick == 0, raw.to(torch.int32).view(torch.float32), x)
+        return torch.where(pick == 1, edges[raw.remainder(5)], x).to(dtype)
+
+    a, b = operand(a_shape), operand(b_shape)
+    if a_shape == b_shape and dtype == torch.float32:
+        pinned = torch.tensor(
+            [[0x3F8CCAF1, 0x3F90DDD7], [0x3F8E1F31, 0x3F90DEBB], [0x3F92A0A1, 0x3F9FF717]],
+            dtype=torch.int32,
+            device=run_device(),
+        ).view(torch.float32)
+        # The first 2048 elements hold only ordinary operands, so the pinned pairs' thread
+        # stays on the fast path.
+        a[:2048], b[:2048] = torch.randn(2, 2048, generator=gen, device=run_device()).add(3)
+        a[:3], b[:3] = pinned[:, 0], pinned[:, 1]
+    out, ref = DivFwdOp()(a, b), torch.div(a, b)
+    number = ~ref.isnan()
+    assert torch.equal(out.isnan(), ~number)
+    assert torch.equal(out[number].view(bits), ref[number].view(bits))
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(not run_device_available(), reason="the run device is not available")
+@pytest.mark.parametrize("broadcast", [False, True], ids=["same", "column"])
+def test_float16_div_rounds_subnormal_ties_as_torch(broadcast) -> None:
+    """float16 division gives torch's quotient where a two-ulp quotient rounds a subnormal
+    tie the wrong way, and keeps the special results of zero, infinite and extreme divisors."""
+    workload = Float16DivisorClassesWorkload("DivFwdOp", broadcast)
+    TestBase.check(workload, DivFwdOp(), *workload.gen_inputs())
 
 
 @pytest.mark.smoke
@@ -525,7 +569,7 @@ def test_float32_floor_ops_match_torch_bit_for_bit(a_shape, b_shape) -> None:
         assert torch.equal(out[number].view(torch.int32), ref[number].view(torch.int32))
 
 
-# Lerp op (ternary in PyTorch; compile-time weight=0.5)
+# Lerp with a Number weight
 
 
 class LerpFixture(FixtureBase):
@@ -547,11 +591,34 @@ class LerpTest(LerpCase, TestBase):
 
 @LerpFixture
 def test_lerp_op(n_total: int, dtype: torch.dtype) -> None:
-    """Validate lerp across multiple construction-time weight values."""
+    """Validate lerp across Number weights, one instance serving every value."""
+    op = LerpFwdOp()
     for weight in [0.0, 0.3, 0.5, 0.7, 1.0]:
         test = LerpTest(n_total, dtype, weight=weight)
-        op = LerpScalarFwdOp(weight=weight)
         test.check(op, *test.gen_inputs())
+
+
+@pytest.mark.parametrize(
+    ("a_shape", "b_shape"),
+    [
+        pytest.param((2, 64, 128), (2, 64, 128), marks=pytest.mark.smoke),
+        pytest.param((2, 64, 128), (2, 64, 1), marks=pytest.mark.full),
+        pytest.param((64, 128), (1, 1), marks=pytest.mark.full),
+        pytest.param((3, 1), (1, 4), marks=pytest.mark.full),
+    ],
+)
+def test_lerp_number_weight_broadcast(a_shape, b_shape) -> None:
+    a = torch.randn(a_shape, dtype=torch.float16, device=run_device())
+    b = torch.randn(b_shape, dtype=torch.float16, device=run_device())
+    workload = ElementwiseWorkload("LerpFwdOp", (a, b, 0.5))
+    TestBase.check(workload, LerpFwdOp(), *workload.gen_inputs())
+
+
+@pytest.mark.smoke
+def test_lerp_rejects_integer_dtype() -> None:
+    a = torch.ones(16, device=run_device(), dtype=torch.int32)
+    with pytest.raises(ValueError, match="dtype is outside"):
+        LerpFwdOp()(a, a, 0.5)
 
 
 # Maximum/Minimum NaN propagation tests
@@ -630,7 +697,7 @@ def test_max_min_nan_propagation(op_cls, torch_ref, dtype: torch.dtype) -> None:
     )
 
 
-# Maximum/Minimum signed-zero regression tests
+# Maximum/Minimum signed zero
 
 
 class SignedZeroFixture(FixtureBase):
@@ -823,7 +890,6 @@ class FloatOnlyBinaryRejectFixture(FixtureBase):
                 pytest.param(RemainderFwdOp, torch.int32, marks=pytest.mark.smoke),
                 pytest.param(PowFwdOp, torch.int32, marks=pytest.mark.smoke),
                 pytest.param(FloorDivideFwdOp, torch.int64, marks=pytest.mark.smoke),
-                pytest.param(LerpScalarFwdOp, torch.int32, marks=pytest.mark.smoke),
             ],
         ),
     ]
@@ -910,9 +976,6 @@ def test_max_min_optimized_large(op_cls, torch_ref, n_total: int, dtype: torch.d
     compare_outputs(out, ref, ElementwiseWorkload(type(op).__name__, (a, b)).verification(*(a, b)))
 
 
-# register_copy broadcast downgrade regression test
-
-
 # request_tune() reaches the autotuner
 
 
@@ -938,7 +1001,7 @@ def test_binary_ops_under_tuning(tune: bool) -> None:
         )
 
 
-# LerpTensorFwdOp — Tensor-weight torch.lerp overload (manifest:
+# LerpFwdOp — Tensor-weight torch.lerp overload (manifest:
 # elementwise_multi_input). Covers same-shape, 3-way broadcast, dtype
 # rejection, and dtype-mismatch rejection at forward().
 
@@ -950,12 +1013,12 @@ _LERP_TENSOR_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 @pytest.mark.skipif(not run_device_available(), reason="the run device is not available")
 @pytest.mark.parametrize("dtype", _LERP_TENSOR_DTYPES)
 def test_lerp_tensor_same_shape(dtype: torch.dtype) -> None:
-    """LerpTensorFwdOp matches torch.lerp on same-shape inputs."""
+    """LerpFwdOp matches torch.lerp on same-shape inputs."""
     shape = (4, 8)
     a = torch.randn(shape, device=run_device(), dtype=dtype)
     b = torch.randn(shape, device=run_device(), dtype=dtype)
     w = torch.rand(shape, device=run_device(), dtype=dtype)
-    op = LerpTensorFwdOp()
+    op = LerpFwdOp()
     out = op(a, b, w)
     ref = torch.lerp(a, b, w)
     compare_outputs(
@@ -966,13 +1029,13 @@ def test_lerp_tensor_same_shape(dtype: torch.dtype) -> None:
 @pytest.mark.smoke
 @pytest.mark.skipif(not run_device_available(), reason="the run device is not available")
 def test_lerp_tensor_broadcast() -> None:
-    """LerpTensorFwdOp supports the manifest's 3-way broadcast rule."""
+    """LerpFwdOp supports the manifest's 3-way broadcast rule."""
     a_shape, b_shape, w_shape = (3, 1), (1, 4), (3, 4)
     dtype = torch.float32
     a = torch.randn(a_shape, device=run_device(), dtype=dtype)
     b = torch.randn(b_shape, device=run_device(), dtype=dtype)
     w = torch.rand(w_shape, device=run_device(), dtype=dtype)
-    op = LerpTensorFwdOp()
+    op = LerpFwdOp()
     out = op(a, b, w)
     ref = torch.lerp(a, b, w)
     compare_outputs(
@@ -999,7 +1062,7 @@ def test_lerp_tensor_reads_broadcast_operands_in_place(a_shape, b_shape, w_shape
     a = torch.randn(a_shape, device=run_device(), dtype=dtype)
     b = torch.randn(b_shape, device=run_device(), dtype=dtype)
     w = torch.rand(w_shape, device=run_device(), dtype=dtype) * 1.5 - 0.25
-    TestBase.check(ElementwiseWorkload("LerpTensorFwdOp", (a, b, w)), LerpTensorFwdOp(), a, b, w)
+    TestBase.check(ElementwiseWorkload("LerpFwdOp", (a, b, w)), LerpFwdOp(), a, b, w)
 
 
 @pytest.mark.smoke
@@ -1008,9 +1071,9 @@ def test_lerp_tensor_reads_broadcast_operands_in_place(a_shape, b_shape, w_shape
     [torch.float8_e4m3fn, torch.float8_e5m2],
 )
 def test_lerp_tensor_rejects_fp8_dtype(bad_dtype: torch.dtype) -> None:
-    """LerpTensorFwdOp must reject fp8 dtypes (manifest declares no fp8)."""
+    """LerpFwdOp must reject fp8 dtypes (manifest declares no fp8)."""
     shape = (4, 8)
-    op = LerpTensorFwdOp()
+    op = LerpFwdOp()
     x = torch.zeros(shape, device=run_device()).to(bad_dtype)
     with pytest.raises((ValueError, TypeError)):
         op(x, x, x)
@@ -1021,7 +1084,7 @@ def test_lerp_tensor_rejects_fp8_dtype(bad_dtype: torch.dtype) -> None:
 def test_lerp_tensor_dtype_mismatch_rejected() -> None:
     """forward() must reject operands that disagree with each other."""
     shape = (4, 8)
-    op = LerpTensorFwdOp()
+    op = LerpFwdOp()
     a = torch.randn(shape, device=run_device(), dtype=torch.float32)
     b = torch.randn(shape, device=run_device(), dtype=torch.float32)
     w_bad = torch.rand(shape, device=run_device(), dtype=torch.float16)
@@ -1290,4 +1353,4 @@ def test_add_bool_broadcast() -> None:
 def test_lerp_tensor_cancellation_uses_float_intermediates(dtype: torch.dtype) -> None:
     """Rounding end-start to the storage dtype can erase a nonzero midpoint."""
     workload = LerpCancellationWorkload(dtype)
-    TestBase.check(workload, LerpTensorFwdOp(), *workload.gen_inputs())
+    TestBase.check(workload, LerpFwdOp(), *workload.gen_inputs())

@@ -8,6 +8,7 @@ import functools
 from collections.abc import Iterator
 
 import torch
+from tilelang.contrib.nvcc import get_target_arch
 from tilelang.jit import JITImpl
 
 import tileops._utils.utils as device_utils
@@ -25,19 +26,17 @@ def other_arch(index: int) -> int:
 
 
 def sm(arch: int) -> str:
-    """How TileLang names SM *arch* in a target."""
-    return f"sm_{arch}a" if arch >= 90 else f"sm_{arch}"
+    """How TileLang names SM *arch* in a target, spelled as ``building_on`` spells it."""
+    return f"sm_{get_target_arch((arch // 10, arch % 10))}"
 
 
 @contextlib.contextmanager
 def described(stated: "dict[int, dict]") -> Iterator[None]:
     """Temporarily override device facts by CUDA device index."""
     real = device_utils._device_facts
-    names = ("arch", "calibration", "sm_count", "smem_budget")
 
-    def facts(index: int) -> tuple:
-        own = dict(zip(names, real(index), strict=True))
-        return tuple({**own, **stated.get(index, {})}[name] for name in names)
+    def facts(index: int) -> device_utils.CudaFacts:
+        return real(index)._replace(**stated.get(index, {}))
 
     device_utils.forget_device_properties()
     device_utils._device_facts = functools.lru_cache(maxsize=16)(facts)

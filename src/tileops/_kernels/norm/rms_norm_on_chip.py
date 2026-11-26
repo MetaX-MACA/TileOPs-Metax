@@ -6,7 +6,7 @@ across a thread-block cluster; the CTAs of a cluster exchange their partial sums
 through each other's shared memory.
 """
 
-from typing import Optional
+import operator
 
 import tilelang
 import tilelang.language as T
@@ -16,17 +16,24 @@ from tileops._csrc import csrc_include
 from tileops._kernels.build_target import target_cache
 from tileops._kernels.constants import MAX_PORTABLE_CLUSTER_BLOCKS, VECTOR_ACCESS_BYTES
 from tileops._kernels.kernel_base import Entry, Kernel
-from tileops._kernels.norm.call_spec import LayerNormCall, RMSNormFwdInterface
+from tileops._kernels.norm.call_spec import (
+    LayerNormCall,
+    RMSNormCall,
+    RMSNormFwdInterface,
+    whole_row_scale_refusal,
+)
 from tileops._kernels.streaming_load import load16
+from tileops._kernels.warp_reduce import warp_reduce
 from tileops._utils import WARP_LANES
 
 __all__ = ["RMSNormOnChipKernel"]
 
+# Threads a CTA takes; the builder and `RMSNormOnChipKernel._plan` agree on it.
+_THREADS = 1024
+
 
 @target_cache(maxsize=32)
-def _rms_norm_on_chip_kernel(
-    M, N, eps, dtype, has_weight, cluster, threads, held_vectors, async_stage
-):
+def _rms_norm_on_chip_kernel(M, N, eps, dtype, has_weight, cluster, held_vectors, async_stage):
     """Build the program for ``(M, N)`` rows, each split across ``cluster`` CTAs.
 
     A CTA takes ``N // cluster`` columns: ``held_vectors`` 16-byte vectors a thread in
@@ -34,6 +41,7 @@ def _rms_norm_on_chip_kernel(
     The buffers are viewed as ``(M * cluster, N // cluster)``, one CTA a row of the view.
     """
     vec = VECTOR_ACCESS_BYTES // getattr(torch, dtype).itemsize
+    threads = _THREADS
     chunk = N // cluster
     held = threads * held_vectors * vec
     staged = chunk - held
@@ -97,8 +105,6 @@ def _rms_norm_on_chip_kernel(
                     T.ptx_wait_group(0)
                     T.sync_threads()
                 else:
-                    # Staged through registers: T.copy lowers to the same vector copy, without
-                    # a cache policy.
                     for v in T.unroll(staged_vectors):
                         load16(piece, 0, x, (cta, held + (v * threads + tx) * vec))
                         for i in T.vectorized(vec):
@@ -115,8 +121,7 @@ def _rms_norm_on_chip_kernel(
                     for i in T.unroll(vec):
                         value = T.cast(piece[i], "float32")
                         total[0] += value * value
-                for step in T.unroll(WARP_LANES.bit_length() - 1):
-                    total[0] += T.shfl_xor(total[0], T.shift_left(1, step))
+                warp_reduce(total, operator.add)
                 if tx % WARP_LANES == 0:
                     sums[tx // WARP_LANES] = total[0]
                 T.sync_threads()
@@ -179,10 +184,8 @@ class RMSNormOnChipKernel(Kernel, RMSNormFwdInterface):
     supported_archs = [90]
     preferred_over = frozenset({"rms_norm_streaming", "rms_norm_two_pass"})
 
-    _THREADS = 1024
-
     @classmethod
-    def _plan(cls, n: int, dtype: torch.dtype, smem_budget: int) -> Optional[tuple]:
+    def _plan(cls, n: int, dtype: torch.dtype, smem_budget: int) -> tuple | None:
         """``(cluster, held_vectors, async_stage)`` for rows of *n*, or ``None``."""
         elem = dtype.itemsize
         vec = VECTOR_ACCESS_BYTES // elem
@@ -200,10 +203,10 @@ class RMSNormOnChipKernel(Kernel, RMSNormFwdInterface):
             async_stage = share > async_stage_bytes
             # 16-byte vectors a thread holds in registers.
             held_vectors = 4 if async_stage else 3
-            staged = chunk - cls._THREADS * held_vectors * vec
+            staged = chunk - _THREADS * held_vectors * vec
             if (
                 n % cluster == 0
-                and chunk % (cls._THREADS * vec) == 0
+                and chunk % (_THREADS * vec) == 0
                 and staged > 0
                 and staged * elem <= smem_budget - reserved_bytes
             ):
@@ -212,7 +215,9 @@ class RMSNormOnChipKernel(Kernel, RMSNormFwdInterface):
         return None
 
     @classmethod
-    def refusal(cls, call: LayerNormCall) -> "str | None":
+    def refusal(cls, call: RMSNormCall) -> "str | None":
+        if (reason := whole_row_scale_refusal(call)) is not None:
+            return reason
         if cls._plan(call.n, call.dtype, call.smem_budget) is None:
             return f"a row of {call.n} {call.dtype} elements does not fit on chip"
         return super().refusal(call)
@@ -236,7 +241,8 @@ class RMSNormOnChipKernel(Kernel, RMSNormFwdInterface):
     def autotune_configs(self) -> list[dict]:
         return [self.default_config]
 
-    def forward(self, x: torch.Tensor, weight: Optional[torch.Tensor]) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, weight: torch.Tensor | None) -> torch.Tensor:
+        self._require_devices(x=x, weight=weight)
         rows = x.reshape(-1, self.n)
         m = rows.shape[0]
         has_weight = weight is not None
@@ -255,7 +261,6 @@ class RMSNormOnChipKernel(Kernel, RMSNormFwdInterface):
             self.dtype_str,
             has_weight,
             self.cluster,
-            self._THREADS,
             self.held_vectors,
             self.async_stage,
         )

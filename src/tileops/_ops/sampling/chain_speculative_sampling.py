@@ -1,6 +1,7 @@
 """The chain speculative sampling op."""
 
-from typing import ClassVar, Mapping, Tuple
+from collections.abc import Mapping
+from typing import ClassVar
 
 import torch
 
@@ -66,7 +67,7 @@ class ChainSpeculativeSamplingFwdOp(Op):
         target_probs: torch.Tensor,
         seed: torch.Tensor,
         offset: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Verify the draft chains and draw the token after each accepted prefix.
 
         Args:
@@ -86,7 +87,6 @@ class ChainSpeculativeSamplingFwdOp(Op):
         seed = seed.contiguous()
         offset = offset.contiguous()
         batch, num_draft, vocab = draft_probs.shape
-        inputs = (draft_probs, draft_token_ids, target_probs, seed, offset)
         kernel = self.kernel_for(
             "chain_speculative_sampling",
             lambda: SamplingCall(
@@ -97,4 +97,4 @@ class ChainSpeculativeSamplingFwdOp(Op):
                 num_draft=num_draft,
             ),
         )
-        return kernel(*inputs)
+        return kernel(draft_probs, draft_token_ids, target_probs, seed, offset)

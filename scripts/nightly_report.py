@@ -15,11 +15,15 @@ import json
 import math
 import re
 import subprocess
+import sys
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import NamedTuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from benchmarks.outcomes import UNAVAILABLE_PROPERTY
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -66,15 +70,8 @@ BASELINE_RATIO_ALERT = 0.99
 BASELINE_ALERT_WORST_N = 10  # alerts shown open; the rest collapse
 HISTORY_RETENTION_DAYS = 14
 
-# Algorithmic speed-of-light (SOL) verdict lines. Efficiency is
-# sol_time / measured_time against the *calibrated* (effective) ceilings;
-# see docs/design/roofline.md §1.2 and §4.3.
-#
-# The HBM ceiling is the envelope over access mixes, and a kernel's own mix
-# caps lower (a perfect 2R:1W kernel reaches ~90% of it, a perfect 1R:1W ~87%);
-# the green line must sit below every mix's personal ceiling.
-SOL_GREEN_MEMORY = 0.80
-SOL_GREEN_COMPUTE = 0.80  # tensor-core sustained calibration is noisier
+# Algorithmic speed-of-light (SOL) efficiency is sol_time / measured_time against the
+# calibrated (effective) ceilings; see docs/design/roofline.md §1.2 and §4.3.
 SOL_ANOMALY = 1.05  # above the effective ceiling: formula or profile is wrong
 # Below both floors the roofline has no traction: launch overhead and wave
 # quantization dominate, so the row is labeled instead of judged. Regression
@@ -107,9 +104,7 @@ _DTYPE_TOKEN = re.compile(r"bfloat16|bool|u?int\d+|float\d+(?:_[a-z0-9]+)?|compl
 _CONCLUSION_KEY = "device_busy_ms"
 #: Absorbs the rounding a count recovered from ``tflops`` carries.
 _DERIVED_COUNT_RTOL = 1e-3
-# A kernel file below this share of executed lines was never constructed by any
-# test. The lowest genuinely-built kernel file measures 36.9%, so the threshold
-# has room before it starts catching built kernels.
+# A kernel file below this share of executed lines was never constructed by any test.
 _KERNEL_BUILT_PCT = 25
 # Unattributed failures listed before the table says how many it left out. The
 # attributed table above caps its per-op test names at three for the same reason.
@@ -133,10 +128,15 @@ def _testcase_fields(tc: ET.Element, props: dict[str, str]) -> dict:
     """The fields every parsed testcase carries: its id, outcome, op and failure message."""
     failure = tc.find("failure")
     error = tc.find("error")
-    if tc.find("skipped") is not None:
-        outcome = "skipped"
-    elif failure is not None or error is not None:
+    if failure is not None or error is not None:
+        # A teardown error after a skip writes both elements; the error wins.
         outcome = "failed"
+    elif tc.find("skipped") is not None and UNAVAILABLE_PROPERTY in props:
+        # A row no implementation serves yet (benchmarks/conftest.py): neither a skip to
+        # warn of nor a failure.
+        outcome = "unavailable"
+    elif tc.find("skipped") is not None:
+        outcome = "skipped"
     else:
         outcome = "passed"
     reported = failure if failure is not None else error
@@ -291,30 +291,48 @@ def parse_coverage_xml(path: str) -> list[dict] | None:
 # ---------------------------------------------------------------------------
 
 
-def aggregate_test_results(results: list[dict]) -> dict:
-    """Group test results by Op."""
-    ops = defaultdict(
-        lambda: {
-            "module": None,
-            "passed": 0,
-            "failed": 0,
-            "skipped": 0,
-            "compared": 0,
-            "failing_tests": [],
-        }
+def _tally(results: list[dict], key_of) -> dict[str, dict]:
+    """Group testcases by ``key_of``, counting each group's outcomes and naming its failing
+    tests. A testcase ``key_of`` maps to nothing is left out."""
+    groups: dict[str, dict] = defaultdict(
+        lambda: {"passed": 0, "failed": 0, "skipped": 0, "failing_tests": []}
     )
     for r in results:
-        op = r.get("op")
-        if op:
-            d = ops[op]
-            if not d["module"]:
-                d["module"] = r.get("op_module")
+        key = key_of(r)
+        if key:
+            d = groups[key]
             d[r["outcome"]] += 1
-            if r["outcome"] == "passed" and r.get("compared"):
-                d["compared"] += 1
             if r["outcome"] == "failed":
                 d["failing_tests"].append(r["name"])
-    return dict(ops)
+    return dict(groups)
+
+
+def aggregate_test_results(results: list[dict]) -> dict:
+    """Group test results by Op."""
+    ops = _tally(results, lambda r: r.get("op"))
+    for d in ops.values():
+        d.update(module=None, compared=0)
+    for r in results:
+        d = ops.get(r.get("op"))
+        if d is not None:
+            d["module"] = d["module"] or r.get("op_module")
+            d["compared"] += r["outcome"] == "passed" and bool(r.get("compared"))
+    return ops
+
+
+def _model_of(result: dict) -> str:
+    """The model a testcase tests: ``<model>`` of the ``tests.models.test_<model>`` module in
+    its classname, or in its name where a collection error leaves the classname empty."""
+    source = result["nodeid"].split("::")[0] or result["name"]
+    parts = source.split(".")
+    module = parts[parts.index("models") + 1] if "models" in parts[:-1] else source
+    return module.removeprefix("test_")
+
+
+def aggregate_model_results(results: list[dict]) -> dict[str, dict]:
+    """Group model test results by model, the ``tests/models/test_<model>.py`` file each
+    testcase comes from."""
+    return _tally(results, _model_of)
 
 
 def aggregate_bench_results(results: list[dict]) -> dict:
@@ -338,7 +356,7 @@ def aggregate_bench_results(results: list[dict]) -> dict:
     return dict(ops)
 
 
-def _case_id(name: str) -> str:
+def case_id(name: str) -> str:
     """The parametrized part of a testcase name, which is the workload's own id and keys the
     row's history: renaming a test function keeps it. It is unique per op, which
     ``scripts/check_bench_coverage.py`` holds."""
@@ -349,12 +367,13 @@ def _case_id(name: str) -> str:
 
 def _dtypes_of(name: str) -> tuple[str, ...]:
     """The dtype names in a row's case id, in order."""
-    return tuple(t for t in _case_id(name).split("-") if _DTYPE_TOKEN.fullmatch(t))
+    return tuple(t for t in case_id(name).split("-") if _DTYPE_TOKEN.fullmatch(t))
 
 
-def count_bench_skips(results: list[dict]) -> int:
-    """Skipped cases, which are neither configs nor failures: without a count they vanish."""
-    return sum(1 for r in results if r["outcome"] == "skipped")
+def count_bench_outcome(results: list[dict], outcome: str) -> int:
+    """Cases with *outcome*, skipped or unavailable, which are neither configs nor failures:
+    without a count they vanish."""
+    return sum(1 for r in results if r["outcome"] == outcome)
 
 
 def collect_bench_failures(results: list[dict]) -> list[dict]:
@@ -547,7 +566,7 @@ def _reportable(delta_ms: float, base: _Reading, curr_spread: float | None) -> b
 def _verdict_inputs(bench_ops: dict, history_runs: list[dict]):
     """Yield one verdict input per config with a positive reading and history."""
     for op, data in bench_ops.items():
-        current = frozenset(_case_id(cfg["name"]) for cfg in data["configs"])
+        current = frozenset(case_id(cfg["name"]) for cfg in data["configs"])
         for cfg in data["configs"]:
             lat, key = _conclusion(cfg)
             if lat is None or lat <= 0:
@@ -555,7 +574,7 @@ def _verdict_inputs(bench_ops: dict, history_runs: list[dict]):
             props = {k.removeprefix("tileops_"): v for k, v in cfg.items()}
             work = _work_counts(props, lat)
             readings = _config_readings(
-                history_runs, op, _case_id(cfg["name"]), key, work, current, props.get("l2_flush")
+                history_runs, op, case_id(cfg["name"]), key, work, current, props.get("l2_flush")
             )
             if readings:
                 yield op, cfg, lat, _spread(props), readings
@@ -720,58 +739,74 @@ BADGE_GREEN_SHARE = 0.95
 BADGE_NOISE_MS = 0.010
 
 
-def badge_rows(bench_xml: str) -> dict:
-    """``{(classname, name): (tileops_ms, fastest_ms)}`` for the badge, read from the XML.
+def fastest_comparator(props: dict) -> tuple[str, float] | None:
+    """``(tag, ms)`` of the fastest comparator among a row's properties, or ``None``.
 
     Every ``<tag>_device_busy_ms`` property except ``tileops`` and ``baseline`` is a
-    comparator, including tags marked ``no_ratio``. A failed row, or one without a
-    nonzero TileOPs time or a comparator, maps to ``None`` and is judged nowhere.
+    comparator, including tags marked ``no_ratio``.
     """
+    timed = [
+        (name[: -len("_device_busy_ms")], float(value))
+        for name, value in props.items()
+        if name.endswith("_device_busy_ms")
+        and name not in ("tileops_device_busy_ms", "baseline_device_busy_ms")
+    ]
+    return min(timed, key=lambda item: item[1]) if timed else None
+
+
+def case_reading(case: ET.Element) -> tuple[dict, tuple[float, float] | None]:
+    """A benchmark testcase's properties and its ``(tileops_ms, fastest_ms)`` reading.
+
+    The reading is ``None`` for a failed row, or one without a nonzero TileOPs time or a
+    comparator; such a row is judged nowhere.
+    """
+    props = {p.get("name"): p.get("value") for p in case.iter("property")}
+    failed = any(child.tag in ("failure", "error") for child in case)
+    fastest = fastest_comparator(props)
+    tileops = float(props.get("tileops_device_busy_ms") or 0)
+    if failed or fastest is None or tileops == 0:
+        return props, None
+    return props, (tileops, fastest[1])
+
+
+def badge_rows(bench_xml: str) -> dict:
+    """``{(classname, name): reading}`` for the badge, by ``case_reading``."""
     rows = {}
     for case in ET.parse(bench_xml).getroot().iter("testcase"):
-        props = {p.get("name"): p.get("value") for p in case.iter("property")}
-        if not props.get("op"):
-            continue
-        failed = any(child.tag in ("failure", "error") for child in case)
-        comparators = [
-            float(value)
-            for name, value in props.items()
-            if name.endswith("_device_busy_ms")
-            and name not in ("tileops_device_busy_ms", "baseline_device_busy_ms")
-        ]
-        tileops = props.get("tileops_device_busy_ms")
-        key = (case.get("classname"), case.get("name"))
-        if failed or not comparators or not tileops or float(tileops) == 0:
-            rows[key] = None
-        else:
-            rows[key] = (float(tileops), min(comparators))
+        props, reading = case_reading(case)
+        if props.get("op"):
+            rows[(case.get("classname"), case.get("name"))] = reading
     return rows
+
+
+def row_behind(reading: tuple[float, float], earlier: tuple[float, float] | None) -> bool:
+    """Whether a ``(tileops_ms, fastest_ms)`` row is behind its fastest comparator.
+
+    A row is behind when its ratio is below ``BASELINE_RATIO_ALERT``. A row whose
+    fastest comparator takes under ``BADGE_NOISE_MS`` is behind only if *earlier*, the
+    same row in the previous night, was also below that ratio.
+    """
+
+    def ratio(pair):
+        return pair[1] / pair[0]
+
+    if ratio(reading) >= BASELINE_RATIO_ALERT:
+        return False
+    if reading[1] >= BADGE_NOISE_MS:
+        return True
+    return earlier is not None and ratio(earlier) < BASELINE_RATIO_ALERT
 
 
 def badge_standing(rows: dict, previous: dict | None) -> tuple[int, int]:
     """``(rows ahead of or level with their fastest comparator, rows behind)`` for the badge.
 
-    A row is behind when its ratio is below ``BASELINE_RATIO_ALERT``. A row whose
-    fastest comparator takes under ``BADGE_NOISE_MS`` is behind only if it was also
-    behind in *previous*; without a previous night, such a row is not behind.
+    Each row is judged by ``row_behind`` against the same row in *previous*.
     """
-
-    def ratio(reading):
-        tileops_ms, fastest_ms = reading
-        return fastest_ms / tileops_ms
-
     ahead = behind = 0
     for key, reading in rows.items():
         if reading is None:
             continue
-        if ratio(reading) >= BASELINE_RATIO_ALERT:
-            ahead += 1
-            continue
-        if reading[1] >= BADGE_NOISE_MS:
-            behind += 1
-            continue
-        earlier = (previous or {}).get(key)
-        if earlier is not None and ratio(earlier) < BASELINE_RATIO_ALERT:
+        if row_behind(reading, (previous or {}).get(key)):
             behind += 1
         else:
             ahead += 1
@@ -879,7 +914,7 @@ def build_history_entry(bench_ops: dict, run: dict, coverage: list[dict] | None 
                 if bl_entry:
                     entry[btag] = bl_entry
             if entry:
-                cfg_data[_case_id(cfg["name"])] = entry
+                cfg_data[case_id(cfg["name"])] = entry
         if cfg_data:
             ops_data[op] = cfg_data
     entry = {
@@ -1242,6 +1277,15 @@ def _ratio_emoji(ratio: float) -> str:
     return _RED
 
 
+def _failing_tests_cell(names: list[str]) -> str:
+    """The first three failing test names, then a count of the rest."""
+    shown = 3
+    cell = ", ".join(names[:shown])
+    if len(names) > shown:
+        cell += f", ... (+{len(names) - shown})"
+    return cell
+
+
 def generate_report(
     test_ops: dict | None,
     bench_ops: dict | None,
@@ -1252,6 +1296,7 @@ def generate_report(
     coverage: list[dict] | None = None,
     coverage_prev: dict | None = None,
     bench_skips: int = 0,
+    bench_unavailable: int = 0,
     previous_run_shifts: list[dict] | None = None,
     sol_anomalies: list[dict] | None = None,
     have_gpu_profile: bool = False,
@@ -1260,6 +1305,7 @@ def generate_report(
     scale: dict[str, int] | None = None,
     implemented: set[str] | None = None,
     new_ops: list[dict] | None = None,
+    models: dict[str, dict] | None = None,
 ) -> str:
     """Generate markdown report."""
     lines = []
@@ -1286,9 +1332,17 @@ def generate_report(
         )
         total_passed = sum(d["passed"] for d in (test_ops or {}).values())
 
+    # An empty result is a model run that wrote no testcase: it crashed or collected nothing.
+    model_failures = sum(d["failed"] for d in (models or {}).values()) or int(models == {})
     health = (
         _PASS
-        if (n_failures == 0 and not regressions and not bench_failures and not sol_fails)
+        if (
+            n_failures == 0
+            and model_failures == 0
+            and not regressions
+            and not bench_failures
+            and not sol_fails
+        )
         else _FAIL
     )
     lines.append(f"# {health} TileOPs Nightly Report")
@@ -1301,6 +1355,8 @@ def generate_report(
     bench_fail_icon = f"{_FAIL} {len(bench_failures)}" if bench_failures else f"{_PASS} None"
     if bench_skips:
         bench_fail_icon += f" &ensp;|&ensp; {_WARN} {bench_skips} skipped"
+    if bench_unavailable:
+        bench_fail_icon += f" &ensp;|&ensp; {bench_unavailable} unavailable"
     reg_icon = f"{_PASS} None" if not regressions else f"{_WARN} {len(regressions)}"
     alert_icon = f"{_WARN} {len(baseline_alerts)}" if baseline_alerts else f"{_PASS} None"
 
@@ -1321,6 +1377,20 @@ def generate_report(
     lines.append(
         f"| **Correctness** | {corr_icon} &ensp; ({scope}{total_passed}/{total_tests} tests) |"
     )
+    if models is not None:
+        model_tests = sum(d["passed"] + d["failed"] + d["skipped"] for d in models.values())
+        model_passed = sum(d["passed"] for d in models.values())
+        model_icon = (
+            f"{_FAIL} no results"
+            if not models
+            else _PASS
+            if model_failures == 0
+            else f"{_FAIL} {model_failures} failed"
+        )
+        lines.append(
+            f"| **Models** | {model_icon} &ensp; ({len(models)} models, "
+            f"{model_passed}/{model_tests} tests) |"
+        )
     lines.append(f"| **Benchmarked Ops** | {n_bench_ops} |")
     lines.append(f"| **Benchmark Failures** | {bench_fail_icon} |")
     lines.append(f"| **Regressions** (vs 14-day median) | {reg_icon} |")
@@ -1407,6 +1477,20 @@ def generate_report(
             )
     lines.append("")
 
+    # ── Models ────────────────────────────────────────────────────────────
+    if models:
+        lines.append("## Models")
+        lines.append("")
+        lines.append("| Model | Passed | Failed | Skipped | Failing Tests |")
+        lines.append("|:------|:------:|:------:|:-------:|:--------------|")
+        for model, d in sorted(models.items()):
+            icon = _PASS if d["failed"] == 0 else _FAIL
+            lines.append(
+                f"| {icon} **{model}** | {d['passed']} | {d['failed']} | {d['skipped']} "
+                f"| {_failing_tests_cell(d['failing_tests'])} |"
+            )
+        lines.append("")
+
     # ── Test Failures (only if any) ───────────────────────────────────────
     failed_ops = {op: d for op, d in (test_ops or {}).items() if d["failed"] > 0}
     if failed_ops:
@@ -1416,11 +1500,9 @@ def generate_report(
         lines.append("|:---|:-------|:--------------:|:--------------|")
         for op, d in sorted(failed_ops.items()):
             total = d["passed"] + d["failed"] + d["skipped"]
-            tests_str = ", ".join(d["failing_tests"][:3])
-            if len(d["failing_tests"]) > 3:
-                tests_str += f", ... (+{len(d['failing_tests']) - 3})"
             lines.append(
-                f"| **{op}** | `{d['module'] or 'N/A'}` | {d['failed']}/{total} | {tests_str} |"
+                f"| **{op}** | `{d['module'] or 'N/A'}` | {d['failed']}/{total} "
+                f"| {_failing_tests_cell(d['failing_tests'])} |"
             )
         lines.append("")
 
@@ -1655,6 +1737,7 @@ def _coverage_section(signals: dict, worst_n: int = _COVERAGE_WORST_N) -> list[s
 def main():
     parser = argparse.ArgumentParser(description="Generate TileOPs nightly Op-level report")
     parser.add_argument("--test-xml", help="Path to correctness test JUnit XML")
+    parser.add_argument("--model-test-xml", help="Path to the model tests' JUnit XML")
     parser.add_argument("--bench-xml", help="Path to benchmark JUnit XML")
     parser.add_argument("--history", help="Path to perf_history.json (input)")
     parser.add_argument("--output", required=True, help="Output markdown report path")
@@ -1678,14 +1761,21 @@ def main():
         test_results = parse_test_xml(args.test_xml)
         test_ops = aggregate_test_results(test_results)
 
+    # Given but absent, the model run died before pytest wrote it: no results, not a pass.
+    models = None
+    if args.model_test_xml:
+        path = Path(args.model_test_xml)
+        models = aggregate_model_results(parse_test_xml(str(path))) if path.exists() else {}
+
     bench_ops = None
     bench_failures = []
-    bench_skips = 0
+    bench_skips = bench_unavailable = 0
     if args.bench_xml and Path(args.bench_xml).exists():
         bench_results = parse_bench_xml(args.bench_xml)
         bench_ops = aggregate_bench_results(bench_results)
         bench_failures = collect_bench_failures(bench_results)
-        bench_skips = count_bench_skips(bench_results)
+        bench_skips = count_bench_outcome(bench_results, "skipped")
+        bench_unavailable = count_bench_outcome(bench_results, "unavailable")
 
     # The rebuild can reach past the period when a run gap exceeds it, and the
     # verdicts below are labelled with the 14-day window.
@@ -1721,6 +1811,7 @@ def main():
         coverage=coverage,
         coverage_prev=coverage_prev,
         bench_skips=bench_skips,
+        bench_unavailable=bench_unavailable,
         previous_run_shifts=previous_run_shifts,
         sol_anomalies=sol_anomalies,
         have_gpu_profile=gpu_profile is not None,
@@ -1729,6 +1820,7 @@ def main():
         scale=_library_scale(manifest),
         implemented=implemented,
         new_ops=new_ops,
+        models=models,
     )
     Path(args.output).write_text(report)
     print(f"Report written to {args.output}")

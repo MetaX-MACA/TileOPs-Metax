@@ -6,7 +6,6 @@ The GLA inference contract lives in ``tileops._kernels.linear_attention.gla.call
 
 import dataclasses
 from abc import abstractmethod
-from typing import Optional
 
 import torch
 
@@ -34,12 +33,10 @@ __all__ = [
 ]
 
 
-def head_count_refusal(*counts: int) -> Optional[str]:
+def head_count_refusal(*counts: int) -> str | None:
     """Why no in-tree linear-attention kernel serves these head counts, or ``None``.
 
-    Every model that runs a gated delta rule, a delta rule or GLA splits its state into an
-    even number of heads, or into a single one, so an odd count above one is declined
-    rather than tuned for.
+    An odd count above one is declined: no model splits its state that way.
     """
     for count in counts:
         if count != 1 and count % 2:
@@ -57,7 +54,7 @@ class DeltaNetChunkCall(CallSpec):
     chunk_size: int = 0
     dim_k: int = 0
     dim_v: int = 0
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -68,7 +65,7 @@ class DeltaNetDecodeCall(CallSpec):
     heads: int = 0
     dim_k: int = 0
     dim_v: int = 0
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -80,7 +77,7 @@ class DeltaNetCall(CallSpec):
     heads: int = 0
     dim_k: int = 0
     dim_v: int = 0
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
     scale: float = 0.0
     l2norm: bool = False
     varlen: bool = False
@@ -99,7 +96,7 @@ class GLAChunkCall(CallSpec):
     dim_v: int = 0
     chunk_size: int = 0
     scale: float = 0.0
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
     has_initial_state: bool = False
 
 
@@ -112,12 +109,17 @@ class GLADecodeCall(CallSpec):
     dim_k: int = 0
     dim_v: int = 0
     scale: float = 0.0
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
 
 
 @dataclasses.dataclass(frozen=True)
 class GDNCall(CallSpec):
-    """One GDN inference call, with the recurrence semantics the op fixed."""
+    """One GDN inference call, with the recurrence semantics the op fixed.
+
+    ``pooled`` is whether ``state_indices`` maps each sequence to its slots of a state
+    pool, and ``rollback`` whether ``num_accepted_tokens`` is passed with a slot a token;
+    ``drafts`` is then the slots of each sequence, the most tokens it holds.
+    """
 
     batch: int = 0
     seq_len: int = 0
@@ -125,7 +127,7 @@ class GDNCall(CallSpec):
     value_heads: int = 0
     dim_k: int = 0
     dim_v: int = 0
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
     scale: float = 0.0
     has_initial_state: bool = False
     varlen: bool = False
@@ -135,6 +137,9 @@ class GDNCall(CallSpec):
     beta_sigmoid: bool = False
     allow_neg_eigval: bool = False
     num_sequences: int = 0
+    pooled: bool = False
+    rollback: bool = False
+    drafts: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -155,7 +160,7 @@ class KDACall(CallSpec):
     value_heads: int = 0
     dim_k: int = 0
     dim_v: int = 0
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
     scale: float = 0.0
     has_initial_state: bool = False
     varlen: bool = False
@@ -164,23 +169,25 @@ class KDACall(CallSpec):
     gate_in_kernel: bool = False
     beta_sigmoid: bool = False
     allow_neg_eigval: bool = False
-    lower_bound: Optional[float] = None
+    lower_bound: float | None = None
     has_dt_bias: bool = False
+    # As GDNCall.
+    pooled: bool = False
+    rollback: bool = False
 
     @property
-    def chunk_refusal(self) -> Optional[str]:
+    def chunk_refusal(self) -> str | None:
         """Why no in-tree Kimi Delta Attention program serves this call, or ``None``.
 
-        The recurrence variants and state layouts the in-tree pair does not
-        implement, whatever the sequence length. Both implementations ask this
-        first, then state the lengths and widths they serve themselves.
+        Every implementation asks this first, then refuses the lengths, widths and state
+        layouts it does not serve.
         """
         unsupported = [
             name
             for name, present in (
-                ("state_v_first=True", self.state_v_first),
                 ("use_beta_sigmoid_in_kernel=True", self.beta_sigmoid),
                 ("allow_neg_eigval=True", self.allow_neg_eigval),
+                ("num_accepted_tokens", self.rollback),
             )
             if present
         ]
@@ -314,9 +321,9 @@ class DeltaNetFwdInterface(KernelInterface):
         k: torch.Tensor,
         v: torch.Tensor,
         beta: torch.Tensor,
-        initial_state: Optional[torch.Tensor] = None,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        cu_seqlens_cpu: Optional[torch.Tensor] = None,
+        initial_state: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run the recurrence from *initial_state* over the call's sequence.
 
@@ -350,7 +357,7 @@ class GLAChunkFwdInterface(KernelInterface):
         k: torch.Tensor,
         v: torch.Tensor,
         g: torch.Tensor,
-        initial_state: Optional[torch.Tensor] = None,
+        initial_state: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run the chunked gated recurrence; nothing is written in place.
 
@@ -389,7 +396,7 @@ class GLAChunkBwdInterface(KernelInterface):
         do: torch.Tensor,
         dht: torch.Tensor,
         has_initial_state: bool = False,
-    ) -> tuple[Optional[torch.Tensor], ...]:
+    ) -> tuple[torch.Tensor | None, ...]:
         """Propagate *do* and *dht* back through the recurrence; nothing is written in place.
 
         Every tensor is on ``call.device`` in BTHD layout; the op passes them as the caller
@@ -458,17 +465,20 @@ class GDNFwdInterface(KernelInterface):
         v: torch.Tensor,
         g: torch.Tensor,
         beta: torch.Tensor,
-        initial_state: Optional[torch.Tensor] = None,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        cu_seqlens_cpu: Optional[torch.Tensor] = None,
-        A_log: Optional[torch.Tensor] = None,
-        dt_bias: Optional[torch.Tensor] = None,
+        initial_state: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
+        A_log: torch.Tensor | None = None,
+        dt_bias: torch.Tensor | None = None,
+        state_indices: torch.Tensor | None = None,
+        num_accepted_tokens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run the recurrence from *initial_state* over the call's sequence.
 
-        Every tensor is contiguous on ``call.device`` but ``cu_seqlens_cpu``, and nothing is
-        written in place. Unless ``call.gate_in_kernel``, *g* already carries the log-space
-        decay; unless ``call.beta_sigmoid``, *beta* already carries the update strength.
+        Every tensor is contiguous on ``call.device`` but ``cu_seqlens_cpu``. Nothing is
+        written in place but a state pool. Unless ``call.gate_in_kernel``, *g* already
+        carries the log-space decay; unless ``call.beta_sigmoid``, *beta* already carries the
+        update strength.
 
         Args:
             q: ``(batch, seq_len, heads, dim_k)`` in ``call.dtype``.
@@ -484,10 +494,22 @@ class GDNFwdInterface(KernelInterface):
             cu_seqlens_cpu: The same offsets on the CPU, or ``None``.
             A_log: ``float32`` ``(value_heads,)``, passed exactly when ``call.gate_in_kernel``.
             dt_bias: ``float32`` ``(value_heads,)``, passed exactly when ``call.gate_in_kernel``.
+            state_indices: ``int32`` ``(n,)``, passed exactly when ``call.pooled``: sequence
+                ``i`` starts from ``initial_state[state_indices[i]]`` and its final state is
+                written back there. *initial_state* is then a pool of states, one a slot, the
+                slots other than -1 distinct across the call. Under ``call.rollback`` it is
+                ``(n, L)``, one slot a token: the state after token ``t`` of sequence ``i`` is
+                written to ``initial_state[state_indices[i, t]]``, a sequence holding at most
+                ``L`` tokens. A slot of -1 is never written; a sequence starting from
+                it has unspecified outputs and leaves unspecified states in its other slots.
+            num_accepted_tokens: ``int32`` ``(n,)``, passed exactly when ``call.rollback``:
+                sequence ``i`` starts from ``initial_state[state_indices[i, a - 1]]``, ``a`` its
+                entry, at least 1 and at most ``L``.
 
         Returns:
-            New ``(o, final_state)``: ``o`` shaped like *v* in ``call.dtype``, and the
-            ``float32`` state after the last step, laid out like *initial_state*.
+            ``(o, final_state)``: a new ``o`` shaped like *v* in ``call.dtype``, and the
+            ``float32`` state after the last step, laid out like *initial_state*; under
+            ``call.pooled``, *initial_state* itself, updated in place.
         """
 
 
@@ -504,17 +526,18 @@ class KDAFwdInterface(KernelInterface):
         v: torch.Tensor,
         g: torch.Tensor,
         beta: torch.Tensor,
-        initial_state: Optional[torch.Tensor] = None,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        cu_seqlens_cpu: Optional[torch.Tensor] = None,
-        A_log: Optional[torch.Tensor] = None,
-        dt_bias: Optional[torch.Tensor] = None,
+        initial_state: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
+        A_log: torch.Tensor | None = None,
+        dt_bias: torch.Tensor | None = None,
+        state_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run the recurrence from *initial_state* over the call's sequence.
 
-        Every tensor is contiguous on ``call.device`` but ``cu_seqlens_cpu``, and
-        nothing is written in place. Unless ``call.gate_in_kernel``, *g* already
-        carries the log-space decay of each key channel; unless
+        Every tensor is contiguous on ``call.device`` but ``cu_seqlens_cpu``.
+        Nothing is written in place but a state pool. Unless ``call.gate_in_kernel``,
+        *g* already carries the log-space decay of each key channel; unless
         ``call.beta_sigmoid``, *beta* already carries the update strength.
 
         Args:
@@ -524,18 +547,25 @@ class KDAFwdInterface(KernelInterface):
             g: ``(batch, seq_len, value_heads, dim_k)`` log-space per-channel
                 decay in ``call.dtype``.
             beta: ``(batch, seq_len, value_heads)`` in ``call.dtype``.
-            initial_state: ``float32`` ``(n, value_heads, dim_k, dim_v)``, or
-                ``None`` for zero. ``n`` is the batch size, or the packed
-                sequence count under ``call.varlen``.
+            initial_state: ``float32`` ``(n, value_heads, dim_k, dim_v)``,
+                value-major ``(n, value_heads, dim_v, dim_k)`` when
+                ``call.state_v_first``, or ``None`` for zero. ``n`` is the batch
+                size, or the packed sequence count under ``call.varlen``.
             cu_seqlens: ``int64`` packed sequence offsets, passed exactly when
                 ``call.varlen``.
             cu_seqlens_cpu: The same offsets on the CPU, or ``None``.
             A_log: ``float32`` ``(value_heads,)``, passed exactly when
                 ``call.gate_in_kernel``.
             dt_bias: ``float32`` ``(value_heads * dim_k,)``, or ``None``.
+            state_indices: ``int32`` ``(n,)``, passed exactly when ``call.pooled``:
+                sequence ``i`` starts from ``initial_state[state_indices[i]]`` and its
+                final state is written back there. *initial_state* is then a pool of
+                states, one a slot, the slots other than -1 distinct across the call. A slot
+                of -1 is never written, and its sequence's outputs are unspecified.
 
         Returns:
-            New ``(o, final_state)``: ``o`` shaped like *v* in ``call.dtype``, and
-            the ``float32`` ``(n, value_heads, dim_k, dim_v)`` state after the
-            last step.
+            ``(o, final_state)``: a new ``o`` shaped like *v* in ``call.dtype``, and
+            the ``float32`` state after the last step, laid out like
+            *initial_state*; under ``call.pooled``, *initial_state* itself, updated
+            in place.
         """

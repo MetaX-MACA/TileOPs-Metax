@@ -1,8 +1,7 @@
 """Tests for tileops._ops.op_base.
 
 Covers construction, the ``kernel_for`` path, the kernel enumeration ``Op.request_tune``
-runs over, tuned mode, sub-ops held through ``delegate_for`` and their stages, and instance
-keys.
+runs over, tuned mode, and sub-ops held through ``delegate_for`` and their stages.
 """
 
 import dataclasses
@@ -16,7 +15,6 @@ import yaml
 
 from tileops._kernels.call_spec import CallSpec
 from tileops._kernels.kernel_base import Kernel, KernelInterface
-from tileops._ops import op_base
 from tileops._ops.op_base import Op
 
 pytestmark = pytest.mark.smoke
@@ -209,9 +207,9 @@ class TestGetOrBuildKernel:
     def test_call_specs_that_keep_changing_hold_a_bounded_cache(self):
         """Distinct call specs of one build identity reuse its entry; the oldest specs go."""
         op = _SlottedOp([])
-        for i in range(300):
+        for i in range(op._MAX_DISPATCHED_CALLS + 1):
             op.build("fwd", torch.float16, str(i))
-        assert len(op._entries_by_call) == 256
+        assert len(op._entries_by_call) == op._MAX_DISPATCHED_CALLS
         assert op.builds == [("fwd", torch.float16)]
 
     def test_built_entries_is_empty_before_the_first_build(self):
@@ -245,22 +243,11 @@ class TestIterKernels:
         op.build("aux", torch.bfloat16, "entry")
         assert sorted(k.name for k in op.iter_kernels()) == ["bwd", "pre", "record"]
 
-    def test_ignores_kernels_bound_to_other_attributes(self):
-        """Enumeration is explicit: an unregistered attribute is not searched."""
+    def test_ignores_kernels_the_op_holds_outside_its_entries(self):
+        """Enumeration is explicit: only kernels built through a role are enumerated."""
         tuned: list[str] = []
         op = _SlottedOp(tuned)
         op.some_other_attribute = op._installed_kernel_types["fwd"]("hidden")
-        assert list(op.iter_kernels()) == []
-
-    def test_ignores_a_kernel_dict_the_op_owns(self):
-        """A private dict of kernels is unreachable — the miss reflection used to hide.
-
-        The old ``dir(self)`` walk descended dict values, so an op could keep its
-        own cache and still be tuned. Enumeration does not, which is the point:
-        the kernels have to be built through a role to be seen at all.
-        """
-        tuned: list[str] = []
-        op = _SlottedOp(tuned)
         op.private_cache = {torch.float16: op._installed_kernel_types["fwd"]("private")}
         assert list(op.iter_kernels()) == []
         op.request_tune()
@@ -335,14 +322,6 @@ class _TunableOp(_SlottedOp):
 class TestTunedMode:
     """``request_tune()`` is a lifecycle decision, so it governs later builds too."""
 
-    def test_a_kernel_built_after_request_tune_is_tuned(self):
-        tuned: list[str] = []
-        op = _TunableOp(tuned)
-        op.request_tune()  # nothing built yet
-        assert tuned == []
-        op.build(torch.float16)
-        assert tuned == ["torch.float16"]
-
     def test_every_later_specialization_is_tuned_not_just_the_next(self):
         """The decision persists: a second dtype arriving later is tuned too."""
         tuned: list[str] = []
@@ -362,7 +341,8 @@ class TestTunedMode:
         """The build path tunes what a factory returns, and a second request changes nothing."""
         tuned: list[str] = []
         op = _SlottedOp(tuned)
-        op.request_tune()
+        op.request_tune()  # nothing built yet
+        assert tuned == []
         op.build("fwd", torch.float16, "fp16")
         op.request_tune()
         assert tuned == ["fp16"]
@@ -516,33 +496,6 @@ class TestStages:
             op.delegate_for("second", None, shared)
         with pytest.raises(ValueError, match="already holds"):
             op.delegate_for("first", 1, shared)
-
-
-class TestInstanceKeys:
-    def test_a_collected_instances_key_is_never_handed_out_again(self):
-        """An op reaching a used key inherits that op's compiled shapes."""
-        import weakref
-
-        class _Dummy:
-            pass
-
-        keys = set()
-        for _ in range(50):
-            op = _Dummy()
-            keys.add(op_base.register_instance(op))
-            ref = weakref.ref(op)
-            del op
-            assert ref() is None
-
-        assert len(keys) == 50
-
-    def test_a_key_names_the_class_it_belongs_to(self):
-        """Graph dumps and guard failures show the key, not the instance."""
-
-        class _Dummy:
-            pass
-
-        assert op_base.register_instance(_Dummy()).startswith("_Dummy")
 
 
 def test_no_abstract_op_class_is_instantiated_anywhere():

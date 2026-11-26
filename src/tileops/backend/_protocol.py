@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Callable, Final, Union
+from collections.abc import Callable
+from typing import Final, Union
 
 import torch
 
 # One call's result. A purely mutating op returns ``None``: ``torch.library.custom_op``
 # cannot express a return value aliasing an input.
-KernelResult = Union[torch.Tensor, tuple[torch.Tensor, ...], None]
-# Called ``build_kernel(*inputs, **params)``: a `TensorSpec` per input in
-# ``signature.inputs`` order — ``None`` for an ``optional: true`` input the call did not
-# pass, so presence is read off the slot rather than off how many slots there are — then
+KernelResult = Union[torch.Tensor, tuple[torch.Tensor, ...], None]  # noqa: UP007 -- released alias kind
+# Called ``build_kernel(*inputs, **params)``: one description per input in
+# ``signature.inputs`` order — a `TensorSpec` for a tensor, a tuple of them for a tensor
+# sequence, the Python type of a call-time scalar, ``None`` for an input holding None, so
+# the member is read off the slot rather than off how many slots there are — then
 # ``signature.params`` by keyword. Both lists are per-op, which the type system cannot
 # express, hence ``...``. The kernel it returns may also define ``request_tune()`` and
 # ``config``, as an in-tree ``Kernel`` does (``tileops.backend``).
@@ -56,7 +58,7 @@ class TensorSpec:
     shape: tuple[int, ...]
 
     @staticmethod
-    def of(tensor: torch.Tensor) -> "TensorSpec":
+    def of(tensor: torch.Tensor) -> TensorSpec:
         """Describe *tensor*."""
         return TensorSpec(device=tensor.device, dtype=tensor.dtype, shape=tuple(tensor.shape))
 
@@ -75,4 +77,4 @@ class _Builtin:
 BUILTIN: Final = _Builtin()
 
 # What ``target=`` and the process default accept.
-Target = Union[str, _Builtin, None]
+Target = Union[str, _Builtin, None]  # noqa: UP007 -- released alias kind

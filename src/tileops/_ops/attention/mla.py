@@ -1,4 +1,5 @@
-from typing import ClassVar, Mapping, Optional
+from collections.abc import Mapping
+from typing import ClassVar
 
 import torch
 
@@ -85,7 +86,6 @@ class MLADenseDecodeFwdOp(Op):
         """
         batch, heads, dim = q.shape
         _, seqlen_kv, heads_kv, _ = k.shape
-        inputs = (q, q_pe, k, k_pe)
         return self.kernel_for(
             "mla_decode_kernel",
             lambda: MLADecodeCall(
@@ -98,7 +98,7 @@ class MLADenseDecodeFwdOp(Op):
                 dtype=q.dtype,
                 device=q.device,
             ),
-        )(*inputs)
+        )(q, q_pe, k, k_pe)
 
     def roof_key(self) -> str:
         """FLOPs are matmul contractions; priced on tensor cores."""
@@ -129,7 +129,7 @@ class MLAPagedFwdOp(Op):
         self,
         kv_lora_rank: int,
         is_causal: bool = False,
-        sm_scale: Optional[float] = None,
+        sm_scale: float | None = None,
         *,
         target: Target = None,
     ) -> None:
@@ -155,7 +155,7 @@ class MLAPagedFwdOp(Op):
         kv_cache: torch.Tensor,
         block_table: torch.Tensor,
         cache_seqlens: torch.Tensor,
-        kv_scale: Optional[torch.Tensor] = None,
+        kv_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Attend each request's query tokens to its cache.
 
@@ -222,7 +222,7 @@ class MLAVarlenFwdOp(Op):
     def __init__(
         self,
         is_causal: bool = False,
-        sm_scale: Optional[float] = None,
+        sm_scale: float | None = None,
         *,
         validate_inputs: bool = False,
         target: Target = None,
@@ -243,21 +243,6 @@ class MLAVarlenFwdOp(Op):
         self.sm_scale = sm_scale
         self.validate_inputs = validate_inputs
         super().__init__(target=target)
-
-    def _varlen_call(self, inputs: tuple) -> MLAVarlenCall:
-        """State what one contiguous call is, for selection to filter against."""
-        q, k_nope, k_pe, _v, cu_seqlens = inputs
-        return MLAVarlenCall(
-            batch=cu_seqlens.shape[0] - 1,
-            heads=q.shape[1],
-            dim_nope=k_nope.shape[2],
-            dim_pe=k_pe.shape[1],
-            dim_v=_v.shape[2],
-            is_causal=self.is_causal,
-            sm_scale=self.sm_scale,
-            dtype=q.dtype,
-            device=q.device,
-        )
 
     def forward(
         self,
@@ -281,7 +266,20 @@ class MLAVarlenFwdOp(Op):
             that sees no key.
         """
         inputs = tuple(tensor.contiguous() for tensor in (q, k_nope, k_pe, v, cu_seqlens))
-        return self.kernel_for("mla_varlen_fwd", lambda: self._varlen_call(inputs))(*inputs)
+        return self.kernel_for(
+            "mla_varlen_fwd",
+            lambda: MLAVarlenCall(
+                batch=cu_seqlens.shape[0] - 1,
+                heads=q.shape[1],
+                dim_nope=k_nope.shape[2],
+                dim_pe=k_pe.shape[1],
+                dim_v=v.shape[2],
+                is_causal=self.is_causal,
+                sm_scale=self.sm_scale,
+                dtype=q.dtype,
+                device=q.device,
+            ),
+        )(*inputs)
 
     def roof_key(self) -> str:
         """FLOPs are matmul contractions; priced on tensor cores."""
@@ -316,7 +314,7 @@ class MLADenseBwdOp(Op):
     def __init__(
         self,
         is_causal: bool = False,
-        sm_scale: Optional[float] = None,
+        sm_scale: float | None = None,
         *,
         target: Target = None,
     ) -> None:
@@ -412,7 +410,7 @@ class MLAVarlenBwdOp(Op):
     def __init__(
         self,
         is_causal: bool = False,
-        sm_scale: Optional[float] = None,
+        sm_scale: float | None = None,
         *,
         validate_inputs: bool = False,
         target: Target = None,

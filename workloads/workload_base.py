@@ -10,7 +10,8 @@ Correctness declarations live beside references. Tests and benchmarks consume th
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Callable, TypeVar
+from collections.abc import Callable
+from typing import Any, TypeVar
 from zlib import crc32
 
 import torch
@@ -93,12 +94,12 @@ class CallWorkload(WorkloadBase):
     omits one; ``arguments()`` the op's constructor arguments.
     """
 
-    def __init__(self, call: Any, device: "torch.device | str | None" = None):
+    def __init__(self, call: Any, device: torch.device | str | None = None):
         self.call = call
         self._device = device
 
     @property
-    def device(self) -> "torch.device | str":
+    def device(self) -> torch.device | str:
         """The device the inputs go on: the one passed in, else the run's."""
         return self._device if self._device is not None else run_device()
 
@@ -107,7 +108,7 @@ class CallWorkload(WorkloadBase):
         return tuple(tensors[t] for t in self.call.signature.inputs)
 
     def arguments(self) -> dict[str, Any]:
-        return self.call.arguments(self.call.materialize(self.device))
+        return self.call.arguments()
 
 
 class RandnWorkload(WorkloadBase):
@@ -137,8 +138,8 @@ class FixtureMeta(type):
         @MyFixture
         def test_something(a, b): ...
 
-    PARAMS may also be set as a plain class variable (list) for backwards
-    compatibility when pytest is already importable at module scope.
+    PARAMS may also be set as a plain class variable (list) when pytest is
+    importable at module scope.
     """
 
     def __call__(cls, fn: _F) -> _F:

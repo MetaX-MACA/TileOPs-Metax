@@ -1,14 +1,14 @@
 """W4A8 GEMM for prefill token counts over the unified INT4 weight order."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Optional
 
 import tilelang
 import tilelang.language as T
 import torch
 
 from tileops._csrc import csrc_include
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.constants import (
     SHARED_BUFFER_ALIGN_BYTES,
     TMA_DTYPE_UINT8,
@@ -23,7 +23,7 @@ from tileops._kernels.gemm.call_spec import GEMMW4A8Call, GEMMW4A8FwdInterface
 from tileops._kernels.gemm.w4a8_decode import GEMMW4A8DecodeKernel
 from tileops._kernels.gemm.w4a8_repack import GROUP_SIZE, W4A8_LAYOUT
 from tileops._kernels.kernel_base import CompiledProgram, Entry, Kernel
-from tileops._utils import WARP_LANES, get_shared_memory_optin, get_sm_count
+from tileops._utils import WARP_LANES
 
 __all__ = ["GEMMW4A8PrefillKernel"]
 
@@ -211,8 +211,8 @@ def _worker_count(
     m: int, n: int, k: int, sms: int, block_m: int, cluster: int, stream_k: int
 ) -> int:
     """Choose the resident worker count shared by the launch and workspace plan."""
-    # The balanced grid was measured faster only for 48- and 64-token tiles from K = 3072,
-    # and only while the idle SMs would leave at most 22 K groups each.
+    # The balanced grid pays only for 48- and 64-token tiles from K = 3072, and only while
+    # the idle SMs would leave at most 22 K groups each.
     if not (
         GEMMW4A8DecodeKernel.base_token_limit < m <= block_m
         and block_m in (48, 64)
@@ -241,7 +241,7 @@ def _gemm_w4a8_prefill_kernel(m: int, n: int, k: int, sms: int) -> Callable:
     slice_bytes = 2 * W4A8_LAYOUT.unit_bytes
     rows_per_slice = slice_bytes // LAYOUT.tma_row_bytes
     # Scale bytes are prefetched four K steps ahead into an eight-register ring per lane,
-    # measured deep enough to hide their load behind the decode.
+    # deep enough to hide their load behind the decode.
     depth = 4
     odd_k = kg % 2 == 1
     clamp = "true" if ragged else "false"
@@ -257,7 +257,7 @@ def _gemm_w4a8_prefill_kernel(m: int, n: int, k: int, sms: int) -> Callable:
     @tilelang.jit(
         out_idx=[-1],
         compile_flags=[
-            "-O3",
+            *CUDA_COMPILE_FLAGS,
             "--use_fast_math",
             "-DENABLE_BF16",
             *csrc_include("w4a8_prefill_helper.h"),
@@ -285,9 +285,9 @@ def _gemm_w4a8_prefill_kernel(m: int, n: int, k: int, sms: int) -> Callable:
         consumers = LAYOUT.consumer_threads
         # The first warp of the last consumer warpgroup issues the output stores.
         store_warp = (threads - WARPGROUP_THREADS) // WARP_LANES
-        # A single M tile needs only whole eight-token MMA groups covering m.
-        # Multiple M tiles retain the full width. Keep physical activation/output
-        # layouts and workspace pitch; transport only the live accumulator prefix.
+        # A single M tile runs only the whole eight-token MMA groups covering m; several M
+        # tiles run the full width. The activation, output and workspace keep the full
+        # tile's pitch; only the live accumulator prefix moves.
         active_tokens = min(block_m, -(-m // 8) * 8)
         active_regs = active_tokens // 2
         mma = f"tileops::w4a8_decode_mma<{active_tokens}>"
@@ -335,6 +335,26 @@ def _gemm_w4a8_prefill_kernel(m: int, n: int, k: int, sms: int) -> Callable:
                 )
             else:
                 T.barrier_arrive(empty[(ci + num_stages - 1) % num_stages])
+
+        @T.macro
+        def count_partials(take, flag_s, cnt, wsi, parts, tx):
+            # One consumer thread reads (take) or adds to the tile's count and shares whether
+            # this CTA finishes the tile in flag_s. Barrier 5 orders any partial the consumers
+            # just stored before the count, and follows their reads of flag_s from the previous
+            # call. Named barriers 1, 2, 5 and 6 span the consumers; TileLang keeps 1 and 2 for
+            # reductions, none here, and numbers the barriers it inserts from 3 (3 and 4 at most
+            # in this program).
+            T.sync_threads(barrier_id=5, arrive_count=consumers)
+            if tx == WARPGROUP_THREADS:
+                if take:
+                    flag_s[0] = T.call_extern(
+                        "int32", "tileops::w4a8_take_partials", cnt.data, wsi, parts
+                    )
+                else:
+                    flag_s[0] = T.call_extern(
+                        "int32", "tileops::w4a8_count_partial", cnt.data, wsi, parts
+                    )
+            T.sync_threads(barrier_id=6, arrive_count=consumers)
 
         @T.macro
         def k_step(kk, a_cur, a_prev, ops, ci, kfirst):
@@ -462,7 +482,9 @@ def _gemm_w4a8_prefill_kernel(m: int, n: int, k: int, sms: int) -> Callable:
                                 if ragged:
                                     # Per 64-row block: a whole tile, the compact last tile, or
                                     # nothing past N.
-                                    for b in T.unroll(LAYOUT.consumer_warpgroups, explicit=True):
+                                    # A Python loop, so no ragged copy is emitted under a branch
+                                    # no rb0 can take: TileLang rejects it there.
+                                    for b in tuple(range(LAYOUT.consumer_warpgroups)):
                                         if rb0 + b < full_blocks:
                                             T.tma_copy(
                                                 wq[
@@ -476,7 +498,11 @@ def _gemm_w4a8_prefill_kernel(m: int, n: int, k: int, sms: int) -> Callable:
                                                 w_s[slot, b, :, :],
                                                 barrier=full[slot],
                                             )
-                                        if ragged_units > 0 and rb0 + b == full_blocks:
+                                        if (
+                                            ragged_units > 0
+                                            and b == full_blocks % LAYOUT.consumer_warpgroups
+                                            and rb0 + b == full_blocks
+                                        ):
                                             T.tma_copy(
                                                 wq[
                                                     full_blocks * kg * rows_per_tma
@@ -697,33 +723,34 @@ def _gemm_w4a8_prefill_kernel(m: int, n: int, k: int, sms: int) -> Callable:
                             T.wait_wgmma(0)
                             if tx % WARP_LANES == 0:
                                 release_stage(empty, c_idx)
-                            # Stream-K: every contributor stores its partial; the last to arrive
-                            # adds the others' and runs the epilogue.
+                            # Stream-K: contributor 0 holds the tile's first K steps, which end
+                            # its range, so it tends to reach the tile last. Finding every other
+                            # partial stored, it adds them without storing its own; otherwise it
+                            # stores its own like the others, and the contributor whose count
+                            # completes the tile adds the rest and runs the epilogue. No CTA
+                            # waits.
                             do_epi = 1
-                            if seg[3] >= 0 and (seg[1] > 0 or seg[2] < kg):
+                            if sk_tiles > 0 and seg[3] >= 0 and (seg[1] > 0 or seg[2] < kg):
                                 t = seg[3]
                                 nc = contributor_counts[t]
                                 wsi = t * cluster + rank
                                 base = wsi * max_contributors * acc_regs * consumers
-                                T.call_extern(
-                                    "handle",
-                                    f"tileops::w4a8_store_partial<{active_regs}, {consumers}>",
-                                    acc.data,
-                                    ws.data,
-                                    base + seg[4] * acc_regs * consumers + lt * 4,
-                                )
-                                # Named barriers 1, 2, 5 and 6 span the consumers. TileLang keeps
-                                # 1 and 2 for reductions, none here, and numbers the barriers it
-                                # inserts from 3 (3 and 4 at most in this program).
-                                T.sync_threads(barrier_id=5, arrive_count=consumers)
-                                if tx == WARPGROUP_THREADS:
-                                    flag_s[0] = T.call_extern(
-                                        "int32", "tileops::w4a8_signal", cnt.data, wsi, nc
+                                do_epi = 0
+                                if seg[4] == 0:
+                                    count_partials(True, flag_s, cnt, wsi, nc - 1, tx)
+                                    do_epi = flag_s[0]
+                                if do_epi == 0:
+                                    T.call_extern(
+                                        "handle",
+                                        f"tileops::w4a8_store_partial<{active_regs}, {consumers}>",
+                                        acc.data,
+                                        ws.data,
+                                        base + seg[4] * acc_regs * consumers + lt * 4,
                                     )
-                                T.sync_threads(barrier_id=6, arrive_count=consumers)
-                                do_epi = flag_s[0]
-                                # The last arriving CTA keeps its accumulator, so FP32
-                                # addition order can vary between launches (see the op API).
+                                    count_partials(False, flag_s, cnt, wsi, nc, tx)
+                                    do_epi = flag_s[0]
+                                # The contributor that completes the tile keeps its accumulator,
+                                # so FP32 addition order can vary between launches (see the op API).
                                 if do_epi == 1:
                                     for c in T.serial(nc):
                                         if c != seg[4]:
@@ -816,7 +843,7 @@ class GEMMW4A8PrefillKernel(Kernel, GEMMW4A8FwdInterface):
     supported_archs: list[int] = [90]
 
     @classmethod
-    def refusal(cls, call: GEMMW4A8Call) -> Optional[str]:
+    def refusal(cls, call: GEMMW4A8Call) -> str | None:
         """Serve prefill token counts with 128-wide groups, N a multiple of 16 and K of 128."""
         if call.m <= GEMMW4A8DecodeKernel.base_token_limit:
             return (
@@ -835,7 +862,7 @@ class GEMMW4A8PrefillKernel(Kernel, GEMMW4A8FwdInterface):
 
     @classmethod
     def entry_for(cls, call: GEMMW4A8Call) -> Entry:
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         identity = (call.m, call.n, call.k, call.group_size, index)
         return identity, lambda: cls(call.m, call.n, call.k, device_index=index)
 
@@ -844,8 +871,8 @@ class GEMMW4A8PrefillKernel(Kernel, GEMMW4A8FwdInterface):
         m: int,
         n: int,
         k: int,
-        config: Optional[dict] = None,
-        device_index: Optional[int] = None,
+        config: dict | None = None,
+        device_index: int | None = None,
     ) -> None:
         super().__init__(device_index=device_index)
         self.m = m
@@ -858,15 +885,11 @@ class GEMMW4A8PrefillKernel(Kernel, GEMMW4A8FwdInterface):
     def default_config(self) -> dict:
         """A legal tile and schedule for this shape and device."""
         m, n, k = self.m, self.n, self.k
-        hardware_sms = get_sm_count(self.device_index)
-        block_m = next(
-            (t for t in GEMMW4A8PrefillKernel.token_tiles if m <= t),
-            GEMMW4A8PrefillKernel.token_tiles[-1],
-        )
+        hardware_sms = self.build_target.sm_count
+        block_m = next((t for t in self.token_tiles if m <= t), self.token_tiles[-1])
         if m > 128 and -(-m // 192) == -(-m // 256):
             block_m = 192
-        # Thresholds below were measured on H200 over the manifest's W4A8 rows. Up to K = 3584
-        # (the TP8 down projections) a tile has few K steps, so an extra segment or a
+        # Up to K = 3584 a tile has few K steps, so an extra segment or a
         # stream-K split costs more than it saves; from K = 7168 it can pay.
         short_k, long_k = 3584, 7168
         base_workers = _worker_count(m, n, k, hardware_sms, block_m, 1, 2)
@@ -881,7 +904,7 @@ class GEMMW4A8PrefillKernel(Kernel, GEMMW4A8FwdInterface):
             and _balanced_wave(balanced, hardware_sms)
             and not one_segment
         ):
-            trial = next((t for t in GEMMW4A8PrefillKernel.token_tiles if -(-m // 2) <= t), 256)
+            trial = next((t for t in self.token_tiles if -(-m // 2) <= t), 256)
             if trial <= 128 and -(-m // trial) == 2:
                 block_m, short_dp = trial, True
         # Larger token tiles leave shared memory for fewer stages.
@@ -889,8 +912,8 @@ class GEMMW4A8PrefillKernel(Kernel, GEMMW4A8FwdInterface):
         # 192- and 256-token tiles store their output in two 64-token buffers.
         epilogue_tokens = block_m if block_m <= 128 else 64
         epilogue_buffers = 2 if block_m in (192, 256) else 1
-        # A two-CTA cluster multicasts the activation; measured faster only on outputs at
-        # most 2304 wide.
+        # A two-CTA cluster multicasts the activation, which pays only on outputs at most
+        # 2304 wide.
         cluster = 2 if block_m == 256 and n % (2 * LAYOUT.block_n) == 0 and n <= 2304 else 1
         group_m = 16 if cluster == 2 else 8
         if short_dp:
@@ -899,11 +922,14 @@ class GEMMW4A8PrefillKernel(Kernel, GEMMW4A8FwdInterface):
             # short_dp is false here, so block_m is the one base_workers was counted for.
             sms = base_workers
             stream_k = 2
+            # At most 16 K groups per idle SM: the bound under which both rules below drop
+            # stream-K.
+            idle_group_bound = 16 * sms
             # Stream-K is dropped where the idle SMs would leave at most 16 K groups each and
             # it would still split a tile into several segments.
             if block_m in (48, 64) and k <= short_k:
                 tiles = -(-n // LAYOUT.block_n)
-                if tiles < sms and (k // W4A8_LAYOUT.tile_k) * (sms - tiles) <= 16 * sms:
+                if tiles < sms and (k // W4A8_LAYOUT.tile_k) * (sms - tiles) <= idle_group_bound:
                     plan = _schedule(m, n, k, sms, 1, stream_k, block_m)
                     if plan["max_segs"] > 1:
                         stream_k = 0
@@ -912,11 +938,10 @@ class GEMMW4A8PrefillKernel(Kernel, GEMMW4A8FwdInterface):
             # A whole wave already runs a tile a CTA under stream-K.
             tiles = -(-m // block_m) * -(-n // LAYOUT.block_n)
             idle_groups = (k // W4A8_LAYOUT.tile_k) * (sms - tiles)
-            if 3 * sms <= 4 * tiles < 4 * sms and idle_groups <= 16 * sms:
+            if 3 * sms <= 4 * tiles < 4 * sms and idle_groups <= idle_group_bound:
                 stream_k = 0
         else:
-            # A worker owns one CTA, or a pair of CTAs for cluster 2. Use the same
-            # units as _schedule for both the grid and the hardware capacity.
+            # A worker is one CTA, or the pair of a 2-CTA cluster, as in _schedule.
             workers = hardware_sms // cluster
             tiles = -(-m // block_m) * (-(-n // LAYOUT.block_n) // cluster)
             waves, tail = divmod(tiles, workers)
@@ -967,10 +992,10 @@ class GEMMW4A8PrefillKernel(Kernel, GEMMW4A8FwdInterface):
         """The prefill program compiled from *cfg*, and the schedule and workspace *cfg*
         sizes for it: partial sums, per-tile counters, segments and contributor counts, which
         the kernel holds."""
-        m, n, k, index = self.m, self.n, self.k, self.device_index
-        _check_config(n, cfg, get_shared_memory_optin(index))
+        m, n, k, index, target = self.m, self.n, self.k, self.device_index, self.build_target
+        _check_config(n, cfg, target.smem_budget)
         workers = _worker_count(
-            m, n, k, get_sm_count(index), cfg["block_m"], cfg["cluster"], cfg["stream_k"]
+            m, n, k, target.sm_count, cfg["block_m"], cfg["cluster"], cfg["stream_k"]
         )
         plan = _schedule(m, n, k, workers, cfg["cluster"], cfg["stream_k"], cfg["block_m"])
         device = torch.device("cuda", index) if index is not None else "cuda"

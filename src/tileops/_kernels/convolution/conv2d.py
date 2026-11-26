@@ -1,26 +1,28 @@
 """2-D convolution kernels: dense, grouped, depthwise, symmetric, and 1x1."""
 
-from typing import Optional
-
 import tilelang
 import tilelang.language as T
 import torch
 
-from tileops._kernels.build_target import target_cache
+from tileops._kernels.build_target import CUDA_COMPILE_FLAGS, target_cache
 from tileops._kernels.convolution._common import (
+    SWIZZLE_PANEL,
     conv_autotune_configs,
     grid_refusal,
     launch,
+    operand_refusal,
+    stage_output_tile,
 )
 from tileops._kernels.convolution.call_spec import Conv2dCall, Conv2dFwdInterface
 from tileops._kernels.kernel_base import Entry, Kernel
-from tileops._utils import get_shared_memory_optin, get_sm_version, is_maca
+from tileops._utils import WARP_LANES, is_maca
 
 __all__ = [
     "Conv2d1x1Kernel",
     "Conv2dKernel",
     "Conv2dSymmetricKernel",
     "DepthwiseConv2dKernel",
+    "DepthwiseConv2dWarpKernel",
     "GroupConv2dKernel",
 ]
 
@@ -32,22 +34,13 @@ def _conv2d_1x1_kernel(
     h: int,
     w: int,
     c_out: int,
-    stride_h: int,
-    stride_w: int,
-    pad_h: int,
-    pad_w: int,
     has_bias: bool,
-    dtype: str = "float16",
+    dtype: str,
 ):
-    # Swizzle panel: a power of two so the block remap divides by shift, and the
-    # narrowest one because long grids lose as it widens.
-    swizzle_panel = 2
     accum_dtype = "float"
-    if stride_h != 1 or stride_w != 1 or pad_h != 0 or pad_w != 0:
-        raise ValueError("Conv2d1x1Kernel requires stride=1 and padding=0")
     hw = h * w
 
-    @tilelang.jit(out_idx=[2], compile_flags=["-O3", "-DENABLE_BF16"])
+    @tilelang.jit(out_idx=[2], compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"])
     def _conv2d_1x1_func(
         block_m: int,
         block_n: int,
@@ -71,7 +64,7 @@ def _conv2d_1x1_kernel(
                 out_shared = T.alloc_shared((block_m, block_n), dtype)
                 out_local = T.alloc_fragment((block_m, block_n), accum_dtype)
 
-                T.use_swizzle(swizzle_panel, enable=enable_rasterization)
+                T.use_swizzle(SWIZZLE_PANEL, enable=enable_rasterization)
                 T.clear(out_local)
 
                 for k_iter in T.Pipelined(T.ceildiv(c_in, block_k), num_stages=num_stages):
@@ -79,21 +72,19 @@ def _conv2d_1x1_kernel(
                     T.copy(x_flat[bz, k_iter * block_k, bx * block_n], data_shared)
                     T.gemm(weight_shared, data_shared, out_local)
 
-                for i, j in T.Parallel(block_m, block_n):
-                    oc = by * block_m + i
-                    hw_idx = bx * block_n + j
-                    if has_bias:
-                        out_shared[i, j] = T.if_then_else(
-                            (oc < c_out) & (hw_idx < hw),
-                            T.cast(out_local[i, j] + T.cast(bias[oc], accum_dtype), dtype),
-                            T.cast(0.0, dtype),
-                        )
-                    else:
-                        out_shared[i, j] = T.if_then_else(
-                            (oc < c_out) & (hw_idx < hw),
-                            T.cast(out_local[i, j], dtype),
-                            T.cast(0.0, dtype),
-                        )
+                stage_output_tile(
+                    out_local,
+                    out_shared,
+                    bias,
+                    block_m,
+                    block_n,
+                    by * block_m,
+                    c_out,
+                    bx * block_n,
+                    hw,
+                    0,
+                    dtype,
+                )
 
                 T.copy(out_shared, out_flat[bz, by * block_m, bx * block_n])
 
@@ -139,26 +130,22 @@ def _conv2d_kernel(
     dilation_h: int,
     dilation_w: int,
     has_bias: bool,
-    dtype: str = "float16",
-    pad_h_end: Optional[int] = None,
-    pad_w_end: Optional[int] = None,
+    dtype: str,
+    *,
+    pad_h_end: int,
+    pad_w_end: int,
 ):
-    # Swizzle panel: a power of two so the block remap divides by shift, and the
-    # narrowest one because long grids lose as it widens.
-    swizzle_panel = 2
-    # The end of each axis may pad more than the start; unset, it pads the same.
-    pad_h_end = pad_h if pad_h_end is None else pad_h_end
-    pad_w_end = pad_w if pad_w_end is None else pad_w_end
+    # The end of each axis may pad more than the start.
     accum_dtype = "float"
     out_h = (h + pad_h + pad_h_end - dilation_h * (kernel_h - 1) - 1) // stride_h + 1
     out_w = (w + pad_w + pad_w_end - dilation_w * (kernel_w - 1) - 1) // stride_w + 1
     k_total = kernel_h * kernel_w * c_in
 
-    # Re-enable automatic async copy once TileLang lowers scalar cp.async
-    # widening for vectorized manual data loads. Keep weight T.copy eligible for TMA.
+    # Automatic async copy is off: TileLang does not widen the scalar cp.async it emits for
+    # the gathered data loads. The weight T.copy stays eligible for TMA.
     @tilelang.jit(
         out_idx=[2],
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
         pass_configs={"tl.enable_async_copy": False},
     )
     def _conv2d_func(
@@ -186,7 +173,7 @@ def _conv2d_kernel(
                 weight_flat = T.Tensor((c_out, k_total), dtype, weight.data)
                 out_flat = T.Tensor((n, c_out, out_hw), dtype, out.data)
 
-                T.use_swizzle(swizzle_panel, enable=enable_rasterization)
+                T.use_swizzle(SWIZZLE_PANEL, enable=enable_rasterization)
                 T.clear(out_local)
 
                 for k_iter in T.Pipelined(T.ceildiv(k_total, block_k), num_stages=num_stages):
@@ -219,21 +206,19 @@ def _conv2d_kernel(
 
                     T.gemm(weight_shared, data_shared, out_local)
 
-                for i, j in T.Parallel(block_m, block_n):
-                    oc = by * block_m + i
-                    spatial_idx = bx * block_n + j
-                    if has_bias:
-                        out_shared[i, j] = T.if_then_else(
-                            (oc < c_out) & (spatial_idx < out_hw),
-                            T.cast(out_local[i, j] + T.cast(bias[oc], accum_dtype), dtype),
-                            T.cast(0.0, dtype),
-                        )
-                    else:
-                        out_shared[i, j] = T.if_then_else(
-                            (oc < c_out) & (spatial_idx < out_hw),
-                            T.cast(out_local[i, j], dtype),
-                            T.cast(0.0, dtype),
-                        )
+                stage_output_tile(
+                    out_local,
+                    out_shared,
+                    bias,
+                    block_m,
+                    block_n,
+                    by * block_m,
+                    c_out,
+                    bx * block_n,
+                    out_hw,
+                    0,
+                    dtype,
+                )
 
                 T.copy(out_shared, out_flat[bz, by * block_m, bx * block_n])
 
@@ -279,30 +264,24 @@ def _conv2d_group_kernel(
     dilation_h: int,
     dilation_w: int,
     has_bias: bool,
-    dtype: str = "float16",
-    groups: int = 1,
-    c_in_g: int = 0,
-    c_out_g: int = 0,
-    pad_h_end: Optional[int] = None,
-    pad_w_end: Optional[int] = None,
+    dtype: str,
+    groups: int,
+    c_in_g: int,
+    c_out_g: int,
+    *,
+    pad_h_end: int,
+    pad_w_end: int,
 ):
-    # Swizzle panel: a power of two so the block remap divides by shift, and the
-    # narrowest one because long grids lose as it widens.
-    swizzle_panel = 2
-    # The end of each axis may pad more than the start; unset, it pads the same.
-    pad_h_end = pad_h if pad_h_end is None else pad_h_end
-    pad_w_end = pad_w if pad_w_end is None else pad_w_end
+    # The end of each axis may pad more than the start.
     accum_dtype = "float"
     out_h = (h + pad_h + pad_h_end - dilation_h * (kernel_h - 1) - 1) // stride_h + 1
     out_w = (w + pad_w + pad_w_end - dilation_w * (kernel_w - 1) - 1) // stride_w + 1
     out_hw = out_h * out_w
-    c_in_g = c_in_g if c_in_g > 0 else c_in // groups
-    c_out_g = c_out_g if c_out_g > 0 else c_out // groups
     k_total = kernel_h * kernel_w * c_in_g
 
     @tilelang.jit(
         out_idx=[2],
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
         pass_configs={"tl.enable_async_copy": False},
     )
     def _conv2d_group_func(
@@ -333,7 +312,7 @@ def _conv2d_group_kernel(
                 weight_flat = T.Tensor((c_out, k_total), dtype, weight.data)
                 out_flat = T.Tensor((n, c_out, out_hw), dtype, out.data)
 
-                T.use_swizzle(swizzle_panel, enable=enable_rasterization)
+                T.use_swizzle(SWIZZLE_PANEL, enable=enable_rasterization)
                 T.clear(out_local)
 
                 batch_id = bz // groups
@@ -368,22 +347,19 @@ def _conv2d_group_kernel(
 
                     T.gemm(weight_shared, data_shared, out_local)
 
-                for i, j in T.Parallel(block_m, block_n):
-                    oc_g = by * block_m + i
-                    oc = group_id * c_out_g + oc_g
-                    spatial_idx = bx * block_n + j
-                    if has_bias:
-                        out_shared[i, j] = T.if_then_else(
-                            (oc_g < c_out_g) & (spatial_idx < out_hw),
-                            T.cast(out_local[i, j] + T.cast(bias[oc], accum_dtype), dtype),
-                            T.cast(0.0, dtype),
-                        )
-                    else:
-                        out_shared[i, j] = T.if_then_else(
-                            (oc_g < c_out_g) & (spatial_idx < out_hw),
-                            T.cast(out_local[i, j], dtype),
-                            T.cast(0.0, dtype),
-                        )
+                stage_output_tile(
+                    out_local,
+                    out_shared,
+                    bias,
+                    block_m,
+                    block_n,
+                    by * block_m,
+                    c_out_g,
+                    bx * block_n,
+                    out_hw,
+                    group_id * c_out_g,
+                    dtype,
+                )
 
                 if c_out_g % block_m == 0:
                     # The tile ends on this group's last channel, so the copy cannot spill
@@ -441,9 +417,10 @@ def _conv2d_depthwise_kernel(
     dilation_h: int,
     dilation_w: int,
     has_bias: bool,
-    dtype: str = "float16",
-    pad_h_end: Optional[int] = None,
-    pad_w_end: Optional[int] = None,
+    dtype: str,
+    *,
+    pad_h_end: int,
+    pad_w_end: int,
 ):
     """Build the depthwise Conv2d program: one input channel feeds one output channel.
 
@@ -451,23 +428,16 @@ def _conv2d_depthwise_kernel(
     channel, so a tile of ``block_m`` rows carries one useful row. This one multiplies and
     accumulates directly instead, the way the Conv1d depthwise path does.
     """
-    # Swizzle panel: a power of two so the block remap divides by shift, and the
-    # narrowest one because long grids lose as it widens.
-    swizzle_panel = 2
-    # The end of each axis may pad more than the start; unset, it pads the same.
-    pad_h_end = pad_h if pad_h_end is None else pad_h_end
-    pad_w_end = pad_w if pad_w_end is None else pad_w_end
+    # The end of each axis may pad more than the start.
     accum_dtype = "float"
     out_h = (h + pad_h + pad_h_end - dilation_h * (kernel_h - 1) - 1) // stride_h + 1
     out_w = (w + pad_w + pad_w_end - dilation_w * (kernel_w - 1) - 1) // stride_w + 1
     out_hw = out_h * out_w
 
-    @tilelang.jit(out_idx=[2], compile_flags=["-O3", "-DENABLE_BF16"])
+    @tilelang.jit(out_idx=[2], compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"])
     def _conv2d_depthwise_func(
         block_m: int,
         block_n: int,
-        block_k: int,
-        num_stages: int,
         threads: int,
         enable_rasterization: bool,
     ):
@@ -481,7 +451,7 @@ def _conv2d_depthwise_kernel(
                 threads=threads,
             ) as (bx, by, bz):
                 out_local = T.alloc_fragment((block_m, block_n), accum_dtype)
-                T.use_swizzle(swizzle_panel, enable=enable_rasterization)
+                T.use_swizzle(SWIZZLE_PANEL, enable=enable_rasterization)
                 T.clear(out_local)
 
                 for kh, kw in T.grid(kernel_h, kernel_w):
@@ -557,11 +527,8 @@ def _conv2d_symmetric_kernel(
     pad: int,
     dilation: int,
     has_bias: bool,
-    dtype: str = "float16",
+    dtype: str,
 ):
-    # Swizzle panel: a power of two so the block remap divides by shift, and the
-    # narrowest one because long grids lose as it widens.
-    swizzle_panel = 2
     accum_dtype = "float"
     out_h = (h + 2 * pad - dilation * (kernel_size - 1) - 1) // stride + 1
     out_w = (w + 2 * pad - dilation * (kernel_size - 1) - 1) // stride + 1
@@ -570,7 +537,7 @@ def _conv2d_symmetric_kernel(
 
     @tilelang.jit(
         out_idx=[4],
-        compile_flags=["-O3", "-DENABLE_BF16"],
+        compile_flags=[*CUDA_COMPILE_FLAGS, "-DENABLE_BF16"],
         pass_configs={"tl.enable_async_copy": False},
     )
     def _conv2d_symmetric_func(
@@ -664,7 +631,7 @@ def _conv2d_symmetric_kernel(
                 weight_flat = T.Tensor((c_out, k_total), dtype, weight_krsc.data)
                 out_nchw = T.Tensor((n, c_out, out_hw), dtype, out.data)
 
-                T.use_swizzle(swizzle_panel, enable=enable_rasterization)
+                T.use_swizzle(SWIZZLE_PANEL, enable=enable_rasterization)
                 T.clear(out_local)
 
                 for k_iter in T.Pipelined(T.ceildiv(k_total, block_k), num_stages=num_stages):
@@ -721,6 +688,27 @@ def _conv2d_symmetric_kernel(
     return _conv2d_symmetric_func
 
 
+def _gathered_gemm_default_config(arch: int, *, maca: bool = False) -> dict:
+    """The tile ``Conv2dKernel`` and ``GroupConv2dKernel`` launch with before tuning."""
+    if arch == 90:
+        return {
+            "block_m": 64,
+            "block_n": 64,
+            "block_k": 64,
+            "num_stages": 1 if maca else 3,
+            "threads": 128,
+            "enable_rasterization": False,
+        }
+    return {
+        "block_m": 64,
+        "block_n": 64,
+        "block_k": 64,
+        "threads": 128,
+        "num_stages": 1 if maca else 2,
+        "enable_rasterization": True,
+    }
+
+
 class Conv2dSymmetricKernel(Kernel, Conv2dFwdInterface):
     """Dense Conv2d staged through an NHWC implicit GEMM.
 
@@ -737,7 +725,7 @@ class Conv2dSymmetricKernel(Kernel, Conv2dFwdInterface):
     block_m_candidates: tuple[int, ...] = (64, 128)
 
     @classmethod
-    def refusal(cls, call: Conv2dCall) -> Optional[str]:
+    def refusal(cls, call: Conv2dCall) -> str | None:
         if call.groups != 1:
             return "serves ungrouped convolution"
         if not (
@@ -761,7 +749,7 @@ class Conv2dSymmetricKernel(Kernel, Conv2dFwdInterface):
 
         Its region is the symmetric one, so one extent of each pair speaks for both.
         """
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         args = (
             call.n,
             call.c_in,
@@ -791,9 +779,9 @@ class Conv2dSymmetricKernel(Kernel, Conv2dFwdInterface):
         dilation: int,
         dtype: torch.dtype,
         has_bias: bool = False,
-        config: Optional[dict] = None,
+        config: dict | None = None,
         *,
-        device_index: Optional[int] = None,
+        device_index: int | None = None,
     ) -> None:
         super().__init__(device_index=device_index)
         self.n = n
@@ -802,15 +790,9 @@ class Conv2dSymmetricKernel(Kernel, Conv2dFwdInterface):
         self.w = w
         self.c_out = c_out
         self.kernel_size = kernel_size
-        self.stride = stride
-        self.pad = pad
-        self.dilation = dilation
         self.dtype = dtype
-        self.has_bias = has_bias
         self.out_h = (h + 2 * pad - dilation * (kernel_size - 1) - 1) // stride + 1
         self.out_w = (w + 2 * pad - dilation * (kernel_size - 1) - 1) // stride + 1
-        self.m = n * self.out_h * self.out_w
-        self.k_total = c_in * kernel_size * kernel_size
 
         self.kernel = _conv2d_symmetric_kernel(
             n,
@@ -840,10 +822,40 @@ class Conv2dSymmetricKernel(Kernel, Conv2dFwdInterface):
     @property
     def default_config(self) -> dict:
         block_m, block_n, block_k = min(self.block_m_candidates), 256, 32
+        if self.build_target.arch == 90 and self.dtype in (torch.float16, torch.bfloat16):
+            if self.c_out <= 64:
+                return {
+                    "block_m": block_m,
+                    "block_n": 64,
+                    "block_k": 32,
+                    "num_stages": 3,
+                    "threads": 128,
+                    "enable_rasterization": True,
+                }
+            # The wide tile for large channel counts.
+            wide_m, wide_n, wide_k, wide_stages = 128, 256, 64, 3
+            if (
+                self.c_out >= 256
+                and self.c_in >= 256
+                and self.out_h * self.out_w >= 8192
+                and wide_m in self.block_m_candidates
+                and self.tile_stays_in_one_image(self.n, self.out_h * self.out_w, wide_m)
+                and self.c_in % wide_k == 0
+                and wide_stages * (wide_m + wide_n) * wide_k * self.dtype.itemsize
+                <= self.build_target.smem_budget
+            ):
+                return {
+                    "block_m": wide_m,
+                    "block_n": wide_n,
+                    "block_k": wide_k,
+                    "num_stages": wide_stages,
+                    "threads": 256,
+                    "enable_rasterization": False,
+                }
         # The output tile reuses the pipeline's shared memory, so the stages are all of
         # it: two where three do not fit (float32 on SM89's 99 KB).
         stage_bytes = (block_m + block_n) * block_k * self.dtype.itemsize
-        fits = 3 * stage_bytes <= get_shared_memory_optin(self.device_index)
+        fits = 3 * stage_bytes <= self.build_target.smem_budget
         return {
             "block_m": block_m,
             "block_n": block_n,
@@ -859,7 +871,7 @@ class Conv2dSymmetricKernel(Kernel, Conv2dFwdInterface):
         # so a 32-wide k tile always divides it.
         configs = conv_autotune_configs(
             self.dtype,
-            self.device_index,
+            self.build_target.smem_budget,
             block_m=list(self.block_m_candidates),
             block_k=[32, 64],
         )
@@ -875,7 +887,7 @@ class Conv2dSymmetricKernel(Kernel, Conv2dFwdInterface):
         self,
         x: torch.Tensor,
         weight: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x_nhwc = torch.empty(
             (self.n, self.h, self.w, self.c_in),
@@ -897,14 +909,14 @@ class Conv2dKernel(Kernel, Conv2dFwdInterface):
     supported_archs: list[int] = [80, 86, 89, 90]
 
     @classmethod
-    def refusal(cls, call: Conv2dCall) -> Optional[str]:
+    def refusal(cls, call: Conv2dCall) -> str | None:
         if call.groups != 1:
             return "serves ungrouped convolution"
         return super().refusal(call) or grid_refusal(z=call.n)
 
     @classmethod
     def entry_for(cls, call: Conv2dCall) -> Entry:
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         args = (
             call.n,
             call.c_in,
@@ -945,32 +957,14 @@ class Conv2dKernel(Kernel, Conv2dFwdInterface):
         dilation_w: int,
         dtype: torch.dtype,
         has_bias: bool = False,
-        pad_end: Optional[tuple[int, ...]] = None,
-        config: Optional[dict] = None,
+        pad_end: tuple[int, ...] | None = None,
+        config: dict | None = None,
         *,
-        device_index: Optional[int] = None,
+        device_index: int | None = None,
     ) -> None:
         super().__init__(device_index=device_index)
-        self.n = n
-        self.c_in = c_in
-        self.h = h
-        self.w = w
-        self.c_out = c_out
-        self.kernel_h = kernel_h
-        self.kernel_w = kernel_w
-        self.stride_h = stride_h
-        self.stride_w = stride_w
-        self.pad_h = pad_h
-        self.pad_w = pad_w
-        self.pad_h_end, self.pad_w_end = pad_end if pad_end is not None else (pad_h, pad_w)
-        self.dilation_h = dilation_h
-        self.dilation_w = dilation_w
         self.dtype = dtype
-        self.has_bias = has_bias
-        self.out_h = (h + pad_h + self.pad_h_end - dilation_h * (kernel_h - 1) - 1) // stride_h + 1
-        self.out_w = (w + pad_w + self.pad_w_end - dilation_w * (kernel_w - 1) - 1) // stride_w + 1
-        self.m = n * self.out_h * self.out_w
-        self.k_total = c_in * kernel_h * kernel_w
+        pad_h_end, pad_w_end = pad_end if pad_end is not None else (pad_h, pad_w)
 
         self.kernel = _conv2d_kernel(
             n,
@@ -988,46 +982,22 @@ class Conv2dKernel(Kernel, Conv2dFwdInterface):
             dilation_w,
             has_bias,
             self.dtype_str,
-            pad_h_end=self.pad_h_end,
-            pad_w_end=self.pad_w_end,
+            pad_h_end=pad_h_end,
+            pad_w_end=pad_w_end,
         )
         self.init_config(config)
 
     @property
     def default_config(self) -> dict:
-        sm_version = get_sm_version(self.device_index)
-        if sm_version in {90}:
-            return {
-                "block_m": 64,
-                "block_n": 64,
-                "block_k": 64,
-                "num_stages": 3,
-                "threads": 128,
-                "enable_rasterization": False,
-            }
-        if sm_version in {80}:
-            return {
-                "block_m": 64,
-                "block_n": 64,
-                "block_k": 64,
-                "threads": 128,
-                "num_stages": 1,
-                "enable_rasterization": True,
-            }
-        return {
-            "block_m": 64,
-            "block_n": 64,
-            "block_k": 64,
-            "threads": 128,
-            "num_stages": 1,
-            "enable_rasterization": True,
-        }
+        return _gathered_gemm_default_config(
+            self.build_target.arch, maca=self.build_target.kind == "maca"
+        )
 
     @property
     def autotune_configs(self) -> list[dict]:
         return conv_autotune_configs(
             self.dtype,
-            self.device_index,
+            self.build_target.smem_budget,
             block_m=[64, 128],
             block_k=[64, 128],
         )
@@ -1036,7 +1006,7 @@ class Conv2dKernel(Kernel, Conv2dFwdInterface):
         self,
         x: torch.Tensor,
         weight: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return launch(self, x, weight, bias=bias)
 
@@ -1052,14 +1022,14 @@ class GroupConv2dKernel(Kernel, Conv2dFwdInterface):
         return call.n * call.groups
 
     @classmethod
-    def refusal(cls, call: Conv2dCall) -> Optional[str]:
+    def refusal(cls, call: Conv2dCall) -> str | None:
         if call.groups <= 1:
             return "serves grouped convolution"
         return super().refusal(call) or grid_refusal(z=cls._grid_z(call))
 
     @classmethod
     def entry_for(cls, call: Conv2dCall) -> Entry:
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         args = (
             call.n,
             call.c_in,
@@ -1104,13 +1074,13 @@ class GroupConv2dKernel(Kernel, Conv2dFwdInterface):
         dilation_w: int,
         dtype: torch.dtype,
         has_bias: bool = False,
-        pad_end: Optional[tuple[int, ...]] = None,
-        groups: int = 1,
-        c_in_g: Optional[int] = None,
-        c_out_g: Optional[int] = None,
-        config: Optional[dict] = None,
+        pad_end: tuple[int, ...] | None = None,
+        config: dict | None = None,
         *,
-        device_index: Optional[int] = None,
+        groups: int,
+        c_in_g: int,
+        c_out_g: int,
+        device_index: int | None = None,
     ) -> None:
         super().__init__(device_index=device_index)
         self.n = n
@@ -1128,14 +1098,12 @@ class GroupConv2dKernel(Kernel, Conv2dFwdInterface):
         self.dilation_h = dilation_h
         self.dilation_w = dilation_w
         self.groups = groups
-        self.c_in_g = c_in_g if c_in_g is not None else c_in // groups
-        self.c_out_g = c_out_g if c_out_g is not None else c_out // groups
+        self.c_in_g = c_in_g
+        self.c_out_g = c_out_g
         self.dtype = dtype
         self.has_bias = has_bias
         self.out_h = (h + pad_h + self.pad_h_end - dilation_h * (kernel_h - 1) - 1) // stride_h + 1
         self.out_w = (w + pad_w + self.pad_w_end - dilation_w * (kernel_w - 1) - 1) // stride_w + 1
-        self.m = n * self.groups * self.out_h * self.out_w
-        self.k_total = self.c_in_g * kernel_h * kernel_w
         if self.groups <= 1:
             raise ValueError(f"{type(self).__name__} requires groups > 1")
         if self.c_in % self.groups or self.c_out % self.groups:
@@ -1173,33 +1141,19 @@ class GroupConv2dKernel(Kernel, Conv2dFwdInterface):
 
     @property
     def default_config(self) -> dict:
-        if get_sm_version(self.device_index) == 90:
-            return {
-                "block_m": 64,
-                "block_n": 64,
-                "block_k": 64,
-                "num_stages": 3,
-                "threads": 128,
-                "enable_rasterization": False,
-            }
-        return {
-            "block_m": 64,
-            "block_n": 64,
-            "block_k": 64,
-            "threads": 128,
-            "num_stages": 1,
-            "enable_rasterization": True,
-        }
+        return _gathered_gemm_default_config(
+            self.build_target.arch, maca=self.build_target.kind == "maca"
+        )
 
     @property
     def autotune_configs(self) -> list[dict]:
-        return conv_autotune_configs(self.dtype, self.device_index, threads=[128])
+        return conv_autotune_configs(self.dtype, self.build_target.smem_budget, threads=[128])
 
     def forward(
         self,
         x: torch.Tensor,
         weight: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return launch(self, x, weight, bias=bias)
 
@@ -1215,7 +1169,7 @@ class DepthwiseConv2dKernel(GroupConv2dKernel):
     preferred_over = frozenset({"group_conv2d"})
 
     @classmethod
-    def refusal(cls, call) -> "str | None":
+    def refusal(cls, call: Conv2dCall) -> str | None:
         if call.c_in_g != 1 or call.c_out_g != 1:
             return "serves one input and one output channel per group"
         return super().refusal(call)
@@ -1248,15 +1202,14 @@ class DepthwiseConv2dKernel(GroupConv2dKernel):
 
     @property
     def default_config(self) -> dict:
-        # No GEMM here, so block_k and num_stages carry nothing: one channel per block
-        # row, a strip of outputs per block column.
+        # One channel per block row, a strip of outputs per block column.
         return {
             "block_m": 1,
             "block_n": 128,
-            "block_k": 1,
-            "num_stages": 1,
             "threads": 128,
-            "enable_rasterization": True,
+            "enable_rasterization": not (
+                self.build_target.arch == 90 and self.out_h * self.out_w >= 4096
+            ),
         }
 
     @property
@@ -1264,6 +1217,139 @@ class DepthwiseConv2dKernel(GroupConv2dKernel):
         # One tile shape, since there is no GEMM to tile. The swizzle is still a
         # choice, so both ways are searched.
         return [{**self.default_config, "enable_rasterization": value} for value in (False, True)]
+
+
+@target_cache(maxsize=32)
+def _conv2d_depthwise_warp_kernel(
+    n: int, channels: int, h: int, w: int, dtype: str, has_bias: bool
+):
+    @tilelang.jit(out_idx=[2])
+    def build():
+        @T.macro
+        def convolve(x, weight, y, bias):
+            # Four warps of two output rows cover an eight-row band; a lane takes two columns.
+            with T.Kernel(h // 8, channels, n, threads=128) as (band, channel, image):
+                thread = T.get_thread_binding()
+                column = thread % WARP_LANES * 2
+                row = band * 8 + thread // WARP_LANES * 2
+                even = T.alloc_local((4,), "float32")
+                odd = T.alloc_local((4,), "float32")
+                left = T.alloc_local((4,), "float32")
+                right = T.alloc_local((4,), "float32")
+                values = T.alloc_local((2, 2), "float32")
+                out = T.alloc_local((2, 2), dtype)
+                T.clear(values)
+
+                # Two output rows reuse four input rows. Adjacent lanes exchange the
+                # outer columns of their two-pixel strips.
+                for tap in T.unroll(4):
+                    ih = row + tap - 1
+                    if column < w and 0 <= ih < h:
+                        even[tap] = T.cast(x[image, channel, ih, column], "float32")
+                        odd[tap] = T.cast(x[image, channel, ih, column + 1], "float32")
+                    else:
+                        even[tap] = 0.0
+                        odd[tap] = 0.0
+                    left[tap] = T.shfl_up(odd[tap], 1)
+                    right[tap] = T.shfl_down(even[tap], 1)
+
+                for tap in T.unroll(3):
+                    wl = T.cast(weight[channel, 0, tap, 0], "float32")
+                    wc = T.cast(weight[channel, 0, tap, 1], "float32")
+                    wr = T.cast(weight[channel, 0, tap, 2], "float32")
+                    for j in T.unroll(2):
+                        i = j + tap
+                        if 0 <= row + i - 1 < h:
+                            values[j, 0] += T.if_then_else(column > 0, left[i] * wl, 0.0)
+                            values[j, 0] += even[i] * wc
+                            values[j, 0] += odd[i] * wr
+                            values[j, 1] += even[i] * wl
+                            values[j, 1] += odd[i] * wc
+                            values[j, 1] += T.if_then_else(column + 2 < w, right[i] * wr, 0.0)
+
+                if column < w:
+                    for j in T.unroll(2):
+                        for k in T.unroll(2):
+                            if has_bias:
+                                out[j, k] = T.cast(
+                                    values[j, k] + T.cast(bias[channel], "float32"), dtype
+                                )
+                            else:
+                                out[j, k] = T.cast(values[j, k], dtype)
+                        for k in T.vectorized(2):
+                            y[image, channel, row + j, column + k] = out[j, k]
+
+        if has_bias:
+
+            @T.prim_func
+            def main(
+                x: T.Tensor[(n, channels, h, w), dtype],
+                weight: T.Tensor[(channels, 1, 3, 3), dtype],
+                y: T.Tensor[(n, channels, h, w), dtype],
+                bias: T.Tensor[(channels,), dtype],
+            ):
+                convolve(x, weight, y, bias)
+
+        else:
+
+            @T.prim_func
+            def main(
+                x: T.Tensor[(n, channels, h, w), dtype],
+                weight: T.Tensor[(channels, 1, 3, 3), dtype],
+                y: T.Tensor[(n, channels, h, w), dtype],
+            ):
+                convolve(x, weight, y, None)
+
+        return main
+
+    return build
+
+
+class DepthwiseConv2dWarpKernel(Kernel, Conv2dFwdInterface):
+    """Reuse overlapping 3-by-3 depthwise windows across registers and warp lanes."""
+
+    supported_archs = [90]
+    preferred_over = frozenset({"depthwise_conv2d"})
+
+    @classmethod
+    def refusal(cls, call: Conv2dCall) -> str | None:
+        if not (
+            call.c_in == call.c_out == call.groups > 1
+            and call.kernel_h == call.kernel_w == 3
+            and call.stride == call.dilation == (1, 1)
+            and call.padding == (1, 1)
+            and call.padding_end in (None, (1, 1))
+        ):
+            return "requires a depthwise 3-by-3 window with one pixel of symmetric padding"
+        if not (call.h % 8 == 0 and 16 <= call.w <= 64 and call.w % 2 == 0):
+            return "requires full eight-row bands and an even width from 16 to 64"
+        if call.dtype not in (torch.float16, torch.bfloat16):
+            return "requires fp16 or bf16"
+        return (
+            super().refusal(call)
+            or grid_refusal(y=call.c_out, z=call.n)
+            or operand_refusal(call.n * call.c_in * call.h * call.w)
+        )
+
+    @classmethod
+    def entry_for(cls, call: Conv2dCall) -> Entry:
+        index = call.device_index
+        args = (call.n, call.c_in, call.h, call.w, call.dtype, call.has_bias)
+        return (*args, index), lambda: cls(*args, device_index=index)
+
+    def __init__(self, n, channels, h, w, dtype, has_bias, *, device_index=None):
+        super().__init__(device_index=device_index)
+        self.dtype = dtype
+        self.kernel = _conv2d_depthwise_warp_kernel(n, channels, h, w, self.dtype_str, has_bias)
+        self.init_config()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return launch(self, x, weight, bias=bias)
 
 
 class Conv2d1x1Kernel(Kernel, Conv2dFwdInterface):
@@ -1278,7 +1364,7 @@ class Conv2d1x1Kernel(Kernel, Conv2dFwdInterface):
     preferred_over = frozenset({"conv2d_symmetric"})
 
     @classmethod
-    def refusal(cls, call: Conv2dCall) -> Optional[str]:
+    def refusal(cls, call: Conv2dCall) -> str | None:
         if not (
             call.groups == 1
             and call.kernel_h == 1
@@ -1293,17 +1379,13 @@ class Conv2d1x1Kernel(Kernel, Conv2dFwdInterface):
 
     @classmethod
     def entry_for(cls, call: Conv2dCall) -> Entry:
-        index = call.device.index if call.device is not None else None
+        index = call.device_index
         args = (
             call.n,
             call.c_in,
             call.h,
             call.w,
             call.c_out,
-            call.stride[0],
-            call.stride[1],
-            call.padding[0],
-            call.padding[1],
             call.dtype,
         )
         return (*args, call.has_bias, index), lambda: cls(
@@ -1317,57 +1399,22 @@ class Conv2d1x1Kernel(Kernel, Conv2dFwdInterface):
         h: int,
         w: int,
         c_out: int,
-        stride_h: int,
-        stride_w: int,
-        pad_h: int,
-        pad_w: int,
         dtype: torch.dtype,
         has_bias: bool = False,
-        config: Optional[dict] = None,
+        config: dict | None = None,
         *,
-        device_index: Optional[int] = None,
+        device_index: int | None = None,
     ) -> None:
         super().__init__(device_index=device_index)
-        self.n = n
         self.c_in = c_in
-        self.h = h
-        self.w = w
         self.c_out = c_out
-        self.stride_h = stride_h
-        self.stride_w = stride_w
-        self.pad_h = pad_h
-        self.pad_w = pad_w
         self.dtype = dtype
-        self.has_bias = has_bias
-
-        self.kernel = _conv2d_1x1_kernel(
-            n,
-            c_in,
-            h,
-            w,
-            c_out,
-            stride_h,
-            stride_w,
-            pad_h,
-            pad_w,
-            has_bias,
-            self.dtype_str,
-        )
+        self.kernel = _conv2d_1x1_kernel(n, c_in, h, w, c_out, has_bias, self.dtype_str)
         self.init_config(config)
 
     @property
     def default_config(self) -> dict:
-        sm_version = get_sm_version(self.device_index)
-        if sm_version in {80}:
-            return {
-                "block_m": 64,
-                "block_n": 64,
-                "block_k": 64,
-                "num_stages": 1,
-                "threads": 128,
-                "enable_rasterization": True,
-            }
-        if sm_version in {90}:
+        if self.build_target.arch == 90:
             return {
                 "block_m": 64,
                 "block_n": 128,
@@ -1392,7 +1439,7 @@ class Conv2d1x1Kernel(Kernel, Conv2dFwdInterface):
         # small map has no other way to fill the device.
         return conv_autotune_configs(
             self.dtype,
-            self.device_index,
+            self.build_target.smem_budget,
             block_m=[64, 128],
             block_n=[32, 64, 128, 256],
             threads=[128],
@@ -1402,7 +1449,7 @@ class Conv2d1x1Kernel(Kernel, Conv2dFwdInterface):
         self,
         x: torch.Tensor,
         weight: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # OIHW -> OC,IC since the 1x1 kernel consumes a dense [C_out, C_in] weight matrix.
         weight_oc_ci = weight.view(self.c_out, self.c_in).contiguous()
